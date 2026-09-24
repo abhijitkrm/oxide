@@ -1145,6 +1145,7 @@ dependencies = [
  "codec",
  "criterion",
  "crypto",
+ "libc",
  "ports",
  "primitives",
  "tempfile",

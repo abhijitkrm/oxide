@@ -17,6 +17,10 @@ codec = { workspace = true }
 crypto = { workspace = true }
 types = { workspace = true }
 ports = { workspace = true }
+# libc: `O_DSYNC` + `fallocate` for the WAL's data-synchronous,
+# preallocated append path on Linux — no std exposure. Justified in
+# the workspace manifest; no other libc surface is used.
+libc = { workspace = true }
 
 [features]
 # Conformance mode: disables BLS signature verification for

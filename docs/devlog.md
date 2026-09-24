@@ -21871,3 +21871,48 @@ directly. Regression test: a timeout carrying an adopted QC
 verifies `Current` and collects; the proposal-flood E2E (6 real
 nodes + an authenticated Byzantine peer, 38k junk frames) now
 passes with TCs forming under the flood.
+
+## WAL: folded fsync + preallocated extents
+
+`Wal::append` paid `write(2)` + `fdatasync(2)` per signature
+emission, and every deferred frame paid its own `write` to stay
+inside the next fsync's coverage. On Linux the file now opens
+`O_DSYNC` — each `write(2)` completes only when its own data and
+the metadata needed to retrieve it (the file-size update, which
+`O_APPEND` requires and `O_DSYNC` covers) are committed — so the
+append's write *is* the durability point: one syscall per
+signature emission.
+
+The catch: `O_DSYNC` syncs only the data in *that* write call, so
+a deferred frame flushed on its own would pay a full sync and
+invert the batching win. `append_unsynced` therefore no longer
+flushes — deferred frames sit in the `BufWriter` and flush inside
+the *same write* as the next signature frame, one `O_DSYNC`
+completion covering both. The deferred contract is unchanged
+(loss-tolerant state only) but the loss window now honestly
+includes process exit, not just power loss — an unflushed buffer
+never reached the kernel. Checkpoint drops the buffer safely (the
+snapshot strictly supersedes it); `mem::forget` in the test
+proves only synced frames survive a kill.
+
+`fallocate(FALLOC_FL_KEEP_SIZE)` maps 8 MiB extents ahead of the
+append position: a synced write then touches only the size update
+in the journal — never a block-allocation transaction — and
+`ENOSPC` surfaces at allocation time instead of mid-view.
+`KEEP_SIZE` keeps the logical length honest so recovery never
+scans reserved zeros; `EOPNOTSUPP`/`ENOSYS` disables the hint
+rather than failing appends. `appended_end`/`allocated_end` are
+tracked in-memory (no per-append `stat`), re-seeded by
+`repair_tail`, `checkpoint`, and `truncate`.
+
+macOS deliberately keeps `write` + `sync_data`: Apple's `O_DSYNC`
+does not imply `F_FULLFSYNC` (the drive-cache flush), so the
+previous path is the stronger guarantee there — the audit's
+target is Linux NVMe+PLP anyway. Both platforms share the new
+buffered-deferred batching, which alone measured
+`deliver_qc_signed_wal` 1.40→1.37 ms (−16%) and
+`form_qc_signed_wal` −20% on the dev Mac (each deferred frame no
+longer pays a write syscall); `vote_signed_wal` unchanged
+(F_FULLFSYNC-dominated). The `O_DSYNC` fold itself needs the
+Linux re-baseline. One fsync per signature emission, unchanged;
+`wal_fsyncs_once_per_signature_emission` still pins the count.

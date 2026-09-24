@@ -218,6 +218,12 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 # (published 2018+, used by tokio, rayon, and most Rust async runtimes).
 crossbeam-channel = "0.5.14"
 
+# libc: `O_DSYNC`/`fallocate` have no std exposure — the consensus WAL
+# opens its file data-synchronous and preallocates extents on Linux
+# (the audit's target platform; other platforms keep write+fdatasync).
+# MIT/Apache-2.0 (GPL-compatible), the most-vetted dep in the graph.
+libc = "0.2.189"
+
 [profile.release]
 # Whole-program optimization for the hot paths; slower builds are acceptable
 # because perf gates (README.md → Roadmap) are release-profile measurements.

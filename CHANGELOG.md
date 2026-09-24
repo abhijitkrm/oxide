@@ -12,6 +12,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Folded-fsync consensus WAL** (`consensus::wal`): on Linux the
+  WAL opens `O_DSYNC`, so a signature-path append's `write(2)` is
+  itself durable — no second fsync syscall per vote — and
+  `fallocate` pre-maps 8 MiB extents so the synced write never
+  journals block allocation (and `ENOSPC` surfaces early, not
+  mid-view). Deferred frames (QC adoptions, commit markers) now
+  buffer in userspace and ride the signature frame's single write
+  — required, because `O_DSYNC` syncs only its own write.
+  Durability contract unchanged: one durability point per
+  signature emission, deferred state still loss-tolerant.
+  Measured on the dev Mac (which keeps write+`F_FULLFSYNC` —
+  Apple's `O_DSYNC` lacks the drive-cache flush — but shares the
+  buffered batching): `deliver_qc_signed_wal` 1.40→1.37 ms (−16%),
+  `form_qc_signed_wal` −20%, `vote_signed_wal` unchanged.
+  The `O_DSYNC` fold itself re-baselines on the Linux target.
+  - **In plain words:** every vote used to cost two disk
+    operations (write, then flush-to-storage). On the target
+    Linux hardware it now costs one — the write itself is the
+    flush — and background bookkeeping rides along inside it for
+    free. Nothing got less safe: a vote is still on disk before
+    it reaches the network.
+
 - **Real-contract EVM benchmark** (`evm`, `contract_mix`): the
   first bench over *deployed contracts* — an ERC-20-style mapping
   transfer emitting a real `Transfer` log, a Uniswap-pair-style

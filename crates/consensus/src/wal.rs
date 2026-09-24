@@ -57,12 +57,49 @@
 //! not durability. Compaction bounds the file at
 //! `COMPACT_AFTER_BYTES + MAX_WAL_ENTRY_BYTES` and the recovery scan
 //! at the same order, so restart time no longer grows with uptime.
+//!
+//! ## Synchronous durability (the fsync fold)
+//!
+//! On Linux the WAL file is opened `O_DSYNC`: every `write(2)`
+//! completes only when its own data and the metadata needed to
+//! retrieve it (the file-size update, covered because appends extend
+//! the file) are committed to storage. That folds the fsync into the
+//! append's write — one syscall per signature emission instead of
+//! `write` + `fdatasync`, which was the dominant per-view cost.
+//!
+//! Two consequences shape the layout:
+//!
+//! * **Deferred frames buffer, not write.** `O_DSYNC` syncs only the
+//!   data in *that* write call — a deferred frame flushed on its own
+//!   would pay a full sync and invert the batching win. So
+//!   [`Wal::append_unsynced`] leaves the frame in the `BufWriter`;
+//!   the next signature-path [`Wal::append`] flushes it inside the
+//!   same `write(2)` as the signature frame, and the one `O_DSYNC`
+//!   completion covers both. The deferred contract is unchanged —
+//!   loss-tolerant state only — but the loss window now includes
+//!   process exit, not just power loss: an unflushed buffer never
+//!   reached the kernel.
+//! * **Extents are preallocated.** `fallocate(FALLOC_FL_KEEP_SIZE)`
+//!   maps [`PREALLOC_CHUNK_BYTES`] ahead of the append position, so
+//!   a synced write touches only the file-size update in the journal
+//!   — never a block-allocation transaction — and `ENOSPC` surfaces
+//!   at allocation time rather than mid-view. `KEEP_SIZE` keeps the
+//!   logical length honest: recovery scans real frames only.
+//!
+//! macOS and other non-Linux targets keep the previous path —
+//! `write` + `sync_data` (`F_FULLFSYNC` on Apple, the stronger
+//! drive-cache flush `O_DSYNC` does not imply there) — with the same
+//! buffered-deferred batching.
 
 use codec::{Decode, DecodeError, Encode, Reader};
 use primitives::{Epoch, Hash, Height, View};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 /// Upper bound on one WAL entry's payload.
@@ -103,6 +140,17 @@ pub(crate) const MAX_PERSISTED_PENDING: usize = 8;
 /// raising it delays the checkpoint a busy validator would otherwise
 /// take for free.
 const COMPACT_AFTER_BYTES: u64 = 32 << 20;
+
+/// Extent preallocation quantum — see "Synchronous durability" above.
+///
+/// Unit: bytes. `fallocate(FALLOC_FL_KEEP_SIZE)` is issued in chunks
+/// of this size so a synced append never triggers a block-allocation
+/// journal transaction. Sized a quarter of the compaction bound: a
+/// WAL that lives to `COMPACT_AFTER_BYTES` allocates four times ever,
+/// while a short-lived test WAL pays at most 8 MiB of reserved space.
+/// Linux only — other platforms keep the unsized-append behaviour.
+#[cfg(target_os = "linux")]
+const PREALLOC_CHUNK_BYTES: u64 = 8 << 20;
 
 /// The safety-critical consensus state persisted to the WAL.
 ///
@@ -640,6 +688,42 @@ pub struct Wal {
     /// Checkpoint fsyncs (`atomic_replace` inside [`checkpoint`]) are
     /// compaction events, not signature emissions, and are not counted.
     syncs: u64,
+    /// Logical end of appended data — the file length once every
+    /// buffered frame is flushed. Tracked rather than re-stat'd per
+    /// append because every write flows through this `BufWriter`;
+    /// `repair_tail`, `checkpoint`, and `truncate` re-seed it.
+    /// Drives [`ensure_room`](Self::ensure_room).
+    appended_end: u64,
+    /// End of the `fallocate`'d extent. `appended_end` may pass it
+    /// only transiently between appends — [`ensure_room`](
+    /// Self::ensure_room) extends before the write lands.
+    allocated_end: u64,
+    /// `false` once `fallocate` reports `EOPNOTSUPP`/`ENOSYS` (an
+    /// exotic filesystem or kernel): preallocation is a hint layer —
+    /// `O_DSYNC` still covers durability — so it disables itself
+    /// rather than failing appends.
+    #[cfg(target_os = "linux")]
+    prealloc_ok: bool,
+}
+
+/// Open the WAL's data file for read+append — and, on Linux,
+/// `O_DSYNC`: the flag makes each `write(2)` complete only when its
+/// own data plus the metadata needed to retrieve it are committed
+/// to storage, folding the durability fsync into the append write.
+/// `O_DSYNC` covers the file-size update that `O_APPEND` needs —
+/// unlike `O_SYNC` it does not force unrelated metadata — and the
+/// `fallocate`'d extent keeps that update journal-cheap.
+///
+/// macOS is deliberately excluded: its `O_DSYNC` does not imply
+/// `F_FULLFSYNC` (the drive-cache flush `File::sync_data` performs),
+/// so Apple builds keep the write+`sync_data` path in
+/// [`Wal::sync`](Wal::sync) — identical durability to before.
+fn open_wal_file(path: &std::path::Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true).read(true);
+    #[cfg(target_os = "linux")]
+    opts.custom_flags(libc::O_DSYNC);
+    opts.open(path)
 }
 
 impl Wal {
@@ -657,12 +741,7 @@ impl Wal {
     /// tail cannot be repaired.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, WalError> {
         let path = path.into();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)
-            .map_err(WalError::Open)?;
+        let file = open_wal_file(&path).map_err(WalError::Open)?;
         let mut wal = Self {
             path,
             writer: BufWriter::new(file),
@@ -670,13 +749,24 @@ impl Wal {
             bytes_since_checkpoint: 0,
             compact_after: COMPACT_AFTER_BYTES,
             syncs: 0,
+            appended_end: 0,
+            allocated_end: 0,
+            #[cfg(target_os = "linux")]
+            prealloc_ok: true,
         };
         // Repair before any append can land after the damaged bytes,
         // then seed the compaction counter with the repaired length:
         // an old, never-compacted WAL counts its whole history toward
         // the threshold so it compacts on the next append.
         wal.repair_tail()?;
-        wal.bytes_since_checkpoint = std::fs::metadata(&wal.path).map_err(WalError::Io)?.len();
+        let len = std::fs::metadata(&wal.path).map_err(WalError::Io)?.len();
+        wal.bytes_since_checkpoint = len;
+        // The file's real length is both the append position and the
+        // floor of the allocated extent (a repaired file may be
+        // shorter than what was once allocated — truncation freed
+        // the tail). The first append's `ensure_room` extends.
+        wal.appended_end = len;
+        wal.allocated_end = len;
         Ok(wal)
     }
 
@@ -756,43 +846,49 @@ impl Wal {
         self.poisoned = true;
     }
 
-    /// Append a WAL entry and fsync it to disk.
+    /// Append a WAL entry and make it durable.
     ///
     /// This must be called BEFORE the engine sends a vote or
-    /// advances safety-critical state. The fsync ensures the
-    /// entry is durable before the vote hits the network.
+    /// advances safety-critical state: the call returns only after
+    /// the frame is committed to storage (an `O_DSYNC` write on
+    /// Linux, write+`sync_data` elsewhere) — see the module's
+    /// "Synchronous durability" section. Every previously buffered
+    /// deferred frame rides the same durability point.
     ///
     /// # Errors
     ///
-    /// Returns [`WalError::Io`] if the write or fsync fails.
+    /// Returns [`WalError::Io`] if the write or sync fails.
     pub fn append(&mut self, entry: &WalEntry) -> Result<(), WalError> {
         self.append_unsynced(entry)?;
         self.sync()
     }
 
-    /// Append a WAL entry WITHOUT fsyncing it.
+    /// Append a WAL entry WITHOUT a durability point of its own.
     ///
-    /// The frame is flushed to the file (a `write` syscall, not
-    /// merely the userspace buffer) so it is covered by the *next*
-    /// `sync_data` this `Wal` performs: fsync durability is a
-    /// property of the file at sync time, not of the write call, so
-    /// every frame flushed before an [`append`](Self::append) shares
-    /// that append's fsync. That is the batching contract the engine
-    /// relies on — state records no pending signature depends on
-    /// (QC adoptions, commit markers) are appended here and made
-    /// durable by the next signature-gated append instead of paying
-    /// their own fsync.
+    /// The frame stays in the `BufWriter` — it is flushed inside the
+    /// *same `write(2)`* as the next signature-path
+    /// [`append`](Self::append), so the one `O_DSYNC` completion (or
+    /// `sync_data` on non-Linux) covers every buffered frame. That is
+    /// the batching contract the engine relies on: state records no
+    /// pending signature depends on (QC adoptions, commit markers)
+    /// defer here and are made durable by the next signature-gated
+    /// append instead of paying their own sync. Flushing each frame
+    /// eagerly would still preserve durability — but under `O_DSYNC`
+    /// each flush is itself a full sync, which inverts the win.
     ///
-    /// A crash between this call and the next [`append`](Self::append)
-    /// may lose the frame: recovery tolerates either presence or
-    /// absence, so callers must only defer state that peers can
-    /// re-deliver (QCs re-gossip) or that an idempotent downstream
-    /// re-applies (the executor's `next_proposal_height` watermark
-    /// dedupes re-finalized blocks).
+    /// A process exit or power loss between this call and the next
+    /// [`append`](Self::append) loses the frame — it never left
+    /// userspace. Recovery tolerates either presence or absence, so
+    /// callers must only defer state that peers can re-deliver (QCs
+    /// re-gossip) or that an idempotent downstream re-applies (the
+    /// executor's `next_proposal_height` watermark dedupes
+    /// re-finalized blocks). A `checkpoint` or `truncate` supersedes
+    /// buffered frames — the snapshot they carry is strictly newer.
     ///
     /// # Errors
     ///
-    /// Returns [`WalError::Io`] if the write fails.
+    /// Returns [`WalError::Io`] if the buffered write or the
+    /// extent-preallocation check fails.
     pub fn append_unsynced(&mut self, entry: &WalEntry) -> Result<(), WalError> {
         // Fault-injection latch (tests only): fail before touching
         // the file, the same outcome an ENOSPC write produces.
@@ -800,39 +896,95 @@ impl Wal {
             return Err(WalError::Io(std::io::Error::other("WAL poisoned")));
         }
         let frame = frame_entry(entry)?;
+        self.ensure_room(frame.len() as u64)?;
         self.writer.write_all(&frame)?;
-        // Flush to the file even though nothing is synced yet —
-        // otherwise the deferred frame would sit in the BufWriter
-        // and a later `sync_data` would fsync a file that does not
-        // contain it, silently breaking the batching contract.
-        self.writer.flush()?;
+        self.appended_end = self.appended_end.saturating_add(frame.len() as u64);
         self.bytes_since_checkpoint =
             self.bytes_since_checkpoint.saturating_add(frame.len() as u64);
         Ok(())
     }
 
-    /// `sync_data` the WAL file, making every flushed frame durable.
+    /// Make every buffered frame durable — the durability point the
+    /// batching contract counts one-per-signature-emission.
     ///
-    /// Covers all frames written so far — including any written by
-    /// [`append_unsynced`](Self::append_unsynced) — because fsync
-    /// acts on the file's state at call time. That one-call-many-
-    /// frames property is what makes deferred appends free.
+    /// The `BufWriter` flush issues one `write(2)` for all buffered
+    /// frames (or a few, if a frame exceeded the buffer and bypassed
+    /// it): under Linux `O_DSYNC` that write IS the sync — data plus
+    /// the file-size metadata land committed before it returns, with
+    /// no second syscall. On macOS and other non-Linux targets the
+    /// explicit `sync_data` retains the previous `F_FULLFSYNC`
+    /// strength, which `O_DSYNC` does not imply there.
     ///
     /// # Errors
     ///
-    /// Returns [`WalError::Io`] if the fsync fails.
+    /// Returns [`WalError::Io`] if the flush or fsync fails.
     fn sync(&mut self) -> Result<(), WalError> {
+        self.writer.flush()?;
+        #[cfg(not(target_os = "linux"))]
         self.writer.get_ref().sync_data()?;
         self.syncs = self.syncs.saturating_add(1);
         Ok(())
     }
 
-    /// Number of `sync_data` calls this `Wal` has issued.
+    /// Extend the `fallocate`'d extent so `appended_end + need`
+    /// stays inside mapped space — see "Synchronous durability".
+    /// `FALLOC_FL_KEEP_SIZE` keeps the logical length honest, so
+    /// recovery never scans reserved-but-unwritten zeros.
+    ///
+    /// A failure other than `EOPNOTSUPP`/`ENOSYS` (typically
+    /// `ENOSPC`) propagates — surfacing a full disk at allocation
+    /// time rather than mid-view is the point. Unsupported
+    /// filesystems disable the hint and keep writing.
+    #[cfg(target_os = "linux")]
+    fn ensure_room(&mut self, need: u64) -> Result<(), WalError> {
+        if !self.prealloc_ok || self.appended_end.saturating_add(need) <= self.allocated_end {
+            return Ok(());
+        }
+        while self.appended_end.saturating_add(need) > self.allocated_end {
+            // SAFETY: `fallocate` takes a borrowed fd — no ownership
+            // or memory-safety contract; `offset`/`len` are plain
+            // integers. The fd is valid: `self.writer` owns an open
+            // `File` for the life of `self`.
+            let ret = unsafe {
+                libc::fallocate(
+                    self.writer.get_ref().as_raw_fd(),
+                    libc::FALLOC_FL_KEEP_SIZE,
+                    i64::try_from(self.allocated_end).unwrap_or(i64::MAX) as libc::off_t,
+                    PREALLOC_CHUNK_BYTES as libc::off_t,
+                )
+            };
+            if ret == 0 {
+                self.allocated_end = self.allocated_end.saturating_add(PREALLOC_CHUNK_BYTES);
+                continue;
+            }
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) => {
+                    self.prealloc_ok = false;
+                    return Ok(());
+                }
+                _ => return Err(WalError::Io(err)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Non-Linux `ensure_room`: no `fallocate`, nothing to do —
+    /// the write+`sync_data` path sizes itself per append. Kept
+    /// as a `Result` stub so the call site stays platform-blind.
+    #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn ensure_room(&mut self, _need: u64) -> Result<(), WalError> {
+        Ok(())
+    }
+
+    /// Number of durability points this `Wal` has issued.
     ///
     /// Test/bench instrumentation for the fsync-batching contract:
-    /// the engine must issue exactly one fsync per signature
-    /// emission, so a happy-path view costs a voter one sync
-    /// (its vote) and a leader two (proposal + self-vote).
+    /// the engine must issue exactly one per signature emission, so
+    /// a happy-path view costs a voter one (its vote) and a leader
+    /// two (proposal + self-vote). On Linux each is an `O_DSYNC`
+    /// write, elsewhere a write+`sync_data` — same contract.
     #[doc(hidden)]
     pub fn sync_count(&self) -> u64 {
         self.syncs
@@ -877,17 +1029,17 @@ impl Wal {
             return Err(WalError::Io(std::io::Error::other("WAL poisoned")));
         }
         let frame = frame_entry(entry)?;
+        // Buffered deferred frames die with the old writer — the
+        // checkpoint snapshot strictly supersedes them, so dropping
+        // the buffer loses nothing recoverable.
         atomic_replace(&self.path, &frame)?;
         // Reopen for appending — `rename` swapped the inode under the
         // old writer, which still points at the unlinked file.
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&self.path)
-            .map_err(WalError::Open)?;
+        let file = open_wal_file(&self.path).map_err(WalError::Open)?;
         self.writer = BufWriter::new(file);
         self.bytes_since_checkpoint = frame.len() as u64;
+        self.appended_end = frame.len() as u64;
+        self.allocated_end = frame.len() as u64;
         Ok(())
     }
 
@@ -989,13 +1141,12 @@ impl Wal {
         // Flush and close the current writer.
         self.writer.flush()?;
         // Truncate the file to zero bytes.
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)
-            .map_err(WalError::Open)?;
+        let file = open_wal_file(&self.path).map_err(WalError::Open)?;
+        file.set_len(0).map_err(WalError::Io)?;
         self.writer = BufWriter::new(file);
         self.bytes_since_checkpoint = 0;
+        self.appended_end = 0;
+        self.allocated_end = 0;
         Ok(())
     }
 
@@ -1584,5 +1735,72 @@ mod tests {
         wal.truncate().unwrap();
         wal.set_compact_threshold(u64::MAX);
         assert!(!wal.should_compact());
+    }
+
+    /// The deferred-batching contract under the folded fsync:
+    /// `append_unsynced` frames buffer in userspace and ride the
+    /// *same write* as the next signature-path `append` — one
+    /// durability point covers all of them.
+    #[test]
+    fn wal_deferred_frames_ride_next_append() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("consensus.wal");
+        let mut wal = Wal::open(&path).unwrap();
+
+        wal.append_unsynced(&genesis_entry()).unwrap();
+        wal.append_unsynced(&voted_entry()).unwrap();
+        // One signature-path append flushes both deferred frames
+        // plus its own in a single write — one durability point.
+        wal.append(&voted_entry()).unwrap();
+        assert_eq!(wal.sync_count(), 1, "three frames, one durability point");
+
+        drop(wal);
+        let wal = Wal::open(&path).unwrap();
+        let recovered = wal.recover().unwrap().expect("frames must be durable");
+        assert_eq!(recovered, voted_entry());
+    }
+
+    /// Buffered deferred frames are userspace-only until a
+    /// signature-path append flushes them — a `mem::forget`
+    /// (no `Drop`, so no flush) simulates the crash loss the
+    /// contract documents: only synced state survives.
+    #[test]
+    fn wal_buffered_deferred_frames_lost_on_crash() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("consensus.wal");
+        let mut wal = Wal::open(&path).unwrap();
+
+        wal.append(&genesis_entry()).unwrap();
+        wal.append_unsynced(&voted_entry()).unwrap();
+        // Forget skips `BufWriter::drop`'s best-effort flush — the
+        // deferred frame never left userspace, matching a kill.
+        std::mem::forget(wal);
+
+        let wal = Wal::open(&path).unwrap();
+        let recovered = wal.recover().unwrap().expect("synced entry survives");
+        assert_eq!(recovered, genesis_entry(), "only the signature-path frame is durable");
+    }
+
+    /// On Linux the WAL preallocates extents ahead of the append
+    /// position: allocated blocks meet or exceed the file's logical
+    /// length while the length itself stays honest — recovery never
+    /// scans reserved zeros.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wal_preallocates_extents() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("consensus.wal");
+        let mut wal = Wal::open(&path).unwrap();
+
+        wal.append(&genesis_entry()).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(
+            meta.blocks() * 512 >= PREALLOC_CHUNK_BYTES.min(meta.len()),
+            "allocated blocks should cover the file"
+        );
+        assert!(meta.len() < PREALLOC_CHUNK_BYTES, "KEEP_SIZE keeps the logical length honest");
+        // And the reserved tail is never mistaken for frames.
+        assert_eq!(wal.recover().unwrap(), Some(genesis_entry()));
     }
 }
