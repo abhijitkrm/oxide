@@ -21452,3 +21452,34 @@ per-source cap refuses the third same-source socket, and a
 reputation-banned peer's messages stop mid-connection. Unit
 tests cover bucket independence, lease release, empty-bucket
 removal, and IPv6 /64 bucketing.
+
+## Session: real-contract EVM bench — the honest number
+
+**What landed.** `modules/evm/benches/contract_mix.rs` — the
+deployed-contracts benchmark the audit kept open. Three
+genesis-deployed contracts run the real storage paths: an
+ERC-20-style mapping transfer (`keccak256(pad32(addr)‖pad32(0))`
+slots, real `Transfer` LOG1), a Uniswap-pair-style swap
+contending on shared reserve slots 0/1 with a `Sync` log, and a
+store-then-`REVERT` contract. The mix is 70/20/10 signed legacy
+txs across 50 senders, measured through `handle_batch` (serial
+reference) vs `handle_batch_parallel`, plus a `parallel_persist`
+row with a `Volatile` backend so `end_block`'s atomic
+account/history/undo flush is inside the measurement. A one-time
+probe asserts the execution *product* — one receipt per tx,
+exactly 900 logged and 100 `status=false` in the 1000-tx block,
+34.5M gas actually charged, non-zero `receipts_root` and
+`state_root` — so the figures cannot silently degrade into a
+scheduler simulation.
+
+**The number the transfer-only benches hid.** Serial 13.86 ms vs
+parallel 17.03 ms per 1000-tx block (~72.2k vs ~58.7k signed tx/s
+≈ 2.49 vs 2.03 GG/s of *executed* contract gas): **parallel is
+23% slower on a real mix**. 637 of 1000 speculative executions
+re-ran — the 200 shared-pool swaps contend on slots 0/1, and the
+coinbase/fee accounts every tx touches conflict on top. The
+disjoint-slot ERC-20 bench showed parity; realistic contention
+says the speculation overhead doesn't pay for itself until the
+canonical-order merge goes multi-version (Phase 5 residual —
+this is now measured motivation, not hypothesis). Persistence
+flush adds ~1% — amortized across the batch.

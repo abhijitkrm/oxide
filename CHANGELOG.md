@@ -12,6 +12,30 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Real-contract EVM benchmark** (`evm`, `contract_mix`): the
+  first bench over *deployed contracts* — an ERC-20-style mapping
+  transfer emitting a real `Transfer` log, a Uniswap-pair-style
+  swap contending on shared reserve slots, and a store-then-revert
+  contract — signed legacy txs 70/20/10 across 50 senders, charged
+  at actual executed gas, with a probe asserting one receipt/tx,
+  ~90% logged, ~10% `status=false`, and non-zero
+  `receipts_root`/`state_root`. Measured (8-core, release): serial
+  13.86 ms vs parallel 17.03 ms per 1000-tx block (~72.2k vs
+  ~58.7k signed tx/s ≈ 2.49 vs 2.03 GG/s of executed gas) —
+  **parallel is 23% slower on a real mix** (637/1000 speculative
+  re-executions from shared-pool and coinbase/fee-account
+  contention), the honest figure the transfer-only benches masked;
+  the multi-version store follow-up is the measured fix. A
+  `parallel_persist` row with the `Volatile` backend shows the
+  `end_block` flush adds ~1%.
+  - **In plain words:** running transactions side-by-side used to
+    look free on paper because the old tests had every transaction
+    touching different data. On a realistic mix — where swaps hit
+    the same pool and every transaction pays the same fee
+    accounts — doing them in parallel is actually about a quarter
+    slower today. Now we can see exactly why, and the planned
+    storage upgrade is what fixes it.
+
 - **Parallel EVM execution on shared contracts** (`evm`):
   `handle_batch_parallel*` conflict detection is now slot-granular
   instead of account-granular. Transactions writing *different*

@@ -70,5 +70,9 @@ harness = false
 name = "breakdown"
 harness = false
 
+[[bench]]
+name = "contract_mix"
+harness = false
+
 [lints]
 workspace = true
