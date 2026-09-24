@@ -21979,3 +21979,43 @@ re-execution instead of "conflict ⇒ re-execute" — under MVCC a
 resolved conflict is a *validated merge*, not a re-run.
 Differential properties, replay, and the full workspace gates
 hold.
+
+## Mempool: in-flight proposal dedup
+
+**Observed:** `Mempool::select` is a peek — entries leave the pool
+only at `remove_committed` — so every pipelined `prepare_proposal`
+re-selected the same head of each sender's nonce chain. Under
+oxideBFT's pipelining (positions `h`, `h+1`, `h+2` proposed before
+`h` commits) the duplicates committed as deterministic
+`NonceTooLow` skips: block space burned on txs that could never
+execute.
+
+**Fix:** per-position in-flight sets. `Mempool` keeps
+`proposed: VecDeque<HashSet<Hash>>` — one set per built proposal,
+oldest first — and `prepare_proposal` records its final
+(gas-filtered) contents via `note_proposed`. `select` skips an
+in-flight hash but *keeps walking* the sender's nonce chain, so
+position `h+1` carries the chain's next chunk rather than a copy
+of position `h`'s — the continuation is the actual pipelining
+win. `remove_committed` pops exactly one set per committed block:
+positions commit strictly in order and a descendant can only
+commit if its parent did, so the deque front is always the next
+position to resolve — a dead proposal's txs release exactly when
+their position does, never before. The deque is capped at 16
+positions; overflow releases the oldest early (re-selection is
+conservative — it can waste a slot, never censor).
+
+The release point is deliberately commit-time: the OAI has no
+"proposal aborted" signal, so position resolution is the earliest
+sound trigger. Cost of a dead proposal is one position of delayed
+re-selection — set against the old behaviour, where every
+in-flight duplicate cost a committed skip.
+
+**Tests:** mempool units pin the mechanism — chain continuation
+past in-flight entries (`pipelined_select_skips_in_flight_and_continues_chain`),
+release-on-resolution (`in_flight_releases_when_position_commits`),
+drain-and-release (`committed_proposal_drains_and_releases`), and
+oldest-first position ordering (`commits_resolve_positions_oldest_first`).
+`uncommitted_proposal_keeps_txs` (executor) now asserts the real
+contract: in-flight while open, re-proposable after the position
+commits. 254 consensus + 125 executor + 34 mempool tests green.

@@ -351,6 +351,15 @@ impl AppInterface for Executor {
             total_gas += gas;
             txs.push(tx);
         }
+        // Mark the built proposal's contents in-flight: `select`
+        // is a peek, so a pipelined proposal at the next position
+        // would otherwise re-select this same mempool head and the
+        // duplicate would commit as a nonce skip — wasted block
+        // space. The set resolves on the next commit, so a lost
+        // proposal's txs re-select rather than leak. Marked only
+        // after the gas filter so filtered-out candidates stay
+        // eligible.
+        primitives::sync::lock_state(&self.mempool).note_proposed(&txs);
         let height = Height::new(*primitives::sync::lock_state(&self.next_proposal_height));
         if let Some(recorder) = &self.recorder {
             recorder.record("prepare_proposal", start.elapsed());

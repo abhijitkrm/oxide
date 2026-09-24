@@ -2769,6 +2769,13 @@ fn exec_lane_saturates_without_blocking() {
 /// `select` is a peek, so losing the round doesn't lose the tx.
 /// The old remove-on-select path drained the pool the moment a
 /// proposal was built — a losing proposal erased its txs forever.
+///
+/// Under in-flight marking the tx is not re-selected *while its
+/// proposal's position is open*: a pipelined proposal carrying it
+/// again would commit as a deterministic nonce skip. It re-proposes
+/// once the next commit resolves the position — a one-position
+/// delay, never a loss. (The OAI has no "proposal aborted" signal,
+/// so commit is the earliest sound release point.)
 #[test]
 fn uncommitted_proposal_keeps_txs() {
     let mut executor = test_executor(100);
@@ -2777,11 +2784,22 @@ fn uncommitted_proposal_keeps_txs() {
     let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
     let first = executor.prepare_proposal(&budget);
     assert_eq!(first.txs.len(), 1);
-    // The proposal loses — no `finalize_block` — so the next
-    // round's proposal must offer the same tx again.
+    // The position is still open: the in-flight tx must not
+    // duplicate into the next proposal — that duplicate would
+    // commit as a nonce skip and waste the slot.
     let second = executor.prepare_proposal(&budget);
-    assert_eq!(second.txs.len(), 1, "uncommitted txs stay re-proposable");
-    assert_eq!(second.txs, first.txs);
+    assert!(second.txs.is_empty(), "in-flight txs are not re-selected");
+    assert_eq!(executor.mempool_len(), 1, "the tx stays pooled");
+    // A commit resolves the open position — even one carrying no
+    // txs — and the pooled tx becomes selectable again.
+    executor.finalize_block(&FinalizedBlock {
+        context: types::BlockContext::default(),
+        height: Height::new(0),
+        txs: Vec::new(),
+        signers: Vec::new(),
+    });
+    let third = executor.prepare_proposal(&budget);
+    assert_eq!(third.txs, first.txs, "the released tx re-proposes once its position resolves");
 }
 
 /// The mirror image: txs DO leave the pool — but only when a

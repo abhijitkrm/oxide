@@ -162,6 +162,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Pipelined proposals no longer commit the same txs twice**
+  (`mempool`, `executor`): mempool selection is a peek — entries
+  leave the pool only at finalization — so every pipelined
+  `prepare_proposal` re-selected the same head of each sender's
+  nonce chain, and the duplicates committed as deterministic
+  `NonceTooLow` skips that burned block space. The pool now tracks
+  one in-flight set per outstanding proposal position
+  (`note_proposed` at proposal build, `remove_committed` resolving
+  the oldest position per commit — positions commit in order, so
+  the deque front is always the next position to resolve).
+  `select` skips an in-flight tx but continues the sender's nonce
+  chain, so a pipelined proposal carries the chain's next chunk
+  rather than a doomed copy; a dead proposal's txs re-select the
+  moment their position resolves — never dropped, never
+  duplicated.
+  - **In plain words:** when several blocks were being built at
+    once, each one used to grab the same pending transactions —
+    the copies landed on-chain as automatic skips that wasted
+    space. Now each block in the pipeline takes the *next* slice
+    of every sender's queue, and a transaction from a block that
+    lost its round goes straight back into circulation.
+
 - **Two transport bugs that black-holed a restarted validator's
   traffic** (`p2p`, `tls` feature): first, `TlsReadHalf` treated a
   partial `read_tls` consume — normal rustls deframer backpressure

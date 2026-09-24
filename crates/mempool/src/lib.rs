@@ -33,7 +33,7 @@
 //! per-account nonce tracking. No rate limiting, no eviction policy
 //! beyond size cap, no mempool gossip. Those arrive in Phase 2+.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use primitives::{Address, Hash};
 use types::TxBytes;
@@ -105,7 +105,34 @@ pub struct Mempool {
     /// which could be a mid-chain nonce after earlier txs executed,
     /// creating a nonce gap in the block.
     executed_nonces: HashMap<Address, u64>,
+    /// Tx hashes already carried by an uncommitted proposal — one
+    /// set per outstanding proposal position, oldest first.
+    ///
+    /// `select` is a peek (entries leave the pool only at
+    /// finalization), so without this marker every pipelined
+    /// `prepare_proposal` re-selects the same head of each sender's
+    /// nonce chain — the duplicate then commits as a deterministic
+    /// nonce skip and wastes the block space. `select` skips
+    /// in-flight hashes, `note_proposed` records each built
+    /// proposal's set, and `remove_committed` resolves the oldest
+    /// position per commit: positions commit strictly in order and
+    /// a descendant can only commit if its parent did, so the
+    /// front of the deque is always the next position to resolve.
+    /// If the committed block carried these txs they are already
+    /// gone from the pool; if a different branch won the position,
+    /// the txs become selectable again.
+    proposed: VecDeque<HashSet<Hash>>,
 }
+
+/// Maximum outstanding proposal positions tracked for in-flight
+/// exclusion.
+///
+/// The pipeline keeps ~2 uncommitted positions; a deque deeper than
+/// this means commits have stalled across many proposals, so the
+/// oldest set releases early rather than grow the bookkeeping
+/// without bound (early release can only re-select — it can never
+/// censor a tx).
+const MAX_IN_FLIGHT_PROPOSALS: usize = 16;
 
 /// Default per-sender selection cap: 1000 txs per block.
 ///
@@ -240,6 +267,7 @@ impl Mempool {
             max_entries,
             max_per_sender: DEFAULT_MAX_PER_SENDER,
             executed_nonces: HashMap::new(),
+            proposed: VecDeque::new(),
         }
     }
 
@@ -524,6 +552,21 @@ impl Mempool {
                 let Some(&hash) = queue.get(&nonce) else {
                     break;
                 };
+                // In-flight: an earlier uncommitted proposal
+                // already carries this tx — re-selecting it would
+                // commit as a deterministic nonce skip and waste
+                // the slot. Skip the hash but keep walking the
+                // nonce chain: positions commit in order, so a
+                // later proposal position may carry this sender's
+                // next nonces (that is the pipelining win). The
+                // skip is safe on a dead branch — a descendant
+                // position can only commit after its parent, so
+                // this tx's position always resolves before any
+                // proposal carrying the later nonces commits.
+                if self.proposed.iter().any(|set| set.contains(&hash)) {
+                    nonce = nonce.saturating_add(1);
+                    continue;
+                }
                 let Some(entry) = self.by_hash.get(&hash) else {
                     break;
                 };
@@ -555,6 +598,38 @@ impl Mempool {
         selected
     }
 
+    /// Record a built proposal's tx set as in-flight.
+    ///
+    /// `select` is a peek, so a pipelined `prepare_proposal` for the
+    /// next position would otherwise re-select the same head of each
+    /// sender's nonce chain — every duplicate commits as a
+    /// deterministic nonce skip and wastes the block space. Marking
+    /// each proposal's contents closes that window while keeping the
+    /// liveness property the peek was built for: the txs stay pooled,
+    /// so a lost proposal's work re-selects once its position
+    /// resolves on commit (see `proposed`).
+    ///
+    /// The set is pushed unconditionally — even for an empty
+    /// proposal — because `remove_committed` resolves exactly one
+    /// position per call and the deque's order must stay aligned
+    /// with the chain's position order. A missed push would release
+    /// a later set early (re-admitting its txs for one position —
+    /// the duplicate-skip this exists to prevent); an extra push
+    /// only delays a release past its position, which is the safe
+    /// direction.
+    ///
+    /// Hashes are recomputed here because `Proposal` carries only
+    /// `TxBytes`: O(proposal txs) hashing on the proposal path —
+    /// the same price `remove_committed` pays at finalization.
+    pub fn note_proposed(&mut self, txs: &[TxBytes]) {
+        let set: HashSet<Hash> =
+            txs.iter().map(|tx| Hasher::hash_one(Domain::Transaction, tx.as_bytes())).collect();
+        self.proposed.push_back(set);
+        while self.proposed.len() > MAX_IN_FLIGHT_PROPOSALS {
+            self.proposed.pop_front();
+        }
+    }
+
     /// Remove committed transactions from the pool. Called by the
     /// executor at block finalization (`finalize_block`) with the
     /// block's tx list: a committed tx — whether it executed or was
@@ -570,7 +645,14 @@ impl Mempool {
     ///
     /// Hashes are recomputed here because `FinalizedBlock` carries
     /// only `TxBytes`: O(block txs) hashing on the commit path.
+    ///
+    /// Also resolves the oldest outstanding proposal position: the
+    /// commit answers whether that proposal's txs committed (they
+    /// are already gone via `remove` below) or must re-select (a
+    /// different branch won the position — the released set is
+    /// eligible again on the next `select`).
     pub fn remove_committed(&mut self, txs: &[TxBytes]) {
+        self.proposed.pop_front();
         for tx in txs {
             let hash = Hasher::hash_one(Domain::Transaction, tx.as_bytes());
             self.remove(&hash);
@@ -1308,5 +1390,130 @@ mod tests {
         pool.refresh_anchors(|a| next_expected.get(a).copied());
         assert_eq!(pool.executed_nonces.len(), 1, "only pooled senders keep an anchor");
         assert!(pool.executed_nonces.contains_key(&addr(1)));
+    }
+
+    fn nonces_of(selected: &[TxBytes]) -> Vec<u64> {
+        selected.iter().map(|tx| parse_tx(tx.as_bytes()).unwrap().1).collect()
+    }
+
+    /// The defect this guards: `select` is a peek, so a pipelined
+    /// `prepare_proposal` at the next position used to re-select the
+    /// same mempool head — every duplicate committed as a nonce
+    /// skip and wasted block space. After `note_proposed`, a second
+    /// select must skip the in-flight txs and continue the sender's
+    /// nonce chain with the next unproposed entries.
+    #[test]
+    fn pipelined_select_skips_in_flight_and_continues_chain() {
+        let mut pool = Mempool::new(100).with_max_per_sender(2);
+        for nonce in 0..4u64 {
+            pool.submit(build_tx(addr(1), nonce, 100, &[u8::try_from(nonce).unwrap_or(0xff)]))
+                .unwrap();
+        }
+        pool.submit(build_tx(addr(2), 0, 100, &[9])).unwrap();
+
+        let first = pool.select(1 << 20);
+        pool.note_proposed(&first);
+        // cap=2 → the first proposal carries addr(1) nonces 0,1 and
+        // addr(2) nonce 0 (fee ties order across senders; collect
+        // nonces per sender instead of asserting an interleave).
+        assert_eq!(first.len(), 3);
+
+        let second = pool.select(1 << 20);
+        // The in-flight txs must not re-appear; addr(1)'s chain
+        // continues at nonce 2 past the in-flight prefix — that
+        // continuation is the pipelining win.
+        assert_eq!(
+            nonces_of(&second),
+            vec![2, 3],
+            "second proposal extends the chain past in-flight entries"
+        );
+    }
+
+    /// A dead proposal's txs must re-select: `remove_committed`
+    /// resolves the oldest outstanding position, so a commit that
+    /// carried none of them releases the set.
+    #[test]
+    fn in_flight_releases_when_position_commits() {
+        let mut pool = Mempool::new(100);
+        for nonce in 0..3u64 {
+            pool.submit(build_tx(addr(1), nonce, 100, &[u8::try_from(nonce).unwrap_or(0xff)]))
+                .unwrap();
+        }
+        let first = pool.select(1 << 20);
+        pool.note_proposed(&first);
+        assert!(
+            pool.select(1 << 20).is_empty(),
+            "in-flight head is excluded while its position is open"
+        );
+
+        // A different branch won the position: the commit carries
+        // none of the proposed txs. The set releases.
+        pool.remove_committed(&[]);
+        let reselected = pool.select(1 << 20);
+        assert_eq!(
+            nonces_of(&reselected),
+            vec![0, 1, 2],
+            "released txs re-select after their position resolves"
+        );
+        assert_eq!(pool.len(), 3, "release does not drop pooled txs");
+    }
+
+    /// Committing a block that did carry the proposed txs removes
+    /// them from the pool and releases the position — subsequent
+    /// selects see only the uncommitted remainder.
+    #[test]
+    fn committed_proposal_drains_and_releases() {
+        let mut pool = Mempool::new(100).with_max_per_sender(2);
+        for nonce in 0..4u64 {
+            pool.submit(build_tx(addr(1), nonce, 100, &[u8::try_from(nonce).unwrap_or(0xff)]))
+                .unwrap();
+        }
+        let first = pool.select(1 << 20);
+        pool.note_proposed(&first);
+        let second = pool.select(1 << 20);
+        pool.note_proposed(&second);
+
+        // Position 1 commits its proposal: those txs leave the
+        // pool, and the position resolves.
+        pool.remove_committed(&first);
+        assert_eq!(pool.len(), 2);
+        // Position 2 still open: nonces 2,3 stay in-flight.
+        assert!(pool.select(1 << 20).is_empty());
+        // Position 2 resolves the same way.
+        pool.remove_committed(&second);
+        assert_eq!(pool.len(), 0);
+    }
+
+    /// Commits resolve outstanding proposal positions oldest-first:
+    /// a released position's txs re-select while a still-open
+    /// position's stay excluded — the deque order tracks the chain's
+    /// position order.
+    #[test]
+    fn commits_resolve_positions_oldest_first() {
+        let mut pool = Mempool::new(100).with_max_per_sender(1);
+        pool.submit(build_tx(addr(1), 0, 100, &[0])).unwrap();
+        pool.submit(build_tx(addr(1), 1, 100, &[1])).unwrap();
+
+        let first = pool.select(1 << 20); // carries nonce 0
+        pool.note_proposed(&first);
+        let second = pool.select(1 << 20); // continues past it: nonce 1
+        pool.note_proposed(&second);
+        assert_eq!(nonces_of(&second), vec![1]);
+
+        // An alien block won position 1: the first set releases,
+        // the second stays in-flight.
+        pool.remove_committed(&[]);
+        let third = pool.select(1 << 20);
+        assert_eq!(
+            nonces_of(&third),
+            vec![0],
+            "released position-1 tx re-selects while position 2 is open"
+        );
+        pool.note_proposed(&third);
+
+        // Position 2 resolves on the next commit — its tx releases.
+        pool.remove_committed(&[]);
+        let fourth = pool.select(1 << 20);
+        assert_eq!(nonces_of(&fourth), vec![1], "position 2 resolves on its own commit");
     }
 }

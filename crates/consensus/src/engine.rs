@@ -2124,9 +2124,13 @@ impl OxideBft {
 
     /// Sign `header` under [`Domain::Proposal`] and stamp the
     /// signature on it. On signer failure the proposal's txs are
-    /// requeued through `ingest_tx_batch` — `prepare_proposal`
-    /// consumed them, so a bare failure would leak the mempool's
-    /// contents — and `false` returns to abort the proposal.
+    /// requeued through `ingest_tx_batch` — `prepare_proposal` left
+    /// them pooled (selection is a peek), so the requeue is a dedup
+    /// no-op for them but re-admits any entry evicted between select
+    /// and now — and `false` returns to abort the proposal. The
+    /// in-flight mark made at proposal build stays until a commit
+    /// resolves the position; a failed signature means no block
+    /// occupies it, so the next commit releases them.
     ///
     /// The fencing coordinate a remote signer persists is the
     /// proposal's `(view, epoch)`: the signable is an opaque hash,
