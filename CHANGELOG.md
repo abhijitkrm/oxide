@@ -227,6 +227,42 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Sustained-load transaction injection** (`oxide-devnet
+  --tx-inject-rate <tx/s>`): the shared network runner can now
+  drive real signed load from inside the consensus pump — the
+  load path the multi-host TLS+WAL throughput harness uses. A
+  `ValidatorNetSpec.tx_inject` builds one signed envelope per
+  owed tick (nonce seeded from committed state so a restarted
+  injector resumes cleanly), submits it through normal mempool
+  admission, and gossips it over the same `MSG_TX` path RPC
+  submissions take — identical to client traffic minus the HTTP
+  hop. Devnet nodes sign EIP-155 legacy transfers as their own
+  funded test identity; production validators always run with
+  injection off. `oxide-devnet genesis` emits the matching
+  committee genesis (deterministic BLS pubkeys + funded injector
+  identities) and its TLS peer certs now use the same
+  address-keyed `peer-<addr-hex>.pem` naming `oxide-validator
+  tls-gen` writes.
+  - **In plain words:** the test network can now load itself
+    with real signed transactions at a steady rate — the missing
+    piece for measuring how fast the chain actually processes
+    traffic across machines, with TLS and disk persistence on.
+
+- **Execution-divergence detection on consume paths**
+  (`consensus`): `OxideBft::confirm_exec_cert` runs the same
+  "verified certificate vs locally executed root" check the vote
+  path applies — now invoked for certified blocks fetched over
+  block sync and by fullnode followers, who never vote and
+  previously only verified certificate *signatures* without
+  comparing their own state. A quorum-certified root the local
+  executor did not compute latches the shared divergence halt
+  (same CRITICAL log, WAL-first persistence, first-write-wins
+  repair anchor) instead of silently mirroring wrong state.
+  - **In plain words:** a watching node that somehow ended up in
+    a different state than the network provably agreed on now
+    stops and says so, instead of quietly serving you wrong
+    data forever.
+
 - **Fullnode follower mode** (`oxide-fullnode --consensus-peer`):
   the fullnode binary is now a real certified-block consumer that
   mirrors committed chain state from validator peers — the

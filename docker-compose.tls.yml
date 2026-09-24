@@ -1,0 +1,202 @@
+# Oxide 4-validator TLS+WAL testnet with sustained signed load.
+#
+# The durable multi-host throughput harness (production-readiness
+# Gate 7 / audit residual 7.2): unlike the plaintext
+# docker-compose.yml soak, every node here runs the production
+# surface — mTLS peer authentication, a real fsync'd consensus
+# WAL + executor data dir, and pump-injected signed EVM transfers
+# at a configurable offered rate.
+#
+# Topology: a one-shot `provision` container generates the
+# committee genesis (`oxide-devnet genesis` — real BLS pubkeys +
+# funded injector identities) and the mTLS material
+# (`oxide-validator tls-gen --genesis-file` — peer certs keyed by
+# staking address) into the shared `prov` volume. Validators wait
+# for it, then run `oxide-devnet` against the provisioned files.
+#
+# Usage:
+#   docker compose -f docker-compose.tls.yml up --abort-on-container-exit
+#   # measure from the host while it runs:
+#   ./scripts/measure-tls-throughput.sh 60
+#   docker compose -f docker-compose.tls.yml down -v
+#
+# Knobs: INJECT_RATE (per-node offered tx/s, default 200),
+# LATENCY_MS / JITTER_MS / LOSS_PERCENT (netem, default 5/2/0).
+
+x-validator: &validator
+  build: .
+  networks:
+    oxidetestnet:
+  cap_add:
+    - NET_ADMIN
+  environment:
+    - RUST_LOG=info
+    - LATENCY_MS=${LATENCY_MS:-5}
+    - JITTER_MS=${JITTER_MS:-2}
+    - LOSS_PERCENT=${LOSS_PERCENT:-0}
+    - OXIDE_STORAGE_DATA_DIR=/data
+  volumes:
+    - ./scripts/inject-latency.sh:/inject-latency.sh:ro
+    - prov:/prov:ro
+  entrypoint: ["/bin/bash", "/inject-latency.sh"]
+  depends_on:
+    provision:
+      condition: service_completed_successfully
+
+services:
+  provision:
+    build: .
+    container_name: oxide-tls-provision
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - "oxide-devnet genesis --num-nodes 4 --output /prov/genesis.json &&
+         oxide-validator tls-gen --genesis-file /prov/genesis.json -o /prov/tls"
+    volumes:
+      - prov:/prov
+
+  validator-0:
+    <<: *validator
+    container_name: oxide-tls-validator-0
+    command:
+      - "--node"
+      - "0"
+      - "--num-nodes"
+      - "4"
+      - "--base-port"
+      - "22000"
+      - "--bind-host"
+      - "0.0.0.0"
+      - "--peer-host-template"
+      - "10.0.0.1{i}"
+      - "--genesis-file"
+      - "/prov/genesis.json"
+      - "--tls-dir"
+      - "/prov/tls/node-0"
+      - "--rpc-listen"
+      - "0.0.0.0:8545"
+      - "--tx-inject-rate"
+      - "${INJECT_RATE:-200}"
+      # Private container bridge — the 0.0.0.0 bind is not public.
+      - "--unsafe-allow-insecure-posture"
+    networks:
+      oxidetestnet:
+        ipv4_address: 10.0.0.10
+    ports:
+      - "8545:8545"
+    volumes:
+      - ./scripts/inject-latency.sh:/inject-latency.sh:ro
+      - prov:/prov:ro
+      - data0:/data
+
+  validator-1:
+    <<: *validator
+    container_name: oxide-tls-validator-1
+    command:
+      - "--node"
+      - "1"
+      - "--num-nodes"
+      - "4"
+      - "--base-port"
+      - "22000"
+      - "--bind-host"
+      - "0.0.0.0"
+      - "--peer-host-template"
+      - "10.0.0.1{i}"
+      - "--genesis-file"
+      - "/prov/genesis.json"
+      - "--tls-dir"
+      - "/prov/tls/node-1"
+      - "--rpc-listen"
+      - "0.0.0.0:8545"
+      - "--tx-inject-rate"
+      - "${INJECT_RATE:-200}"
+      - "--unsafe-allow-insecure-posture"
+    networks:
+      oxidetestnet:
+        ipv4_address: 10.0.0.11
+    ports:
+      - "8546:8545"
+    volumes:
+      - ./scripts/inject-latency.sh:/inject-latency.sh:ro
+      - prov:/prov:ro
+      - data1:/data
+
+  validator-2:
+    <<: *validator
+    container_name: oxide-tls-validator-2
+    command:
+      - "--node"
+      - "2"
+      - "--num-nodes"
+      - "4"
+      - "--base-port"
+      - "22000"
+      - "--bind-host"
+      - "0.0.0.0"
+      - "--peer-host-template"
+      - "10.0.0.1{i}"
+      - "--genesis-file"
+      - "/prov/genesis.json"
+      - "--tls-dir"
+      - "/prov/tls/node-2"
+      - "--rpc-listen"
+      - "0.0.0.0:8545"
+      - "--tx-inject-rate"
+      - "${INJECT_RATE:-200}"
+      - "--unsafe-allow-insecure-posture"
+    networks:
+      oxidetestnet:
+        ipv4_address: 10.0.0.12
+    ports:
+      - "8547:8545"
+    volumes:
+      - ./scripts/inject-latency.sh:/inject-latency.sh:ro
+      - prov:/prov:ro
+      - data2:/data
+
+  validator-3:
+    <<: *validator
+    container_name: oxide-tls-validator-3
+    command:
+      - "--node"
+      - "3"
+      - "--num-nodes"
+      - "4"
+      - "--base-port"
+      - "22000"
+      - "--bind-host"
+      - "0.0.0.0"
+      - "--peer-host-template"
+      - "10.0.0.1{i}"
+      - "--genesis-file"
+      - "/prov/genesis.json"
+      - "--tls-dir"
+      - "/prov/tls/node-3"
+      - "--rpc-listen"
+      - "0.0.0.0:8545"
+      - "--tx-inject-rate"
+      - "${INJECT_RATE:-200}"
+      - "--unsafe-allow-insecure-posture"
+    networks:
+      oxidetestnet:
+        ipv4_address: 10.0.0.13
+    ports:
+      - "8548:8545"
+    volumes:
+      - ./scripts/inject-latency.sh:/inject-latency.sh:ro
+      - prov:/prov:ro
+      - data3:/data
+
+networks:
+  oxidetestnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.0.0/24
+
+volumes:
+  prov:
+  data0:
+  data1:
+  data2:
+  data3:

@@ -341,6 +341,45 @@ results.
     higher-view QC.
   - `on_timeout_certificate` rejecting higher-view TCs. Fixed by
     accepting valid TCs for views higher than the current view.
+- **mTLS + WAL sustained signed load** (2026-09-16): 3-validator
+  fleet (`oxide-devnet` in genesis mode), each process with its own
+  data directory, committee-scoped mTLS transport, consensus WAL,
+  block journal, certified journal, and EVM `redb` store. Signed
+  EIP-155 EVM legacy transfers injected in-band at each validator's
+  pump (mempool admission → gossip → proposal → QC → execution).
+  Executed-tx rate measured via sink-account balance deltas over
+  timed windows (`scripts/measure-tls-throughput.sh`).
+
+  | Offered (tx/s) | Executed (tx/s) | Absorption | blk/s | tx/blk |
+  | -------------- | --------------- | ---------- | ----- | ------ |
+  | 150            | 150.0           | 100%       | 19.7  | 8      |
+  | 600            | 600.7           | 100%       | 19.2  | 31     |
+  | 1,500          | 1,500.2         | 100%       | 19.1  | 79     |
+  | 3,000          | 2,998.9         | 100%       | 17.8  | 168    |
+  | 6,000          | 5,005.8         | ~83%       | 11.5  | 434    |
+
+  The fleet absorbs 100% of offered load up to ~3k tx/s; the
+  sustained knee is ≈5.0–5.2k executed tx/s on this host
+  (~11.5–12 blk/s at ~435 tx/blk). The configured block budgets
+  (10G gas, 16 MiB bytes) are not the binding constraint — one
+  observed block carried 542 txs at 11.4M gas — so the bound is
+  consensus+execution pipeline throughput under mTLS+fsync, not
+  policy.
+  - **Durability evidence**: ~20–22 MB `consensus.wal`,
+    `block-journal`, `certified-journal`, and ~539 MB `evm.redb`
+    per node after the sustained run. Killing node-0 mid-load and
+    restarting it replayed the WAL and resumed at height 1215;
+    all three validators reconverged at exactly height 1215.
+  - **Docker harness**: `docker-compose.tls.yml` +
+    `scripts/measure-tls-throughput.sh` reproduce this measurement
+    as multi-container deployment (provision one-shot generates
+    genesis + mTLS material; four validators, separate volumes,
+    published RPC ports). Local Docker Desktop image pulls were
+    unreachable in this environment, so the containerized run was
+    validated by compose-config check plus the equivalent
+    multi-process loopback deployment above; run the compose
+    harness where registry access works for true multi-host
+    numbers.
 
 ---
 

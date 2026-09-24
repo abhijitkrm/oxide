@@ -21618,3 +21618,48 @@ mempool's pending txs — committed replays skip deterministically
 as `NonceTooLow`. Wasteful block space under sustained load;
 executed-tx throughput (not committed bytes) is the honest
 metric the harness reports.
+
+## Session: sustained mTLS+WAL throughput measurement
+
+Ran the real deployment the injector was built for: 3 `oxide-devnet`
+validators in genesis mode on loopback, each with its own data dir,
+committee-scoped mTLS transport (peer certs keyed by staking-address
+hex), consensus WAL, block journal, certified journal, and EVM `redb`
+store. Each node injected `--tx-inject-rate N` signed EIP-155 legacy
+transfers; executed rate measured as sink-account balance delta per
+wall-clock window (each executed transfer moves exactly 1 wei, so
+`eth_getBalance` is a lossless executed-tx counter — unlike
+`eth_getBlockTransactionCount`, it can't be fooled by replay-skips).
+
+Load sweep (offered → executed):
+
+| Offered | Executed | Absorption | blk/s | tx/blk |
+| ------- | -------- | ---------- | ----- | ------ |
+| 150     | 150.0    | 100%       | 19.7  | 8      |
+| 600     | 600.7    | 100%       | 19.2  | 31     |
+| 1,500   | 1,500.2  | 100%       | 19.1  | 79     |
+| 3,000   | 2,998.9  | 100%       | 17.8  | 168    |
+| 6,000   | 5,005.8  | ~83%       | 11.5  | 434    |
+
+The pipeline absorbs 100% of offered load to ~3k tx/s; the sustained
+knee lands at ≈5.0–5.2k executed tx/s on this host — 300,386
+transfers over a 60s window. Notably this is NOT the configured
+budgets (10G gas, 16 MiB block bytes — a 542-tx block only burned
+11.4M gas); the bound is consensus+execution pipeline throughput
+under mTLS handshakes + WAL fsync, i.e. the honest production-path
+number, not the in-process executor bench (28.7k EVM tx/s raw).
+
+Durability evidence: ~20–22 MB `consensus.wal`, `block-journal`,
+`certified-journal`, ~539 MB `evm.redb` per node. Killed node-0
+mid-load; restart replayed the WAL, resumed at height 1215, and all
+three validators reconverged at exactly 1215.
+
+Shipped `docker-compose.tls.yml` (provision one-shot → 4 mTLS+WAL
+validators on separate volumes) +
+`scripts/measure-tls-throughput.sh` (host-side windowed measurement)
+for the true multi-host variant. Docker Desktop image pulls hang in
+this environment (even `hello-world` never completes — daemon
+networking, not a build failure), so the compose config is validated
+(`docker compose config`) but the recorded numbers come from the
+equivalent multi-process loopback deployment. Run the compose
+harness where registry access works for cross-machine numbers.

@@ -26,8 +26,11 @@ COPY modules/ modules/
 COPY bin/ bin/
 COPY sim/ sim/
 
-# Build the devnet binary in release mode.
-RUN cargo build --release -p oxide-devnet
+# Build the devnet binary in release mode. oxide-validator ships
+# too — the TLS testnet's provision container runs its `tls-gen`
+# against the generated genesis inside the cluster, so nothing
+# depends on host-side tooling.
+RUN cargo build --release -p oxide-devnet -p oxide-validator
 
 # ── Runtime image ──────────────────────────────────────────────────
 
@@ -38,8 +41,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the release binary.
+# Copy the release binaries.
 COPY --from=builder /oxide/target/release/oxide-devnet /usr/local/bin/oxide-devnet
+COPY --from=builder /oxide/target/release/oxide-validator /usr/local/bin/oxide-validator
 
 # Default: run as devnet node 0 with 4 nodes.
 # Override via docker-compose environment variables.
