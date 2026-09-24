@@ -16,18 +16,12 @@ path = "src/main.rs"
 # lets `--bls-key-file` accept encrypted operator key files too.
 node = { workspace = true, features = ["dev-identities", "keystore"] }
 primitives = { workspace = true }
-types = { workspace = true }
-ports = { workspace = true }
 framework = { workspace = true }
 config = { workspace = true }
 crypto = { workspace = true, features = ["dev-identities"] }
 consensus = { workspace = true }
-executor = { workspace = true }
-p2p = { workspace = true, features = ["tls"] }
 staking = { workspace = true }
 evm = { workspace = true }
-rpc = { workspace = true }
-codec = { workspace = true }
 alloy-primitives = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

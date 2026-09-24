@@ -59,6 +59,7 @@ pub mod cli;
 pub mod devnet;
 pub mod peer_auth;
 pub mod rpc_adapters;
+pub mod validator_net;
 
 /// The consensus engine selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

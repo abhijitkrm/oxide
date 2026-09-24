@@ -1,0 +1,1279 @@
+//! `validator_net` — the networked single-validator node runtime.
+//!
+//! # What this is
+//!
+//! One process = one validator: the transport-to-engine pump that
+//! turns an assembled [`crate::devnet::DevnetNode`] into a live
+//! committee member. Both node binaries consume it:
+//!
+//! - `oxide-devnet --node <i>` derives its inputs from devnet
+//!   conventions (deterministic keys, index-templated ports) and
+//!   calls [`run`];
+//! - `oxide-validator --validator` resolves them from config —
+//!   `--genesis-file`, `--bls-key-file`, `--tls-dir`, and
+//!   `addr@host:port` peer entries — and calls the same [`run`].
+//!
+//! Keeping the pump here rather than in either binary is the point:
+//! a divergence between "the devnet's networking" and "the
+//! production validator's networking" is exactly the kind of drift
+//! the 6.5 remediation removed from executor assembly.
+//!
+//! # Wire protocol
+//!
+//! One-byte message tags on the transport frame: `MSG_PROPOSAL`,
+//! `MSG_VOTE`, `MSG_QC`, `MSG_TIMEOUT`, `MSG_TC`, `MSG_TX`. This IS
+//! the production consensus wire format — a change here is a
+//! protocol change, not a devnet tweak.
+//!
+//! # Routing convention
+//!
+//! Transport peer IDs are staking *addresses*, not committee
+//! indexes: sends resolve the live committee's
+//! `validator_addresses()` (which follows rotations), and inbound
+//! attribution resolves `msg.from` — the handshake-authenticated
+//! address — back to a committee index via `index_of`. An index
+//! baked into the peer id would point at a different member the
+//! moment a removal reshuffled the committee; the address cannot.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
+
+use ports::ConsensusEngine;
+use ports::transport::Transport;
+use types::TxBytes;
+
+// Codec traits for encoding/decoding consensus messages.
+use codec::{Decode, Encode};
+
+// ── Wire message tags ───────────────────────────────────
+// One-byte type tags for the transport frame: the first byte of
+// each message identifies the payload type.
+const MSG_PROPOSAL: u8 = 0x00;
+const MSG_VOTE: u8 = 0x01;
+const MSG_QC: u8 = 0x02;
+const MSG_TIMEOUT: u8 = 0x03; // timeout signature (view-change init)
+const MSG_TC: u8 = 0x04; // timeout certificate (view-change proof)
+const MSG_TX: u8 = 0x05; // raw tx envelope gossip (mempool propagation)
+
+/// Idle heartbeat interval for the consensus pump (unit: wall-clock
+/// time). A leader with no pending work still owes the network a
+/// — usually empty — block on this cadence: followers cannot
+/// distinguish "idle" from "dead", so silence would churn views
+/// through timeout certificates forever. Must stay comfortably
+/// below the pacemaker's base timeout (2s default) so a live idle
+/// leader's heartbeats keep follower timers reset; 1s leaves a
+/// full timeout of slack for scheduling jitter. Lower = more empty
+/// blocks (fresher liveness evidence, more I/O); higher = fewer
+/// blocks but closer to timeout churn.
+const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// mTLS material for the peer transport — resolved file paths.
+///
+/// Peer certificates are required per expected peer: a peer without
+/// a trusted cert can never complete the handshake, which is the
+/// point — the trust list IS the admission policy at the TLS layer
+/// (membership itself is re-checked live by `BlsPeerAuth`).
+#[derive(Debug)]
+pub struct TlsSpec {
+    /// This node's own certificate (PEM).
+    pub cert_path: PathBuf,
+    /// This node's private key (PEM).
+    pub key_path: PathBuf,
+    /// `(peer_id, cert_path)` for every peer this node trusts —
+    /// `peer_id` is the peer's staking-address bytes.
+    pub trusted_peer_certs: Vec<(Vec<u8>, PathBuf)>,
+}
+
+/// Genesis `evm.alloc` application hook — see
+/// [`ValidatorNetSpec::genesis_alloc`].
+pub type GenesisAlloc = Box<dyn FnOnce(&evm::EvmModule) + Send>;
+
+/// Everything [`run`] needs, already resolved.
+///
+/// The binaries own flag/config parsing and their mode's defaults;
+/// this spec is the boundary between "how the operator expressed
+/// it" and "what the node runs". Nothing inside `validator_net`
+/// reads CLI flags — an input that matters to the network path is
+/// a field here, so a binary cannot accidentally inherit another
+/// binary's flag conventions.
+pub struct ValidatorNetSpec {
+    /// Log prefix on every line this node prints —
+    /// `oxide-devnet[0]` or `oxide-validator`.
+    pub log_tag: String,
+    /// This node's committee seat: the index into `validator_set`
+    /// its `secret_key` resolves to. Decoupled from any process/
+    /// port index — a post-rotation genesis legitimately seats a
+    /// node differently than its address sort or launch order.
+    pub seat: usize,
+    /// The committee this node joins.
+    pub validator_set: consensus::ValidatorSet,
+    /// This node's BLS secret key — signs votes/QC contributions
+    /// and the peer-handshake proof.
+    pub secret_key: crypto::BlsSecretKey,
+    /// The resolved node config — executor graph, genesis, chain
+    /// id, block budget, pacemaker timeouts.
+    pub node_config: crate::NodeConfig,
+    /// Consensus WAL path — `None` follows `node_config`'s own
+    /// `<data_dir>/consensus.wal` derivation; both `None` disables
+    /// WAL persistence.
+    pub wal_path: Option<PathBuf>,
+    /// TCP listen address for peer connections (`host:port`).
+    pub listen_addr: String,
+    /// Peers to dial: `(peer_id, host:port)` where `peer_id` is the
+    /// member's staking-address bytes. The transport authenticates
+    /// each peer id against the live committee at handshake time,
+    /// so an entry for an address that never joins simply fails
+    /// auth — listing a pending rotation member early is safe.
+    pub peers: Vec<(Vec<u8>, String)>,
+    /// mTLS material; `None` runs plaintext TCP. The posture gate
+    /// (`refuse_insecure_posture_on_external_binds`) is what stands
+    /// between `None` and a public bind — this layer does not
+    /// re-decide policy.
+    pub tls: Option<TlsSpec>,
+    /// `[network]` transport tunables — timeouts, frame bound.
+    pub network: config::NetworkConfig,
+    /// Genesis `evm.alloc` application hook, run only on a fresh
+    /// start (a restart must not rewind balances the chain moved).
+    /// A closure rather than parsed data so the `node` crate stays
+    /// free of an `alloy_primitives` dependency — the binaries own
+    /// the hex→U256 conversion.
+    pub genesis_alloc: Option<GenesisAlloc>,
+    /// Data directory for block journal + checkpoint durability and
+    /// the shutdown snapshot export. `None` = in-memory only.
+    pub data_dir: Option<PathBuf>,
+    /// Resolved RPC listen address (`None` = no RPC server).
+    pub rpc_listen: Option<String>,
+    /// `[rpc]` config — chain id, base fee, debug API.
+    pub rpc_config: config::RpcConfig,
+    /// Optional startup transaction (the devnet smoke test).
+    /// Production validators pass `None` — a validator must not
+    /// emit transactions signed by public test identities.
+    pub smoke_tx: Option<TxBytes>,
+    /// Shutdown flag — the binary installs its own signal handling
+    /// (tokio `select!` in `oxide-validator`, a supervised signal
+    /// thread in `oxide-devnet`); the pump polls it each iteration.
+    pub shutdown: Arc<AtomicBool>,
+}
+
+/// Run a networked validator until `spec.shutdown` is set.
+///
+/// The full lifecycle: assemble the engine + executor (with WAL and
+/// durable-state recovery), build the authenticated transport, start
+/// RPC, and drive the consensus pump. On shutdown, exports a state
+/// snapshot to `<data_dir>/snapshot.bin` when a data dir is
+/// configured. Blocks the calling thread — the pump is deliberately
+/// synchronous (single-writer engine, non-blocking transport
+/// drains).
+///
+/// # Panics
+///
+/// Panics on unrecoverable startup failures (assembly errors, TLS
+/// config, data-dir creation) — startup is the right place for
+/// fatal errors; a half-assembled validator emits only rejected
+/// noise.
+#[allow(clippy::too_many_lines)]
+pub fn run(spec: ValidatorNetSpec) {
+    let ValidatorNetSpec {
+        log_tag,
+        seat,
+        validator_set,
+        secret_key,
+        node_config,
+        wal_path,
+        listen_addr,
+        peers,
+        tls,
+        network,
+        genesis_alloc,
+        data_dir,
+        rpc_listen,
+        rpc_config,
+        smoke_tx,
+        shutdown,
+    } = spec;
+
+    // Peer identity is the validator's staking address — the stable
+    // identity that survives index reshuffles on removal and key
+    // replacement on rotation. Our own address (becomes our
+    // transport peer id) is read from the committee, never derived.
+    let our_addr = validator_set.validator_addresses()[seat];
+    let own_id = our_addr.0.to_vec();
+
+    println!(
+        "{log_tag}: listening on {listen_addr}, {} peers, seat {seat} of {}",
+        peers.len(),
+        validator_set.n()
+    );
+
+    // Assemble the node through the ONE shared production path —
+    // `assemble_devnet_node` runs the same executor graph, engine
+    // wiring (configured timeouts/budget), WAL recovery, and
+    // membership gate every caller consumes.
+    let crate::devnet::DevnetNode {
+        mut engine,
+        app,
+        evm_module,
+        staking_module: _,
+        exchange_module: _,
+        recovered: _,
+        recovery,
+        wal_path: effective_wal_path,
+    } = crate::devnet::assemble_devnet_node(crate::devnet::DevnetNodeSpec {
+        index: seat,
+        validator_set: validator_set.clone(),
+        secret_key: secret_key.clone(),
+        config: node_config.clone(),
+        clock: None, // production wall clock
+        wal_path,
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("{log_tag}: {e} — exiting");
+        std::process::exit(1);
+    });
+    let app: Arc<executor::Executor> = app;
+    // `evm.alloc` is genesis state: it applies on a fresh start
+    // only. `assemble_executor` already ran durable recovery, so a
+    // restart arrives here holding the replayed tip — overwriting
+    // alloc accounts now would rewind balances the chain moved.
+    let fresh_start =
+        recovery.as_ref().is_none_or(|r| r.snapshot_height.is_none() && r.blocks_replayed == 0);
+    if fresh_start && let Some(apply) = genesis_alloc {
+        apply(&evm_module);
+    }
+    if let Some(ref wal_path) = effective_wal_path {
+        println!("{log_tag}: WAL loaded from {}", wal_path.display());
+    }
+
+    // Shared validator set — created before the transport so the
+    // handshake authenticator and the RPC provider both read the
+    // same live committee. The consensus loop writes the rotated
+    // set at each epoch boundary; readers always see the current
+    // keys.
+    let shared_validator_set = Arc::new(std::sync::RwLock::new(validator_set.clone()));
+    // Shared pending set: while a rotation is scheduled, the
+    // consensus loop publishes `engine.next_validator_set()` here so
+    // `BlsPeerAuth` admits the incoming member's handshake BEFORE
+    // its first consensus duty — a member admitted only at
+    // activation would miss its opening views. `None` otherwise.
+    let shared_next_validator_set =
+        Arc::new(std::sync::RwLock::new(Option::<consensus::ValidatorSet>::None));
+
+    // Create the TCP transport: mTLS when `tls` is configured, plain
+    // TCP otherwise. `[network]` timeouts and the frame bound flow
+    // into `TcpTransportConfig`. Peer IDs are cryptographically
+    // bound to committee keys via the signed greeting
+    // (`BlsPeerAuth`) — a self-claimed ID can neither join nor
+    // displace a live peer.
+    let mut transport = build_transport(
+        &listen_addr,
+        &log_tag,
+        own_id,
+        peers,
+        tls,
+        &network,
+        secret_key,
+        shared_validator_set.clone(),
+        shared_next_validator_set.clone(),
+    );
+
+    // Give connections time to establish. TLS handshakes take
+    // longer than plain TCP — 2s gives all peers time to connect
+    // and complete the handshake before the first proposal.
+    thread::sleep(Duration::from_millis(2000));
+
+    // Data directory enables durable state — `<dir>/block-journal/`
+    // records every finalized block and `<dir>/snapshot.bin` is the
+    // periodic checkpoint, both already replayed by
+    // `assemble_executor` above (the `recovery` report).
+    if let Some(ref dir) = data_dir {
+        std::fs::create_dir_all(dir)
+            .unwrap_or_else(|e| panic!("failed to create data dir {}: {e}", dir.display()));
+        if let Some(report) = &recovery {
+            if report.snapshot_height.is_some() || report.blocks_replayed > 0 {
+                println!(
+                    "{log_tag}: recovered durable state from {} \
+                     (snapshot {:?}, replayed {} blocks, height {})",
+                    dir.display(),
+                    report.snapshot_height,
+                    report.blocks_replayed,
+                    report.recovered_height,
+                );
+            }
+            if let Some(reason) = &report.snapshot_rejected {
+                eprintln!(
+                    "{log_tag}: snapshot.bin rejected ({reason}); \
+                     recovered from the block journal alone"
+                );
+            }
+        }
+    }
+
+    // Tx-gossip channel: the RPC submitter pushes accepted txs here;
+    // the consensus loop drains it and broadcasts `MSG_TX` frames to
+    // all peers. Bounded at 10k — a full channel drops the gossip
+    // copy (local submission already succeeded) instead of blocking
+    // the RPC thread.
+    let (gossip_tx, gossip_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(10_000);
+
+    // Start the RPC server if a listen address was resolved.
+    let rpc_handle = start_rpc(
+        &rpc_config,
+        rpc_listen,
+        &app,
+        &log_tag,
+        shared_validator_set.clone(),
+        &evm_module,
+        gossip_tx,
+    );
+
+    println!("{log_tag}: consensus engine started, waiting for blocks...");
+
+    // Optional startup transaction — the devnet smoke test. `None`
+    // on production validators.
+    if let Some(tx) = smoke_tx {
+        engine.submit_tx(tx);
+    }
+
+    let height = engine.finalized_height();
+    println!("{log_tag}: finalized height = {height:?}");
+    println!("{log_tag}: node running");
+
+    // Run the consensus message pump loop until shutdown.
+    run_consensus_loop(
+        &mut engine,
+        &mut transport,
+        &log_tag,
+        our_addr,
+        shutdown.as_ref(),
+        rpc_handle.as_deref(),
+        &shared_validator_set,
+        &shared_next_validator_set,
+        &gossip_rx,
+    );
+
+    // Graceful shutdown: if a data dir is configured, export the
+    // current state to `<dir>/snapshot.bin` so a restart can resume
+    // with the full chain state (not just the WAL).
+    if let Some(ref dir) = data_dir {
+        let height = crate::devnet::export_snapshot(&app, dir).unwrap_or_else(|e| panic!("{e}"));
+        println!(
+            "{log_tag}: exported snapshot to {} (height {height})",
+            dir.join("snapshot.bin").display(),
+        );
+    }
+    println!("{log_tag}: shutdown complete");
+}
+
+/// Build the TCP transport: `spec.tls` for mTLS, plain TCP otherwise.
+///
+/// The `network` config supplies the timeouts and frame bound.
+/// Admission is cryptographic, not list-based: `allowed_peer_ids`
+/// stays `None` because a static set can never follow committee
+/// rotations (a member added post-boot would be refused before the
+/// handshake it must pass). `BlsPeerAuth` resolves each connection's
+/// address-id against the LIVE validator set — plus the staged
+/// `pending` set during a rotation's activation window — and
+/// requires a `Domain::PeerHandshake` signature under that member's
+/// registered key. A self-claimed id can neither join nor displace
+/// a live peer, and a removed member's proofs die the moment the
+/// new set activates.
+///
+/// # Panics
+///
+/// Panics if a `TlsSpec` is given but the TLS config cannot be built
+/// (missing cert/key files, invalid PEM, etc.).
+#[allow(clippy::too_many_arguments)]
+fn build_transport(
+    listen_addr: &str,
+    log_tag: &str,
+    own_id: Vec<u8>,
+    peers: Vec<(Vec<u8>, String)>,
+    tls: Option<TlsSpec>,
+    network: &config::NetworkConfig,
+    our_key: crypto::BlsSecretKey,
+    validators: Arc<std::sync::RwLock<consensus::ValidatorSet>>,
+    pending: Arc<std::sync::RwLock<Option<consensus::ValidatorSet>>>,
+) -> p2p::tcp::TcpTransport {
+    // Signed greeting: peer IDs are staking addresses bound to
+    // committee keys, so a connection claiming member `a` must sign
+    // with the key registered for `a` — the ID can no longer be
+    // self-claimed, and a duplicate connection is a
+    // proven-same-identity reconnect, not a hijack. The shared sets
+    // mean committee rotations take effect without a transport
+    // restart.
+    let auth: Arc<dyn p2p::tcp::PeerAuth> =
+        Arc::new(crate::peer_auth::BlsPeerAuth::new(our_key, validators, pending));
+    let transport_config =
+        p2p::tcp::TcpTransportConfig { peer_auth: Some(auth), ..to_transport_config(network) };
+    // Admission control is always on in the shipped node: connection
+    // caps, per-peer ingress rate limits, and reputation bans are not
+    // optional defenses. Default limits (256 connections, 10 MiB
+    // burst / 1 MiB/s per peer) comfortably fit consensus traffic.
+    let admission =
+        p2p::admission::SharedAdmissionControl::new(p2p::admission::AdmissionControl::new());
+    if let Some(tls_spec) = tls {
+        let trusted_peers: Vec<(Vec<u8>, String)> = tls_spec
+            .trusted_peer_certs
+            .iter()
+            .map(|(id, path)| (id.clone(), path.display().to_string()))
+            .collect();
+        let trusted_peers_refs: Vec<(Vec<u8>, &str)> =
+            trusted_peers.iter().map(|(id, path)| (id.clone(), path.as_str())).collect();
+        let tls_config = p2p::tls::TlsConfig::from_files(
+            &tls_spec.cert_path.display().to_string(),
+            &tls_spec.key_path.display().to_string(),
+            &trusted_peers_refs,
+        )
+        .unwrap_or_else(|e| panic!("{log_tag}: failed to build TLS config: {e}"));
+        println!("{log_tag}: mTLS enabled");
+        p2p::tcp::TcpTransport::with_tls_and_admission(
+            listen_addr,
+            own_id,
+            peers,
+            transport_config,
+            tls_config,
+            admission,
+        )
+    } else {
+        p2p::tcp::TcpTransport::with_admission(
+            listen_addr,
+            own_id,
+            peers,
+            transport_config,
+            admission,
+        )
+    }
+}
+
+/// A `ValidatorSetProvider` that reads from a shared
+/// `Arc<RwLock<ValidatorSet>>` — the consensus loop writes the
+/// updated set after each epoch rotation; the RPC handler reads it.
+struct SharedValidatorSetProvider {
+    /// The shared validator set — written by the consensus loop
+    /// after `rotate_epoch`, read by the RPC handler.
+    set: std::sync::Arc<std::sync::RwLock<consensus::ValidatorSet>>,
+}
+
+impl rpc::ValidatorSetProvider for SharedValidatorSetProvider {
+    fn validator_set(&self) -> Result<Vec<rpc::ValidatorSetEntry>, String> {
+        let set = self.set.read().map_err(|e| format!("validator set lock poisoned: {e}"))?;
+        let entries = set
+            .validator_addresses()
+            .iter()
+            .zip(set.public_keys().iter())
+            .zip(set.stakes().iter())
+            .map(|((addr, pk), stake)| rpc::ValidatorSetEntry {
+                address: format!("0x{}", crate::cli::hex_encode(&addr.0)),
+                public_key: format!("0x{}", crate::cli::hex_encode(pk.as_bytes())),
+                stake: *stake,
+            })
+            .collect();
+        Ok(entries)
+    }
+}
+
+/// Start the RPC server for a networked validator.
+///
+/// Returns a handle to the `RpcServer` for metrics updates, or
+/// `None` if no RPC address is configured.
+///
+/// The HTTP server is spawned on a dedicated tokio runtime thread so
+/// the consensus loop can run on the calling thread.
+fn start_rpc(
+    rpc_config: &config::RpcConfig,
+    rpc_listen: Option<String>,
+    app: &Arc<executor::Executor>,
+    log_tag: &str,
+    shared_validator_set: Arc<std::sync::RwLock<consensus::ValidatorSet>>,
+    evm_module: &Arc<evm::EvmModule>,
+    gossip_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+) -> Option<Arc<rpc::RpcServer>> {
+    let listen = rpc_listen?;
+
+    let mut rpc_server = rpc::RpcServer::new(rpc_config.chain_id, rpc_config.base_fee)
+        .with_debug_api(rpc_config.enable_debug_api);
+    // Gossip-aware submitter: accepted txs are broadcast to all peers
+    // so a tx sent to a non-leader still reaches the current leader.
+    rpc_server.set_tx_submitter(Arc::new(crate::rpc_adapters::GossipingTxSubmitter {
+        inner: crate::rpc_adapters::ExecutorTxSubmitter { executor: app.clone() },
+        gossip: gossip_tx,
+    }));
+    rpc_server.set_evm(evm_module.clone());
+    rpc_server.set_txpool_provider(Arc::new(crate::rpc_adapters::ExecutorTxpoolProvider {
+        executor: app.clone(),
+    }));
+    rpc_server.set_snapshot_provider(Arc::new(crate::rpc_adapters::ExecutorSnapshotProvider {
+        executor: app.clone(),
+    }));
+    rpc_server.set_validator_set_provider(Arc::new(SharedValidatorSetProvider {
+        set: shared_validator_set,
+    }));
+    let rpc = Arc::new(rpc_server);
+    let http_server = rpc::server::HttpServer::from_shared(rpc.clone(), listen.clone());
+
+    // Spawn the HTTP server on a dedicated tokio runtime thread so
+    // the consensus loop can run on the calling thread. Non-critical:
+    // a dead RPC leaves consensus running; health probes see a
+    // refused connection.
+    let rpc_clone = rpc.clone();
+    let _ = primitives::supervision::spawn_supervised("rpc-http", false, move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rpc runtime");
+        rt.block_on(async move {
+            http_server.serve().await;
+        });
+    });
+
+    println!("{log_tag}: RPC server on http://{listen}");
+    Some(rpc_clone)
+}
+
+/// Map the `[network]` config onto the transport's tunables.
+///
+/// `listen_addr`/`peers` are NOT taken from the file by callers that
+/// derive them per-index (`--node`, `--base-port`) or per-member
+/// (`addr@host:port` entries); the timeouts and frame bound DO apply
+/// to both TLS and plain TCP.
+fn to_transport_config(network: &config::NetworkConfig) -> p2p::tcp::TcpTransportConfig {
+    p2p::tcp::TcpTransportConfig {
+        connect_timeout: network.connect_timeout(),
+        read_timeout: network.read_timeout(),
+        max_message_bytes: network.max_message_bytes,
+        ..Default::default()
+    }
+}
+/// The consensus message pump loop: proposes, votes, drains the
+/// transport, forms QCs, advances views, and syncs heights.
+///
+/// This is the distributed equivalent of the in-process devnet's
+/// `pipelined_tick`. Each iteration:
+/// 1. Leader proposes and broadcasts to followers.
+/// 2. Followers vote on pending proposals.
+/// 3. Drain inbound transport messages (proposals, votes, QCs).
+/// 4. Form QC if quorum reached, broadcast to peers.
+/// 5. Advance views and sync heights.
+///
+/// Routing convention: transport peer IDs are staking *addresses*,
+/// not committee indexes. Sends resolve the live committee's
+/// `validator_addresses()` — which follows rotations as soon as the
+/// engine swaps the set — and inbound attribution resolves
+/// `msg.from` (the handshake-authenticated address) back to a
+/// committee index via `index_of`. An index baked into the peer id
+/// would point at a different member the moment a removal reshuffled
+/// the committee; the address cannot.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn run_consensus_loop(
+    engine: &mut consensus::OxideBft,
+    transport: &mut p2p::tcp::TcpTransport,
+    log_tag: &str,
+    our_addr: primitives::Address,
+    shutdown: &AtomicBool,
+    rpc: Option<&rpc::RpcServer>,
+    shared_validator_set: &std::sync::RwLock<consensus::ValidatorSet>,
+    shared_next_validator_set: &std::sync::RwLock<Option<consensus::ValidatorSet>>,
+    gossip_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    // Gossip dedup cap: tx hashes we've already ingested (ours +
+    // peers'). 100k entries covers several blocks' worth of txs; a
+    // duplicate arriving after eviction is re-ingested harmlessly
+    // (the executor's nonce-replay check still applies).
+    const GOSSIP_SEEN_CAP: usize = 100_000;
+    // Track proposals received from the network. Followers vote on
+    // these proposals; the leader proposes locally.
+    let mut pending_proposals: Vec<(types::BlockHeader, types::Proposal)> = Vec::new();
+    // Admitted-proposal dedupe: `(view, proposer)` pairs that
+    // already occupy a pending slot. The key is claimed only by a
+    // *verified* proposal (the intake runs `admit_proposal` before
+    // inserting), so one entry per view is the honest maximum — an
+    // equivocating leader's second signed body for the same view,
+    // or a re-delivered identical header, is dropped here without
+    // re-running any verification.
+    let mut seen_proposals: std::collections::HashSet<(u64, primitives::Hash)> =
+        std::collections::HashSet::new();
+    // Per-sender budget on proposal *authentication attempts*:
+    // `(last window start, frames admitted this second)` per
+    // authenticated peer id. Every distinct admissible frame costs
+    // one BLS verify inside `admit_proposal`; without a per-peer
+    // bound a flooding member would hold the consensus thread in
+    // verification while the real leader's proposal queues behind
+    // the junk in the transport's merged recv queue. The key is the
+    // handshake-proven peer id — a peer cannot spend another's
+    // budget. Committee-sized map: only `allowed_peer_ids` can hold
+    // a connection at all.
+    let mut proposal_verify_budget: std::collections::HashMap<Vec<u8>, (std::time::Instant, u32)> =
+        std::collections::HashMap::new();
+    let mut voted_views: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut proposed_views: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut last_reported_height: u64 = 0;
+    // View-change timeout tracking. The pacemaker has an internal
+    // timeout duration (base 2s, exponential backoff). We track when
+    // the current view started; if it hasn't advanced within the
+    // timeout, we fire `on_timeout()` and broadcast the timeout
+    // signature to all peers. This is essential for recovering from
+    // a byzantine or crashed leader — without it, the consensus
+    // stalls forever when the leader stops proposing.
+    let mut view_start = std::time::Instant::now();
+    let mut timeout_sent_for_view: Option<u64> = None;
+    // Track the last epoch — when `engine.epoch()` increments, the
+    // validator set was rotated by `complete_rotation`. Update the
+    // shared set so `GET /validator-set` reflects the new set.
+    let mut last_epoch = engine.epoch().value();
+    let mut seen_txs: std::collections::HashSet<primitives::Hash> =
+        std::collections::HashSet::with_capacity(GOSSIP_SEEN_CAP.min(4096));
+    let mut seen_txs_fifo: std::collections::VecDeque<primitives::Hash> =
+        std::collections::VecDeque::new();
+
+    loop {
+        // Graceful shutdown: SIGINT/SIGTERM sets the flag, we break
+        // cleanly so the transport can flush and the WAL can be
+        // closed by `Drop`.
+        if shutdown.load(Ordering::Relaxed) {
+            println!("{log_tag}: shutdown signal received, stopping");
+            break;
+        }
+
+        // Phase 1: propose (if leader and haven't proposed this view).
+        // Leader decisions consult the engine's LIVE committee —
+        // `is_leader` reads the current validator set AND our
+        // re-seated index, so a rotated epoch can't strand us on the
+        // startup set's schedule (or our startup slot).
+        let view = engine.current_view().value();
+        if engine.is_leader() && !proposed_views.contains(&view) {
+            if view > 0 && engine.high_qc().is_none() {
+                // Need the previous QC before proposing.
+            } else {
+                // Idle mode is an explicit heartbeat, not silence:
+                // `propose()` returns None when no work is pending, but
+                // a silent leader is indistinguishable from a dead one —
+                // followers' view timers would fire and views would
+                // churn through timeout certificates without committing
+                // anything. If this view has been idle past
+                // `IDLE_HEARTBEAT`, propose anyway: the QC advances the
+                // chain on the healthy path and commits the uncommitted
+                // tail. (Replaces the keep-alive transaction, which
+                // needed a funded test identity to fake real work.)
+                let produced = engine.propose().or_else(|| {
+                    if view_start.elapsed() >= IDLE_HEARTBEAT {
+                        engine.propose_heartbeat()
+                    } else {
+                        None
+                    }
+                });
+                if let Some((header, proposal)) = produced {
+                    let proposal_view = header.view.value();
+                    proposed_views.insert(proposal_view);
+                    pending_proposals.push((header.clone(), proposal.clone()));
+                    // C10: the leader self-votes through `engine.vote()` —
+                    // the single signing authority — which records the
+                    // vote locks and appends the WAL BEFORE signing. The
+                    // manual sign-then-collect this replaces emitted a
+                    // signature whose anti-equivocation state was never
+                    // durable: a restart could then double-vote.
+                    if let Some(leader_vote) = engine.vote(&header, &proposal) {
+                        let _ = engine.collect_vote(engine.validator_index(), leader_vote);
+                        voted_views.insert(proposal_view);
+                    }
+                    // Broadcast proposal to followers — every live
+                    // committee member except us, addressed by the
+                    // staking address that IS its peer id.
+                    let mut buf = Vec::with_capacity(1 + 512);
+                    buf.push(MSG_PROPOSAL);
+                    header.encode(&mut buf);
+                    proposal.encode(&mut buf);
+                    for addr in engine.validator_set().validator_addresses() {
+                        if *addr != our_addr {
+                            let _ = transport.send(&addr.0.to_vec(), &buf);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 2: vote on pending proposals (followers).
+        for (header, proposal) in &pending_proposals {
+            let proposal_view = header.view.value();
+            if voted_views.contains(&proposal_view) {
+                continue;
+            }
+            let leader = usize::from(engine.validator_set().leader(header.view));
+            if usize::from(engine.validator_index()) == leader {
+                continue; // Leader already self-voted.
+            }
+            if let Some(vote) = engine.vote(header, proposal) {
+                let mut buf = Vec::with_capacity(1 + 137);
+                buf.push(MSG_VOTE);
+                vote.encode(&mut buf);
+                // The leader's peer id is its staking address —
+                // `leader` is a committee index into the live set.
+                if let Some(leader_addr) = engine.validator_set().validator_addresses().get(leader)
+                {
+                    let _ = transport.send(&leader_addr.0.to_vec(), &buf);
+                }
+                voted_views.insert(proposal_view);
+            }
+        }
+
+        // Phase 3: drain inbound transport messages.
+        while let Some(msg) = transport.recv() {
+            if msg.bytes.is_empty() {
+                continue;
+            }
+            let tag = msg.bytes[0];
+            let mut reader = codec::Reader::new(&msg.bytes[1..]);
+            match tag {
+                MSG_PROPOSAL => {
+                    if let (Ok(header), Ok(proposal)) = (
+                        types::BlockHeader::decode(&mut reader),
+                        types::Proposal::decode(&mut reader),
+                    ) {
+                        // Intake gate, cheapest check first: a junk
+                        // proposal must be dropped before it ever
+                        // costs this single-threaded loop a BLS
+                        // verify. `proposal_admissible` applies the
+                        // view window (stale/premature churn) and the
+                        // scheduled-leader compare — both pure, no
+                        // crypto. Without this gate a Byzantine peer
+                        // could push unbounded pending entries and
+                        // have `vote()` re-verify all of them on
+                        // every iteration.
+                        let proposal_view = header.view.value();
+                        if !engine.proposal_admissible(&header) {
+                            continue;
+                        }
+                        // Per-sender verify budget before the one
+                        // expensive step: a distinct admissible
+                        // frame costs one BLS verify in
+                        // `admit_proposal`. Charged per frame rather
+                        // than per fresh verify — memo-hit
+                        // redeliveries are cheap enough that the
+                        // accounting stays simple and honest bursts
+                        // (≤1 proposal per view per leader) sit far
+                        // below the cap.
+                        let budget = proposal_verify_budget
+                            .entry(msg.from.clone())
+                            .or_insert((std::time::Instant::now(), 0));
+                        if budget.0.elapsed() >= std::time::Duration::from_secs(1) {
+                            *budget = (std::time::Instant::now(), 0);
+                        }
+                        if budget.1 >= consensus::PROPOSAL_VERIFY_BUDGET_PER_SEC {
+                            continue;
+                        }
+                        budget.1 += 1;
+                        // Authenticate BEFORE the dedupe slot is
+                        // claimed: `header.proposer` is a public
+                        // claim, so junk can pass the leader compare
+                        // while carrying a forged signature. If an
+                        // unverified frame took the (view, proposer)
+                        // key, junk that races ahead of the real
+                        // leader would park it and the genuine
+                        // proposal would be dropped as a "duplicate"
+                        // — the flood becomes censorship. Only a
+                        // verified proposal may occupy the slot;
+                        // `admit_proposal` memoises both verdicts so
+                        // re-deliveries are free.
+                        if engine.admit_proposal(&header, &proposal)
+                            && seen_proposals.insert((proposal_view, header.proposer))
+                        {
+                            pending_proposals.push((header, proposal));
+                        }
+                    }
+                }
+                MSG_VOTE => {
+                    if let Ok(vote) = types::Vote::decode(&mut reader) {
+                        // Attribute by the AUTHENTICATED peer id: the
+                        // handshake proved the sender owns the staking
+                        // address it claims, so `index_of` resolves the
+                        // committee seat the signature must verify
+                        // under. A removed member's address resolves to
+                        // nothing — its vote dies here rather than
+                        // collecting under whatever index it used to
+                        // hold.
+                        let voter = msg
+                            .from
+                            .as_slice()
+                            .try_into()
+                            .map(primitives::Address)
+                            .ok()
+                            .and_then(|a| engine.validator_set().index_of(&a));
+                        if let Some(voter_idx) = voter {
+                            let _ = engine.collect_vote(voter_idx, vote);
+                        }
+                    }
+                }
+                MSG_QC => {
+                    if let Ok(qc) = types::QuorumCertificate::decode(&mut reader) {
+                        let _ = engine.deliver_qc(qc);
+                    }
+                }
+                MSG_TX => {
+                    // Raw tx envelope gossiped by a peer's RPC
+                    // (`eth_sendRawTransaction`). Ingest into our
+                    // mempool — the leader may be a different node,
+                    // so without gossip a tx submitted to a non-leader
+                    // would sit until that node's leader turn.
+                    //
+                    // Never re-broadcast: in the full-mesh validator
+                    // topology a single hop reaches every peer, and
+                    // re-gossip would loop indefinitely.
+                    let payload = &msg.bytes[1..];
+                    let tx_hash =
+                        crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, payload);
+                    if seen_txs.insert(tx_hash) {
+                        seen_txs_fifo.push_back(tx_hash);
+                        if seen_txs_fifo.len() > GOSSIP_SEEN_CAP
+                            && let Some(old) = seen_txs_fifo.pop_front()
+                        {
+                            seen_txs.remove(&old);
+                        }
+                        let _ = engine.submit_tx(TxBytes::new(payload.to_vec()));
+                        // Feed pending-tx subscribers/filters — the
+                        // Ethereum hash is keccak256 of the signed
+                        // RLP inside the envelope, not the envelope
+                        // hash used for dedup.
+                        if let Some(rpc) = rpc
+                            && let Some(raw) = evm::unwrap_evm_tx_envelope(payload)
+                        {
+                            rpc.record_pending_tx(alloy_primitives::keccak256(raw));
+                        }
+                    }
+                }
+                MSG_TIMEOUT => {
+                    // View-change timeout signature from a peer.
+                    // Format: [voter_addr: 20B][view: 8B][epoch: 8B]
+                    //         [has_qc: 1B][qc?][has_tc: 1B][tc?]
+                    //         [signature: 96B]
+                    // The certificate fields are the DiemBFT v4
+                    // timeout evidence: entering view v is
+                    // legitimate only via QC(v−1) or TC(v−1).
+                    if let Ok(voter_bytes) = reader.read_slice(20)
+                        && let Ok(sig_view) = reader.read_u64()
+                        && let Ok(sig_epoch) = reader.read_u64()
+                        && let Ok(has_qc) = reader.read_u8()
+                    {
+                        // The claimed voter must BE the authenticated
+                        // sender — otherwise a member could attribute
+                        // its timeout signature to any other seat.
+                        let Ok(voter_arr): Result<[u8; 20], _> = voter_bytes.try_into() else {
+                            continue;
+                        };
+                        if voter_arr.as_slice() != msg.from.as_slice() {
+                            continue;
+                        }
+                        // Resolve the sender's address to its seat in
+                        // the live committee; a non-member (or a
+                        // removed member post-activation) collects
+                        // nothing.
+                        let voter_idx =
+                            engine.validator_set().index_of(&primitives::Address(voter_arr));
+                        let Some(voter_idx) = voter_idx else { continue };
+                        // The wire interleaves each flag with its
+                        // payload — has_qc then the QC bytes, then
+                        // has_tc then the TC bytes. Reading both
+                        // flags up front would consume the QC's
+                        // first byte as `has_tc` and misalign every
+                        // field after it, so the qc_ev the signature
+                        // is verified against would never match what
+                        // the sender signed.
+                        let qc_ev = if has_qc == 1 {
+                            types::QuorumCertificate::decode(&mut reader).ok()
+                        } else {
+                            None
+                        };
+                        let Ok(has_tc) = reader.read_u8() else { continue };
+                        let tc_ev = if has_tc == 1 {
+                            types::TimeoutCertificate::decode(&mut reader).ok()
+                        } else {
+                            None
+                        };
+                        if let Ok(sig) = crypto::Signature::decode(&mut reader) {
+                            // Authenticate the evidence BEFORE acting
+                            // on it. Everything below mutates
+                            // consensus state — the pacemaker timer,
+                            // the vote buffer, high_qc — so a peer
+                            // claiming a high view with a garbage
+                            // signature must be rejected here rather
+                            // than after the damage is done. The
+                            // signature is checked against the
+                            // (view, epoch) the sender actually signed,
+                            // never against our own current view.
+                            if engine
+                                .verify_timeout_signature_for(
+                                    voter_idx,
+                                    primitives::View::new(sig_view),
+                                    primitives::Epoch::new(sig_epoch),
+                                    qc_ev.as_ref(),
+                                    &sig,
+                                )
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            let my_epoch = engine.epoch().value();
+                            // Ignore timeout sigs from a different
+                            // epoch — they are not valid for this epoch.
+                            if sig_epoch != my_epoch {
+                                continue;
+                            }
+                            // Bounded catch-up: feed the attached
+                            // certificate evidence through the
+                            // verified ingestion paths first — a
+                            // timeout signature alone cannot move
+                            // our view; only real QC/TC evidence
+                            // can. After this, a collectible sig
+                            // must claim exactly our current view.
+                            let view_before = engine.current_view().value();
+                            engine.deliver_timeout_evidence(qc_ev.clone(), tc_ev);
+                            // If the sig is for a past view, ignore it
+                            // (stale — the sender is behind us); if it
+                            // is for a view the evidence didn't reach,
+                            // ignore it — an unjustified jump (the
+                            // old code synced to the claimed view
+                            // unconditionally, letting one peer pull
+                            // the node to an arbitrary view).
+                            if sig_view != engine.current_view().value() {
+                                continue;
+                            }
+                            // Reset the view timer only when the
+                            // evidence actually moved us — resetting
+                            // on every same-view sig would let a peer
+                            // starve our own timeout.
+                            if engine.current_view().value() != view_before {
+                                view_start = std::time::Instant::now();
+                                timeout_sent_for_view = None;
+                            }
+                            match engine.collect_timeout_signature(voter_idx, sig, qc_ev) {
+                                Ok(Some(tc)) => {
+                                    // TC formed — broadcast to all peers.
+                                    eprintln!(
+                                        "{log_tag}: TC formed after collecting timeout sig from voter={voter_idx} view={}",
+                                        engine.current_view().value()
+                                    );
+                                    let mut tc_buf = Vec::with_capacity(1 + 200);
+                                    tc_buf.push(MSG_TC);
+                                    tc.encode(&mut tc_buf);
+                                    for addr in engine.validator_set().validator_addresses() {
+                                        if *addr != our_addr {
+                                            let _ = transport.send(&addr.0.to_vec(), &tc_buf);
+                                        }
+                                    }
+                                    view_start = std::time::Instant::now();
+                                    timeout_sent_for_view = None;
+                                }
+                                Ok(None) => {
+                                    // Timeout sig collected but
+                                    // no TC yet — no log needed
+                                    // (this is the common case).
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "{log_tag}: timeout sig from voter={voter_idx} rejected: {e:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                MSG_TC => {
+                    // Timeout certificate from a peer — advance the view.
+                    if let Ok(tc) = types::TimeoutCertificate::decode(&mut reader) {
+                        match engine.on_timeout_certificate(&tc) {
+                            Ok(()) => {
+                                view_start = std::time::Instant::now();
+                                timeout_sent_for_view = None;
+                            }
+                            Err(e) => {
+                                eprintln!("{log_tag}: TC rejected: {e:?}");
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Phase 3b: drain the tx-gossip channel — the RPC submitter
+        // pushes locally-accepted txs here; broadcast each as a
+        // `MSG_TX` frame to every peer. Bounded by the channel cap
+        // (10k), so worst case this drains 10k frames in one
+        // iteration — each send is a channel push to the peer's
+        // writer task, non-blocking.
+        while let Ok(tx_bytes) = gossip_rx.try_recv() {
+            // Record locally-originated txs in the dedup set too, so a
+            // peer that somehow reflects our frame back is dropped.
+            let tx_hash =
+                crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, &tx_bytes);
+            if seen_txs.insert(tx_hash) {
+                seen_txs_fifo.push_back(tx_hash);
+                if seen_txs_fifo.len() > GOSSIP_SEEN_CAP
+                    && let Some(old) = seen_txs_fifo.pop_front()
+                {
+                    seen_txs.remove(&old);
+                }
+            }
+            let mut buf = Vec::with_capacity(1 + tx_bytes.len());
+            buf.push(MSG_TX);
+            buf.extend_from_slice(&tx_bytes);
+            for addr in engine.validator_set().validator_addresses() {
+                if *addr != our_addr {
+                    let _ = transport.send(&addr.0.to_vec(), &buf);
+                }
+            }
+        }
+
+        // Phase 4: form QC (if quorum reached).
+        if let Some(qc) = engine.try_form_qc() {
+            let mut qc_buf = Vec::with_capacity(1 + 150);
+            qc_buf.push(MSG_QC);
+            qc.encode(&mut qc_buf);
+            for addr in engine.validator_set().validator_addresses() {
+                if *addr != our_addr {
+                    let _ = transport.send(&addr.0.to_vec(), &qc_buf);
+                }
+            }
+            let _ = engine.deliver_qc(qc);
+        }
+
+        // Phase 5: advance views.
+        let prev_view = engine.current_view().value();
+        if let Some(hqc) = engine.high_qc()
+            && hqc.view == engine.current_view()
+        {
+            engine.advance_view();
+        }
+
+        // Phase 5b: view-change timeout. If the current view hasn't
+        // advanced within the pacemaker's timeout duration, fire
+        // `on_timeout()`, broadcast the timeout signature to all
+        // peers, and let the pacemaker collect signatures to form a
+        // TC. This is the critical path for recovering from a
+        // byzantine or crashed leader.
+        let current_view_now = engine.current_view().value();
+        if current_view_now != prev_view {
+            // View advanced — reset the timer and clear the sent flag.
+            view_start = std::time::Instant::now();
+            timeout_sent_for_view = None;
+        }
+        let timeout_ms = engine.pacemaker_timeout_ms();
+        let elapsed_ms = u64::try_from(view_start.elapsed().as_millis()).unwrap_or(0);
+        if timeout_sent_for_view.is_none() && elapsed_ms >= timeout_ms {
+            timeout_sent_for_view = Some(current_view_now);
+            if let Some(sig) = engine.on_timeout() {
+                eprintln!(
+                    "{log_tag}: view timeout view={current_view_now} elapsed={elapsed_ms}ms — broadcasting timeout sig"
+                );
+                // The certificate evidence that justifies our
+                // presence at this view (DiemBFT v4 timeout fields):
+                // receivers only honor a view claim backed by
+                // QC(view−1) or TC(view−1) — a bare signature can no
+                // longer pull a peer to an arbitrary view.
+                let (high_qc_ev, last_tc_ev) = engine.timeout_evidence();
+                let mut buf = Vec::with_capacity(1 + 20 + 8 + 8 + 2 + 96);
+                buf.push(MSG_TIMEOUT);
+                // Encode: voter_address (20B) + view (8B) + epoch (8B)
+                // + [has_qc 1B][qc?] + [has_tc 1B][tc?] + sig (96B).
+                // The voter field is our staking address — the same
+                // bytes the transport proves ownership of at
+                // handshake, so the receiver can cross-check the
+                // claimed voter against the authenticated peer id
+                // and resolve the committee seat that must have
+                // signed. (An index here would misattribute the
+                // signature the moment a removal reshuffled seats.)
+                // The view and epoch are included so the receiver can
+                // verify the signature against the correct view and
+                // ignore stale sigs from a different view (e.g., after
+                // a partition when validators may be at different views).
+                buf.extend_from_slice(&our_addr.0);
+                buf.extend_from_slice(&current_view_now.to_le_bytes());
+                buf.extend_from_slice(&engine.epoch().value().to_le_bytes());
+                // Evidence flags + optional certificates.
+                match &high_qc_ev {
+                    Some(qc) => {
+                        buf.push(1u8);
+                        qc.encode(&mut buf);
+                    }
+                    None => buf.push(0u8),
+                }
+                match &last_tc_ev {
+                    Some(tc) => {
+                        buf.push(1u8);
+                        tc.encode(&mut buf);
+                    }
+                    None => buf.push(0u8),
+                }
+                sig.encode(&mut buf);
+                for addr in engine.validator_set().validator_addresses() {
+                    if *addr != our_addr {
+                        let _ = transport.send(&addr.0.to_vec(), &buf);
+                    }
+                }
+                // Self-collect: feed our own timeout signature to the
+                // engine so it counts toward the quorum.
+                if let Ok(Some(tc)) = engine.collect_timeout_signature(
+                    engine.validator_index(),
+                    sig,
+                    high_qc_ev.clone(),
+                ) {
+                    // TC formed immediately (unlikely with 1/4, but
+                    // handle it). Broadcast the TC to all peers.
+                    eprintln!(
+                        "{log_tag}: TC formed locally after self-timeout view={current_view_now}"
+                    );
+                    let mut tc_buf = Vec::with_capacity(1 + 200);
+                    tc_buf.push(MSG_TC);
+                    tc.encode(&mut tc_buf);
+                    for addr in engine.validator_set().validator_addresses() {
+                        if *addr != our_addr {
+                            let _ = transport.send(&addr.0.to_vec(), &tc_buf);
+                        }
+                    }
+                    view_start = std::time::Instant::now();
+                    timeout_sent_for_view = None;
+                }
+            }
+        }
+
+        // Height sync is handled inside `vote()` — `authenticate_
+        // proposal` calls `observe_block_height` once the header's
+        // leader and signature check out. The previous self-sync
+        // (sync_next_height(next_height_value)) was a no-op — it
+        // synced the engine to its own value.
+
+        // Report finalized height changes.
+        let height = engine.finalized_height();
+        if let Some(h) = height {
+            let h_val = h.value();
+            if h_val > last_reported_height {
+                println!("{log_tag}: finalized height = {h_val}");
+                last_reported_height = h_val;
+                // Update the RPC server's block height so
+                // `eth_blockNumber` and `/metrics` reflect the
+                // current finalized height, then push the block to
+                // WebSocket subscribers (no-op when nobody is
+                // subscribed or no EVM is attached).
+                if let Some(rpc) = rpc {
+                    rpc.set_block_height(h_val);
+                    rpc.publish_new_block(h_val);
+                }
+            }
+        }
+
+        // A confirmed execution divergence is terminal for this
+        // process: the engine has already logged CRITICAL and
+        // stopped signing; mirror the latch into RPC status so
+        // `/health` flips to 503 and `/metrics` exposes the gauge —
+        // otherwise the only signal is a stderr line a watchdog
+        // never sees. Idempotent: the detail is write-once.
+        if let (Some(rpc), Some(d)) = (rpc, engine.divergence()) {
+            rpc.set_exec_divergence(*d);
+        }
+
+        // Mirror the engine's execution certificates into RPC so
+        // `GET /snapshot/cert/{height}` can answer a syncing node's
+        // certificate poll. Pushed every iteration (the mirror
+        // dedups by height); a syncing client verifies the cert
+        // against its own validator-set checkpoint, so serving the
+        // bytes costs this node no trust assumption.
+        if let Some(rpc) = rpc {
+            rpc.record_exec_certificates(engine.exec_certificates());
+        }
+
+        // Compact proposal bookkeeping (keep last
+        // PROPOSAL_PAST_VIEWS views — the same bound the intake
+        // gate applies, so a set entry and its pending slot age
+        // out together).
+        let current_view = engine.current_view().value();
+        let keep_from = current_view.saturating_sub(consensus::PROPOSAL_PAST_VIEWS);
+        pending_proposals.retain(|(h, _)| h.view.value() >= keep_from);
+        voted_views.retain(|v| *v >= keep_from);
+        proposed_views.retain(|v| *v >= keep_from);
+        seen_proposals.retain(|(v, _)| *v >= keep_from);
+
+        // Epoch lifecycle: drain the validator-set transition the
+        // executor's finalized blocks recorded (staking key changes,
+        // validator adds/removes) and schedule the epoch rotation.
+        // The drain is deterministic — the queues only fill when a
+        // block *executes*, so every node stages the same committee
+        // at the same committed height — and activation is deferred
+        // to a certified boundary (`ROTATION_ACTIVATION_DELAY`
+        // commits later), never immediate on a local queue.
+        match engine.drive_epoch_changes() {
+            Ok(0) => {}
+            Ok(applied) => {
+                eprintln!(
+                    "{log_tag}: epoch rotation scheduled ({applied} \
+                     validator-set change(s)) — activates at committed height {:?}",
+                    engine.rotation_activation_height()
+                );
+            }
+            Err(e) => {
+                // Deterministic rejection — every replica folds the
+                // same deltas through `build_next_set` and reaches
+                // the same verdict, so this is consistent cluster
+                // state, not a fork: the transition is dropped and
+                // must be re-submitted.
+                eprintln!(
+                    "{log_tag}: epoch transition rejected: {e} — \
+                     pending change dropped (re-submit a valid set)"
+                );
+            }
+        }
+
+        // Epoch boundary: `commit_block` (from `deliver_qc` in the
+        // drain loop or Phase 4) and `drive_epoch_changes` (the
+        // activation-height completion above) may both swap the
+        // validator set — as can `adopt_certified_epoch` inside
+        // `deliver_qc` when a verified higher-epoch QC lands. Publish
+        // the live committee whenever the epoch moved so the
+        // authenticator and `GET /validator-set` track it.
+        if engine.epoch().value() != last_epoch {
+            last_epoch = engine.epoch().value();
+            if let Ok(mut shared) = shared_validator_set.write() {
+                *shared = engine.validator_set().clone();
+            }
+            // The pump's view-keyed bookkeeping must die with the
+            // epoch: the new epoch's view space restarts at 0, so a
+            // retained `voted_views`/`proposed_views` entry for view 0
+            // would suppress this node's first vote/proposal of the
+            // epoch, and pending proposals signed under the old epoch
+            // can never become votable. Mirrors the engine's own
+            // `clear_epoch_scoped_state`.
+            pending_proposals.clear();
+            seen_proposals.clear();
+            voted_views.clear();
+            proposed_views.clear();
+            view_start = std::time::Instant::now();
+            timeout_sent_for_view = None;
+        }
+
+        // Publish the staged committee to the transport's handshake
+        // authenticator for the whole schedule→activation window:
+        // an incoming member's first connection must already pass
+        // membership verification before its committee duties start.
+        // `next_validator_set` returns `None` outside the window (and
+        // clears itself at activation), so this is `None` most of the
+        // time — the `!=` guard avoids paying a committee clone on
+        // every pass.
+        if let Ok(mut pending) = shared_next_validator_set.write() {
+            let staged = engine.next_validator_set().cloned();
+            if *pending != staged {
+                *pending = staged;
+            }
+        }
+
+        // Yield to avoid busy-spinning when no messages are available.
+        // `transport.recv()` uses non-blocking `try_recv()`, so the loop
+        // would spin at 100% CPU without this sleep. A 1ms sleep keeps
+        // CPU usage near-zero while providing ~1ms message latency,
+        // 10x better than the previous `recv_timeout(10ms)` approach.
+        // The consensus hot path (propose -> vote -> QC) is message-driven:
+        // when messages arrive, `recv()` returns them immediately and
+        // the sleep is never reached. The sleep only fires when the
+        // transport is idle (waiting for the next network round).
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}

@@ -21116,3 +21116,46 @@ Regression tests: `disjoint_slots_skip_reexec`,
 `disjoint_slot_accesses_skip_reexec`, `erc20_disjoint_balances`,
 `erc20_shared_slot_conflicts` — all asserting exact re-execution
 counts plus serial root parity.
+## Session N+41 — the networked-validator pump moves into `node::`
+
+The only networked single-validator runtime lived inside the
+`oxide-devnet` binary: `run_node`'s ~900 lines of transport build,
+mTLS peer-cert resolution, tx gossip, RPC wiring, and the consensus
+pump (`run_consensus_loop` — propose/vote/drain/QC/timeout/epoch
+rotation) were unreachable by `oxide-validator`, which could only
+run solo. The audit's call is a production multi-validator binary,
+and the honest way to ship one is to make the pump shared code —
+not to copy it into a second binary where it would drift.
+
+New `node::validator_net` module owns the runtime:
+
+- `ValidatorNetSpec` is the boundary — every input the pump needs,
+  already resolved (seat, validator set, key, listen addr,
+  `(staking-addr, host:port)` peers, optional `TlsSpec`, network
+  tunables, RPC listen, data dir, shutdown flag). Nothing inside
+  reads CLI flags, so no binary inherits another's conventions.
+- `run(spec)` orchestrates: `assemble_devnet_node` → fresh-start
+  `genesis_alloc` hook → shared live/pending validator sets →
+  `build_transport` (BlsPeerAuth + admission + optional mTLS) →
+  gossip channel + RPC → `run_consensus_loop` → snapshot export on
+  shutdown.
+- `run_consensus_loop` moved verbatim except `log_tag` replaces the
+  hardcoded `oxide-devnet[{i}]` print prefix. The MSG_* wire tags
+  and `IDLE_HEARTBEAT` moved with it — they are the production wire
+  format, not devnet internals.
+- `apply_evm_alloc` stays binary-side as a
+  `Option<Box<dyn FnOnce(&EvmModule)>>` hook: its hex→U256 storage
+  parsing needs `alloy_primitives`, and keeping `node` free of that
+  dep preserves the boundary the original comment defended. (node
+  does now take `alloy-primitives` for `B256` — `record_pending_tx`
+  exposes it in rpc's public API — and `p2p/tls` unconditionally,
+  since every binary that can run the pump must be able to do mTLS;
+  plus `tokio` for the RPC thread runtime.)
+
+`oxide-devnet` slims to ~520 lines: flag parsing, devnet identity
+fallbacks, peer/template resolution, `peer-<i>.pem` cert naming,
+the smoke tx, and the signal thread — then `validator_net::run`.
+
+Verified live: a 4-process `oxide-devnet` fleet on ports 23100–03
+finalized 13+ heights in lockstep through the extracted pump;
+`cargo test -p devnet` 34/34; clippy clean.

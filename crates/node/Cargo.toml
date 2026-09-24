@@ -44,8 +44,18 @@ trading = { workspace = true }
 storage = { workspace = true, features = ["redb"] }
 rpc = { workspace = true }
 # p2p: `PeerAuth` impl for the transport's signed greeting — the
-# node assembly layer binds peer IDs to consensus keys.
-p2p = { workspace = true }
+# node assembly layer binds peer IDs to consensus keys. The `tls`
+# feature is on unconditionally: `validator_net` is the production
+# networked-validator pump, and mTLS must exist in every binary that
+# can run it (the posture gate decides when it is *required*).
+p2p = { workspace = true, features = ["tls"] }
+# tokio: the RPC HTTP server runs on a dedicated current-thread
+# runtime spawned by `validator_net`'s `start_rpc`.
+tokio = { workspace = true }
+# alloy-primitives: `B256` appears in the rpc crate's public API
+# (`record_pending_tx`) — already a transitive dep via revm/evm, so
+# this adds nothing to the compiled graph.
+alloy-primitives = { workspace = true }
 # tracing: structured diagnostic logging for node lifecycle events
 # (startup, shutdown, block finalization). Not on the hot path.
 tracing = { workspace = true }
