@@ -2646,6 +2646,7 @@ dependencies = [
  "primitives",
  "rpc",
  "staking",
+ "statesync",
  "storage",
  "tokio",
  "tracing",

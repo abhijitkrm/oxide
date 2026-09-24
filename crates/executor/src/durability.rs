@@ -611,4 +611,178 @@ impl Executor {
         report.recovered_height = applied_tip;
         Ok(Some(report))
     }
+
+    /// Repair-time import: install a peer-served, certificate-
+    /// verified snapshot and rebuild execution on top of it — the
+    /// in-process half of certified state repair after an
+    /// execution-divergence halt.
+    ///
+    /// Unlike [`Executor::import_snapshot`] (used on cold paths where
+    /// nothing is mid-flight), this variant is safe on a LIVE
+    /// executor whose committed history kept executing on the
+    /// diverged base while consensus kept finalizing:
+    ///
+    ///   1. The lane is quiesced first (skipped when `lane_dead` —
+    ///      a dead worker cannot race, and the watermark it stopped
+    ///      at would hang the wait forever).
+    ///   2. [`Executor::import_snapshot`] performs the staged,
+    ///      fully verified module reset — no payload byte installs
+    ///      before every module's claimed root reproduces.
+    ///   3. `state_roots` above the snapshot height are purged: they
+    ///      were computed on the diverged base and must never answer
+    ///      an attestation again. Roots at or below it are retained —
+    ///      they predate the diverged height (or are the freshly
+    ///      imported, certified one).
+    ///   4. The lane's pending deque is drained without execution:
+    ///      `finalize_block` journals every block before enqueueing,
+    ///      so nothing is lost — the replay below refills
+    ///      `finalized` — and no block the snapshot already covers
+    ///      can be double-applied by a stale queue entry.
+    ///   5. The durable journal refills `finalized` above the
+    ///      snapshot height. `TAG_CHECKPOINT` records are skipped
+    ///      unconditionally: a journaled checkpoint exported after
+    ///      the divergence carries the same wrong state this repair
+    ///      exists to remove — only the verified peer snapshot is a
+    ///      trusted base. Heights must be contiguous from
+    ///      `snapshot.height + 1`; a gap fails closed, because
+    ///      replaying past a hole produces a state no peer shares.
+    ///   6. `execute_committed_backlog` re-executes the gap through
+    ///      the identical `execute_block` path the live commit used,
+    ///      then the `enqueued`/`executed` watermarks and
+    ///      `next_proposal_height` advance to the rebuilt tip.
+    ///
+    /// When durability is not configured the in-memory `finalized`
+    /// map is the only block source; it must cover
+    /// `snapshot.height + 1 ..= tip` contiguously or the repair
+    /// reports [`DurabilityError::JournalGap`] — retention eviction
+    /// cannot be undone in-process.
+    ///
+    /// Clearing the consensus divergence latch is deliberately NOT
+    /// done here: the engine owns that decision and only clears it
+    /// when the rebuilt state reproduces a quorum-certified root
+    /// (`OxideBft::mark_repaired`) — a deterministic executor fault
+    /// replays to the same wrong root and stays halted, which is
+    /// the correct outcome.
+    ///
+    /// # Errors
+    ///
+    /// [`DurabilityError`] — `Import` on snapshot verification
+    /// failure, `Journal`/`Io`/`Decode`/`UnknownRecordTag` on journal
+    /// replay, `JournalGap` when committed history above the
+    /// snapshot cannot be replayed contiguously.
+    ///
+    /// # Returns
+    ///
+    /// The highest committed height execution now covers — the
+    /// snapshot height plus replayed journal blocks.
+    pub fn repair_import_snapshot(
+        &self,
+        snapshot: &ExecutorSnapshot,
+    ) -> Result<u64, DurabilityError> {
+        let lane_dead = {
+            let (lock, _cv) = &*self.exec_sync;
+            primitives::sync::lock_state(lock).lane_dead
+        };
+        if !lane_dead {
+            self.wait_exec_idle();
+        }
+        self.import_snapshot(snapshot).map_err(DurabilityError::Import)?;
+        let base = snapshot.height;
+
+        // Purge post-snapshot taint and lane debt. Roots above
+        // `base` were computed on the diverged base; every pending
+        // block is journaled, so dropping the deque loses nothing.
+        primitives::sync::lock_state(&self.state_roots).retain(|h, _| *h <= base);
+        {
+            let (lock, _cv) = &*self.exec_sync;
+            let mut s = primitives::sync::lock_state(lock);
+            s.pending.clear();
+            s.in_flight = None;
+            s.executed = Some(base);
+            s.saturated = false;
+        }
+        // Committed blocks the snapshot covers are no longer owed —
+        // keep only the heights the replay must re-execute.
+        primitives::sync::lock_state(&self.finalized).retain(|h, _| *h > base);
+
+        let mut covered = base;
+        if let Some(durability) = &self.durability {
+            let replay = journal::replay(&durability.journal_dir())?;
+            for record in replay.records {
+                let Some((&tag, payload)) = record.payload.split_first() else {
+                    return Err(DurabilityError::UnknownRecordTag(0xff));
+                };
+                match tag {
+                    // Never a repair base — see the doc comment.
+                    TAG_CHECKPOINT => {}
+                    TAG_BLOCK => {
+                        let mut reader = codec::Reader::new(payload);
+                        let block = FinalizedBlock::decode(&mut reader)?;
+                        let height = block.height.value();
+                        if height <= covered {
+                            continue;
+                        }
+                        let expected = covered.saturating_add(1);
+                        if height != expected {
+                            return Err(DurabilityError::JournalGap { expected, found: height });
+                        }
+                        self.insert_finalized(height, block);
+                        covered = height;
+                    }
+                    other => return Err(DurabilityError::UnknownRecordTag(other)),
+                }
+            }
+        } else {
+            // In-memory only: the retained `finalized` map must span
+            // base+1..=tip without a hole — there is no journal to
+            // backfill from.
+            let heights: Vec<u64> =
+                primitives::sync::lock_state(&self.finalized).keys().copied().collect();
+            for (i, h) in heights.iter().enumerate() {
+                let expected = base.saturating_add(1).saturating_add(i as u64);
+                if *h != expected {
+                    return Err(DurabilityError::JournalGap { expected, found: *h });
+                }
+                covered = *h;
+            }
+        }
+        self.execute_committed_backlog();
+        // Watermarks — mirror recover_durable_state's contract so
+        // attestation waiters and `prepare_proposal` resume at the
+        // rebuilt tip, not the snapshot's.
+        {
+            let (lock, cv) = &*self.exec_sync;
+            let mut s = primitives::sync::lock_state(lock);
+            s.enqueued = Some(s.enqueued.map_or(covered, |e| e.max(covered)));
+            s.executed = Some(s.executed.map_or(covered, |e| e.max(covered)));
+            cv.notify_all();
+        }
+        {
+            // Scoped guard: `durable_checkpoint` below re-enters
+            // `next_proposal_height` through `export_snapshot` —
+            // holding this MutexGuard across the call deadlocks
+            // (std Mutex is non-reentrant).
+            let next = covered.saturating_add(1);
+            let mut height = primitives::sync::lock_state(&self.next_proposal_height);
+            if next > *height {
+                *height = next;
+            }
+        }
+        // Persist the repaired base: a checkpoint rewrites
+        // `snapshot.bin` with the rebuilt state and prunes the
+        // covered journal — so a crash after repair restarts from
+        // clean durable state instead of re-importing the tainted
+        // snapshot and re-latching the halt. Failure leaves the
+        // in-memory repair intact (the next divergence-free
+        // checkpoint interval will retry); log loudly rather than
+        // fail the repair over a persistence nicety.
+        if let Err(e) = self.durable_checkpoint() {
+            eprintln!(
+                "executor: repair checkpoint failed ({e}) — in-memory state is repaired \
+                 but snapshot.bin may still hold pre-repair state; a restart will \
+                 re-run divergence repair"
+            );
+        }
+        Ok(covered)
+    }
 }

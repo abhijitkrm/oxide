@@ -418,6 +418,24 @@ pub enum SyncReject {
     BadProposerSignature,
 }
 
+/// What [`OxideBft::mark_repaired`] concluded about the divergence
+/// latch — the state machine around a confirmed execution
+/// divergence, certified-repair cleared or still halted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairOutcome {
+    /// No divergence is latched — nothing to repair.
+    NotLatched,
+    /// The latch cleared: local state now attests identically to a
+    /// quorum-certified root at the returned height (at or above
+    /// the diverged height). Signing may resume.
+    Repaired(Height),
+    /// Still halted: no held certificate at or above the diverged
+    /// height matches a locally executed root. Either repair has
+    /// not landed or the divergence is a deterministic executor
+    /// fault — re-execution reproduces the wrong root either way.
+    NoAnchor,
+}
+
 impl std::fmt::Display for ConsensusError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1112,13 +1130,103 @@ impl OxideBft {
     }
 
     /// The confirmed execution divergence that halted signing, if
-    /// any. `Some` is terminal for the process: the validator must
-    /// be repaired (certified state sync) before it can safely
-    /// participate again, so operators should treat this as a
-    /// page-worthy condition, not a transient.
+    /// any. `Some` means participation is unsafe until certified
+    /// state repair lands — signing only resumes through
+    /// [`OxideBft::mark_repaired`] (or process restart into a
+    /// repaired data dir), never on its own.
     #[must_use]
     pub fn divergence(&self) -> Option<&ExecDivergence> {
         self.divergence.as_ref()
+    }
+
+    /// Feed an externally fetched execution certificate through the
+    /// same verification the proposal path applies — epoch match,
+    /// bitmap bounds, quorum stake, aggregate signature against the
+    /// live committee — and cache the verdict. Returns `true` only
+    /// when the cert verifies: the repair flow uses it to admit a
+    /// certificate served by a peer's snapshot endpoint into the
+    /// engine's verified store, so `mark_repaired` can compare it
+    /// against rebuilt state. A cert under a different epoch cannot
+    /// verify here (that committee is gone or not yet installed);
+    /// such repairs need a weak-subjectivity checkpoint file, which
+    /// the manual `--state-sync` path already supports.
+    pub fn admit_exec_cert(&mut self, cert: &ExecCertificate) -> bool {
+        self.exec_cert_verified(cert)
+    }
+
+    /// Attempt to clear the divergence latch by proving the local
+    /// state once again reproduces a quorum-certified root.
+    ///
+    /// The latch exists because a *verified* certificate attested a
+    /// root this node did not compute; the symmetric clearing rule
+    /// is therefore: a verified certificate at a height **at or
+    /// above** the diverged height whose root the app now attests
+    /// identically. Scanning only `h >= diverged.height` matters —
+    /// matching an earlier root never proved the diverged height
+    /// was rebuilt, and scanning above the executed tip would wait
+    /// on heights that cannot have roots yet, so candidates are
+    /// bounded by `attest_latest`.
+    ///
+    /// On success the latch clears, the WAL is appended (persisting
+    /// `divergence = None` — a failed append latches `wal_failed`,
+    /// which halts signing identically, so the failure mode stays
+    /// closed), and staged sync records are left in place: they are
+    /// verified consensus evidence, not execution state, and the
+    /// commit walk will consume them normally.
+    ///
+    /// `NoAnchor` means no held certificate matches a local root —
+    /// either repair has not landed or the divergence is a
+    /// deterministic executor fault, in which case re-execution
+    /// reproduces the same wrong root and the halt correctly
+    /// persists.
+    pub fn mark_repaired(&mut self) -> RepairOutcome {
+        let Some(d) = self.divergence else {
+            return RepairOutcome::NotLatched;
+        };
+        // The newest executed root bounds which certified heights
+        // can possibly attest — certs above it cannot match yet.
+        let Some(latest) = self.app.attest_latest() else {
+            return RepairOutcome::NoAnchor;
+        };
+        // Newest-first: after a snapshot repair the rebuilt tip is
+        // the likeliest anchor, and a single match is sufficient.
+        let mut candidates: Vec<u64> = self
+            .exec_certs
+            .keys()
+            .chain(self.verified_exec_certs.keys())
+            .copied()
+            .filter(|h| *h >= d.height.value() && *h <= latest.height.value())
+            .collect();
+        candidates.sort_unstable_by(|a, b| b.cmp(a));
+        candidates.dedup();
+        for h in candidates {
+            let Some(att) = self.app.attest_state(Height::new(h)) else {
+                continue;
+            };
+            let certified = self
+                .exec_certs
+                .get(&h)
+                .or_else(|| self.verified_exec_certs.get(&h))
+                .map(|c| c.state_root);
+            if certified == Some(att.root) {
+                eprintln!(
+                    "oxideBFT: execution state repaired — local root at height {h} \
+                     matches the quorum-certified root; resuming participation \
+                     (was halted since height {})",
+                    d.height.value()
+                );
+                self.divergence = None;
+                // Persist BEFORE reporting success — a crash between
+                // the in-memory clear and the next routine append
+                // would restore the latch, and the repaired state is
+                // durable so re-running repair is only wasteful, but
+                // a silent clear is strictly better than a
+                // re-halted node whose repair already landed.
+                let _ = self.append_wal();
+                return RepairOutcome::Repaired(Height::new(h));
+            }
+        }
+        RepairOutcome::NoAnchor
     }
 
     /// The execution certificates this engine holds, keyed by

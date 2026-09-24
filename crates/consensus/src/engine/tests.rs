@@ -12,7 +12,7 @@ use super::*;
 use crate::verify::VerifiedQc;
 use ports::conformance;
 use ports::mock::MockApp;
-use types::ExecCertificate;
+use types::{ExecCertificate, ExecDivergence};
 
 fn pk(byte: u8) -> crypto::bls::PublicKey {
     crypto::bls::PublicKey([byte; crypto::bls::PublicKey::LEN])
@@ -3261,6 +3261,246 @@ fn divergence_latch_survives_restart_via_wal() {
         assert!(
             engine.on_timeout().is_none(),
             "a restarted diverged engine must still refuse to sign"
+        );
+    }
+}
+
+#[test]
+fn mark_repaired_requires_a_certified_anchor_at_or_above_divergence() {
+    // The latch clears only when local state attests to a
+    // quorum-certified root at a height >= the diverged height.
+    // Matching an earlier root never proves the diverged height
+    // was rebuilt — a repair that stops below the anchor is not
+    // a repair.
+    let app = Arc::new(MockApp::new());
+    let sk = bls_key(1);
+    let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+    let mut engine = OxideBft::new(app.clone(), vs).with_secret_key(sk.clone());
+
+    // Latch the divergence at height 1 directly — the same state
+    // the verified-mismatch path in `vote` produces, without
+    // needing a two-block chain to reach it.
+    engine.divergence = Some(ExecDivergence {
+        height: Height::new(1),
+        local_root: Hash([0x01; 32]),
+        certified_root: Hash([0xDE; 32]),
+    });
+
+    // No certified anchor yet — repair is impossible.
+    assert_eq!(engine.mark_repaired(), crate::RepairOutcome::NoAnchor);
+    assert!(engine.divergence().is_some());
+
+    // Execute through height 0 so `attest_latest` reports a tip —
+    // the anchor filter (h >= diverged height) is what rejects the
+    // below-anchor cert, not a missing attestation.
+    app.finalize_block(&FinalizedBlock {
+        context: types::BlockContext::default(),
+        height: Height::new(0),
+        txs: vec![],
+        signers: vec![],
+    });
+
+    // A cert BELOW the diverged height cannot clear the latch even
+    // though its root matches local state.
+    let below_root = Hash([0x00; 32]); // mock root at height 0
+    let att_msg0 = engine.attestation_signing_message(Height::new(0), &below_root);
+    let att_sig0 = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg0);
+    let below_cert = ExecCertificate {
+        height: Height::new(0),
+        state_root: below_root,
+        epoch: Epoch::new(0),
+        signer_bitmap: vec![0b0000_0001],
+        aggregate_signature: crypto::aggregate(&[att_sig0]).expect("aggregate"),
+    };
+    assert!(engine.admit_exec_cert(&below_cert), "valid cert must be admitted");
+    assert_eq!(engine.mark_repaired(), crate::RepairOutcome::NoAnchor);
+    assert!(
+        engine.divergence().is_some(),
+        "an anchor below the diverged height must not clear the latch"
+    );
+}
+
+#[test]
+fn mark_repaired_clears_when_local_root_matches_certified_anchor() {
+    // The repair flow: node diverges, rebuilds state from a
+    // certified snapshot, re-executes to a height a quorum cert
+    // attests, and the engine observes the roots now agree.
+    let app = Arc::new(MockApp::new());
+    let sk = bls_key(1);
+    let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+    let mut engine = OxideBft::new(app.clone(), vs).with_secret_key(sk.clone());
+
+    // Diverge at height 0.
+    let divergent_root = Hash([0xDE; 32]);
+    let att_msg = engine.attestation_signing_message(Height::new(0), &divergent_root);
+    let att_sig = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg);
+    let cert = ExecCertificate {
+        height: Height::new(0),
+        state_root: divergent_root,
+        epoch: Epoch::new(0),
+        signer_bitmap: vec![0b0000_0001],
+        aggregate_signature: crypto::aggregate(&[att_sig]).expect("aggregate"),
+    };
+    let (header, proposal) = genesis_proposal_with_cert(&sk, cert);
+    assert!(engine.vote(&header, &proposal).is_none(), "setup: divergent vote withheld");
+    assert!(!engine.signing_healthy(), "setup: signing halted");
+
+    // Simulate the repair: the rebuilt chain re-executes through
+    // height 2, whose mock root Hash([2;32]) is what quorum
+    // attested (the repair peer's cert).
+    app.finalize_block(&FinalizedBlock {
+        context: types::BlockContext::default(),
+        height: Height::new(0),
+        txs: vec![],
+        signers: vec![],
+    });
+    app.finalize_block(&FinalizedBlock {
+        context: types::BlockContext::default(),
+        height: Height::new(1),
+        txs: vec![],
+        signers: vec![],
+    });
+    app.finalize_block(&FinalizedBlock {
+        context: types::BlockContext::default(),
+        height: Height::new(2),
+        txs: vec![],
+        signers: vec![],
+    });
+    let repaired_root = Hash([2; 32]); // mock_state_root(2)
+    let att_msg2 = engine.attestation_signing_message(Height::new(2), &repaired_root);
+    let att_sig2 = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg2);
+    let anchor_cert = ExecCertificate {
+        height: Height::new(2),
+        state_root: repaired_root,
+        epoch: Epoch::new(0),
+        signer_bitmap: vec![0b0000_0001],
+        aggregate_signature: crypto::aggregate(&[att_sig2]).expect("aggregate"),
+    };
+    // The fetched cert arrives through the same verification the
+    // proposal path applies — admit_exec_cert is the serving-
+    // endpoint intake.
+    assert!(engine.admit_exec_cert(&anchor_cert), "verified anchor cert must be admitted");
+
+    assert_eq!(
+        engine.mark_repaired(),
+        crate::RepairOutcome::Repaired(Height::new(2)),
+        "a certified anchor above the diverged height with a matching local root must clear"
+    );
+    assert!(engine.divergence().is_none(), "latch cleared");
+    assert!(engine.signing_healthy(), "signing resumes after repair");
+
+    // Idempotent: a second call has nothing to repair.
+    assert_eq!(engine.mark_repaired(), crate::RepairOutcome::NotLatched);
+}
+
+#[test]
+fn admit_exec_cert_rejects_invalid_certificates() {
+    // The repair intake must not poison `verified_exec_certs` with
+    // a fabricated cert: same verification as the proposal path —
+    // a bad aggregate signature is refused and not cached.
+    let app = Arc::new(MockApp::new());
+    let sk = bls_key(1);
+    let sk2 = bls_key(2);
+    let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+    let mut engine = OxideBft::new(app, vs).with_secret_key(sk.clone());
+
+    // Signed by a key outside the committee: bitmap seat 0 resolves
+    // to `sk`, so `sk2`'s signature can never verify.
+    let msg = engine.attestation_signing_message(Height::new(0), &Hash([0x00; 32]));
+    let bad_sig = sk2.sign(crypto::hash::Domain::ExecAttest, &msg);
+    let forged = ExecCertificate {
+        height: Height::new(0),
+        state_root: Hash([0x00; 32]),
+        epoch: Epoch::new(0),
+        signer_bitmap: vec![0b0000_0001],
+        aggregate_signature: crypto::aggregate(&[bad_sig]).expect("aggregate"),
+    };
+    assert!(!engine.admit_exec_cert(&forged), "a forged cert must not be admitted");
+
+    // Wrong epoch: the signed message binds epoch 99, the engine is
+    // at epoch 0 — verification fails on the epoch mismatch.
+    let msg99 = engine.attestation_signing_message(Height::new(0), &Hash([0x00; 32]));
+    let sig99 = sk.sign(crypto::hash::Domain::ExecAttest, &msg99);
+    let foreign = ExecCertificate {
+        height: Height::new(0),
+        state_root: Hash([0x00; 32]),
+        epoch: Epoch::new(99),
+        signer_bitmap: vec![0b0000_0001],
+        aggregate_signature: crypto::aggregate(&[sig99]).expect("aggregate"),
+    };
+    assert!(!engine.admit_exec_cert(&foreign), "a foreign-epoch cert must not be admitted");
+}
+
+#[test]
+fn mark_repaired_persists_clear_through_wal() {
+    // The cleared latch must be durable like the latch itself: a
+    // crash after repair must not wake up halted on state the
+    // operator already rebuilt.
+    use crate::wal::Wal;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let wal_path = dir.path().join("consensus.wal");
+    let divergent_root = Hash([0xDE; 32]);
+    let repaired_root = Hash([1; 32]); // mock_state_root(1)
+
+    {
+        let app = Arc::new(MockApp::new());
+        let sk = bls_key(1);
+        let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+        let wal = Wal::open(&wal_path).expect("open WAL");
+        let mut engine = OxideBft::new(app.clone(), vs).with_secret_key(sk.clone()).with_wal(wal);
+
+        let att_msg = engine.attestation_signing_message(Height::new(0), &divergent_root);
+        let att_sig = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg);
+        let cert = ExecCertificate {
+            height: Height::new(0),
+            state_root: divergent_root,
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: crypto::aggregate(&[att_sig]).expect("aggregate"),
+        };
+        let (header, proposal) = genesis_proposal_with_cert(&sk, cert);
+        assert!(engine.vote(&header, &proposal).is_none());
+        assert!(engine.divergence().is_some(), "setup: latch set");
+
+        // Repair: execute to height 1 and admit the anchor cert.
+        app.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: vec![],
+            signers: vec![],
+        });
+        app.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(1),
+            txs: vec![],
+            signers: vec![],
+        });
+        let att_msg1 = engine.attestation_signing_message(Height::new(1), &repaired_root);
+        let att_sig1 = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg1);
+        let anchor = ExecCertificate {
+            height: Height::new(1),
+            state_root: repaired_root,
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: crypto::aggregate(&[att_sig1]).expect("aggregate"),
+        };
+        assert!(engine.admit_exec_cert(&anchor));
+        assert_eq!(engine.mark_repaired(), crate::RepairOutcome::Repaired(Height::new(1)));
+        // Engine drops — the crash.
+    }
+
+    {
+        let app = Arc::new(MockApp::new());
+        let sk = bls_key(1);
+        let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+        let wal = Wal::open(&wal_path).expect("open WAL");
+        let mut engine = OxideBft::new(app, vs).with_secret_key(sk.clone()).with_wal(wal);
+        engine.recover_from_wal().expect("recover from WAL");
+        assert!(
+            engine.divergence().is_none(),
+            "the cleared latch must survive restart — the WAL entry after repair carries divergence=None"
         );
     }
 }

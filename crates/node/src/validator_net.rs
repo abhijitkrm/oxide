@@ -100,6 +100,24 @@ const SYNC_REQ_RETRY: Duration = Duration::from_millis(750);
 /// channel.
 const SYNC_PENDING_CAP: usize = 1024;
 
+/// Interval between full divergence-repair attempts (unit:
+/// wall-clock). Each attempt is a manifest fetch + certificate
+/// verify + chunked snapshot download + journal replay — seconds of
+/// work and megabytes of peer bandwidth — so the cadence is
+/// deliberate rather than per-tick. Ten seconds is far below the
+/// cost of a halted validator to the fleet (missed leader turns
+/// burn whole views), and slow enough that a transient peer
+/// failure does not spin the download loop.
+const REPAIR_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Per-peer certificate poll budget during a repair attempt: a
+/// serving validator forms an exec cert within a few views of the
+/// manifest's height, so `CERT_POLL_ATTEMPTS × CERT_POLL_INTERVAL`
+/// ≈ 2s bounds the wait without letting one peer stall the pass.
+const CERT_POLL_ATTEMPTS: u32 = 10;
+/// See [`CERT_POLL_ATTEMPTS`].
+const CERT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
 /// mTLS material for the peer transport — resolved file paths.
 ///
 /// Peer certificates are required per expected peer: a peer without
@@ -188,6 +206,18 @@ pub struct ValidatorNetSpec {
     /// (tokio `select!` in `oxide-validator`, a supervised signal
     /// thread in `oxide-devnet`); the pump polls it each iteration.
     pub shutdown: Arc<AtomicBool>,
+    /// Peer RPC endpoints (`host:port`) for certified state repair
+    /// after an execution-divergence halt. When the engine latches a
+    /// divergence, the pump polls these peers' `/snapshot/*`
+    /// endpoints for a manifest + quorum-signed certificate it can
+    /// verify against the live committee, imports the snapshot, and
+    /// replays the durable journal over it — clearing the latch only
+    /// when the rebuilt state reproduces a certified root
+    /// (`OxideBft::mark_repaired`). Empty disables auto-repair: the
+    /// node stays halted and the manual runbook applies. These are
+    /// RPC endpoints, not consensus transport addresses — the
+    /// snapshot surface lives on the HTTP server.
+    pub repair_peers: Vec<String>,
 }
 
 /// Run a networked validator until `spec.shutdown` is set.
@@ -225,6 +255,7 @@ pub fn run(spec: ValidatorNetSpec) {
         rpc_config,
         smoke_tx,
         shutdown,
+        repair_peers,
     } = spec;
 
     // Peer identity is the validator's staking address — the stable
@@ -383,6 +414,7 @@ pub fn run(spec: ValidatorNetSpec) {
     run_consensus_loop(
         &mut engine,
         &mut transport,
+        &app,
         &log_tag,
         our_addr,
         shutdown.as_ref(),
@@ -391,6 +423,7 @@ pub fn run(spec: ValidatorNetSpec) {
         &shared_next_validator_set,
         &gossip_rx,
         &mut sync_store,
+        &repair_peers,
     );
     // Flush any batched certified-record appends before the data
     // dir is handed to the snapshot exporter.
@@ -612,6 +645,7 @@ fn to_transport_config(network: &config::NetworkConfig) -> p2p::tcp::TcpTranspor
 fn run_consensus_loop(
     engine: &mut consensus::OxideBft,
     transport: &mut p2p::tcp::TcpTransport,
+    app: &executor::Executor,
     log_tag: &str,
     our_addr: primitives::Address,
     shutdown: &AtomicBool,
@@ -620,6 +654,7 @@ fn run_consensus_loop(
     shared_next_validator_set: &std::sync::RwLock<Option<consensus::ValidatorSet>>,
     gossip_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
     sync_store: &mut crate::block_sync::SyncStore,
+    repair_peers: &[String],
 ) {
     // Gossip dedup cap: tx hashes we've already ingested (ours +
     // peers'). 100k entries covers several blocks' worth of txs; a
@@ -690,6 +725,18 @@ fn run_consensus_loop(
     // the height we need — the gap is beyond block sync's window and
     // certified state sync is the designed recovery.
     let mut sync_below_floor_logged = false;
+    // ── Divergence auto-repair state ─────────────────────
+    // Next instant a full repair attempt may run. Poll cadence —
+    // each attempt is a verified snapshot download + journal replay,
+    // expensive enough to rate-limit but cheap next to a halted
+    // validator's cost to the network.
+    let mut repair_next_attempt: Option<std::time::Instant> = None;
+    // Round-robin cursor over `repair_peers` so repeated attempts do
+    // not pin one peer's snapshot endpoint.
+    let mut repair_peer_cursor: usize = 0;
+    // One-shot log latch for the unconfigured case — a halted node
+    // with no repair peers is page-worthy once, not every tick.
+    let mut repair_unconfigured_logged = false;
 
     loop {
         // Graceful shutdown: SIGINT/SIGTERM sets the flag, we break
@@ -1424,6 +1471,67 @@ fn run_consensus_loop(
             rpc.set_exec_divergence(*d);
         }
 
+        // Certified state repair: while the divergence latch holds,
+        // periodically try to prove the local state again matches a
+        // quorum-certified root. `mark_repaired` runs first every
+        // pass — it is cheap relative to a download and clears the
+        // moment an earlier repair (or an unrelated snapshot import)
+        // lands the matching root. Only `NoAnchor` pays for the full
+        // fetch path. The pump stalls for the download + replay —
+        // acceptable: a diverged node signs nothing anyway, and the
+        // buffered network backlog plus certified block sync close
+        // the gap on resume.
+        if let Some(divergence) = engine.divergence().copied()
+            && repair_next_attempt.is_none_or(|t| std::time::Instant::now() >= t)
+        {
+            match engine.mark_repaired() {
+                consensus::RepairOutcome::Repaired(h) => {
+                    println!("{log_tag}: divergence cleared at height {}", h.value());
+                    // The mirror was set on the latch pass — clearing
+                    // the engine without clearing it would leave
+                    // `/health` reporting a halted node that is in
+                    // fact signing again.
+                    if let Some(rpc) = rpc {
+                        rpc.clear_exec_divergence();
+                    }
+                }
+                consensus::RepairOutcome::NotLatched => {}
+                consensus::RepairOutcome::NoAnchor => {
+                    if repair_peers.is_empty() {
+                        if !repair_unconfigured_logged {
+                            eprintln!(
+                                "{log_tag}: divergence latched and no --repair-peer configured — \
+                                 node stays halted; manual certified-state repair per runbook 7"
+                            );
+                            repair_unconfigured_logged = true;
+                        }
+                    } else {
+                        attempt_state_repair(
+                            repair_peers,
+                            &mut repair_peer_cursor,
+                            divergence,
+                            engine,
+                            app,
+                            log_tag,
+                        );
+                        // Re-check immediately: a completed import may
+                        // already attest to a held certificate — no
+                        // reason to wait out the retry window.
+                        if let consensus::RepairOutcome::Repaired(h) = engine.mark_repaired() {
+                            println!(
+                                "{log_tag}: divergence cleared at height {} after certified state repair",
+                                h.value()
+                            );
+                            if let Some(rpc) = rpc {
+                                rpc.clear_exec_divergence();
+                            }
+                        }
+                    }
+                    repair_next_attempt = Some(std::time::Instant::now() + REPAIR_RETRY_INTERVAL);
+                }
+            }
+        }
+
         // Mirror the engine's execution certificates into RPC so
         // `GET /snapshot/cert/{height}` can answer a syncing node's
         // certificate poll. Pushed every iteration (the mirror
@@ -1600,5 +1708,515 @@ fn drain_sync_buffer(
                 eprintln!("{log_tag}: buffered certified block {next} rejected: {e}");
             }
         }
+    }
+}
+
+/// One certified-repair pass across the configured peers.
+///
+/// For each peer (starting at `cursor`, wrapping once): fetch the
+/// snapshot manifest, poll for the quorum-signed execution
+/// certificate at the manifest's height, require the cert to match
+/// the manifest's `(height, root)` — the peer cannot substitute a
+/// different anchor — verify it through `admit_exec_cert` (the same
+/// quorum+signature+epoch checks the proposal path applies), then
+/// download the chunk-verified snapshot and rebuild local state via
+/// `Executor::repair_import_snapshot` (verified import + tainted-
+/// state purge + journal replay). Returns `true` when an import
+/// landed — the caller then re-runs `mark_repaired`, which clears
+/// the latch only if the rebuilt state attests to a held certified
+/// root. A peer that fails any step is skipped; a deterministic
+/// executor fault survives every honest repair, which is correct —
+/// the node must stay halted until the binary is fixed.
+///
+/// The certificate poll is bounded (`CERT_POLL_ATTEMPTS` ×
+/// `CERT_POLL_INTERVAL`): the serving engine mirrors certs per tick
+/// so a healthy peer answers quickly, and an older binary without
+/// the endpoint only costs ~2s.
+fn attempt_state_repair(
+    peers: &[String],
+    cursor: &mut usize,
+    divergence: types::ExecDivergence,
+    engine: &mut consensus::OxideBft,
+    app: &executor::Executor,
+    log_tag: &str,
+) -> bool {
+    for _ in 0..peers.len() {
+        let peer = &peers[*cursor % peers.len()];
+        *cursor = cursor.wrapping_add(1);
+        // 1. Manifest — pins the peer's claimed (height, root) and
+        //    chunk hashes before any state byte moves.
+        let manifest = match statesync::fetch_manifest(peer) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("{log_tag}: repair peer {peer}: manifest fetch failed: {e}");
+                continue;
+            }
+        };
+        // Anchor reach: a snapshot below the diverged height cannot
+        // carry the certified state this node needs to rebuild —
+        // `mark_repaired` only clears on an anchor >= the diverged
+        // height, so importing such a snapshot would be pure cost.
+        if manifest.height < divergence.height.value() {
+            eprintln!(
+                "{log_tag}: repair peer {peer}: snapshot at height {} predates the diverged \
+                 height {} — skipping (cannot anchor the repair)",
+                manifest.height,
+                divergence.height.value()
+            );
+            continue;
+        }
+        if manifest.format_version > executor::SNAPSHOT_FORMAT_VERSION {
+            eprintln!(
+                "{log_tag}: repair peer {peer}: snapshot format {} newer than supported {} — skipping",
+                manifest.format_version,
+                executor::SNAPSHOT_FORMAT_VERSION
+            );
+            continue;
+        }
+        // 2. Certificate at the manifest's height — bounded poll.
+        let mut cert = None;
+        for _ in 0..CERT_POLL_ATTEMPTS {
+            match statesync::fetch_exec_certificate(peer, manifest.height) {
+                Ok(c) => {
+                    cert = Some(c);
+                    break;
+                }
+                Err(_) => std::thread::sleep(CERT_POLL_INTERVAL),
+            }
+        }
+        let Some(cert) = cert else {
+            eprintln!(
+                "{log_tag}: repair peer {peer}: no execution certificate for height {} — skipping",
+                manifest.height
+            );
+            continue;
+        };
+        // 3. Anchor consistency: the served certificate must cover
+        //    exactly the manifest's pinned (height, root) — the peer
+        //    is untrusted, so a mismatch is a lie, not bad luck.
+        if cert.height.value() != manifest.height || cert.state_root != manifest.state_root {
+            eprintln!(
+                "{log_tag}: repair peer {peer}: certificate (height {}, root {}) does not cover \
+                 manifest (height {}, root {}) — refusing inconsistent anchors",
+                cert.height.value(),
+                cert.state_root,
+                manifest.height,
+                manifest.state_root
+            );
+            continue;
+        }
+        // 4. Verify quorum + signatures against OUR live committee —
+        //    the engine's own verification path, so an epoch the
+        //    engine no longer holds (or has not reached) fails here
+        //    and the repair correctly refuses unverifiable state.
+        if !engine.admit_exec_cert(&cert) {
+            eprintln!(
+                "{log_tag}: repair peer {peer}: certificate for height {} failed engine \
+                 verification (epoch/committee mismatch or bad signature) — skipping",
+                manifest.height
+            );
+            continue;
+        }
+        // 5. Download + per-chunk verify + decode.
+        let blob = match statesync::fetch_blob(peer, &manifest) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("{log_tag}: repair peer {peer}: chunk download failed: {e}");
+                continue;
+            }
+        };
+        let mut reader = codec::Reader::new(&blob);
+        let snapshot = match <executor::ExecutorSnapshot as codec::Decode>::decode(&mut reader) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{log_tag}: repair peer {peer}: snapshot decode failed: {e}");
+                continue;
+            }
+        };
+        // 6. Verified import + tainted-state purge + journal replay.
+        //    A JournalGap means our durable log cannot cover the
+        //    committed heights above the snapshot — a later peer
+        //    manifest may sit higher, so keep trying other peers.
+        match app.repair_import_snapshot(&snapshot) {
+            Ok(tip) => {
+                println!(
+                    "{log_tag}: certified state repair imported height {} from {peer}; \
+                     execution rebuilt through height {tip}",
+                    manifest.height
+                );
+                return true;
+            }
+            Err(e) => {
+                eprintln!("{log_tag}: repair peer {peer}: snapshot import/replay failed: {e}");
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod repair_tests {
+    //! End-to-end coverage for the automatic certified state repair
+    //! path: a live `OxideBft` latched by a real `vote()` divergence,
+    //! a canned HTTP peer serving manifest/cert/chunks, and the real
+    //! `Executor::repair_import_snapshot` rebuild underneath.
+    use super::*;
+    use ports::AppInterface;
+    use primitives::{Epoch, Hash, Height, View};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Lowercase hex — the snapshot endpoints' wire format
+    /// (`statesync::fetch_hex` decodes exactly this).
+    fn hex_encode(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+    }
+
+    /// Mint an exec certificate over `(height, root, epoch)` signed by
+    /// `sk` as committee seat 0. The message layout is the protocol's
+    /// attestation preimage — `height ‖ root ‖ epoch`, 48 bytes under
+    /// `Domain::ExecAttest` (consensus `attestation_signing_message`;
+    /// duplicated here because that helper is crate-private — the
+    /// layout itself is wire-stable).
+    fn exec_cert(
+        sk: &crypto::BlsSecretKey,
+        height: u64,
+        root: Hash,
+        epoch: u64,
+    ) -> types::ExecCertificate {
+        let mut msg = [0u8; 48];
+        msg[..8].copy_from_slice(&height.to_le_bytes());
+        msg[8..40].copy_from_slice(root.as_bytes());
+        msg[40..48].copy_from_slice(&epoch.to_le_bytes());
+        let sig = sk.sign(crypto::hash::Domain::ExecAttest, &msg);
+        types::ExecCertificate {
+            height: Height::new(height),
+            state_root: root,
+            epoch: Epoch::new(epoch),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: crypto::aggregate(&[sig]).expect("single-sig aggregate"),
+        }
+    }
+
+    /// A canned snapshot peer: serves the manifest, the exec cert at
+    /// any height, and the chunk table — the three endpoints
+    /// `attempt_state_repair` consumes. Nonblocking accept + a stop
+    /// flag so the test cannot leak a parked thread.
+    struct Peer {
+        addr: String,
+        stop: Arc<AtomicBool>,
+        join: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Drop for Peer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    fn spawn_peer(
+        manifest: &statesync::Manifest,
+        cert: &types::ExecCertificate,
+        chunks: Vec<Vec<u8>>,
+    ) -> Peer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake peer");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let mut manifest_bytes = Vec::new();
+        manifest.encode(&mut manifest_bytes);
+        let mut cert_bytes = Vec::new();
+        cert.encode(&mut cert_bytes);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let join = thread::spawn(move || {
+            while !stop2.load(Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(c) => c,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut req = Vec::with_capacity(256);
+                let mut buf = [0u8; 512];
+                // One request per connection — `fetch_hex` is
+                // HTTP/1.0 close-delimited.
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            req.extend_from_slice(&buf[..n]);
+                            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&req);
+                let path = text.split_whitespace().nth(1).unwrap_or("").to_string();
+                let body: Option<Vec<u8>> = if path == "/snapshot/manifest" {
+                    Some(manifest_bytes.clone())
+                } else if path.starts_with("/snapshot/cert/") {
+                    Some(cert_bytes.clone())
+                } else if let Some(idx) =
+                    path.strip_prefix("/snapshot/chunk/").and_then(|s| s.parse::<usize>().ok())
+                {
+                    chunks.get(idx).cloned()
+                } else {
+                    None
+                };
+                match body {
+                    Some(bytes) => {
+                        let hexed = hex_encode(&bytes);
+                        let resp = format!(
+                            "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                            hexed.len(),
+                            hexed
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    None => {
+                        let _ = stream
+                            .write_all(b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                    }
+                }
+            }
+        });
+        Peer { addr, stop, join: Some(join) }
+    }
+
+    /// An assembled executor + engine over it, latched by a REAL
+    /// divergence: a signed genesis proposal carrying a verified cert
+    /// whose root the local executor cannot reproduce.
+    fn latched_node() -> (crate::AssembledExecutor, consensus::OxideBft, crypto::BlsSecretKey) {
+        let assembled = crate::assemble_executor(&crate::NodeConfig::default());
+        let sk = crate::cli::bls_key(1);
+        let vs = consensus::ValidatorSet::new(vec![sk.public_key()], vec![1])
+            .expect("one-validator set");
+        let app_dyn: Arc<dyn ports::AppInterface> = assembled.app.clone();
+        let mut engine = consensus::OxideBft::new(app_dyn, vs).with_secret_key(sk.clone());
+        // Execute height 0 so `attest_state(0)` exists — the
+        // divergence check compares certified vs local roots only at
+        // heights the executor already attests.
+        assembled.app.finalize_block(&types::FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: vec![],
+            signers: vec![],
+        });
+        // Wait for the lane so `attest_state(0)` exists — the
+        // divergence check compares certified vs local roots only at
+        // heights the executor already attests.
+        assembled
+            .app
+            .attest_state_bounded(Height::new(0), Duration::from_secs(10))
+            .expect("block 0 executed");
+        // A cert attesting a root local state never produced —
+        // verified (signed by seat 0, this epoch) but divergent.
+        let bad_root = Hash([0xDE; 32]);
+        let cert = exec_cert(&sk, 0, bad_root, 0);
+        let proposal = types::Proposal {
+            height: Height::new(0),
+            txs: vec![TxBytes::new(vec![1])],
+            attestation: None,
+        };
+        let mut body = Vec::new();
+        proposal.encode(&mut body);
+        let mut header = types::BlockHeader {
+            height: Height::new(0),
+            view: View::new(0),
+            epoch: Epoch::new(0),
+            prev_block: Hash::ZERO,
+            // `OxideBft::tx_root` is crate-private — the wire-stable
+            // formula is `Domain::Transaction` over the concatenated
+            // tx bytes (consensus `tx_root`; duplicated per the
+            // attestation-preimage note above).
+            tx_root: crypto::hash::Hasher::hash_one(
+                crypto::hash::Domain::Transaction,
+                &proposal.txs.iter().flat_map(|t| t.as_bytes().to_vec()).collect::<Vec<u8>>(),
+            ),
+            body_commitment: types::shard::commitment(&body, 1, 1),
+            high_qc: None,
+            timeout_cert: None,
+            proposer: consensus::proposer_hash(0),
+            timestamp: 0,
+            proposer_signature: None,
+            exec_cert: Some(cert),
+        };
+        let signing = consensus::OxideBft::proposal_signing_hash(&header);
+        header.proposer_signature =
+            Some(sk.sign(crypto::hash::Domain::Proposal, signing.as_bytes()));
+        assert!(engine.vote(&header, &proposal).is_none(), "divergent vote withheld");
+        assert!(engine.divergence().is_some(), "setup: latch must hold");
+        (assembled, engine, sk)
+    }
+
+    /// A peer node whose executor finalized empty blocks 0,1 — its
+    /// snapshot is the certified repair base, chunked and served.
+    fn peer_node() -> (crate::AssembledExecutor, executor::ExecutorSnapshot) {
+        let peer = crate::assemble_executor(&crate::NodeConfig::default());
+        for h in 0..2u64 {
+            peer.app.finalize_block(&types::FinalizedBlock {
+                context: types::BlockContext::default(),
+                height: Height::new(h),
+                txs: vec![],
+                signers: vec![],
+            });
+        }
+        // `export_snapshot` drains the lane before reading module
+        // state — the snapshot captures the quiesced tip.
+        let snapshot = peer.app.export_snapshot();
+        assert_eq!(snapshot.height, 1, "peer tip is the snapshot base");
+        (peer, snapshot)
+    }
+
+    /// Encode `snapshot`, chunk it, and return `(manifest, chunks)` —
+    /// the exact serve-side shape `/snapshot/*` endpoints produce.
+    fn chunk_snapshot(
+        snapshot: &executor::ExecutorSnapshot,
+    ) -> (statesync::Manifest, Vec<Vec<u8>>) {
+        let mut blob = Vec::new();
+        snapshot.encode(&mut blob);
+        statesync::chunk_blob(
+            snapshot.height,
+            snapshot.state_root,
+            executor::SNAPSHOT_FORMAT_VERSION,
+            &blob,
+            4096,
+        )
+    }
+
+    #[test]
+    fn state_repair_imports_verified_snapshot_and_clears_latch() {
+        let (_peer, snapshot) = peer_node();
+        let (manifest, chunks) = chunk_snapshot(&snapshot);
+        let sk = crate::cli::bls_key(1);
+        // The anchor cert attests exactly the manifest's (height,
+        // root) — the quorum-signed repair base.
+        let cert = exec_cert(&sk, manifest.height, manifest.state_root, 0);
+        let peer = spawn_peer(&manifest, &cert, chunks);
+
+        let (assembled, mut engine, _sk) = latched_node();
+        let divergence = engine.divergence().copied().expect("latched");
+        assert_eq!(divergence.height, Height::new(0));
+
+        let mut cursor = 0usize;
+        assert!(
+            attempt_state_repair(
+                std::slice::from_ref(&peer.addr),
+                &mut cursor,
+                divergence,
+                &mut engine,
+                assembled.app.as_ref(),
+                "test",
+            ),
+            "a verified peer must complete the repair"
+        );
+        // The latch clears on the NEXT mark_repaired pass — the
+        // admitted cert at height 1 attests the rebuilt root.
+        assert_eq!(
+            engine.mark_repaired(),
+            consensus::RepairOutcome::Repaired(Height::new(1)),
+            "rebuilt state attests to the admitted certified anchor"
+        );
+        assert!(engine.divergence().is_none(), "controlled rejoin");
+    }
+
+    #[test]
+    fn state_repair_refuses_cert_root_mismatch() {
+        let (_peer, snapshot) = peer_node();
+        let (manifest, chunks) = chunk_snapshot(&snapshot);
+        let sk = crate::cli::bls_key(1);
+        // The cert attests a DIFFERENT root than the manifest pins —
+        // a peer lying about which state it serves.
+        let cert = exec_cert(&sk, manifest.height, Hash([0x77; 32]), 0);
+        let peer = spawn_peer(&manifest, &cert, chunks);
+
+        let (assembled, mut engine, _sk) = latched_node();
+        let divergence = engine.divergence().copied().expect("latched");
+        let mut cursor = 0usize;
+        assert!(
+            !attempt_state_repair(
+                std::slice::from_ref(&peer.addr),
+                &mut cursor,
+                divergence,
+                &mut engine,
+                assembled.app.as_ref(),
+                "test",
+            ),
+            "cert/manifest anchor mismatch must refuse the import"
+        );
+        assert!(engine.divergence().is_some(), "latch stays — no repair happened");
+    }
+
+    #[test]
+    fn state_repair_refuses_forged_certificate() {
+        let (_peer, snapshot) = peer_node();
+        let (manifest, chunks) = chunk_snapshot(&snapshot);
+        // Signed by a key OUTSIDE the committee: the bitmap resolves
+        // to seat 0's pubkey, so the aggregate can never verify.
+        let attacker = crate::cli::bls_key(9);
+        let cert = exec_cert(&attacker, manifest.height, manifest.state_root, 0);
+        let peer = spawn_peer(&manifest, &cert, chunks);
+
+        let (assembled, mut engine, _sk) = latched_node();
+        let divergence = engine.divergence().copied().expect("latched");
+        let mut cursor = 0usize;
+        assert!(
+            !attempt_state_repair(
+                std::slice::from_ref(&peer.addr),
+                &mut cursor,
+                divergence,
+                &mut engine,
+                assembled.app.as_ref(),
+                "test",
+            ),
+            "a cert that fails engine verification must not import"
+        );
+        assert!(engine.divergence().is_some(), "latch stays — cert rejected");
+    }
+
+    #[test]
+    fn state_repair_skips_snapshot_below_diverged_height() {
+        // A snapshot that predates the diverged height cannot carry
+        // the certified state the node must rebuild — the peer is
+        // skipped without a cert poll or a single chunk byte.
+        let (assembled, mut engine, _sk) = latched_node();
+        let divergence = engine.divergence().copied().expect("latched");
+        // Forge a manifest pinned below the diverged height. The
+        // peer never gets asked for cert or chunks — a closed
+        // listener proves it (connect refused → skip either way).
+        let (manifest, chunks) = statesync::chunk_blob(
+            0,
+            Hash([1; 32]),
+            executor::SNAPSHOT_FORMAT_VERSION,
+            &[1, 2, 3],
+            1024,
+        );
+        let _ = chunks;
+        let peer =
+            spawn_peer(&manifest, &exec_cert(&crate::cli::bls_key(1), 0, Hash([1; 32]), 0), vec![]);
+        let mut cursor = 0usize;
+        assert!(
+            !attempt_state_repair(
+                std::slice::from_ref(&peer.addr),
+                &mut cursor,
+                divergence,
+                &mut engine,
+                assembled.app.as_ref(),
+                "test",
+            ),
+            "manifest at height 0 cannot repair a divergence at height {}",
+            divergence.height.value()
+        );
+        assert!(engine.divergence().is_some());
     }
 }

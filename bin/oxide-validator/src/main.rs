@@ -247,6 +247,7 @@ fn run_single_node() {
 /// | `--data-dir` / `--wal-file` | Durability paths |
 /// | `--rpc-listen <addr>` | RPC bind override |
 /// | `--export-snapshot` / `--import-snapshot` | Snapshot in/out |
+/// | `--repair-peer <host:port>` | Peer RPC endpoint for certified state repair after a divergence halt, repeatable |
 /// | `--unsafe-allow-insecure-posture` | Opt out of the external-bind refusal (private testnets) |
 fn run_validator_node() {
     let cfg = node::cli::load_config(node::NodeMode::Validator, "oxide-validator");
@@ -322,6 +323,12 @@ fn run_validator_node() {
     let genesis_alloc = Some(Box::new(move |m: &evm::EvmModule| apply_evm_alloc(m, &genesis))
         as Box<dyn FnOnce(&evm::EvmModule) + Send>);
 
+    // Certified-repair peers: `--repair-peer <host:port>` repeatable,
+    // naming peer RPC endpoints (the `/snapshot/*` surface), not
+    // consensus transport addresses. Empty leaves the runbook's
+    // manual repair path — the halt stays terminal.
+    let repair_peers = node::cli::parse_cli_flags("--repair-peer");
+
     node::validator_net::run(node::validator_net::ValidatorNetSpec {
         log_tag: "oxide-validator".to_string(),
         seat: usize::from(our_seat),
@@ -339,6 +346,7 @@ fn run_validator_node() {
         rpc_config: cfg.rpc.clone(),
         smoke_tx: None,
         shutdown,
+        repair_peers,
     });
 }
 

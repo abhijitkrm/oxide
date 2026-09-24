@@ -21356,3 +21356,55 @@ failure that started the hunt — a restarted node frozen at height
 0 with live connections — was the two transport bugs layered on
 top of the over-strict seal check; all three needed fixing for
 the gate to pass.
+
+## Session: automatic certified state repair
+
+**What landed.** A validator that latches `ExecDivergence` now
+repairs itself when started with `--repair-peer <host:port>`
+(repeatable; peer RPC endpoints, not consensus transport). While
+the latch holds, the pump round-robins the configured peers every
+10s: fetch the snapshot manifest, poll for the quorum-signed
+execution certificate covering the manifest's `(height, root)`,
+verify it through `admit_exec_cert` — the same epoch/committee/
+signature checks the proposal path applies — download and
+hash-verify the chunks, then `Executor::repair_import_snapshot`
+quiesces the lane, installs the snapshot only after staged
+per-module verification reproduces the claimed root, purges
+tainted post-base roots, drains the lane debt (every pending
+block is journaled), replays the still-committed tail on the
+verified base, and checkpoints the repaired state to
+`snapshot.bin`. The latch clears only when `mark_repaired` finds
+a held certified root at or above the diverged height that the
+rebuilt state attests identically — a deterministic executor
+fault replays to the same wrong root and the node correctly stays
+halted. A snapshot below the diverged height is skipped outright;
+it cannot anchor the repair. Without `--repair-peer` the halt
+stays terminal and the runbook's manual `--state-sync` path
+applies — logged once, not spammed.
+
+**RPC mirror parity.** The divergence mirror is now two-way:
+`Repaired` clears `rpc.exec_divergence` so `/health` returns 200
+and `oxide_exec_diverged` returns to 0 — the old first-write-wins
+slot would have reported a halted node that was in fact signing
+again. `clear_exec_divergence` exists for exactly this call.
+
+**Bug the tests caught.** `repair_import_snapshot` held the
+`next_proposal_height` MutexGuard across the tail
+`durable_checkpoint()` call — which re-enters the same mutex via
+`export_snapshot → current_height`. Non-reentrant std Mutex →
+every durability-mode repair deadlocked at the checkpoint step.
+The guard is now scoped; the durability regression test
+(`repair_import_skips_self_checkpoint_records_in_journal`)
+reproduced the hang before the fix and passes after.
+
+**Coverage.** Engine: `mark_repaired` requires an anchor >= the
+diverged height, clears on a matching certified root, persists
+the clear through WAL, and `admit_exec_cert` refuses forged and
+foreign-epoch certs. Executor: rebuild reproduces the canonical
+root (not just *a* root), journal gaps fail closed, self-written
+checkpoint records are skipped as repair bases, and a forged
+snapshot root is refused before any mutation. Pump (live engine +
+real HTTP peer + real executor): verified snapshot imports and
+the latch clears for rejoin; cert/manifest anchor mismatch,
+forged certificates, and below-anchor snapshots are all refused
+with the latch intact.

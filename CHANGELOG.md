@@ -203,6 +203,35 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Automatic certified state repair — a diverged validator heals
+  itself.** `oxide-validator --repair-peer <host:port>` (repeatable;
+  peer RPC endpoints) turns the terminal execution-divergence halt
+  into a bounded, certificate-verified rebuild: while the latch
+  holds the node round-robins its repair peers (~10s cadence),
+  fetches the snapshot manifest plus the quorum-signed execution
+  certificate covering exactly the manifest's `(height, root)`,
+  verifies it against the live committee through the same checks
+  the proposal path applies, downloads hash-verified chunks, and
+  installs the snapshot only after staged per-module verification
+  reproduces the claimed root. The still-committed journal tail
+  then replays on the verified base, the repaired state
+  checkpoints to `snapshot.bin`, and the divergence latch clears
+  only when the rebuilt state attests to a quorum-certified root
+  at or above the diverged height — a deterministic executor fault
+  replays to the same wrong root and the node correctly stays
+  halted. Snapshots below the diverged height, mismatched or
+  forged certificates, and unverifiable anchors are all refused
+  with the latch intact; `/health` and `oxide_exec_diverged`
+  return to green on a successful repair. Without `--repair-peer`
+  the halt stays terminal and the manual `--state-sync` runbook
+  path applies.
+  - **In plain words:** a validator that computed different state
+    than the rest of the network used to stop forever until an
+    operator manually repaired it. Now it can fetch the
+    cryptographically-proven-correct state from a configured peer,
+    verify every byte itself, and rejoin — while still refusing to
+    sign anything until that proof is complete.
+
 - **Certified block sync — a behind validator catches up
   cryptographically.** `types::CertifiedBlock` carries each
   committed block with its Jolteon two-chain proof (body,

@@ -1036,6 +1036,17 @@ impl RpcServer {
         }
     }
 
+    /// Clear the mirrored divergence after certified state repair:
+    /// the consensus engine cleared its latch because local state
+    /// once again attests to a quorum-certified root, so `/health`
+    /// and the `oxide_exec_diverged` gauge must flip back — a stale
+    /// mirror would report a halted node that is in fact signing
+    /// again. Only the pump calls this, on the same pass that saw
+    /// `mark_repaired` succeed.
+    pub fn clear_exec_divergence(&self) {
+        *primitives::sync::lock_state(&self.exec_divergence) = None;
+    }
+
     /// The confirmed divergence mirrored from consensus, if any.
     /// The `certified_root` is the quorum-signed anchor operators
     /// should pass as `--trusted-root` when repairing via

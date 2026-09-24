@@ -314,6 +314,9 @@ so restarting without repair does NOT clear it — the node comes
 back up still refusing to sign. The only clearing path is certified
 state repair (which rebuilds executor state, not the safety latch).
 
+When the validator runs with `--repair-peer`, that repair is
+**automatic** — see Resolution below.
+
 ### Diagnosis
 
 ```sh
@@ -336,6 +339,47 @@ curl -s http://diverged-host:9000/metrics | grep oxide_exec_diverged
 ```
 
 ### Resolution
+
+#### Automatic (preferred, when `--repair-peer` is configured)
+
+A validator started with one or more
+`--repair-peer <host:port>` flags repairs itself without operator
+intervention:
+
+1. While the divergence latch holds, the node polls each configured
+   peer's `/snapshot/*` endpoints (round-robin, every ~10s).
+2. It fetches the peer's snapshot manifest, then the quorum-signed
+   execution certificate covering the manifest's `(height, root)`.
+   A snapshot below the diverged height is skipped — it cannot
+   carry the certified state needed to rebuild.
+3. The certificate is verified against the live committee — the
+   same quorum + signature + epoch checks the proposal path
+   applies — and must cover exactly the manifest's anchor.
+4. The snapshot chunks download with per-chunk hash verification;
+   the decoded snapshot installs only after staged per-module
+   verification reproduces the claimed root.
+5. The still-committed journal tail replays on the verified base,
+   the repaired state checkpoints to `snapshot.bin`, and the
+   divergence latch clears **only when** the rebuilt state attests
+   to a quorum-certified root at or above the diverged height. A
+   deterministic executor fault replays to the same wrong root and
+   the node stays halted — which is correct.
+6. `/health` returns 200, `oxide_exec_diverged` returns to 0, and
+   the node resumes signing and catch-up on its own.
+
+Operational notes:
+
+- `--repair-peer` values are peer **RPC** endpoints (the
+  `/snapshot/*` surface), not consensus transport addresses.
+- Configure at least two repair peers so one unavailable or
+  Byzantine peer does not stall recovery; each attempt round-robins.
+- Automatic repair preserves the trust model of the manual path:
+  nothing is imported without a certificate that verifies against
+  the committee this node actually runs.
+- If no `--repair-peer` is configured the node logs the latch once
+  and stays halted for the manual path below.
+
+#### Manual
 
 1. **Stop the diverged node** (runbook 2).
 2. **Repair via certified state sync** from a peer that agrees with
@@ -367,7 +411,9 @@ curl -s http://diverged-host:9000/metrics | grep oxide_exec_diverged
 4. **Investigate the cause before wiping evidence:** preserve the
    data directory (journal + snapshot) — the divergence may
    indicate a nondeterministic-execution bug that must be root-caused
-   before the node rejoins.
+   before the node rejoins. This applies to automatic repairs too:
+  a self-healed node still had a divergence worth root-causing —
+  the repaired journal + checkpoint are under `data_dir`.
 
 ### Prevention
 

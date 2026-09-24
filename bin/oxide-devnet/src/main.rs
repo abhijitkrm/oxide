@@ -346,6 +346,10 @@ fn run_node(node_index_str: &str) {
         rpc_config: rpc_config.clone(),
         smoke_tx,
         shutdown,
+        // Devnet members have no repair peers: divergence there is a
+        // test failure to debug, not a fault to paper over — the
+        // halt must stay loud.
+        repair_peers: Vec::new(),
     });
 }
 

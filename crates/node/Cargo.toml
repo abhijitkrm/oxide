@@ -49,6 +49,11 @@ rpc = { workspace = true }
 # networked-validator pump, and mTLS must exist in every binary that
 # can run it (the posture gate decides when it is *required*).
 p2p = { workspace = true, features = ["tls"] }
+# statesync: the divergence auto-repair path in `validator_net`
+# fetches manifests/certificates/chunks from a peer's `/snapshot/*`
+# endpoints — the same verified-download contract `oxide-fullnode
+# --state-sync` uses.
+statesync = { workspace = true }
 # tokio: the RPC HTTP server runs on a dedicated current-thread
 # runtime spawned by `validator_net`'s `start_rpc`.
 tokio = { workspace = true }

@@ -3157,3 +3157,191 @@ fn fee_failure_rewinds_sender_nonce_chain() {
         "nonce 0 stays unconsumed — the failed tx is retryable"
     );
 }
+
+// ---- certified-repair import (`Executor::repair_import_snapshot`) ----
+//
+// The repair path is the in-process half of divergence recovery:
+// a verified peer snapshot replaces the diverged base, tainted
+// post-base state is purged, and the still-committed tail replays
+// on the verified base. These tests pin the mechanics: what is
+// rebuilt, what is refused, and what watermarks resume.
+
+/// Build a committed block at `height` carrying `txs` — the shape
+/// `finalize_block` consumes, without routing through the mempool
+/// (the committed order is the semantic under test).
+fn repair_block(height: u64, txs: Vec<TxBytes>) -> FinalizedBlock {
+    FinalizedBlock {
+        context: types::BlockContext::default(),
+        height: Height::new(height),
+        txs,
+        signers: Vec::new(),
+    }
+}
+
+#[test]
+fn repair_import_rebuilds_on_verified_snapshot_base() {
+    // Divergence model: committed history is IDENTICAL on both
+    // sides (consensus finalizes the same txs — the divergence is
+    // in the execution *result*). The diverged node executed
+    // blocks 0..=2 correctly, then its module state was corrupted
+    // post-execution — exactly what a verified repair must undo.
+    let mut diverged = test_executor(100);
+    let counter = Arc::new(CounterModule::new());
+    diverged.register_module(counter.clone());
+    // Blocks 0,1: the canonical history the peer also executed.
+    for h in 0..2u64 {
+        diverged.finalize_block(&repair_block(h, vec![make_tx_with_nonce(1, &[9], h)]));
+    }
+    // Block 2: the still-committed tail the peer snapshot does not
+    // cover — two txs, so honest replay lands the counter at 4.
+    diverged.finalize_block(&repair_block(
+        2,
+        vec![make_tx_with_nonce(1, &[1], 2), make_tx_with_nonce(1, &[2], 3)],
+    ));
+    diverged.wait_exec_idle();
+    assert_eq!(*primitives::sync::lock_state(&counter.count), 4, "setup: honest execution");
+    // The honest tip root — captured BEFORE corruption — is what a
+    // correct repair must reproduce.
+    let honest_tip_root = diverged.state_root_at(2);
+    // Corrupt post-execution state: the module's committed state
+    // no longer produces the attested root — the divergence the
+    // consensus side latched on.
+    *primitives::sync::lock_state(&counter.count) = 99;
+
+    // The certified peer: identical committed history through
+    // height 1, so its snapshot carries the canonical base.
+    let mut peer = test_executor(100);
+    peer.register_module(Arc::new(CounterModule::new()));
+    for h in 0..2u64 {
+        peer.finalize_block(&repair_block(h, vec![make_tx_with_nonce(1, &[9], h)]));
+    }
+    peer.wait_exec_idle();
+    let snapshot = peer.export_snapshot();
+    assert_eq!(snapshot.height, 1, "peer tip is the snapshot base");
+
+    let covered = diverged.repair_import_snapshot(&snapshot).expect("repair must import");
+    assert_eq!(covered, 2, "snapshot base + replayed block 2");
+    // The corrupted 99 is gone: peer base (2) + replayed block's
+    // two txs rebuilt state, not patched it.
+    assert_eq!(*primitives::sync::lock_state(&counter.count), 4);
+    // The base root is the certified one, and the rebuilt tip root
+    // equals what honest execution produced — repair reproduced
+    // the canonical state, not merely *a* state.
+    assert_eq!(diverged.state_root_at(1), snapshot.state_root);
+    let rebuilt = diverged.state_root_at(2);
+    assert_eq!(rebuilt, honest_tip_root, "rebuilt tip must match honest execution");
+    // Attestation resumes at the rebuilt tip — `mark_repaired` on
+    // the consensus side keys off exactly this attestation.
+    let latest = diverged.attest_latest().expect("rebuilt state attests");
+    assert_eq!(latest.height, Height::new(2));
+    assert_eq!(latest.root, rebuilt);
+}
+
+#[test]
+fn repair_import_rejects_history_gap_above_base() {
+    // In-memory coverage must be contiguous from base+1: a missing
+    // committed height cannot be skipped — replaying past the hole
+    // produces a state no peer shares.
+    let mut diverged = test_executor(100);
+    diverged.register_module(Arc::new(CounterModule::new()));
+    // Commit 0, 1, and 3 — height 2 never finalized locally (the
+    // retention window or a crash could have dropped it).
+    for (h, n) in [(0u64, 0u64), (1, 1), (3, 2)] {
+        diverged.finalize_block(&repair_block(
+            h,
+            vec![make_tx_with_nonce(1, &[u8::try_from(h).unwrap_or(0xff)], n)],
+        ));
+    }
+    diverged.wait_exec_idle();
+
+    let mut peer = test_executor(100);
+    peer.register_module(Arc::new(CounterModule::new()));
+    peer.finalize_block(&repair_block(0, vec![make_tx_with_nonce(1, &[7], 0)]));
+    peer.wait_exec_idle();
+    let snapshot = peer.export_snapshot();
+    assert_eq!(snapshot.height, 0, "peer tip is the snapshot base");
+
+    let err = diverged.repair_import_snapshot(&snapshot).expect_err("gap must fail closed");
+    assert!(
+        matches!(err, DurabilityError::JournalGap { expected: 2, found: 3 }),
+        "expected JournalGap(2 -> 3), got {err}"
+    );
+}
+
+#[test]
+fn repair_import_skips_self_checkpoint_records_in_journal() {
+    // A journaled self-checkpoint carries the diverged state this
+    // repair exists to remove — the replay must skip TAG_CHECKPOINT
+    // records and only rebuild from TAG_BLOCK entries on top of the
+    // verified peer snapshot.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut diverged = test_executor(100)
+        .with_durability(DurabilityConfig::new(dir.path()).with_checkpoint_interval(4096))
+        .expect("durability config");
+    let counter = Arc::new(CounterModule::new());
+    diverged.register_module(counter.clone());
+    // Same divergence model as the in-memory test: canonical
+    // history through block 1 (identical to the peer's), a
+    // committed tail at height 2, then post-execution corruption.
+    for h in 0..2u64 {
+        diverged.finalize_block(&repair_block(h, vec![make_tx_with_nonce(1, &[9], h)]));
+    }
+    diverged.finalize_block(&repair_block(
+        2,
+        vec![make_tx_with_nonce(1, &[1], 2), make_tx_with_nonce(1, &[2], 3)],
+    ));
+    diverged.wait_exec_idle();
+    *primitives::sync::lock_state(&counter.count) = 99;
+    // The journal now holds [baseline CHECKPOINT, B0, B1, B2] — the
+    // baseline checkpoint records diverged genesis state and must
+    // be skipped, not applied.
+    let mut peer = test_executor(100);
+    peer.register_module(Arc::new(CounterModule::new()));
+    for h in 0..2u64 {
+        peer.finalize_block(&repair_block(h, vec![make_tx_with_nonce(1, &[9], h)]));
+    }
+    peer.wait_exec_idle();
+    let snapshot = peer.export_snapshot();
+    assert_eq!(snapshot.height, 1);
+
+    let covered = diverged.repair_import_snapshot(&snapshot).expect("repair must import");
+    assert_eq!(covered, 2, "journal replayed block 2 on the peer base");
+    assert_eq!(
+        *primitives::sync::lock_state(&counter.count),
+        4,
+        "self-checkpoint skipped — only peer base + journaled blocks applied"
+    );
+}
+
+#[test]
+fn repair_import_still_verifies_snapshot_before_mutation() {
+    // The verified-import gate is unchanged in repair mode: a
+    // snapshot whose claimed root does not recompute from its own
+    // payloads is refused before any state is touched — the diverged
+    // node keeps its (latched) state rather than installing a worse
+    // lie.
+    let mut diverged = test_executor(100);
+    let counter = Arc::new(CounterModule::new());
+    diverged.register_module(counter.clone());
+    diverged.finalize_block(&repair_block(0, vec![make_tx_with_nonce(1, &[1], 0)]));
+    diverged.wait_exec_idle();
+    let count_before = *primitives::sync::lock_state(&counter.count);
+
+    let mut peer = test_executor(100);
+    peer.register_module(Arc::new(CounterModule::new()));
+    peer.finalize_block(&repair_block(0, vec![make_tx_with_nonce(1, &[9], 0)]));
+    peer.wait_exec_idle();
+    let mut snapshot = peer.export_snapshot();
+    snapshot.state_root = Hash([0x77; 32]); // forged root — fails recompute
+
+    let err = diverged.repair_import_snapshot(&snapshot).expect_err("forged root must fail");
+    assert!(
+        matches!(err, DurabilityError::Import(SnapshotImportError::StateRootMismatch { .. })),
+        "expected staged-import root mismatch, got {err}"
+    );
+    assert_eq!(
+        *primitives::sync::lock_state(&counter.count),
+        count_before,
+        "a refused import must not mutate state"
+    );
+}
