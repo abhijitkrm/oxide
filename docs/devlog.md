@@ -21663,3 +21663,68 @@ networking, not a build failure), so the compose config is validated
 (`docker compose config`) but the recorded numbers come from the
 equivalent multi-process loopback deployment. Run the compose
 harness where registry access works for cross-machine numbers.
+
+## Session: per-module governance parameter sinks
+
+`exchange.fee_vault.withdraw` was the only registered
+`ParameterSink` — governance could deliberate but only the fee
+vault's exit could actually change something. Every module with
+real tunables now has a sink, and the one that had none of its
+own — chain-level block economics — got the first shared-state
+design: `types::ChainParams`.
+
+**`chain.*` — one atomic source of truth.** The block gas limit,
+byte budget, and fee floor each had TWO enforcement readers that
+a governed value must move together: the consensus engine packs
+proposals and stamps `BlockContext.gas_limit` from its
+`block_budget`, while the executor rejects oversized blocks and
+under-floor fees from its own `block_gas_limit`/`min_fee` fields.
+Two copies would let a mempool admit under the stale limit while
+consensus packs under the new one — blocks a leader builds that
+validators refuse to vote for. `types::ChainParams` is one
+`Arc` of atomics (`max_gas`, `max_bytes`, `min_fee`), seeded from
+config at `assemble_executor`, installed on the executor
+(`with_gas_limit`/`with_min_fee` now store into it), the engines
+(`OxideBft` and `SequencerEngine` both gained
+`with_chain_params`; `block_budget()` reads the atomics when
+present), and behind the `ChainParamSink` the `chain` prefix
+routes to. The stamped `gas_limit` is committed into the block
+context and journaled, so replayed history keeps the value that
+governed it — the live atomic only moves NEW commits. A budget
+shrink below an in-flight proposal rejects it (one timeout round
+of liveness dip, then the next view proposes under the new
+budget); that tradeoff is documented on the type.
+
+**Module sinks.** `staking.unbonding_period` / `block_reward`
+(atomics now — the sink's `&self` apply demanded interior
+mutability; `0` rejected for unbonding, an instant exit would
+defeat the slashing evidence window). `perps.max_leverage` /
+`mmr_base_bps` (`[market:1][u16 LE]` — re-validated through
+`PerpsMarketConfig::validate`, written to BOTH `inner.configs`
+and the committed `market_config_key` record, the same pair
+`list_market` maintains — mutating only the live map would leave
+the canonical state describing the pre-apply value).
+`governance.*` — self-governance: the six lifecycle tunables
+moved into `GovernanceParams` behind one `Arc`; the module
+registers its own `params()` handle as the `governance` sink so
+its own knobs take the same deposited/voted/timelocked path.
+Zero windows and `>10_000` bps reject; `min_deposit`/`timelock`
+of 0 are legitimate and allowed.
+
+**Determinism note.** Applies run inside `end_block` at a fixed
+height on every replica — `Relaxed` atomics are correct because
+cross-field order doesn't matter and the write's determinism
+comes from block ordering, not memory order. The follower
+(non-signing engine) got `with_chain_params` too — its commit
+path stamps `BlockContext.gas_limit` identically to validators,
+so a governed budget move must land there at the same height or
+the divergence latch would (correctly) fire on a real mismatch.
+
+**Tests.** Unit: per-sink apply+reject (foreign key, malformed,
+domain violations). `chain_params_drive_live_block_budget`
+(engine reads shared atomics; bare engine stays static) and
+`shared_chain_params_drive_live_fee_floor` (executor reads the
+arc, not a snapshot). E2E:
+`governance_applies_chain_min_fee_end_to_end` — real sequencer
+blocks, propose→deposit→vote→timelock→apply, the shared atomic
+moves to 200 and a fee-100 tx then lands `Skipped{FeeFloor}`.

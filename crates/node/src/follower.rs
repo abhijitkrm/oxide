@@ -214,6 +214,7 @@ pub fn run(spec: FollowerSpec) {
         staking_module: _,
         exchange_module: _,
         recovery,
+        chain_params,
     } = crate::assemble_executor(&node_config);
     let app_dyn: Arc<dyn ports::AppInterface> = app.clone();
 
@@ -223,7 +224,13 @@ pub fn run(spec: FollowerSpec) {
         // `assemble_devnet_node` so a `[consensus]` TOML change
         // reaches followers too.
         .with_pacemaker_timeouts(node_config.base_timeout_ms, node_config.max_timeout_ms)
-        .with_block_budget(node_config.block_budget);
+        .with_block_budget(node_config.block_budget)
+        // Mandatory on a consume-only engine too: the commit path
+        // stamps `BlockContext.gas_limit` from the live budget, and
+        // a governed `chain.block_gas_limit` apply must land here at
+        // the same height it lands on validators — a follower
+        // stamping the static config past that height would diverge.
+        .with_chain_params(chain_params);
     // No `.with_signer()` — this engine must never produce a
     // signature. Every signing path (`propose`, `vote`, timeout)
     // is unreachable from this pump by construction.

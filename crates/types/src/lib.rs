@@ -120,6 +120,43 @@ pub const CHAIN_BLOCK_MAX_BYTES: u64 = 16 << 20;
 pub const CHAIN_BLOCK_BUDGET: BlockBudget =
     BlockBudget { max_bytes: CHAIN_BLOCK_MAX_BYTES, max_gas: CHAIN_BLOCK_GAS_LIMIT };
 
+/// Live chain-level execution parameters — the single mutable copy
+/// of the block budget and fee floor every enforcement point reads.
+///
+/// Node assembly seeds one `Arc<ChainParams>` from config and shares
+/// it three ways: the consensus engine budgets proposals and stamps
+/// `BlockContext.gas_limit` from it, the executor enforces it at
+/// admission/proposal-validation/execution, and the governance
+/// `chain.*` parameter sink writes it once a timelocked proposal
+/// applies. Sharing one set of atomics (rather than letting each
+/// consumer keep its own copy) is what keeps a mid-flight
+/// parameter change deterministic: every node applies the
+/// governance write at the same height in the same `end_block`
+/// order, so all enforcement points cross to the new value
+/// together. Splitting them would let a mempool admit under the
+/// stale limit while consensus packs under the new one — blocks
+/// the proposer builds but validators refuse to vote for.
+///
+/// Mutating the budget below an in-flight proposal's contents is
+/// safe (the proposal is rejected at validation and the next view
+/// proposes under the new budget) but is still a liveness dip —
+/// governance shrinking the limit should expect one timeout round.
+#[derive(Debug, Default)]
+pub struct ChainParams {
+    /// The block gas limit — proposal packing budget, stamped as
+    /// `BlockContext.gas_limit` (the EVM module's per-block cap),
+    /// and the executor's cumulative-gas bound. Governed via the
+    /// `chain.block_gas_limit` parameter key. Units: gas.
+    pub max_gas: std::sync::atomic::AtomicU64,
+    /// The block byte budget — proposal packing bound on the wire.
+    /// Governed via `chain.block_max_bytes`. Units: bytes.
+    pub max_bytes: std::sync::atomic::AtomicU64,
+    /// The minimum acceptable envelope fee per transaction — the
+    /// executor's admission floor for native-module txs (`0` = no
+    /// floor). Governed via `chain.min_fee`. Units: base units.
+    pub min_fee: std::sync::atomic::AtomicU64,
+}
+
 impl Encode for BlockBudget {
     fn encode(&self, buf: &mut Vec<u8>) {
         write::u64(buf, self.max_bytes);

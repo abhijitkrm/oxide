@@ -1166,3 +1166,84 @@ fn devnet_node_rejects_wrong_slot_on_fresh_start() {
         other => panic!("expected WrongValidatorSlot, got {:?}", other.map(|_| "Ok")),
     }
 }
+
+/// A `chain.*` parameter travels the full production path —
+/// proposal → deposit → quorum → timelock → apply — and lands on
+/// the shared `ChainParams` the executor's fee floor reads: a
+/// native tx under the new floor then skips deterministically.
+/// This is the wiring proof the per-module sinks can't give: the
+/// governance write must reach a consumer OUTSIDE the governance
+/// module (the executor through its shared atomics).
+#[test]
+fn governance_applies_chain_min_fee_end_to_end() {
+    let config = NodeConfig {
+        consensus: ConsensusConfig::Sequencer,
+        max_mempool_entries: 10_000,
+        parallel_threshold: 32,
+        evm_persistence: false,
+        storage_path: None,
+        settlement_operator: None,
+        min_fee: 0,
+        chain_id: 1,
+        require_signed_txs: false,
+        history_retention: None,
+        ..Default::default()
+    };
+    let mut node = Node::assemble(&config);
+    let validator = primitives::Address([0u8; 20]);
+    let gov = framework::module_id::GOVERNANCE;
+    let staking_id = framework::module_id::STAKING;
+    let mut nonce = 0u64;
+    let mut submit = |node: &mut Node, module_id: u8, payload: &[u8]| {
+        node.engine().submit_tx(build_tx_as(validator, nonce, module_id, payload));
+        nonce += 1;
+        node.engine().run_until_idle();
+    };
+
+    // Bonded voting power for the validator — the same bootstrap
+    // the fee-vault e2e uses.
+    submit(&mut node, staking_id, &staking::msg::delegate(validator, 1_000_000));
+
+    // Propose `chain.min_fee = 200` — above the `fee = 100` the
+    // unsigned test envelopes declare.
+    submit(&mut node, gov, &governance::msg::propose(b"chain.min_fee", &200u64.to_le_bytes()));
+    submit(&mut node, gov, &governance::msg::deposit(0, 1_000_000));
+    submit(&mut node, gov, &governance::msg::vote(0, governance::Vote::Yes));
+
+    // Drive the voting window + timelock with fresh-sender junk
+    // (same lane-lag-safe shape as the fee-vault e2e).
+    let junk = governance::msg::vote(999_999, governance::Vote::Yes);
+    for i in 0..1_150u64 {
+        let mut a = [0xAAu8; 20];
+        a[..8].copy_from_slice(&i.to_le_bytes());
+        node.engine().submit_tx(build_tx_as(primitives::Address(a), 0, gov, &junk));
+        node.engine().run_until_idle();
+    }
+    let height = node.engine().finalized_height().expect("blocks finalized");
+    node.app().attest_state(height).expect("exec lane reached the tip");
+
+    // The apply landed on the shared atomic — the same instance the
+    // executor enforces against.
+    assert_eq!(
+        node.app().chain_params().min_fee.load(std::sync::atomic::Ordering::Relaxed),
+        200,
+        "the governed floor reached the shared chain params"
+    );
+
+    // A fee-100 native tx — fine under the old floor — now skips at
+    // the new one. The junk vote doubles as the payload.
+    let tx = build_tx_as(validator, nonce, gov, &junk);
+    let hash = crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, tx.as_bytes());
+    node.engine().submit_tx(tx);
+    node.engine().run_until_idle();
+    let height = node.engine().finalized_height().expect("blocks finalized");
+    node.app().attest_state(height).expect("exec lane reached the tip");
+    let outcome = node.app().tx_outcome(&hash).expect("outcome recorded");
+    assert!(
+        matches!(
+            outcome,
+            executor::TxOutcome::Skipped { reason: executor::TxSkipReason::FeeFloor }
+        ),
+        "fee-100 tx must skip under the governed 200 floor, got {outcome:?}"
+    );
+}

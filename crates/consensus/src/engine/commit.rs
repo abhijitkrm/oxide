@@ -284,7 +284,7 @@ impl OxideBft {
         let context = types::BlockContext {
             timestamp_ms: header.timestamp,
             beneficiary,
-            gas_limit: self.block_budget.max_gas,
+            gas_limit: self.block_budget().max_gas,
         };
         let block_hash = Self::block_hash(header);
         let block = FinalizedBlock {

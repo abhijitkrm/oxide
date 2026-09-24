@@ -299,6 +299,101 @@ impl Vote {
 /// manifest settled at decision time.
 type DepositRecords = BTreeMap<u64, Vec<(Address, u64)>>;
 
+/// The governable lifecycle tunables — the `governance.*`
+/// parameter keyspace, held behind atomics so the module's own
+/// parameter sink can apply timelocked changes through `&self`
+/// (self-governance: the module is its own sink's state).
+///
+/// Every field is an independent `AtomicU64` — no cross-field
+/// invariant exists beyond each key's own validation, so `Relaxed`
+/// ordering is correct: the apply's determinism comes from
+/// `end_block` ordering on every replica, not memory order.
+#[derive(Debug)]
+pub struct GovernanceParams {
+    /// Voting window in blocks — [`VOTING_PERIOD_BLOCKS`] default.
+    /// Governed via `governance.voting_period`; `0` rejected (a
+    /// proposal that closes instantly can never reach quorum
+    /// legitimately).
+    pub voting_period: std::sync::atomic::AtomicU64,
+    /// Funding threshold for opening voting — [`MIN_DEPOSIT`]
+    /// default; `0` opens voting at submission (a legitimate
+    /// configuration). Governed via `governance.min_deposit`.
+    pub min_deposit: std::sync::atomic::AtomicU64,
+    /// Funding window before an underfunded proposal expires —
+    /// [`DEPOSIT_PERIOD_BLOCKS`] default. Governed via
+    /// `governance.deposit_period`; `0` rejected (unfunded
+    /// proposals would expire in their submit block).
+    pub deposit_period: std::sync::atomic::AtomicU64,
+    /// Turnout threshold in basis points of total committee power —
+    /// [`QUORUM_BPS`] default. Governed via `governance.quorum_bps`;
+    /// values above `10_000` (more than all voting power) rejected.
+    pub quorum_bps: std::sync::atomic::AtomicU64,
+    /// Veto threshold in basis points of total committee power —
+    /// [`VETO_BPS`] default. Governed via `governance.veto_bps`;
+    /// same `> 10_000` bound.
+    pub veto_bps: std::sync::atomic::AtomicU64,
+    /// Delay between a proposal passing and its parameter applying —
+    /// [`TIMELOCK_BLOCKS`] default; `0` applies at the decision
+    /// height (legitimate). Governed via `governance.timelock`.
+    pub timelock: std::sync::atomic::AtomicU64,
+}
+
+impl Default for GovernanceParams {
+    fn default() -> Self {
+        Self {
+            voting_period: std::sync::atomic::AtomicU64::new(VOTING_PERIOD_BLOCKS),
+            min_deposit: std::sync::atomic::AtomicU64::new(MIN_DEPOSIT),
+            deposit_period: std::sync::atomic::AtomicU64::new(DEPOSIT_PERIOD_BLOCKS),
+            quorum_bps: std::sync::atomic::AtomicU64::new(QUORUM_BPS),
+            veto_bps: std::sync::atomic::AtomicU64::new(VETO_BPS),
+            timelock: std::sync::atomic::AtomicU64::new(TIMELOCK_BLOCKS),
+        }
+    }
+}
+
+/// The `governance.*` keyspace — self-governance: the module
+/// registers this handle as its own `governance` sink, so its
+/// lifecycle knobs are tuned through the same deposited, voted,
+/// timelocked path every other module's parameters take. Values
+/// are bare `u64` LE payloads (8 bytes); each key validates its
+/// own domain (see field docs — zero windows and `>10_000` bps are
+/// rejected into `ApplyFailed`, never clamped).
+impl ParameterSink for GovernanceParams {
+    fn apply_param(&self, key: &[u8], value: &[u8]) -> Result<(), ExecError> {
+        let (target, nonzero, capped) = match key {
+            b"governance.voting_period" => (&self.voting_period, true, false),
+            b"governance.min_deposit" => (&self.min_deposit, false, false),
+            b"governance.deposit_period" => (&self.deposit_period, true, false),
+            b"governance.quorum_bps" => (&self.quorum_bps, false, true),
+            b"governance.veto_bps" => (&self.veto_bps, false, true),
+            b"governance.timelock" => (&self.timelock, false, false),
+            _ => {
+                return Err(ExecError::ModuleRejected(
+                    "governance: unknown governed parameter".to_string(),
+                ));
+            }
+        };
+        let Ok(v) = <[u8; 8]>::try_from(value) else {
+            return Err(ExecError::Malformed);
+        };
+        let v = u64::from_le_bytes(v);
+        if nonzero && v == 0 {
+            return Err(ExecError::ModuleRejected(format!(
+                "{}: window must be > 0",
+                String::from_utf8_lossy(key)
+            )));
+        }
+        if capped && v > 10_000 {
+            return Err(ExecError::ModuleRejected(format!(
+                "{}: bps must be <= 10_000",
+                String::from_utf8_lossy(key)
+            )));
+        }
+        target.store(v, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 /// The governance module: on-chain parameter changes.
 pub struct GovernanceModule {
     store: KVStore,
@@ -327,24 +422,14 @@ pub struct GovernanceModule {
     /// `param_key` selects the sink. A key with no registered
     /// prefix is advisory and applies as a no-op.
     sinks: BTreeMap<&'static str, Arc<dyn ParameterSink + Send + Sync>>,
-    /// Voting window in blocks — [`VOTING_PERIOD_BLOCKS`] default;
-    /// overridable for tests/devnets.
-    voting_period: u64,
-    /// Funding threshold for opening voting — [`MIN_DEPOSIT`]
-    /// default; `0` opens voting at submission.
-    min_deposit: u64,
-    /// Funding window before an underfunded proposal expires —
-    /// [`DEPOSIT_PERIOD_BLOCKS`] default.
-    deposit_period: u64,
-    /// Turnout threshold in basis points of total committee power —
-    /// [`QUORUM_BPS`] default.
-    quorum_bps: u64,
-    /// Veto threshold in basis points of total committee power —
-    /// [`VETO_BPS`] default.
-    veto_bps: u64,
-    /// Delay between a proposal passing and its parameter applying —
-    /// [`TIMELOCK_BLOCKS`] default.
-    timelock: u64,
+    /// The governable lifecycle tunables — voting window, deposit
+    /// floor/window, quorum and veto thresholds, timelock — shared
+    /// with this module's own `governance.*` parameter sink
+    /// (self-governance: the `Arc` the sink mutates is the same one
+    /// the module reads). Atomics only need cross-thread
+    /// visibility: the apply lands in `end_block` at the same
+    /// height on every replica, so `Relaxed` suffices.
+    params: Arc<GovernanceParams>,
     /// The height of the block currently executing, captured at
     /// `begin_block` — drives vote-window and finalization checks.
     /// `0` outside block execution (unit tests driving `handle`
@@ -364,12 +449,7 @@ impl GovernanceModule {
             committee: None,
             ledger: None,
             sinks: BTreeMap::new(),
-            voting_period: VOTING_PERIOD_BLOCKS,
-            min_deposit: MIN_DEPOSIT,
-            deposit_period: DEPOSIT_PERIOD_BLOCKS,
-            quorum_bps: QUORUM_BPS,
-            veto_bps: VETO_BPS,
-            timelock: TIMELOCK_BLOCKS,
+            params: Arc::new(GovernanceParams::default()),
             current_height: Mutex::new(0),
         }
     }
@@ -403,50 +483,57 @@ impl GovernanceModule {
         self
     }
 
+    /// The shared lifecycle-parameters handle — the `Arc` node
+    /// assembly registers as the `governance.*` parameter sink so
+    /// the module governs its own knobs.
+    pub fn params(&self) -> Arc<GovernanceParams> {
+        Arc::clone(&self.params)
+    }
+
     /// Override the funding threshold — `0` opens voting at
     /// submission (an explicit no-deposit configuration, used by
     /// tests and deployments that gate proposals out-of-band).
     #[must_use]
-    pub fn with_min_deposit(mut self, amount: u64) -> Self {
-        self.min_deposit = amount;
+    pub fn with_min_deposit(self, amount: u64) -> Self {
+        self.params.min_deposit.store(amount, std::sync::atomic::Ordering::Relaxed);
         self
     }
 
     /// Override the funding window — tests exercise expiry without
     /// driving hundreds of blocks.
     #[must_use]
-    pub fn with_deposit_period(mut self, blocks: u64) -> Self {
-        self.deposit_period = blocks;
+    pub fn with_deposit_period(self, blocks: u64) -> Self {
+        self.params.deposit_period.store(blocks, std::sync::atomic::Ordering::Relaxed);
         self
     }
 
     /// Override the quorum threshold (basis points of total power).
     #[must_use]
-    pub fn with_quorum_bps(mut self, bps: u64) -> Self {
-        self.quorum_bps = bps;
+    pub fn with_quorum_bps(self, bps: u64) -> Self {
+        self.params.quorum_bps.store(bps, std::sync::atomic::Ordering::Relaxed);
         self
     }
 
     /// Override the veto threshold (basis points of total power).
     #[must_use]
-    pub fn with_veto_bps(mut self, bps: u64) -> Self {
-        self.veto_bps = bps;
+    pub fn with_veto_bps(self, bps: u64) -> Self {
+        self.params.veto_bps.store(bps, std::sync::atomic::Ordering::Relaxed);
         self
     }
 
     /// Override the apply timelock — `0` applies in the same
     /// `end_block` the decision lands.
     #[must_use]
-    pub fn with_timelock(mut self, blocks: u64) -> Self {
-        self.timelock = blocks;
+    pub fn with_timelock(self, blocks: u64) -> Self {
+        self.params.timelock.store(blocks, std::sync::atomic::Ordering::Relaxed);
         self
     }
 
     /// Override the voting window — tests exercise the lifecycle
     /// without driving a thousand blocks.
     #[must_use]
-    pub fn with_voting_period(mut self, blocks: u64) -> Self {
-        self.voting_period = blocks;
+    pub fn with_voting_period(self, blocks: u64) -> Self {
+        self.params.voting_period.store(blocks, std::sync::atomic::Ordering::Relaxed);
         self
     }
 
@@ -836,7 +923,7 @@ impl GovernanceModule {
             *next += 1;
             id
         };
-        let funded = self.min_deposit == 0;
+        let funded = self.params.min_deposit.load(std::sync::atomic::Ordering::Relaxed) == 0;
         proposals.insert(
             id,
             Proposal {
@@ -851,9 +938,17 @@ impl GovernanceModule {
                 deposit_deadline: if funded {
                     0
                 } else {
-                    height.saturating_add(self.deposit_period)
+                    height.saturating_add(
+                        self.params.deposit_period.load(std::sync::atomic::Ordering::Relaxed),
+                    )
                 },
-                end_height: if funded { height.saturating_add(self.voting_period) } else { 0 },
+                end_height: if funded {
+                    height.saturating_add(
+                        self.params.voting_period.load(std::sync::atomic::Ordering::Relaxed),
+                    )
+                } else {
+                    0
+                },
                 apply_height: 0,
                 finalized: false,
                 passed: false,
@@ -933,9 +1028,11 @@ impl GovernanceModule {
             // is auditable from the block log.
             data: [&id.to_le_bytes()[..], &ctx.sender.0[..], &amount.to_le_bytes()[..]].concat(),
         }];
-        if proposal.deposit >= self.min_deposit {
+        if proposal.deposit >= self.params.min_deposit.load(std::sync::atomic::Ordering::Relaxed) {
             proposal.status = ProposalStatus::Voting;
-            proposal.end_height = height.saturating_add(self.voting_period);
+            proposal.end_height = height.saturating_add(
+                self.params.voting_period.load(std::sync::atomic::Ordering::Relaxed),
+            );
             proposal.deposit_deadline = 0;
             events.push(Event {
                 module: "governance",
@@ -1121,8 +1218,12 @@ impl Module for GovernanceModule {
                     });
                 }
                 ProposalStatus::Voting if height >= proposal.end_height => {
-                    let status =
-                        Self::decide(proposal, total_power, self.quorum_bps, self.veto_bps);
+                    let status = Self::decide(
+                        proposal,
+                        total_power,
+                        self.params.quorum_bps.load(std::sync::atomic::Ordering::Relaxed),
+                        self.params.veto_bps.load(std::sync::atomic::Ordering::Relaxed),
+                    );
                     Self::set_status(proposal, status);
                     // Refund/burn at the decision — the escrowed bond
                     // is released the moment the tally is known; it
@@ -1131,7 +1232,9 @@ impl Module for GovernanceModule {
                         matches!(status, ProposalStatus::Passed | ProposalStatus::Rejected);
                     self.settle_deposits(id, refund);
                     if status == ProposalStatus::Passed {
-                        proposal.apply_height = height.saturating_add(self.timelock);
+                        proposal.apply_height = height.saturating_add(
+                            self.params.timelock.load(std::sync::atomic::Ordering::Relaxed),
+                        );
                     }
                     // `[id:8B LE][passed:1B][status:1B]` — the
                     // block-log record of the outcome. The status

@@ -1731,3 +1731,60 @@ fn snapshot_rejects_malformed_bls_key() {
         "a malformed group element must fail import, not lodge"
     );
 }
+
+// ── `staking.*` parameter sink ──────────────────────────────
+// The governed knobs land on the same atomics `with_*` builders
+// seed — the applies below prove the sink writes where the
+// enforcement paths read.
+
+/// `staking.unbonding_period` / `staking.block_reward` apply
+/// through the sink onto the live values — the same atomic every
+/// replica's `end_block` writes at the apply height.
+#[test]
+fn staking_sink_applies_unbonding_period_and_block_reward() {
+    let staking = StakingModule::new();
+    framework::ParameterSink::apply_param(
+        &staking,
+        b"staking.unbonding_period",
+        &7u64.to_le_bytes(),
+    )
+    .expect("unbonding_period apply");
+    assert_eq!(staking.unbonding_period(), 7);
+    framework::ParameterSink::apply_param(&staking, b"staking.block_reward", &0u64.to_le_bytes())
+        .expect("block_reward apply — 0 is a legitimate issuance-off policy");
+    assert_eq!(staking.block_reward(), 0);
+}
+
+/// The sink owns its keyspace: foreign keys route to a different
+/// module's sink, malformed payloads fail decode, and a zero
+/// unbonding window is rejected outright — an instant unbond
+/// would let a validator exit before equivocation evidence can
+/// land. Rejected applies leave the configured values untouched.
+#[test]
+fn staking_sink_rejects_foreign_malformed_and_zero_period() {
+    let staking = StakingModule::new();
+    assert!(
+        framework::ParameterSink::apply_param(
+            &staking,
+            b"exchange.fee_vault.withdraw",
+            &1u64.to_le_bytes()
+        )
+        .is_err(),
+        "foreign key must reject"
+    );
+    assert!(
+        framework::ParameterSink::apply_param(&staking, b"staking.block_reward", &[1, 2]).is_err(),
+        "short payload must reject"
+    );
+    assert!(
+        framework::ParameterSink::apply_param(
+            &staking,
+            b"staking.unbonding_period",
+            &0u64.to_le_bytes()
+        )
+        .is_err(),
+        "zero unbonding window must reject"
+    );
+    assert_eq!(staking.unbonding_period(), DEFAULT_UNBONDING_PERIOD_BLOCKS);
+    assert_eq!(staking.block_reward(), DEFAULT_BLOCK_REWARD);
+}

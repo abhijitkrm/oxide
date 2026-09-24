@@ -329,7 +329,7 @@ impl AppInterface for Executor {
         // module makes `process_proposal` reject the WHOLE block —
         // a single malformed mempool entry could otherwise stall
         // the chain by poisoning every proposal.
-        let gas_cap = budget.max_gas.min(self.block_gas_limit);
+        let gas_cap = budget.max_gas.min(self.block_gas_limit());
         let mut total_gas: u64 = 0;
         let mut txs = Vec::with_capacity(candidates.len());
         for tx in candidates {
@@ -476,11 +476,11 @@ impl AppInterface for Executor {
             let payload = module_payload(bytes);
             let gas = module.estimate_gas(payload);
             total_gas = total_gas.saturating_add(gas);
-            if total_gas > self.block_gas_limit {
+            if total_gas > self.block_gas_limit() {
                 return Verdict::Reject {
                     reason: format!(
                         "block gas limit exceeded: {total_gas} > {}",
-                        self.block_gas_limit
+                        self.block_gas_limit()
                     ),
                 };
             }

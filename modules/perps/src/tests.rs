@@ -2758,3 +2758,72 @@ fn oracle_outage_and_recovery_through_real_pipeline() {
     assert_eq!(perps.mark_price(mid), Some(1_600_000_000));
     assert!(!perps.mark_is_stale(mid), "accepted update clears staleness");
 }
+
+// ── `perps.*` parameter sink ────────────────────────────────
+// Governed market-risk knobs land on BOTH halves of the config
+// state: the live `inner.configs` the margin math reads and the
+// committed `market_config_key` record replay/state-root
+// serialize — the same pair `list_market` maintains.
+
+fn param_value(market: u8, v: u16) -> Vec<u8> {
+    let mut value = vec![market];
+    value.extend_from_slice(&v.to_le_bytes());
+    value
+}
+
+#[test]
+fn perps_sink_applies_market_risk_params() {
+    let perps = PerpsModule::new();
+    let mid = perps.list_market(test_cfg()).unwrap();
+    framework::ParameterSink::apply_param(&perps, b"perps.max_leverage", &param_value(mid, 25))
+        .expect("max_leverage apply");
+    framework::ParameterSink::apply_param(&perps, b"perps.mmr_base_bps", &param_value(mid, 200))
+        .expect("mmr_base_bps apply");
+    let cfg = framework::lock_state(&perps.inner).configs[&mid];
+    assert_eq!(cfg.max_leverage, 25);
+    assert_eq!(cfg.mmr_base_bps, 200);
+    // The committed record moved with the live map — a snapshot
+    // export/replay must describe the governed value, not the
+    // listing-time one.
+    let store = framework::lock_state(&perps.store);
+    let record =
+        store.get(&crate::market_config_key(mid)).expect("config record exists after apply");
+    assert_eq!(*record, crate::encode_perps_config(&cfg));
+}
+
+#[test]
+fn perps_sink_rejects_unknown_market_and_invalid_values() {
+    let perps = PerpsModule::new();
+    let mid = perps.list_market(test_cfg()).unwrap();
+    // A market that was never listed has no config to mutate.
+    assert!(
+        framework::ParameterSink::apply_param(&perps, b"perps.max_leverage", &param_value(9, 5))
+            .is_err(),
+        "unlisted market must reject"
+    );
+    // leverage 0 = infinite margin — `validate()` refuses it, and
+    // a refused apply must not touch the live config.
+    assert!(
+        framework::ParameterSink::apply_param(&perps, b"perps.max_leverage", &param_value(mid, 0))
+            .is_err(),
+        "zero leverage must reject"
+    );
+    // mmr above 100% — same validation boundary.
+    assert!(
+        framework::ParameterSink::apply_param(
+            &perps,
+            b"perps.mmr_base_bps",
+            &param_value(mid, 10_001)
+        )
+        .is_err(),
+        "mmr > 100% must reject"
+    );
+    // Foreign key and malformed payload.
+    assert!(
+        framework::ParameterSink::apply_param(&perps, b"perps.other", &param_value(mid, 5))
+            .is_err()
+    );
+    assert!(framework::ParameterSink::apply_param(&perps, b"perps.max_leverage", &[mid]).is_err());
+    let cfg = framework::lock_state(&perps.inner).configs[&mid];
+    assert_eq!(cfg, test_cfg(), "rejected applies leave the config untouched");
+}

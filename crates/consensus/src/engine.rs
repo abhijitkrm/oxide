@@ -842,7 +842,17 @@ pub struct OxideBft {
     /// `consensus.max_block_bytes` / `consensus.max_block_gas`
     /// values reach the proposal path through this field — before it
     /// existed they parsed fine and then silently did nothing.
+    ///
+    /// When `chain_params` is installed this is only the configured
+    /// fallback: the shared atomics are the live budget a governance
+    /// `chain.*` apply can move at runtime (see [`Self::block_budget`]).
     block_budget: types::BlockBudget,
+    /// Shared live chain parameters, when node assembly wired the
+    /// governance `chain.*` sink. `None` keeps the configured
+    /// `block_budget` static (tests, bare engines); `Some` makes
+    /// [`Self::block_budget`] read the atomics so a timelocked
+    /// parameter change reaches proposals at the height it applies.
+    chain_params: Option<Arc<types::ChainParams>>,
     /// Pacemaker timeout config (milliseconds), retained on the
     /// engine so the pacemaker rebuilt at each epoch rotation keeps
     /// the operator's timeouts instead of reverting to defaults.
@@ -953,6 +963,7 @@ impl OxideBft {
             wal_failed: false,
             divergence: None,
             block_budget: types::CHAIN_BLOCK_BUDGET,
+            chain_params: None,
             pacemaker_base_timeout_ms: crate::pacemaker::DEFAULT_BASE_TIMEOUT_MS,
             pacemaker_max_timeout_ms: crate::pacemaker::DEFAULT_MAX_TIMEOUT_MS,
             clock: Arc::new(types::system_time_ms),
@@ -1075,6 +1086,22 @@ impl OxideBft {
     #[must_use]
     pub fn with_block_budget(mut self, budget: types::BlockBudget) -> Self {
         self.block_budget = budget;
+        self
+    }
+
+    /// Install the shared live chain-parameters handle.
+    ///
+    /// Node assembly shares one `Arc<types::ChainParams>` between the
+    /// executor, this engine, and the governance `chain.*` sink —
+    /// once installed, [`Self::block_budget`] reads the atomics so a
+    /// timelocked `chain.block_gas_limit` / `chain.block_max_bytes`
+    /// apply reaches proposal packing and the stamped
+    /// `BlockContext.gas_limit` at the height it lands. Until called,
+    /// the configured `block_budget` is the whole story (tests, bare
+    /// engines).
+    #[must_use]
+    pub fn with_chain_params(mut self, params: Arc<types::ChainParams>) -> Self {
+        self.chain_params = Some(params);
         self
     }
 
@@ -1280,9 +1307,22 @@ impl OxideBft {
     /// engine, the EVM, and the tests all agree on a single source of
     /// truth (plan.md §3); `with_block_budget` overrides it from
     /// parsed config.
+    ///
+    /// With `chain_params` installed the shared atomics are the live
+    /// value — a governance `chain.*` apply mid-run moves the budget
+    /// here and in the executor at the same height. `Relaxed`
+    /// ordering is sufficient: each atomic is an independent knob
+    /// with no cross-field invariant, and the apply's determinism
+    /// comes from `end_block` ordering, not the memory order.
     #[must_use]
     pub fn block_budget(&self) -> types::BlockBudget {
-        self.block_budget
+        match &self.chain_params {
+            Some(params) => types::BlockBudget {
+                max_bytes: params.max_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                max_gas: params.max_gas.load(std::sync::atomic::Ordering::Relaxed),
+            },
+            None => self.block_budget,
+        }
     }
 
     /// Current view.
@@ -1767,7 +1807,7 @@ impl OxideBft {
         if self.wal_failed || self.divergence.is_some() {
             return None;
         }
-        let mut proposal = self.app.prepare_proposal(&self.block_budget);
+        let mut proposal = self.app.prepare_proposal(&self.block_budget());
         let has_pending_txs = !proposal.txs.is_empty();
         // Liveness gate: the leader stays silent only when no work
         // is locally visible. Two sources count as work:

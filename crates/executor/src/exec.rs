@@ -247,7 +247,7 @@ impl Executor {
             }
             let payload = module_payload(bytes);
             let gas = module.estimate_gas(payload);
-            if cumulative_gas.saturating_add(gas) > self.block_gas_limit {
+            if cumulative_gas.saturating_add(gas) > self.block_gas_limit() {
                 skipped.push((tx_hash, TxSkipReason::GasLimit));
                 continue;
             }
@@ -261,7 +261,7 @@ impl Executor {
             // the account is exactly the reordering this plan
             // exists to eliminate. Self-funded modules (EVM: gas is
             // the fee) are exempt either way.
-            if !module.pays_own_fee() && ctx.fee < self.min_fee {
+            if !module.pays_own_fee() && ctx.fee < self.min_fee() {
                 skipped.push((tx_hash, TxSkipReason::FeeFloor));
                 continue;
             }

@@ -7651,3 +7651,27 @@ fn apply_certified_block_verifies_real_crypto() {
         other => panic!("sub-quorum qc must fail, got {other:?}"),
     }
 }
+
+/// The engine's proposal budget follows the shared
+/// `types::ChainParams` atomics once the governance-wired handle
+/// is installed — the path a `chain.block_*` apply travels to
+/// reach proposal packing and the stamped `BlockContext.gas_limit`
+/// at the height it lands.
+#[test]
+fn chain_params_drive_live_block_budget() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let params = Arc::new(types::ChainParams {
+        max_gas: std::sync::atomic::AtomicU64::new(10_000_000_000),
+        max_bytes: std::sync::atomic::AtomicU64::new(16 << 20),
+        min_fee: std::sync::atomic::AtomicU64::new(0),
+    });
+    let engine = make_engine().with_chain_params(params.clone());
+    assert_eq!(engine.block_budget().max_gas, 10_000_000_000);
+    params.max_gas.store(5_000, Relaxed);
+    params.max_bytes.store(1 << 20, Relaxed);
+    assert_eq!(engine.block_budget().max_gas, 5_000);
+    assert_eq!(engine.block_budget().max_bytes, 1 << 20);
+    // Without the handle the configured budget is static.
+    let bare = make_engine();
+    assert_eq!(bare.block_budget(), types::CHAIN_BLOCK_BUDGET);
+}

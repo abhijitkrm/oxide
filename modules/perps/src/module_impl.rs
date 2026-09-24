@@ -12,6 +12,7 @@ use super::{
     TAG_LIST_MARKET, TAG_PLACE, TAG_SET_MARK, TAG_WITHDRAW, TxContext, module_id,
 };
 use crate::decode;
+use crate::{encode_perps_config, market_config_key};
 
 impl Module for PerpsModule {
     fn name(&self) -> &'static str {
@@ -351,5 +352,67 @@ impl framework::MarkSink for PerpsModule {
     /// unbounded price move.
     fn set_mark_price(&self, market: u8, mark: u64) -> Result<(), ExecError> {
         Self::set_mark_price(self, market, mark)
+    }
+}
+
+/// The `perps.*` parameter keyspace — governed market-risk knobs.
+/// Value layout for both keys is `[market:1][u16 LE]` (3 bytes):
+/// the market the config belongs to, plus the new value.
+///
+/// - `perps.max_leverage`: replaces the market's
+///   `PerpsMarketConfig.max_leverage` — initial margin is
+///   `notional / leverage`, so this is the leverage ceiling
+///   governance tunes when volatility regime changes.
+/// - `perps.mmr_base_bps`: replaces the flat maintenance-margin
+///   rate in basis points (≤ `10_000`).
+///
+/// The mutated config is re-validated through
+/// [`PerpsMarketConfig::validate`] and written to BOTH halves of the
+/// config's state: the live `inner.configs` map the margin math
+/// reads, and the committed `market_config_key` store record the
+/// canonical state root and replay path serialize — the same pair
+/// `list_market` maintains, so an apply takes effect immediately
+/// and still round-trips snapshot restore. A rejected validation
+/// lands the proposal in `ApplyFailed` without touching either.
+impl framework::ParameterSink for PerpsModule {
+    fn apply_param(&self, key: &[u8], value: &[u8]) -> Result<(), ExecError> {
+        enum Field {
+            MaxLeverage,
+            MmrBaseBps,
+        }
+        let field = match key {
+            b"perps.max_leverage" => Field::MaxLeverage,
+            b"perps.mmr_base_bps" => Field::MmrBaseBps,
+            _ => {
+                return Err(ExecError::ModuleRejected(
+                    "perps: unknown governed parameter".to_string(),
+                ));
+            }
+        };
+        if value.len() != 3 {
+            return Err(ExecError::Malformed);
+        }
+        let market = value[0];
+        let v = u16::from_le_bytes([value[1], value[2]]);
+        let mut inner = framework::lock_state(&self.inner);
+        let Some(mut cfg) = inner.configs.get(&market).copied() else {
+            return Err(ExecError::ModuleRejected(format!(
+                "perps param: market {market} not listed"
+            )));
+        };
+        match field {
+            Field::MaxLeverage => cfg.max_leverage = v,
+            Field::MmrBaseBps => cfg.mmr_base_bps = v,
+        }
+        cfg.validate().map_err(|e| ExecError::ModuleRejected(format!("perps param: {e}")))?;
+        inner.configs.insert(market, cfg);
+        drop(inner);
+        // Committed half: the store record is what `state_root` and
+        // snapshot replay read for configs — mutating only
+        // `inner.configs` would leave the canonical state describing
+        // the pre-apply value.
+        framework::lock_state(&self.store)
+            .insert(market_config_key(market), encode_perps_config(&cfg));
+        Ok(())
     }
 }

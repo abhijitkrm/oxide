@@ -411,10 +411,15 @@ pub struct StakingModule {
     /// so journal replay rebuilds identical windows). Each entry
     /// is capped at [`DOWNTIME_WINDOW`] outcomes.
     attendance: Mutex<BTreeMap<Address, std::collections::VecDeque<bool>>>,
-    /// The unbonding period in blocks.
-    unbonding_period: u64,
-    /// The block reward in atomic units.
-    block_reward: u64,
+    /// The unbonding period in blocks. An `AtomicU64` because the
+    /// governance `staking.unbonding_period` parameter sink mutates
+    /// it through `&self` — the apply lands in `end_block` at the
+    /// same height on every node, so the atomic needs only
+    /// cross-thread visibility, not ordering.
+    unbonding_period: std::sync::atomic::AtomicU64,
+    /// The block reward in atomic units — same rationale as
+    /// `unbonding_period` (governed via `staking.block_reward`).
+    block_reward: std::sync::atomic::AtomicU64,
     /// The current block height (set at `begin_block`).
     current_height: Mutex<u64>,
 }
@@ -524,8 +529,8 @@ impl StakingModule {
             scheduled_halt: Mutex::new(None),
             seen_evidence: Mutex::new(std::collections::BTreeSet::new()),
             attendance: Mutex::new(BTreeMap::new()),
-            unbonding_period: DEFAULT_UNBONDING_PERIOD_BLOCKS,
-            block_reward: DEFAULT_BLOCK_REWARD,
+            unbonding_period: std::sync::atomic::AtomicU64::new(DEFAULT_UNBONDING_PERIOD_BLOCKS),
+            block_reward: std::sync::atomic::AtomicU64::new(DEFAULT_BLOCK_REWARD),
             current_height: Mutex::new(0),
         }
     }
@@ -536,17 +541,30 @@ impl StakingModule {
     ///
     /// Panics if the unbonding period is 0 (must be at least 1 block).
     #[must_use]
-    pub fn with_unbonding_period(mut self, period: u64) -> Self {
+    pub fn with_unbonding_period(self, period: u64) -> Self {
         assert!(period > 0, "unbonding period must be > 0");
-        self.unbonding_period = period;
+        self.unbonding_period.store(period, std::sync::atomic::Ordering::Relaxed);
         self
     }
 
     /// Construct a staking module with a custom block reward.
     #[must_use]
-    pub fn with_block_reward(mut self, reward: u64) -> Self {
-        self.block_reward = reward;
+    pub fn with_block_reward(self, reward: u64) -> Self {
+        self.block_reward.store(reward, std::sync::atomic::Ordering::Relaxed);
         self
+    }
+
+    /// The live unbonding period in blocks — shared-params read so a
+    /// `staking.unbonding_period` governance apply lands at the same
+    /// height on every enforcement point.
+    fn unbonding_period(&self) -> u64 {
+        self.unbonding_period.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The live block reward — same shared-params read path as
+    /// [`Self::unbonding_period`].
+    fn block_reward(&self) -> u64 {
+        self.block_reward.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Register a validator with zero stake — the "can receive
@@ -1537,6 +1555,46 @@ impl StakingModule {
                 "staking: balance ledger not wired (cannot settle delegation)".to_string(),
             )
         })
+    }
+}
+
+/// The `staking.*` parameter keyspace — value is the bare `u64` LE
+/// payload (8 bytes) for both keys.
+///
+/// - `staking.unbonding_period`: blocks an undelegation waits before
+///   paying out. `0` is rejected — an instant unbond breaks the
+///   evidence window slashing depends on (a validator could exit
+///   before equivocation proof lands).
+/// - `staking.block_reward`: atomic units minted into `REWARD_POOL`
+///   per block. `0` is a legitimate policy (issuance off), so only
+///   the length is validated.
+///
+/// Both land on the same atomics the `with_*` builders seed, so a
+/// timelocked apply replaces the configured value chain-wide at one
+/// height — `end_block` ordering makes the write deterministic
+/// across replicas.
+impl framework::ParameterSink for StakingModule {
+    fn apply_param(&self, key: &[u8], value: &[u8]) -> Result<(), ExecError> {
+        let target = match key {
+            b"staking.unbonding_period" => &self.unbonding_period,
+            b"staking.block_reward" => &self.block_reward,
+            _ => {
+                return Err(ExecError::ModuleRejected(
+                    "staking: unknown governed parameter".to_string(),
+                ));
+            }
+        };
+        let Ok(v) = <[u8; 8]>::try_from(value) else {
+            return Err(ExecError::Malformed);
+        };
+        let v = u64::from_le_bytes(v);
+        if key == b"staking.unbonding_period" && v == 0 {
+            return Err(ExecError::ModuleRejected(
+                "staking.unbonding_period: must be > 0 (evidence window)".to_string(),
+            ));
+        }
+        target.store(v, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 }
 

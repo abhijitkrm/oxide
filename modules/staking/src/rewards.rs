@@ -180,10 +180,10 @@ impl StakingModule {
             // block).
             let _ = ledger.transfer(&FEE_POOL, &REWARD_POOL, fee_collected);
         }
-        if self.block_reward > 0 {
-            ledger.mint(&REWARD_POOL, self.block_reward);
+        if self.block_reward() > 0 {
+            ledger.mint(&REWARD_POOL, self.block_reward());
         }
-        fee_collected.saturating_add(self.block_reward)
+        fee_collected.saturating_add(self.block_reward())
     }
 
     /// Distribute `total_reward` to active validators proportional

@@ -227,6 +227,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Governed parameters for every module** (`staking.*`,
+  `perps.*`, `governance.*`, `chain.*`): governance proposals can
+  now enact changes beyond the exchange fee vault — the only sink
+  that existed before. `staking.unbonding_period` and
+  `staking.block_reward` move staking's live tunables;
+  `perps.max_leverage` and `perps.mmr_base_bps` retune a listed
+  market's risk config through full re-validation; `governance.*`
+  makes the module self-governing (deposit floor, voting and
+  funding windows, quorum/veto thresholds, timelock) through the
+  same deposited, voted, timelocked path; and `chain.*` governs
+  the block budget and fee floor via a new shared
+  `types::ChainParams` — one `Arc` of atomics the consensus
+  engine, the executor, and the sink all read/write, so a
+  parameter apply moves proposal packing, `BlockContext.gas_limit`,
+  and admission enforcement at the same height on every replica
+  (fullnode followers included).
+  - **In plain words:** governance can now actually govern — a
+    proposal that passes changes real knobs like block size, fee
+    floor, leverage limits, and even governance's own rules,
+    everywhere at once, instead of only being able to spend the
+    exchange's collected fees.
+
 - **Sustained-load transaction injection** (`oxide-devnet
   --tx-inject-rate <tx/s>`): the shared network runner can now
   drive real signed load from inside the consensus pump — the

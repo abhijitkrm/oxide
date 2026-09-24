@@ -3345,3 +3345,43 @@ fn repair_import_still_verifies_snapshot_before_mutation() {
         "a refused import must not mutate state"
     );
 }
+
+/// The executor's fee floor reads the shared `types::ChainParams`
+/// atomics — a store on the handle (what a `chain.min_fee`
+/// governance apply performs) moves live enforcement without
+/// touching the executor object, proving the enforcement path
+/// reads the shared copy rather than a private snapshot.
+#[test]
+fn shared_chain_params_drive_live_fee_floor() {
+    let params = Arc::new(types::ChainParams {
+        max_gas: std::sync::atomic::AtomicU64::new(1 << 30),
+        max_bytes: std::sync::atomic::AtomicU64::new(1 << 20),
+        min_fee: std::sync::atomic::AtomicU64::new(0),
+    });
+    let mut executor = test_executor(100).with_chain_params(params.clone());
+    let counter = Arc::new(CounterModule::new());
+    let collector = Arc::new(FeeCollector { charged: Mutex::new(0) });
+    executor.register_module(counter.clone());
+    executor.register_module(collector.clone());
+    executor.set_fee_module(9);
+
+    // With the floor at 0 both txs execute; raising the live floor
+    // to 50 (a governance apply's write) must skip the 10-fee tx.
+    params.min_fee.store(50, std::sync::atomic::Ordering::Relaxed);
+    executor.ingest_tx(make_tx_with_fee_and_sender(1, &[1], 0, 10, 7));
+    executor.ingest_tx(make_tx_with_fee_and_sender(1, &[1], 0, 100, 8));
+    let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+    let proposal = executor.prepare_proposal(&budget);
+    executor.finalize_block(&FinalizedBlock {
+        context: types::BlockContext::default(),
+        height: Height::new(0),
+        txs: proposal.txs,
+        signers: Vec::new(),
+    });
+    assert_eq!(
+        *primitives::sync::lock_state(&counter.count),
+        1,
+        "only the adequately-paid tx executes under the shared floor"
+    );
+    assert_eq!(*primitives::sync::lock_state(&collector.charged), 100);
+}

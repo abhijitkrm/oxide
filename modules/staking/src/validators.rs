@@ -365,7 +365,7 @@ impl StakingModule {
     /// nothing.
     pub(crate) fn cancel_pending_add(&self, validator: &Address) {
         let current = *framework::lock_state(&self.current_height);
-        let completion = current.saturating_add(self.unbonding_period);
+        let completion = current.saturating_add(self.unbonding_period());
         let mut delegations = framework::lock_state(&self.delegations);
         let affected: Vec<(Address, u64)> = delegations
             .iter()

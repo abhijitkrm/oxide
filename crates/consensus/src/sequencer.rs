@@ -78,6 +78,12 @@ pub struct SequencerEngine {
     /// deterministic test/sim can inject a fixed clock via
     /// [`SequencerEngine::with_clock`].
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// Shared live chain parameters, when node assembly wired the
+    /// governance `chain.*` sink — same role as
+    /// [`OxideBft::with_chain_params`]: the atomics replace the
+    /// static [`BUDGET`] so a parameter apply reaches the sequencer's
+    /// proposal budget and stamped `gas_limit` at the same height.
+    chain_params: Option<Arc<types::ChainParams>>,
 }
 
 impl SequencerEngine {
@@ -88,6 +94,7 @@ impl SequencerEngine {
             next_height: Height::new(0),
             finalized: BTreeMap::new(),
             clock: Arc::new(types::system_time_ms),
+            chain_params: None,
         }
     }
 
@@ -98,6 +105,27 @@ impl SequencerEngine {
     pub fn with_clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         self.clock = Arc::new(clock);
         self
+    }
+
+    /// Install the shared live chain-parameters handle — see
+    /// [`OxideBft::with_chain_params`].
+    #[must_use]
+    pub fn with_chain_params(mut self, params: Arc<types::ChainParams>) -> Self {
+        self.chain_params = Some(params);
+        self
+    }
+
+    /// The live proposal budget: the shared atomics when the
+    /// governance-wired handle is installed, the static [`BUDGET`]
+    /// otherwise.
+    fn budget(&self) -> BlockBudget {
+        match &self.chain_params {
+            Some(params) => BlockBudget {
+                max_bytes: params.max_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                max_gas: params.max_gas.load(std::sync::atomic::Ordering::Relaxed),
+            },
+            None => BUDGET,
+        }
     }
 
     /// Access the embedded app for post-run inspection (conformance,
@@ -119,7 +147,7 @@ impl ports::ConsensusEngine for SequencerEngine {
         // Unlike oxideBFT (2-chain pipeline), the sequencer commits
         // immediately — no pending blocks, no flush round.
         loop {
-            let proposal = self.app.prepare_proposal(&BUDGET);
+            let proposal = self.app.prepare_proposal(&self.budget());
             // No pending txs and not genesis → nothing to propose.
             // The sequencer never produces empty blocks (no pipeline
             // to flush — single-block commit).
@@ -149,7 +177,7 @@ impl ports::ConsensusEngine for SequencerEngine {
             let context = types::BlockContext {
                 timestamp_ms: (self.clock)(),
                 beneficiary: primitives::Address::ZERO,
-                gas_limit: BUDGET.max_gas,
+                gas_limit: self.budget().max_gas,
             };
             let block = FinalizedBlock {
                 height: proposal.height,

@@ -784,3 +784,104 @@ fn state_snapshot_round_trips_lifecycle() {
         &[(b"test.p2".to_vec(), b"7".to_vec()), (b"test.p3".to_vec(), b"9".to_vec())]
     );
 }
+
+// ── `governance.*` self-parameter sink ─────────────────────
+// The module's own lifecycle knobs take the same deposited,
+// voted, timelocked path as every other module's — the tests
+// prove the sink writes the atomics the lifecycle reads.
+
+/// `GovernanceParams` applies each `governance.*` key to its
+/// atomic — and rejects what its own keyspace does not cover.
+#[test]
+fn governance_params_apply_each_key_and_validate() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let params = GovernanceParams::default();
+    let ok = |key: &[u8], v: u64| {
+        ParameterSink::apply_param(&params, key, &v.to_le_bytes()).expect("apply should succeed");
+    };
+    ok(b"governance.voting_period", 7);
+    ok(b"governance.min_deposit", 0); // 0 = vote at submission, legitimate
+    ok(b"governance.deposit_period", 9);
+    ok(b"governance.quorum_bps", 5_000);
+    ok(b"governance.veto_bps", 10_000);
+    ok(b"governance.timelock", 0);
+    assert_eq!(params.voting_period.load(Relaxed), 7);
+    assert_eq!(params.min_deposit.load(Relaxed), 0);
+    assert_eq!(params.deposit_period.load(Relaxed), 9);
+    assert_eq!(params.quorum_bps.load(Relaxed), 5_000);
+    assert_eq!(params.veto_bps.load(Relaxed), 10_000);
+    assert_eq!(params.timelock.load(Relaxed), 0);
+
+    // Zero windows are nonsense — a proposal that closes in its
+    // own block can never legitimately reach quorum.
+    assert!(
+        ParameterSink::apply_param(&params, b"governance.voting_period", &0u64.to_le_bytes())
+            .is_err()
+    );
+    assert!(
+        ParameterSink::apply_param(&params, b"governance.deposit_period", &0u64.to_le_bytes())
+            .is_err()
+    );
+    // Bps above 10_000 is a threshold no tally can ever reach.
+    assert!(
+        ParameterSink::apply_param(&params, b"governance.quorum_bps", &10_001u64.to_le_bytes())
+            .is_err()
+    );
+    // Foreign key + malformed payload.
+    assert!(
+        ParameterSink::apply_param(&params, b"staking.block_reward", &1u64.to_le_bytes()).is_err()
+    );
+    assert!(ParameterSink::apply_param(&params, b"governance.timelock", &[1, 2]).is_err());
+}
+
+/// The module registered as its own `governance` sink: a passed
+/// `governance.min_deposit` proposal moves the live atomic the
+/// deposit gate reads — proven end-to-end through propose →
+/// deposit → vote → decide → timelock → apply.
+#[test]
+fn self_sink_applies_governance_params_end_to_end() {
+    let (gov, _ledger) = funded_gov();
+    let params = gov.params();
+    let gov = gov.with_sink("governance", params.clone());
+    let new_deposit = 5_000u64;
+    gov.handle(&ctx(1), &msg::propose(b"governance.min_deposit", &new_deposit.to_le_bytes()))
+        .unwrap();
+    gov.handle(&ctx(2), &msg::deposit(0, 1_000)).unwrap();
+    gov.handle(&ctx(4), &msg::vote(0, Vote::Yes)).unwrap();
+    gov.handle(&ctx(2), &msg::vote(0, Vote::Yes)).unwrap();
+    gov.end_block(Height::new(5)); // decision: Passed, apply_height = 7
+    assert_eq!(
+        params.min_deposit.load(std::sync::atomic::Ordering::Relaxed),
+        1_000,
+        "the configured value holds until the timelock elapses"
+    );
+    gov.end_block(Height::new(7)); // apply
+    assert_eq!(gov.proposal(0).unwrap().status, ProposalStatus::Applied);
+    assert_eq!(
+        params.min_deposit.load(std::sync::atomic::Ordering::Relaxed),
+        5_000,
+        "the applied proposal moved the live deposit floor"
+    );
+}
+
+/// A self-governance proposal the sink rejects (a zero voting
+/// window) lands `ApplyFailed` — terminal, the same outcome a
+/// foreign module's invalid apply records.
+#[test]
+fn self_sink_rejection_is_terminal_apply_failed() {
+    let (gov, _ledger) = funded_gov();
+    let params = gov.params();
+    let gov = gov.with_sink("governance", params.clone());
+    gov.handle(&ctx(1), &msg::propose(b"governance.voting_period", &0u64.to_le_bytes())).unwrap();
+    gov.handle(&ctx(2), &msg::deposit(0, 1_000)).unwrap();
+    gov.handle(&ctx(4), &msg::vote(0, Vote::Yes)).unwrap();
+    gov.handle(&ctx(2), &msg::vote(0, Vote::Yes)).unwrap();
+    gov.end_block(Height::new(5));
+    gov.end_block(Height::new(7));
+    assert_eq!(gov.proposal(0).unwrap().status, ProposalStatus::ApplyFailed);
+    assert_eq!(
+        params.voting_period.load(std::sync::atomic::Ordering::Relaxed),
+        5,
+        "the rejected apply left the configured window untouched"
+    );
+}

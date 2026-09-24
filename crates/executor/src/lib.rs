@@ -1602,14 +1602,18 @@ pub struct Executor {
     /// read by `tx_outcome` from any thread (e.g. the matcher's
     /// settlement confirmer).
     tx_outcomes: Mutex<TxOutcomeStore>,
-    /// Block gas limit. The total gas of all txs in a block must not
-    /// exceed this limit. Enforced in `process_proposal` (rejects
-    /// blocks that exceed the limit) and `execute_block` (skips
-    /// txs that would exceed the cumulative limit).
+    /// Live chain-level execution parameters — block gas limit,
+    /// block byte budget, and the minimum envelope-fee floor —
+    /// shared with the consensus engine and the governance `chain.*`
+    /// parameter sink (see [`types::ChainParams`]). The executor's
+    /// enforcement points read the atomics on every block so a
+    /// timelocked governance apply lands here at the same height it
+    /// lands in the engine's proposal budget.
     ///
-    /// Default: 30 million gas per block (comparable to Ethereum's
-    /// 30M gas limit). Configurable via [`Executor::with_gas_limit`].
-    block_gas_limit: u64,
+    /// `with_gas_limit`/`with_min_fee` configure the atomics before
+    /// the `Arc` is shared; a private default `Arc` exists until
+    /// [`Executor::with_chain_params`] installs the shared handle.
+    chain_params: Arc<types::ChainParams>,
     /// The module that collects transaction fees (the EVM ledger).
     /// When set, every non-self-funded module's txs are charged
     /// `ctx.fee` through this module before execution — previously
@@ -1618,14 +1622,6 @@ pub struct Executor {
     ///
     /// `None` = no fee collection (tests and dev-mode executors).
     fee_module: Option<u8>,
-    /// Minimum acceptable `ctx.fee` per transaction. Txs declaring a
-    /// fee below this floor are skipped before the fee charge —
-    /// the envelope's fee field is sender-controlled, so without a
-    /// floor every tx could declare 0 and execute for free.
-    ///
-    /// `0` = no floor (the fee module's own rules apply — e.g.
-    /// zero-fee txs are free).
-    min_fee: u64,
     /// The chain ID mixed into the EIP-712 domain separator for
     /// native transaction signature verification. Binds every
     /// signed native tx to this chain — a signature produced for
@@ -1706,9 +1702,12 @@ impl Executor {
             mempool_intake_tx: intake_tx,
             mempool_intake_rx: Mutex::new(intake_rx),
             executed_nonce: Mutex::new(Arc::new(ExecutedNonces::default())),
-            block_gas_limit: DEFAULT_BLOCK_GAS_LIMIT,
+            chain_params: Arc::new(types::ChainParams {
+                max_gas: std::sync::atomic::AtomicU64::new(DEFAULT_BLOCK_GAS_LIMIT),
+                max_bytes: std::sync::atomic::AtomicU64::new(types::CHAIN_BLOCK_MAX_BYTES),
+                min_fee: std::sync::atomic::AtomicU64::new(0),
+            }),
             fee_module: None,
-            min_fee: 0,
             chain_id: 1,
             unsigned_tx_policy: UnsignedTxPolicy::Reject,
             history_retention: MAX_RETAINED_HISTORY,
@@ -1747,11 +1746,51 @@ impl Executor {
     ///
     /// The total gas of all txs in a block must not exceed this
     /// limit. Each tx consumes at least 1000 gas (base cost) plus
-    /// 1 gas per byte of payload.
+    /// 1 gas per byte of payload. The limit lives in the shared
+    /// [`types::ChainParams`], so a later governance apply over the
+    /// `chain.block_gas_limit` key can move it again at runtime.
     #[must_use]
-    pub fn with_gas_limit(mut self, limit: u64) -> Self {
-        self.block_gas_limit = limit;
+    pub fn with_gas_limit(self, limit: u64) -> Self {
+        self.chain_params.max_gas.store(limit, std::sync::atomic::Ordering::Relaxed);
         self
+    }
+
+    /// Install the shared chain-parameters handle.
+    ///
+    /// Node assembly creates one `Arc<ChainParams>` seeded from the
+    /// chain config and installs it here, on the consensus engine,
+    /// and behind the governance `chain.*` sink — the enforcement
+    /// points then read one set of atomics. Until this is called the
+    /// executor reads a private default handle, so standalone
+    /// executors behave exactly as before.
+    ///
+    /// The handle is authoritative once installed: seed it before
+    /// sharing (stores made via [`Self::with_gas_limit`]/
+    /// [`Self::with_min_fee`] on the previous handle do not carry
+    /// over).
+    #[must_use]
+    pub fn with_chain_params(mut self, params: Arc<types::ChainParams>) -> Self {
+        self.chain_params = params;
+        self
+    }
+
+    /// The shared chain-parameters handle — the `Arc` the engine and
+    /// the governance sink must see the same instance of.
+    pub fn chain_params(&self) -> Arc<types::ChainParams> {
+        Arc::clone(&self.chain_params)
+    }
+
+    /// The live block gas limit — read through the shared params so
+    /// a governance apply takes effect at the same height on every
+    /// enforcement point.
+    fn block_gas_limit(&self) -> u64 {
+        self.chain_params.max_gas.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The live minimum envelope-fee floor — same shared-params
+    /// read path as [`Self::block_gas_limit`].
+    fn min_fee(&self) -> u64 {
+        self.chain_params.min_fee.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Set how many finalized heights `finalized`/`state_roots`
@@ -1782,8 +1821,8 @@ impl Executor {
     /// floor are skipped before the fee charge (and before the nonce
     /// advances). `0` (default) = no floor.
     #[must_use]
-    pub fn with_min_fee(mut self, min_fee: u64) -> Self {
-        self.min_fee = min_fee;
+    pub fn with_min_fee(self, min_fee: u64) -> Self {
+        self.chain_params.min_fee.store(min_fee, std::sync::atomic::Ordering::Relaxed);
         self
     }
 

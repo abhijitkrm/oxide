@@ -179,8 +179,14 @@ impl std::error::Error for DevnetStartError {}
 /// Panics if `spec.index` exceeds `u16::MAX` — a validator set
 /// that large is a configuration error, not a runtime condition.
 pub fn assemble_devnet_node(spec: DevnetNodeSpec) -> Result<DevnetNode, DevnetStartError> {
-    let AssembledExecutor { app, evm_module, staking_module, exchange_module, recovery } =
-        crate::assemble_executor(&spec.config);
+    let AssembledExecutor {
+        app,
+        evm_module,
+        staking_module,
+        exchange_module,
+        recovery,
+        chain_params,
+    } = crate::assemble_executor(&spec.config);
     let app_dyn: Arc<dyn ports::AppInterface> = app.clone();
 
     let mut engine = consensus::OxideBft::with_index(
@@ -192,7 +198,11 @@ pub fn assemble_devnet_node(spec: DevnetNodeSpec) -> Result<DevnetNode, DevnetSt
     // Configured timeouts/budget — not engine-compiled defaults —
     // so a `[consensus]` TOML change reaches the harnesses too.
     .with_pacemaker_timeouts(spec.config.base_timeout_ms, spec.config.max_timeout_ms)
-    .with_block_budget(spec.config.block_budget);
+    .with_block_budget(spec.config.block_budget)
+    // The shared live params the governance `chain.*` sink writes —
+    // proposal budgeting must track the same atomics the executor
+    // enforces, or a governed budget move desyncs pack vs validate.
+    .with_chain_params(chain_params);
     if let Some(clock) = spec.clock {
         engine = engine.with_clock(move || clock());
     }

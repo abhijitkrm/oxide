@@ -322,7 +322,10 @@ impl Node {
 
         // Select the consensus engine.
         let engine: Box<dyn ConsensusEngine> = match config.consensus {
-            ConsensusConfig::Sequencer => Box::new(SequencerEngine::new(app_dyn.clone())),
+            ConsensusConfig::Sequencer => Box::new(
+                SequencerEngine::new(app_dyn.clone())
+                    .with_chain_params(assembled.chain_params.clone()),
+            ),
             ConsensusConfig::OxideBft => {
                 // oxideBFT in single-validator mode (quorum=1): the
                 // engine self-proposes, self-votes, and commits via
@@ -341,7 +344,8 @@ impl Node {
                 let mut engine = OxideBft::new(app_dyn.clone(), vs)
                     .with_secret_key(key)
                     .with_pacemaker_timeouts(config.base_timeout_ms, config.max_timeout_ms)
-                    .with_block_budget(config.block_budget);
+                    .with_block_budget(config.block_budget)
+                    .with_chain_params(assembled.chain_params.clone());
                 // Consensus WAL: restores `last_committed`, `high_qc`,
                 // and the per-height vote locks — without it a restart
                 // would re-propose from height 0 over the executor's
@@ -533,6 +537,42 @@ impl Node {
     }
 }
 
+/// The `chain.*` parameter sink — writes the shared
+/// [`types::ChainParams`] the consensus engine and executor read.
+/// Values are bare `u64` LE payloads for every key; the block-budget
+/// keys reject `0` (a block that can hold nothing is not a
+/// legitimate governable state — the chain would still finalize
+/// empty blocks, but no transaction could ever land), while
+/// `chain.min_fee` accepts `0` as "no floor".
+struct ChainParamSink(std::sync::Arc<types::ChainParams>);
+
+impl framework::ParameterSink for ChainParamSink {
+    fn apply_param(&self, key: &[u8], value: &[u8]) -> Result<(), executor::ExecError> {
+        let target = match key {
+            b"chain.block_gas_limit" => &self.0.max_gas,
+            b"chain.block_max_bytes" => &self.0.max_bytes,
+            b"chain.min_fee" => &self.0.min_fee,
+            _ => {
+                return Err(executor::ExecError::ModuleRejected(
+                    "chain: unknown governed parameter".to_string(),
+                ));
+            }
+        };
+        let Ok(v) = <[u8; 8]>::try_from(value) else {
+            return Err(executor::ExecError::Malformed);
+        };
+        let v = u64::from_le_bytes(v);
+        if key != b"chain.min_fee" && v == 0 {
+            return Err(executor::ExecError::ModuleRejected(format!(
+                "{}: block budget must be > 0",
+                String::from_utf8_lossy(key)
+            )));
+        }
+        target.store(v, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 /// The executor half of node assembly: the `Arc`'d executor plus the
 /// module handles callers need after construction.
 ///
@@ -564,6 +604,13 @@ pub struct AssembledExecutor {
     /// `Some` with an empty report, which means "durability on,
     /// nothing on disk yet" (a fresh start).
     pub recovery: Option<executor::RecoveryReport>,
+    /// The shared live chain parameters — the `Arc` already installed
+    /// on the executor and behind the governance `chain.*` sink.
+    /// Engine-construction sites (`Node::assemble`,
+    /// `assemble_devnet_node`) must hand it to the engine so
+    /// proposal budgeting and `BlockContext.gas_limit` read the same
+    /// atomics the executor enforces and governance writes.
+    pub chain_params: Arc<types::ChainParams>,
 }
 
 /// Assemble the executor + full module graph from `config`.
@@ -607,7 +654,13 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     // so the parallel threshold is configurable (default: 32 txs,
     // lowered from 100 in the block-size sweep session — rayon
     // overhead amortizes at 32+).
+    // The shared live chain parameters: one `Arc` the executor's
+    // builders write into (so configured values are already in the
+    // atomics), the engine reads for proposal budgeting, and the
+    // governance `chain.*` sink mutates on apply.
+    let chain_params = Arc::new(types::ChainParams::default());
     let mut executor = Executor::with_config(config.max_mempool_entries, config.parallel_threshold)
+        .with_chain_params(chain_params.clone())
         .with_min_fee(config.min_fee)
         // One gas source: the executor's declared-gas admission cap is
         // the same `block_budget.max_gas` consensus packs proposals
@@ -625,6 +678,12 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
         } else {
             executor::UnsignedTxPolicy::Allow
         });
+    // The byte budget has no executor consumer — proposals are
+    // packed against it consensus-side — so it is seeded here
+    // rather than through a builder.
+    chain_params
+        .max_bytes
+        .store(config.block_budget.max_bytes, std::sync::atomic::Ordering::Relaxed);
     if let Some(n) = config.history_retention {
         executor = executor.with_history_retention(n);
     }
@@ -777,12 +836,22 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     executor.register_module(oracle);
     // Governance: stake-weighted parameter lifecycle — deposits
     // escrow on the EVM ledger, staking supplies the voting power,
-    // and "exchange.*" keys route to the exchange's parameter sink
-    // (fee-vault withdrawals carry a governance mandate).
+    // and `<module>.*` keys route to the registered parameter
+    // sinks. `exchange.*` pays fee-vault withdrawals out of module
+    // custody; `staking.*`, `perps.*`, and `governance.*` move the
+    // modules' own tunables; `chain.*` writes the shared block
+    // budget / fee floor the engine and executor read — so a
+    // timelocked proposal is the only path that moves them.
     let gov = governance::GovernanceModule::new()
         .with_committee(staking_module.clone())
-        .with_ledger(evm_module.clone())
-        .with_sink("exchange", exchange.clone());
+        .with_ledger(evm_module.clone());
+    let gov_params = gov.params();
+    let gov = gov
+        .with_sink("exchange", exchange.clone())
+        .with_sink("staking", staking_module.clone())
+        .with_sink("perps", perps.clone())
+        .with_sink("governance", gov_params)
+        .with_sink("chain", Arc::new(ChainParamSink(chain_params.clone())));
     executor.register_module(Arc::new(gov));
     // Wire the exchange and perps modules into the EVM for
     // read-only precompiles (plan.md §10), then register the EVM.
@@ -809,7 +878,14 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     // multi-validator binary previously ran without it, a second
     // execution pipeline with different backpressure behavior.
     app.spawn_exec_lane();
-    AssembledExecutor { app, evm_module, staking_module, exchange_module: exchange, recovery }
+    AssembledExecutor {
+        app,
+        evm_module,
+        staking_module,
+        exchange_module: exchange,
+        recovery,
+        chain_params,
+    }
 }
 
 /// Run a simple smoke test: assemble a node, submit a tx, finalize a block.

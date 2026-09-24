@@ -296,7 +296,7 @@ impl StakingModule {
         drop(validators);
 
         let current = *framework::lock_state(&self.current_height);
-        let completion = current.saturating_add(self.unbonding_period);
+        let completion = current.saturating_add(self.unbonding_period());
         framework::lock_state(&self.unbonding).push(UnbondingEntry {
             delegator,
             validator,
