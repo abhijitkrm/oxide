@@ -621,6 +621,76 @@ fn reputation_window_survives_restart() {
     }
 }
 
+/// The pacemaker's adaptive floor is fed by the engine's injected
+/// clock: each single-step `advance_view` samples the completed
+/// view's duration into the EWMA. Sustained slow rounds raise the
+/// timeout floor above the configured base; fast rounds decay it
+/// back — the base is the floor in both directions.
+#[test]
+fn adaptive_timeout_tracks_view_durations() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let clock = Arc::new(AtomicU64::new(1_700_000_000_000));
+    let c = Arc::clone(&clock);
+    let mut engine = make_engine().with_clock(move || c.load(Ordering::Relaxed));
+    let base = engine.pacemaker.timeout_duration_ms();
+
+    // The first advance only starts the mark — there is no prior
+    // sample to measure against.
+    engine.advance_view();
+    assert_eq!(engine.pacemaker.timeout_duration_ms(), base);
+
+    // Second advance with a 1s elapsed view: the EWMA seeds at
+    // 1000 and the floor lifts to 4× — 4000 > the 2s base.
+    clock.fetch_add(1_000, Ordering::Relaxed);
+    engine.advance_view();
+    assert_eq!(engine.pacemaker.timeout_duration_ms(), 4_000);
+
+    // Sustained 1s rounds hold the floor at 4s.
+    for _ in 0..6 {
+        clock.fetch_add(1_000, Ordering::Relaxed);
+        engine.advance_view();
+    }
+    assert_eq!(engine.pacemaker.timeout_duration_ms(), 4_000);
+
+    // Fast rounds decay the EWMA until the floor returns to base.
+    for _ in 0..32 {
+        clock.fetch_add(100, Ordering::Relaxed);
+        engine.advance_view();
+    }
+    assert_eq!(engine.pacemaker.timeout_duration_ms(), base);
+}
+
+/// A view that timed out before completing must NOT feed the
+/// round-time EWMA — its duration is dead-leader-plus-timeout, not
+/// a round-trip, and feeding it back would let a crashed leader
+/// inflate the timeout floor it was excluded for. The next *clean*
+/// view still samples normally.
+#[test]
+fn timeout_views_do_not_feed_round_ema() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let clock = Arc::new(AtomicU64::new(1_700_000_000_000));
+    let c = Arc::clone(&clock);
+    let mut engine = make_engine().with_clock(move || c.load(Ordering::Relaxed));
+    let base = engine.pacemaker.timeout_duration_ms();
+
+    engine.advance_view(); // start the mark
+    // A 60s stall, a local timeout, then a late-QC advance: the
+    // dead-leader wait must not enter the EWMA.
+    clock.fetch_add(60_000, Ordering::Relaxed);
+    let _ = engine.on_timeout();
+    engine.advance_view();
+    assert_eq!(
+        engine.pacemaker.timeout_duration_ms(),
+        base,
+        "a view completed after timing out must not feed the EWMA"
+    );
+    // The next view is clean — its 1s duration samples normally
+    // and lifts the floor to 4s.
+    clock.fetch_add(1_000, Ordering::Relaxed);
+    engine.advance_view();
+    assert_eq!(engine.pacemaker.timeout_duration_ms(), 4_000);
+}
+
 /// Regression test (safety): a validator that voted for block A
 /// at height h must refuse a *different* block B at the same
 /// height, even in a later view. Without the per-height lock,

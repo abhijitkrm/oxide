@@ -463,6 +463,19 @@ pub struct OxideBft {
     /// rotation: bitmaps index into the *signing* set, and the new
     /// committee is a different index space.
     recent_signers: std::collections::VecDeque<Vec<u8>>,
+    /// The round-time mark for the pacemaker's adaptive-timeout
+    /// EWMA — when the current view started (injected-clock ms) and
+    /// whether it has already burned a local timeout. `None` until
+    /// the first view transition: at construction the clock may
+    /// still be the default (a `with_clock` override would
+    /// otherwise seed a bogus epoch-scale sample), so the first
+    /// advance skips the measurement and merely starts the mark.
+    /// A view that completes *after* timing out measures "dead
+    /// leader plus timeout", not a round-trip —
+    /// [`Self::observe_completed_view`] skips it so a crashed
+    /// leader can't masquerade as a slow network and inflate the
+    /// timeout floor it was excluded for.
+    view_round_mark: Option<ViewMark>,
     /// This engine's BLS secret key (stage 5). Used to sign votes and
     /// timeout messages. `None` in conformance mode (no real signing).
     secret_key: Option<crypto::BlsSecretKey>,
@@ -722,6 +735,21 @@ pub struct OxideBft {
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
+/// Round-time sampling mark for the adaptive timeout: the
+/// injected-clock ms at which the current view started, tagged by
+/// how the view has fared. `Clean` views that complete in a single
+/// step feed the EWMA; `TimedOut` views (a local timeout fired
+/// while the view was open) are skipped — their duration conflates
+/// a dead leader's wait with network latency.
+#[derive(Debug, Clone, Copy)]
+enum ViewMark {
+    /// View started at this clock reading; no local timeout yet.
+    Clean(u64),
+    /// A local timeout already fired in this view — duration is
+    /// dead-leader-plus-timeout, not a round-trip sample.
+    TimedOut,
+}
+
 mod commit;
 mod epoch;
 mod persist;
@@ -759,6 +787,7 @@ impl OxideBft {
             rotation_activation_height: None,
             validator_index,
             recent_signers: std::collections::VecDeque::new(),
+            view_round_mark: None,
             secret_key: None,
             pacemaker,
             high_qc: None,
@@ -1235,6 +1264,39 @@ impl OxideBft {
             }
             v = v.saturating_add(1);
         }
+    }
+
+    /// Sample the completed view's duration into the pacemaker's
+    /// adaptive-timeout EWMA, then restart the mark. Only called from
+    /// the single-step progress path (`advance_view`): a view that
+    /// ends in exactly one step is a clean round-trip measurement,
+    /// while multi-view catch-up jumps measure the replica's own
+    /// stall — and timeout-driven advances measure the timeout
+    /// itself, which fed back would inflate the estimate it sprang
+    /// from. `saturating_sub` tolerates injected clocks that jump
+    /// backwards between calls.
+    fn observe_completed_view(&mut self) {
+        let now = (self.clock)();
+        if let Some(ViewMark::Clean(started)) = self.view_round_mark {
+            self.pacemaker.observe_round_ms(now.saturating_sub(started));
+        }
+        self.restart_view_mark_at(now);
+    }
+
+    /// Restart the round-time mark without sampling — used by every
+    /// view transition that is not a clean single-step completion:
+    /// multi-view catch-up (measures the replica's own stall),
+    /// timeout/TC advances (measure the timeout), rotations, and
+    /// recovery (the mark predates the process).
+    fn restart_view_mark(&mut self) {
+        self.restart_view_mark_at((self.clock)());
+    }
+
+    /// `restart_view_mark` at a clock reading the caller already
+    /// took — avoids a second clock read when observe+restart run
+    /// in the same step.
+    fn restart_view_mark_at(&mut self, now: u64) {
+        self.view_round_mark = Some(ViewMark::Clean(now));
     }
 
     /// Our index in the *current* validator set — re-seated by epoch
@@ -1855,6 +1917,11 @@ impl OxideBft {
         // higher). When qc.view == current_view, the caller handles
         // the normal view advancement via `advance_view()`.
         if qc.view.value() > self.current_view.value() {
+            // A multi-view catch-up jump measures how long this
+            // replica went without progress, not a round-trip —
+            // reset the mark without feeding the EWMA (only the
+            // single-step `advance_view` samples cleanly).
+            self.restart_view_mark();
             // Saturating: a verified QC with view = u64::MAX would
             // wrap current_view to 0 here; saturation keeps it at
             // MAX (chain dead) instead of corrupting the view space.
@@ -1961,6 +2028,7 @@ impl OxideBft {
         // which would make the validator vote in view 0 again (double
         // vote, safety violation). Saturation stalls the chain
         // instead — the only recovery is epoch rotation.
+        self.observe_completed_view();
         self.current_view = self.current_view.saturating_next();
         self.pacemaker.sync_to_view(self.current_view);
         self.pacemaker.on_progress();
@@ -1987,6 +2055,10 @@ impl OxideBft {
         if view.value() <= self.current_view.value() {
             return false;
         }
+        // A sync-driven jump measures "how long this replica went
+        // without progress", not a round-trip — reset the mark
+        // without feeding the EWMA.
+        self.restart_view_mark();
         self.current_view = view;
         self.pacemaker.sync_to_view(self.current_view);
         self.pacemaker.on_progress();

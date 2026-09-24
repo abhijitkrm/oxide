@@ -57,6 +57,11 @@ impl OxideBft {
             // restoring it keeps post-restart exclusions identical
             // to what every live replica computes.
             self.recent_signers = entry.recent_signers.into_iter().collect();
+            // The round-time mark restarts at recovery — the rebuilt
+            // pacemaker carries no EWMA either, so the first
+            // post-restart view is measured from now, not from a
+            // timestamp that predates the crash.
+            self.restart_view_mark();
             // The recorded `current_view` lags real progress by up
             // to one view: `deliver_qc` appends before its own
             // catch-up and `advance_view` does not append at all, so
@@ -442,6 +447,7 @@ impl OxideBft {
         offset += 8;
 
         self.current_view = View::new(current_view_val);
+        self.restart_view_mark();
         self.last_voted_view =
             if last_voted_val == 0 { None } else { Some(View::new(last_voted_val)) };
         self.next_height = Height::new(next_height_val);

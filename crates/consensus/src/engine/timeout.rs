@@ -142,6 +142,12 @@ impl OxideBft {
             return None;
         }
         let _ = self.pacemaker.on_local_timeout();
+        // Latch the mark as timed-out: a view that completes *after*
+        // timing out measures dead-leader-plus-timeout, not a
+        // round-trip — `observe_completed_view` skips it. A `None`
+        // mark (timeout before any transition) latched the same way
+        // keeps the first measured view honest too.
+        self.view_round_mark = Some(crate::engine::ViewMark::TimedOut);
         // Persist the signed view BEFORE the signature leaves the
         // engine — a restart that forgot it could emit both the
         // timeout and a vote for the same view, which is exactly the
@@ -305,6 +311,9 @@ impl OxideBft {
             // formation advances the view; stale votes from the
             // old view must not pollute the new view.
             self.clear_per_view_state();
+            // A timeout-driven advance is not a round-trip sample —
+            // restart the view-start mark without observing.
+            self.restart_view_mark();
             self.current_view = self.pacemaker.current_view();
             // Record the TC that brought us into this view — the
             // next proposal we make must embed it (spec §view-
@@ -378,6 +387,8 @@ impl OxideBft {
             self.pacemaker.on_timeout_certificate(verified.tc())
         {
             self.current_view = new_view;
+            // TC-driven advance — restart the mark, no observation.
+            self.restart_view_mark();
             // Clear stale per-view state. Votes collected for the
             // old view must not pollute the new view's quorum
             // accounting (they would cause ConflictingVote errors

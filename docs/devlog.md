@@ -20966,3 +20966,46 @@ deltas are fsync variance.
 RTT-adaptive pacemaker timeouts (the second half of the M1
 recommendation) remain open — the reputation fix removes the
 per-cycle timeout burn, adaptive sizing is a separate optimization.
+
+### Pacemaker timeouts adapt to the observed network
+
+`docs/audit002.md` M1 residual: the view timeout was a fixed
+configured base — 2 s default, 5 s on the mainnet profile —
+regardless of what the network actually delivers. Too short for a
+genuinely slow WAN and views churn through timeout certificates on
+healthy leaders; too long and every real fault pays for headroom
+it doesn't need.
+
+The pacemaker now carries an EWMA (α = 1/8) of *successful* view
+durations, fed by the engine's injected clock at each single-step
+`advance_view`: a view that completes in one step is a clean
+round-trip measurement — propagation + vote collection + QC,
+exactly what the timeout must outlast. The effective floor is
+`clamp(4 × EWMA, configured_base, max_timeout)`: adaptation only
+ever *raises* the timeout — the configured base stays the
+operator's floor, and the max cap bounds it identically to the
+existing backoff.
+
+The sampling discipline is the load-bearing part:
+
+- Timed-out views are excluded via a `ViewMark::TimedOut` latch
+  set in `on_timeout` — their duration is dead-leader-plus-timeout,
+  and feeding it back would let a crashed validator inflate the
+  very floor it was excluded for (the reputation fix and the
+  adaptive floor would otherwise fight: exclusion skips the dead
+  leader, the inflated floor slows the recovery).
+- Multi-view catch-up jumps and syncs restart the mark without
+  sampling — they measure the replica's own stall, not the
+  network's round-trip.
+- The EWMA is deliberately not WAL-persisted: timeouts are local
+  scheduler state, never consensus inputs, and ~8 successful views
+  re-converge the estimate after a restart.
+
+Regression tests: `adaptive_timeout_tracks_view_durations` and
+`timeout_views_do_not_feed_round_ema` drive the engine on an
+injected atomic clock (floor lifts to 4× after a 1 s view, decays
+back on fast rounds, post-timeout views stay unsampled);
+`adaptive_timeout_tracks_observed_rounds`,
+`adaptive_timeout_caps_at_max`, and `backoff_doubles_from_adapted_base`
+pin the pacemaker arithmetic directly. No bench delta worth
+measuring — the hot path gained three integer ops per view.

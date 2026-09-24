@@ -123,6 +123,19 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     Now the others quietly take its turns until it shows up again,
     and it earns them back by voting.
 
+- **View timeouts now track the observed network** (`consensus`):
+  the pacemaker keeps an EWMA of successful view durations and the
+  effective timeout floor is `max(configured_base, 4 × EWMA)`, capped
+  at the configured max — a validator on a slow WAN stops churning
+  premature view changes, while the configured base remains the
+  floor in the other direction. Views that timed out before
+  completing are excluded from the estimate so a dead leader can't
+  inflate the floor it was excluded for.
+  - **In plain words:** the "how long do we wait for the leader"
+    timer used to be a fixed guess. Now it learns from how fast the
+    network is actually finishing rounds — slower network, longer
+    leash; it never goes below the configured timeout.
+
 - **View changes now recover over real TCP** (`oxide-devnet`): a
   wire-framing bug in the timeout decoder read both certificate
   flags before the certificate bytes, so every peer timeout

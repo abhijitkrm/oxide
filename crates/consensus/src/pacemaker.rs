@@ -151,6 +151,16 @@ pub struct Pacemaker {
     /// backoff. Configurable via [`Pacemaker::with_config`]. Default:
     /// [`DEFAULT_MAX_TIMEOUT_MS`] (30000 ms).
     max_timeout_ms: u64,
+    /// EWMA of observed *successful* view durations in milliseconds —
+    /// the RTT-adaptive signal (α = 1/8: a fresh sample moves the
+    /// estimate one eighth of the distance, converging in ~8 views
+    /// and tolerating single outliers). `0` doubles as "no samples":
+    /// a genuinely instant round needs no adaptation anyway, so the
+    /// configured floor applies unmodified. Fed only by views that
+    /// completed (QC adopted / commit) — a timed-out view's duration
+    /// *is* the current timeout, and feeding it back would inflate
+    /// the estimate it sprang from.
+    round_ema_ms: u64,
 }
 
 impl Pacemaker {
@@ -200,6 +210,7 @@ impl Pacemaker {
             current_timeout_ms: base_timeout_ms,
             base_timeout_ms,
             max_timeout_ms,
+            round_ema_ms: 0,
         }
     }
 
@@ -251,6 +262,42 @@ impl Pacemaker {
     #[must_use]
     pub fn timeout_duration_ms(&self) -> u64 {
         self.current_timeout_ms
+    }
+
+    /// Record the wall-clock duration of a view that *completed*
+    /// (its QC was adopted or its block committed). The engine reads
+    /// its injected clock at view start and calls this on every
+    /// progress-driven advance; timeout-driven advances are not
+    /// observed — a failed view measures the timeout, not the
+    /// network.
+    ///
+    /// The estimate raises the timeout *floor* only (see
+    /// [`Self::effective_base_ms`]): a slow network stops churning
+    /// through premature view changes, while the configured base
+    /// remains the operator's floor — adaptation never shortens a
+    /// timeout below it.
+    pub fn observe_round_ms(&mut self, ms: u64) {
+        self.round_ema_ms = if self.round_ema_ms == 0 {
+            ms
+        } else {
+            self.round_ema_ms.saturating_mul(7).saturating_add(ms) / 8
+        };
+    }
+
+    /// The base timeout actually applied after progress: the
+    /// configured floor, raised to `ADAPTIVE_ROUND_MULT × EWMA` when
+    /// observed rounds consistently exceed it, capped at
+    /// `max_timeout_ms`. A view's timeout must comfortably exceed a
+    /// healthy round-trip; `ADAPTIVE_ROUND_MULT = 4` prices proposal
+    /// propagation + vote collection + jitter at four observed
+    /// round-trips (DiemBFT-family practice is ~2–4×) — tighter
+    /// would churn views on ordinary latency spikes, looser would
+    /// take longer to re-converge after a sustained slowdown.
+    fn effective_base_ms(&self) -> u64 {
+        const ADAPTIVE_ROUND_MULT: u64 = 4;
+        self.round_ema_ms
+            .saturating_mul(ADAPTIVE_ROUND_MULT)
+            .clamp(self.base_timeout_ms, self.max_timeout_ms)
     }
 
     /// The leader for the current view.
@@ -390,8 +437,10 @@ impl Pacemaker {
         self.state = PacemakerState::Active;
         self.reset_view_state();
         // Reset backoff: progress means the current leader is working,
-        // so the next timeout should be the base duration again.
-        self.current_timeout_ms = self.base_timeout_ms;
+        // so the next timeout should be the base duration again —
+        // the *effective* base, raised by the round-time EWMA when
+        // the network is slower than the configured floor assumes.
+        self.current_timeout_ms = self.effective_base_ms();
         // Always reset the timer on progress, whether or not we were
         // timed out — a valid proposal resets the view timer.
         let _ = was_timed_out;
@@ -658,5 +707,66 @@ mod tests {
         let pm = Pacemaker::new(vs, View::new(0), Epoch::new(0));
         // For equal stakes, leader(0) = validator 0.
         assert_eq!(pm.current_leader(), 0);
+    }
+
+    /// The adaptive floor: sustained 1s rounds push the effective
+    /// base to 4×EWMA (the floor lifts above the configured base),
+    /// and fast rounds decay it back — the configured base is the
+    /// floor in both directions.
+    #[test]
+    fn adaptive_timeout_tracks_observed_rounds() {
+        let mut pm = Pacemaker::new(vs4(), View::new(0), Epoch::new(0));
+        assert_eq!(pm.timeout_duration_ms(), DEFAULT_BASE_TIMEOUT_MS);
+        // One 1s sample seeds the EWMA; progress then applies the
+        // raised floor: 4 × 1000 = 4000 > 2000 base.
+        pm.observe_round_ms(1_000);
+        pm.on_progress();
+        assert_eq!(pm.timeout_duration_ms(), 4_000);
+        // Sustained 1s rounds hold the floor at 4s.
+        for _ in 0..8 {
+            pm.observe_round_ms(1_000);
+        }
+        pm.on_progress();
+        assert_eq!(pm.timeout_duration_ms(), 4_000);
+        // Fast rounds decay the EWMA below base/4 — the configured
+        // base returns (adaptation never goes below it).
+        for _ in 0..64 {
+            pm.observe_round_ms(10);
+        }
+        pm.on_progress();
+        assert_eq!(pm.timeout_duration_ms(), DEFAULT_BASE_TIMEOUT_MS);
+    }
+
+    /// A pathologically slow network cannot push the floor past the
+    /// configured max — the cap bounds adaptation exactly like
+    /// backoff.
+    #[test]
+    fn adaptive_timeout_caps_at_max() {
+        let mut pm = Pacemaker::with_config(vs4(), View::new(0), Epoch::new(0), 2_000, 30_000);
+        for _ in 0..8 {
+            pm.observe_round_ms(60_000);
+        }
+        pm.on_progress();
+        assert_eq!(pm.timeout_duration_ms(), 30_000);
+    }
+
+    /// Backoff still doubles from the *effective* base: a timed-out
+    /// view on a slow network doubles the adapted floor, and progress
+    /// resets back to it — not to the configured base.
+    #[test]
+    fn backoff_doubles_from_adapted_base() {
+        let mut pm = Pacemaker::new(vs4(), View::new(0), Epoch::new(0));
+        pm.observe_round_ms(1_000);
+        pm.on_progress();
+        assert_eq!(pm.timeout_duration_ms(), 4_000);
+        // A timeout doubles the adapted floor (4000 → 8000).
+        let _ = pm.on_local_timeout();
+        let _ = pm.on_timeout_signature(0, sig(1));
+        let _ = pm.on_timeout_signature(1, sig(2));
+        let _ = pm.on_timeout_signature(2, sig(3));
+        assert_eq!(pm.timeout_duration_ms(), 8_000);
+        // Progress resets to the adapted floor, still 4s.
+        pm.on_progress();
+        assert_eq!(pm.timeout_duration_ms(), 4_000);
     }
 }

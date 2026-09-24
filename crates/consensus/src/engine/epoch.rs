@@ -92,6 +92,9 @@ impl OxideBft {
         // already dead at epoch u64::MAX.
         self.epoch = self.epoch.saturating_next();
         self.current_view = View::new(0);
+        // The new epoch's first view starts the round-time mark
+        // fresh — the pacemaker rebuild discards the old EWMA too.
+        self.restart_view_mark();
         self.clear_epoch_scoped_state();
         // Persist the cleared locks: a crash between rotation and the
         // next vote would otherwise restore the old epoch's locks
@@ -216,6 +219,7 @@ impl OxideBft {
         // The QC that triggered this adoption bumps us to
         // `qc.view + 1` on the way out.
         self.current_view = View::new(0);
+        self.restart_view_mark();
         self.clear_epoch_scoped_state();
         let _ = self.append_wal_full(true);
         self.pacemaker = crate::pacemaker::Pacemaker::with_config(
