@@ -15,8 +15,9 @@
 //! | `vote_on_proposal`       | < 30 µs    | verdict + BLS sign (if keyed)   |
 //! | `block_hash`             | < 500 ns   | BLAKE3 hash of ~100B header     |
 //! | `vote_signed_wal`        | < 20 ms    | fsync + sign + proposer verify  |
+//! | `propose_signed_wal`     | < 20 ms    | fsync + header build + BLS sign |
 //! | `form_qc_signed_wal`     | < 25 ms    | 3×collect + agg + self-verify   |
-//! | `deliver_qc_signed_wal`  | < 20 ms    | aggregate verify + high_qc fsync|
+//! | `deliver_qc_signed_wal`  | < 5 ms     | aggregate verify + deferred WAL |
 //!
 //! The `propose` and `vote` benches exclude BLS signing (the engine
 //! uses `Signature::ZERO` in conformance mode); the crypto crate
@@ -32,10 +33,15 @@
 //! regressions rather than pinning an absolute hardware budget.
 //!
 //! Measured on the dev Mac (M-series, NVMe): `vote_signed_wal`
-//! 5.7 ms, `form_qc_signed_wal` 6.3 ms, `deliver_qc_signed_wal`
-//! 5.7 ms — i.e. the honest per-view vote budget is ~6 ms, not the
-//! ~1 µs the conformance bench suggests; the durable WAL write is
-//! the dominant term, exactly what the audit asked to be measured.
+//! 5.6 ms, `propose_signed_wal` 5.2 ms, `form_qc_signed_wal`
+//! 2.4 ms, `deliver_qc_signed_wal` 1.4 ms — i.e. the honest
+//! per-view vote budget is ~6 ms, not the ~1 µs the conformance
+//! bench suggests; the durable WAL write is the dominant term,
+//! exactly what the audit asked to be measured. With fsync
+//! batching the per-view durable-write budget dropped from ~3
+//! fsyncs (~17 ms) to 1 for a follower (~5.6 ms) and 2 for a
+//! leader (~10.8 ms: proposal + self-vote) — every non-signature
+//! state record rides the next signature's `sync_data`.
 
 use consensus::wal::Wal;
 use consensus::{OxideBft, ValidatorSet};
@@ -183,10 +189,39 @@ fn bench_qc_signed_wal(c: &mut Criterion) {
     });
 }
 
+/// The leader's per-view proposal cost in production: `propose`
+/// pays the fsync that used to live in `deliver_qc`'s adoption
+/// append — the proposal signature binds the adopted `high_qc`, so
+/// it must be durable before it leaves. Measures the fsync +
+/// header build + BLS sign the leader pays per view.
+fn bench_propose_signed_wal(c: &mut Criterion) {
+    c.bench_function("propose_signed_wal", |b| {
+        b.iter_batched(
+            || {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let keys = production_keys();
+                // Validator 0 leads view 0; genesis propose is
+                // unconditional, so a fresh engine always emits.
+                let leader = setup_production_engine(&dir, &keys, 0);
+                (leader, dir)
+            },
+            |(mut leader, _dir)| {
+                black_box(leader.propose());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 /// The receiver's per-view cost in production: a QC arrives on the
 /// wire (from another peer or the leader's broadcast); `deliver_qc`
 /// verifies the aggregate signature, adopts the new `high_qc`, and
-/// fsyncs it to the WAL before the QC can drive anything further.
+/// records it in the WAL. Since the fsync batching change the
+/// adoption append is *deferred* — flushed but not synced, made
+/// durable by the next signature-path append — so this bench now
+/// isolates the aggregate verify + frame encode + write, with no
+/// fsync in the loop. The gate drops accordingly: what remains is
+/// pure crypto and a ~200 B write, not a durable store.
 fn bench_deliver_qc_signed_wal(c: &mut Criterion) {
     c.bench_function("deliver_qc_signed_wal", |b| {
         b.iter_batched(
@@ -221,6 +256,7 @@ criterion_group!(
     bench_vote,
     bench_block_hash,
     bench_vote_signed_wal,
+    bench_propose_signed_wal,
     bench_qc_signed_wal,
     bench_deliver_qc_signed_wal
 );

@@ -209,16 +209,23 @@ impl OxideBft {
         // extend while `high_qc` is `None` (post-rotation boundary,
         // or a node that has committed but not yet adopted a QC).
         // It is persisted safety state (WalEntry/save_state), so the
-        // advance must hit the WAL before we act on it: otherwise a
-        // crash → restart → rotation sequence would WAL-append the
-        // *stale* anchor and the new epoch's first proposals would
-        // collide with it (or worse, a `None` restore would accept
-        // a forged genesis chain in a later epoch).
+        // advance must reach the WAL before any signature that
+        // could act on it — which every signature path guarantees by
+        // syncing first. The append is deferred (no fsync of its
+        // own): a crash that loses it rolls `last_committed` back,
+        // peers re-deliver the QC, and the commit walk re-commits —
+        // the executor dedupes the re-finalize by its
+        // `next_proposal_height` watermark, so the rollback window
+        // cannot double-apply. A synced append here would still be
+        // ordered before later signatures identically, so deferral
+        // cannot append a *stale* anchor over a rotation either:
+        // `append_wal_full(true)` at the boundary serializes live
+        // state.
         self.last_committed = Some((block_hash, header.height));
         // A failed append latches `wal_failed` (C10): the commit is
         // already real in memory and cannot be undone, but signing
         // must stop — durable state may now trail emitted signatures.
-        let _ = self.append_wal();
+        let _ = self.append_wal_deferred();
         // Prune per-height vote locks at-or-below the committed
         // height: a finalized prefix cannot be forked, so the lock
         // is no longer needed. Keeps the map bounded by the number

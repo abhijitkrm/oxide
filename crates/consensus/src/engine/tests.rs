@@ -5081,6 +5081,152 @@ fn wal_auto_compaction_bounds_file_and_preserves_recovery() {
     }
 }
 
+/// Fsync batching: the WAL pays one `sync_data` per *signature
+/// emission*, not per state mutation. QC adoptions and commit
+/// markers flush their frames but defer the fsync onto the next
+/// signature-path append, so a happy-path view costs a voter one
+/// fsync (its vote) and a leader two (proposal + self-vote) —
+/// not one per adopted QC, committed block, and vote. The
+/// regression this guards: a refactor that re-syncs deferred
+/// records would silently triple the durable-write budget.
+#[test]
+fn wal_fsyncs_once_per_signature_emission() {
+    use crate::wal::Wal;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let syncs = |e: &OxideBft| e.wal.as_ref().expect("wal attached").sync_count();
+
+    // Real BLS keys + real WALs: conformance engines sign nothing,
+    // so `propose` would skip its pre-signature fsync and the
+    // leader count would read 1 instead of 2.
+    let keys: Vec<crypto::BlsSecretKey> = (1u8..=4).map(bls_key).collect();
+    let pks: Vec<crypto::bls::PublicKey> =
+        keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+    let vs = ValidatorSet::new(pks, vec![1; 4]).expect("4 validators");
+    let mut engines: Vec<OxideBft> = (0u16..4)
+        .map(|i| {
+            let wal = Wal::open(dir.path().join(format!("wal-{i}.log"))).expect("open WAL");
+            OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), i)
+                .with_secret_key(keys[usize::from(i)].clone())
+                .with_wal(wal)
+        })
+        .collect();
+
+    // Three full views: view 1's QC commits view 0's block (the
+    // deferred commit marker) and view 2's commits view 1's, so
+    // every append class — proposal, vote, adoption, commit —
+    // runs inside the counted window.
+    for view in 0..3u64 {
+        let leader_pos = usize::from(engines[0].validator_set.leader(View::new(view)));
+        let pre: Vec<u64> = engines.iter().map(syncs).collect();
+
+        let leader = &mut engines[leader_pos];
+        leader.submit_tx(TxBytes::new(vec![u8::try_from(view).expect("view fits u8") + 1]));
+        let (header, proposal) = leader.propose().expect("view's leader proposes");
+        assert_eq!(
+            syncs(leader) - pre[leader_pos],
+            1,
+            "proposal signature pays exactly one fsync (view {view})"
+        );
+        let lidx = leader.validator_index;
+        let self_vote = leader.vote(&header, &proposal).expect("leader self-votes");
+        leader.collect_vote(lidx, self_vote).expect("collect self-vote");
+        assert_eq!(
+            syncs(leader) - pre[leader_pos],
+            2,
+            "leader pays one fsync per signature: proposal + self-vote (view {view})"
+        );
+
+        // Followers vote — one fsync each. Votes are gathered first
+        // so the leader borrow doesn't overlap the iteration.
+        let mut votes: Vec<(usize, types::Vote)> = Vec::new();
+        for (i, engine) in engines.iter_mut().enumerate() {
+            if i == leader_pos {
+                continue;
+            }
+            let Some(vote) = engine.vote(&header, &proposal) else { continue };
+            assert_eq!(
+                syncs(engine) - pre[i],
+                1,
+                "follower {i} pays one fsync per view (view {view})"
+            );
+            votes.push((i, vote));
+        }
+        let leader = &mut engines[leader_pos];
+        for (i, ballot) in votes {
+            let voter_idx = u16::try_from(i).expect("validator index fits u16");
+            leader.collect_vote(voter_idx, ballot).expect("collect follower vote");
+        }
+
+        let qc = leader.try_form_qc().expect("quorum reached");
+        // QC adoption + the commit it triggers are deferred records:
+        // frames flush to the file but no fsync fires — they ride
+        // the next view's signature-path appends.
+        for (i, engine) in engines.iter_mut().enumerate() {
+            engine.deliver_qc(qc.clone()).expect("adopt QC");
+            assert_eq!(
+                syncs(engine) - pre[i],
+                if i == leader_pos { 2 } else { 1 },
+                "QC adoption and commit must not fsync (engine {i}, view {view})"
+            );
+            engine.advance_view();
+        }
+    }
+}
+
+/// Deferred WAL frames become durable at the next signature's fsync:
+/// adopt a QC (no fsync), then emit a timeout signature (one fsync)
+/// — a restart must recover BOTH the adopted `high_qc` and the
+/// timeout bar, proving the deferred frame rode the signature's
+/// `sync_data` rather than paying its own.
+#[test]
+fn deferred_wal_frames_ride_next_signature_fsync() {
+    use crate::wal::Wal;
+    use tempfile::tempdir;
+
+    // A real QC from a conformance cluster (no WALs needed there).
+    let mut aux: Vec<OxideBft> = (0u16..4).map(make_multi_engine).collect();
+    let (l, rest) = aux.split_first_mut().expect("nonempty");
+    let mut f: Vec<&mut OxideBft> = rest.iter_mut().collect();
+    let qc = drive_round(l, &mut f, Some(TxBytes::new(vec![1])));
+
+    let dir = tempdir().expect("tempdir");
+    let wal_path = dir.path().join("voter.wal");
+    {
+        let wal = Wal::open(&wal_path).expect("open WAL");
+        let mut voter = make_multi_engine(1).with_wal(wal);
+        voter.deliver_qc(qc.clone()).expect("adopt QC");
+        assert_eq!(
+            voter.wal.as_ref().expect("wal attached").sync_count(),
+            0,
+            "QC adoption must not fsync — the frame waits for the next signature"
+        );
+        // The timeout signature is a signature emission: its append
+        // fsyncs, covering the deferred adoption frame behind it.
+        voter.on_timeout().expect("timeout signature emitted");
+        assert_eq!(
+            voter.wal.as_ref().expect("wal attached").sync_count(),
+            1,
+            "timeout emission pays the view's only fsync"
+        );
+    }
+
+    // Restart: both records must be durable — the adoption only
+    // survived because the timeout's fsync covered it.
+    let wal = Wal::open(&wal_path).expect("reopen WAL");
+    let mut voter = make_multi_engine(1).with_wal(wal);
+    voter.recover_from_wal().expect("recover from WAL");
+    assert_eq!(
+        voter.high_qc.as_ref().map(crate::verify::VerifiedQc::qc),
+        Some(&qc),
+        "deferred adoption must be durable after the signature's fsync"
+    );
+    // Catch-up requires qc.view > current_view (strict); adopting a
+    // view-0 QC while at view 0 leaves the view at 0.
+    assert_eq!(voter.timeout_signed_view, Some(View::new(0)));
+}
+
 /// Restart continuity: the WAL must restore the uncommitted chain
 /// tail, not just safety metadata. `blocks` is in-memory only, and
 /// the recovered `high_qc` anchors into it — `propose()` stamps

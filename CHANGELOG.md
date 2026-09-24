@@ -51,6 +51,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - **In plain words:** the parsers that used to allocate ~25–31
     times per message now allocate nothing at all.
 
+- **Consensus WAL fsync batching** (`consensus`): the write-ahead
+  log used to `fsync` after every state change — vote locks, QC
+  adoptions, commits — ~3 `sync_data` calls per view (~17 ms on
+  dev-Mac NVMe, the dominant per-view cost). Non-signature state
+  (QC adoption, commit markers) now writes its frame without
+  fsyncing and rides the *next* signature's fsync — fsync covers
+  all flushed frames, and every signature emission (vote, timeout,
+  proposal) still syncs its safety state first. The leader path
+  gained an explicit pre-signature fsync inside `propose` (it
+  previously relied on the adoption append's ordering). Measured:
+  `deliver_qc_signed_wal` 5.9 ms → 1.4 ms (−76%),
+  `form_qc_signed_wal` −64%; per-view fsync count is pinned by a
+  `sync_count` regression test (voter = 1, leader = 2).
+  - **In plain words:** a validator used to pay ~3 disk-syncs per
+    consensus round; it now pays 1 (2 when it's the leader), so
+    rounds finalize roughly 3× cheaper on storage — with the same
+    crash-safety guarantee that no signature leaves before its
+    state is durable.
+
 ### Fixed
 
 - **TLS peer writes no longer queue behind the reader's poll**

@@ -1487,6 +1487,21 @@ impl OxideBft {
                 // view.
                 .filter(|cert| cert.epoch == self.epoch),
         };
+        // Durability before signature: the proposal binds the adopted
+        // `high_qc`, `current_view`, and embedded TC — all safety
+        // state the anti-equivocation rules protect. With QC adoption
+        // now WAL-deferred, this synced append is what carries that
+        // context durable before the leader's signature can leave:
+        // a crash without it restarts amnesiac, and a re-proposal at
+        // this view emits a second, different signed proposal — the
+        // wire-level equivocation the WAL exists to prevent. A failed
+        // append latches `wal_failed` inside `append_wal`; refuse to
+        // sign rather than emit a signature over undurable state.
+        // Conformance mode (no secret key) signs nothing, so it pays
+        // no fsync here.
+        if self.secret_key.is_some() && self.append_wal().is_err() {
+            return None;
+        }
         // C3 fix: sign the header with the leader's BLS secret key.
         // The signature authenticates that the claimed proposer
         // actually created this proposal — preventing a byzantine
@@ -1696,12 +1711,18 @@ impl OxideBft {
 
         // Update the highest QC.
         self.high_qc = Some(verified);
-        // C9 fix: persist the updated high_qc to the WAL. A
+        // C9 fix: persist the updated high_qc to the WAL — deferred:
+        // the frame is flushed but not fsynced, and becomes durable
+        // at the next signature-path append (every signature
+        // emission — vote, timeout, proposal — still fsyncs its
+        // safety state first, and that fsync covers this frame).
+        // A crash in the gap loses the adoption; peers re-gossip
+        // the QC on reconnect, so the window is self-healing. A
         // restarted validator must propose from the correct
         // high_qc; without persistence, it could propose a stale
         // fork. A failure latches `wal_failed` (C10) — this engine
         // must not sign again until restarted on healthy storage.
-        let _ = self.append_wal();
+        let _ = self.append_wal_deferred();
 
         // Catch-up: if the QC's view is higher than our current view,
         // advance our view to qc.view + 1. This lets a restarted or

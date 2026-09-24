@@ -584,6 +584,10 @@ pub struct Wal {
     /// lowered by tests via [`set_compact_threshold`](Self::set_compact_threshold)
     /// to exercise the path without writing megabytes.
     compact_after: u64,
+    /// Signature-path fsync counter — see [`sync_count`](Self::sync_count).
+    /// Checkpoint fsyncs (`atomic_replace` inside [`checkpoint`]) are
+    /// compaction events, not signature emissions, and are not counted.
+    syncs: u64,
 }
 
 impl Wal {
@@ -613,6 +617,7 @@ impl Wal {
             poisoned: false,
             bytes_since_checkpoint: 0,
             compact_after: COMPACT_AFTER_BYTES,
+            syncs: 0,
         };
         // Repair before any append can land after the damaged bytes,
         // then seed the compaction counter with the repaired length:
@@ -709,6 +714,34 @@ impl Wal {
     ///
     /// Returns [`WalError::Io`] if the write or fsync fails.
     pub fn append(&mut self, entry: &WalEntry) -> Result<(), WalError> {
+        self.append_unsynced(entry)?;
+        self.sync()
+    }
+
+    /// Append a WAL entry WITHOUT fsyncing it.
+    ///
+    /// The frame is flushed to the file (a `write` syscall, not
+    /// merely the userspace buffer) so it is covered by the *next*
+    /// `sync_data` this `Wal` performs: fsync durability is a
+    /// property of the file at sync time, not of the write call, so
+    /// every frame flushed before an [`append`](Self::append) shares
+    /// that append's fsync. That is the batching contract the engine
+    /// relies on — state records no pending signature depends on
+    /// (QC adoptions, commit markers) are appended here and made
+    /// durable by the next signature-gated append instead of paying
+    /// their own fsync.
+    ///
+    /// A crash between this call and the next [`append`](Self::append)
+    /// may lose the frame: recovery tolerates either presence or
+    /// absence, so callers must only defer state that peers can
+    /// re-deliver (QCs re-gossip) or that an idempotent downstream
+    /// re-applies (the executor's `next_proposal_height` watermark
+    /// dedupes re-finalized blocks).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError::Io`] if the write fails.
+    pub fn append_unsynced(&mut self, entry: &WalEntry) -> Result<(), WalError> {
         // Fault-injection latch (tests only): fail before touching
         // the file, the same outcome an ENOSPC write produces.
         if self.poisoned {
@@ -716,12 +749,41 @@ impl Wal {
         }
         let frame = frame_entry(entry)?;
         self.writer.write_all(&frame)?;
+        // Flush to the file even though nothing is synced yet —
+        // otherwise the deferred frame would sit in the BufWriter
+        // and a later `sync_data` would fsync a file that does not
+        // contain it, silently breaking the batching contract.
         self.writer.flush()?;
-        // fsync the underlying file (not just the buffer).
-        self.writer.get_ref().sync_data()?;
         self.bytes_since_checkpoint =
             self.bytes_since_checkpoint.saturating_add(frame.len() as u64);
         Ok(())
+    }
+
+    /// `sync_data` the WAL file, making every flushed frame durable.
+    ///
+    /// Covers all frames written so far — including any written by
+    /// [`append_unsynced`](Self::append_unsynced) — because fsync
+    /// acts on the file's state at call time. That one-call-many-
+    /// frames property is what makes deferred appends free.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError::Io`] if the fsync fails.
+    fn sync(&mut self) -> Result<(), WalError> {
+        self.writer.get_ref().sync_data()?;
+        self.syncs = self.syncs.saturating_add(1);
+        Ok(())
+    }
+
+    /// Number of `sync_data` calls this `Wal` has issued.
+    ///
+    /// Test/bench instrumentation for the fsync-batching contract:
+    /// the engine must issue exactly one fsync per signature
+    /// emission, so a happy-path view costs a voter one sync
+    /// (its vote) and a leader two (proposal + self-vote).
+    #[doc(hidden)]
+    pub fn sync_count(&self) -> u64 {
+        self.syncs
     }
 
     /// Whether appended bytes since the last checkpoint have reached

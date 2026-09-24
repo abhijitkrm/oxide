@@ -236,6 +236,47 @@ impl OxideBft {
         &mut self,
         include_set: bool,
     ) -> Result<(), crate::wal::WalError> {
+        self.append_wal_inner(include_set, true)
+    }
+
+    /// Record current state in the WAL WITHOUT paying an fsync.
+    ///
+    /// The frame is flushed to the file and becomes durable at the
+    /// next signature-path [`append_wal`](Self::append_wal): fsync
+    /// covers every frame already written, so the deferred record
+    /// rides that fsync for free. This is the fsync-batching half of
+    /// the durability contract — the invariant it must never break
+    /// is that every signature emission is still preceded by a
+    /// synced append, so deferred state is only ever *at most one
+    /// crash window* behind. Only state peers can re-deliver (QC
+    /// adoptions) or that re-applies idempotently (commit markers —
+    /// the executor dedupes by `next_proposal_height`) may be
+    /// deferred; the divergence latch, timeout bars, vote locks, and
+    /// epoch-set trailers all keep their synced appends.
+    ///
+    /// A failed write still latches [`Self::wal_failed`] — an
+    /// undurable write is the same dead-disk signal whether or not
+    /// it fsynced.
+    ///
+    /// # Errors
+    /// Returns [`crate::wal::WalError`] when the append fails.
+    pub(crate) fn append_wal_deferred(&mut self) -> Result<(), crate::wal::WalError> {
+        self.append_wal_inner(false, false)
+    }
+
+    /// Shared append body: `sync` selects the durability mode.
+    /// `true` is the signature-path contract (fsync before the
+    /// signature leaves); `false` is the deferred record that rides
+    /// the next synced append. Both run the same fail-closed latch
+    /// and the same compaction check — the checkpoint fsyncs via
+    /// `atomic_replace`, so even a node that never signs (observer
+    /// engines with no secret key) keeps a bounded, periodically
+    /// durable WAL.
+    fn append_wal_inner(
+        &mut self,
+        include_set: bool,
+        sync: bool,
+    ) -> Result<(), crate::wal::WalError> {
         if self.wal.is_none() {
             return Ok(());
         }
@@ -244,7 +285,8 @@ impl OxideBft {
         // field list — the pending tail travels with every append.
         let entry = self.wal_entry(include_set);
         let wal = self.wal.as_mut().expect("checked above");
-        if let Err(err) = wal.append(&entry) {
+        let write_result = if sync { wal.append(&entry) } else { wal.append_unsynced(&entry) };
+        if let Err(err) = write_result {
             // Latch + alert once: repeated failures of a dead
             // disk would otherwise spam stderr every view.
             if !self.wal_failed {

@@ -20809,3 +20809,49 @@ explicit zero slot upstream produces a *different* root (a present
 leaf with RLP 0x80), which is exactly why the module-level filter is
 load-bearing — upstream semantics alone would diverge us from
 Ethereum. No migration needed: pre-alpha, no shipped state.
+
+### Consensus WAL — one fsync per signature emission
+
+audit002 M3: `Wal::append` fsynced every call, and the engine
+appended after every vote lock, QC adoption, commit, and rotation —
+~3 `sync_data` calls per happy-path view (~17 ms of durable-write
+budget on the dev Mac's NVMe, dominating the ~1 µs of actual
+consensus work). The fix folds the non-signature appends into the
+signature paths' fsyncs:
+
+- `Wal::append_unsynced` writes + flushes the frame but skips
+  `sync_data`. The flush matters — a frame sitting in the
+  `BufWriter` would NOT be covered by a later fsync; flushed bytes
+  are, because fsync acts on file state at call time.
+- `OxideBft::append_wal_deferred` uses it for `deliver_qc`'s
+  `high_qc` adoption and the commit marker (`last_committed`
+  advance). Both are re-healable state: a crash that loses the
+  frame rolls back, peers re-gossip the QC, and the commit walk
+  re-commits — the executor dedupes re-finalized heights by its
+  `next_proposal_height` watermark, so the rollback cannot
+  double-apply.
+- `propose_inner` now runs `append_wal` BEFORE signing — the
+  proposal signature binds the adopted `high_qc`/view/TC, and with
+  adoption deferred this fsync is what carries that context
+  durable. Previously the leader relied on `deliver_qc` having
+  appended; now the signature's durability gate is local and
+  explicit. A failed append still refuses to sign (`wal_failed`
+  latch unchanged).
+- Unchanged syncs: vote (`votes.rs`), self-vote, timeout
+  (`timeout.rs` — the timeout bar must precede its signature), the
+  divergence latch (forgetting it would resume signing over proven-
+  wrong state), and epoch transitions (`append_wal_full(true)` —
+  rare, and they carry the validator-set trailer deferred entries
+  never write).
+
+Net per view: a voter pays 1 fsync (was ~3), a leader 2
+(proposal + self-vote; was ~3). Measured on the dev Mac:
+`deliver_qc_signed_wal` 5.9 ms → 1.38 ms (−76%, fsync gone —
+what's left is the aggregate verify + ~200 B write),
+`form_qc_signed_wal` −64% (its `deliver_qc` tail), new
+`propose_signed_wal` 5.2 ms pins the leader-side fsync honestly.
+Regression tests: `wal_fsyncs_once_per_signature_emission` counts
+`sync_data` calls per view (voter=1, leader=2) via a `sync_count`
+instrumentation counter, and `deferred_wal_frames_ride_next_
+signature_fsync` proves a deferred adoption is durable after the
+next timeout signature's fsync.
