@@ -1,26 +1,28 @@
 //! oxide-fullnode — the full node binary.
 //!
-//! Runs the executor + modules without a consensus engine (read-only
-//! follower mode). Configuration is loaded from TOML + env vars + CLI
-//! flags (same layered model and the same `node::node_config_from`
-//! conversion as `oxide-validator` — both binaries run identical
-//! effective config).
+//! Two modes, one trust model:
 //!
-//! Follower mode (consensus sync from the network) is **not
-//! implemented**: the only honest function today is
-//! `--state-sync` + `--verify-only` — fetch a snapshot whose
-//! `(height, state_root)` is anchored by a quorum-signed execution
-//! certificate verified against a validator-set checkpoint, import
-//! it, and exit 0. Without `--verify-only` the process exits
-//! non-zero rather than claim a "ready" node that cannot follow the
-//! chain.
+//! - **Follower mode** (`--consensus-peer`): a non-signing replica
+//!   that joins the authenticated peer transport as an *observer*,
+//!   pulls certified blocks through the same block-sync protocol
+//!   validators use for catch-up, verifies each record's Jolteon
+//!   commit proof against the checkpointed committee, executes it,
+//!   and serves RPC. It never votes, proposes, or signs — the
+//!   engine runs without a signer by construction.
+//! - **Bootstrap-only** (no peers): `--state-sync` + `--verify-only`
+//!   fetches a snapshot whose `(height, state_root)` is anchored by
+//!   a quorum-signed execution certificate, imports it, and exits.
+//!   Without `--verify-only` or peers the process exits non-zero —
+//!   a node that cannot follow the chain is not "ready".
 //!
 //! Usage:
 //!
 //! ```sh
 //! oxide-fullnode --config config/devnet.toml \
-//!   --state-sync 127.0.0.1:8545 \
-//!   --trusted-validators checkpoint.json --verify-only
+//!   --genesis-file genesis.json \
+//!   --consensus-peer <validator_addr_hex>=127.0.0.1:9000 \
+//!   --observer-key-file observer.key \
+//!   --data-dir /var/lib/oxide --rpc-listen 127.0.0.1:8545
 //! ```
 //!
 //! The checkpoint is a weak-subjectivity anchor: `{"epoch": E,
@@ -28,7 +30,11 @@
 //! committee the operator trusts. With `--genesis-file`, the genesis
 //! validator set serves as the epoch-0 checkpoint when every entry
 //! carries `public_key`. `--trusted-height`/`--trusted-root` remain
-//! as an optional pin pair, checked against the certified values.
+//! as an optional pin pair for bootstrap mode. Each validator must
+//! allowlist the follower's identity via
+//! `--observer-peer <observer_id>=<observer_bls_pubkey>` — the
+//! follower proves possession of its key in the peer handshake;
+//! its claimed id alone is worthless.
 
 use std::env;
 use std::path::PathBuf;
@@ -57,37 +63,289 @@ fn main() {
     // coherent node instead of running half-alive.
     primitives::supervision::install_panic_hook();
 
-    println!("oxide-fullnode: starting (follower mode)");
+    println!("oxide-fullnode: starting");
 
-    let config = load_config();
+    let (cfg, config) = load_config();
     println!(
         "oxide-fullnode: engine = {}, mempool = {}",
         config.consensus.as_str(),
         config.max_mempool_entries
     );
 
+    // Follower mode: `--consensus-peer <addr_hex>=<host:port>` names
+    // at least one validator transport endpoint. With it the binary
+    // runs `node::follower` — a non-signing replica that consumes
+    // certified blocks and mirrors state. Without it, the only
+    // honest function remains the one-shot certified bootstrap.
+    let consensus_peers = resolve_consensus_peers();
+    if !consensus_peers.is_empty() {
+        run_follower(&cfg, &config, consensus_peers);
+        return;
+    }
+
     let mut node = Node::assemble(&config);
     bootstrap_state_sync(&mut node);
 
     println!("oxide-fullnode: assembled stack (executor + core/staking/evm modules)");
 
-    // Follower mode (consensus sync from the network) is not
-    // implemented — the only thing this binary can honestly do today
-    // is fetch, verify, and import a certified snapshot.
-    // `--verify-only` makes that the explicit contract: exit 0 after
-    // a verified bootstrap. Without it, exiting 0 would claim the
-    // node is "ready" when it cannot follow the chain — so the
-    // process exits non-zero with an actionable message instead.
+    // `--verify-only` makes the bootstrap-and-verify contract
+    // explicit: exit 0 after a certified snapshot import. Without
+    // it — and with no `--consensus-peer` — exiting 0 would claim a
+    // "ready" node that cannot follow the chain.
     if std::env::args().any(|a| a == "--verify-only") {
         println!("oxide-fullnode: verify-only complete");
         return;
     }
     eprintln!(
-        "oxide-fullnode: consensus sync (follower mode) is not implemented — \
-         the assembled node cannot follow the chain. \
-         Re-run with --verify-only for the supported bootstrap-and-verify flow."
+        "oxide-fullnode: no --consensus-peer configured — the node cannot \
+         follow the chain. Pass --consensus-peer <addr_hex>=<host:port> for \
+         follower mode, or --verify-only for the bootstrap-and-verify flow."
     );
     std::process::exit(1);
+}
+
+/// Follower mode: consume certified blocks from validator peers and
+/// mirror committed state. The trust anchor is the same
+/// weak-subjectivity checkpoint `--state-sync` uses
+/// (`--trusted-validators` or `--genesis-file`) — every applied
+/// record's quorum signatures verify against it.
+///
+/// Flags:
+/// - `--consensus-peer <addr_hex>=<host:port>` (repeatable,
+///   required): validator transport endpoints. `addr_hex` is the
+///   member's 20-byte staking address — the peer id its handshake
+///   claims.
+/// - `--observer-key-file <path>` (required): this follower's BLS
+///   key for the handshake proof. The operator allowlists it on
+///   each validator via `--observer-peer <id>=<pubkey>`.
+/// - `--observer-id <addr_hex>` (optional): the claimed peer id —
+///   defaults to `validator_address(observer_pubkey)`, printed at
+///   startup so the operator can allowlist it.
+/// - `--listen <host:port>` (optional): transport bind; peers never
+///   dial a follower, so `127.0.0.1:0` suffices.
+/// - `--state-sync <host:port>` (optional): fetch a certified
+///   snapshot to `<data_dir>/snapshot.bin` first, then follow.
+/// - `--repair-peer <host:port>` (repeatable, optional): snapshot
+///   endpoints for certified state repair after a divergence halt.
+/// - `--tls-dir`, `--data-dir`, `--wal-file`, `--rpc-listen`: same
+///   meaning as on `oxide-validator`.
+fn run_follower(cfg: &config::Config, config: &NodeConfig, peers: Vec<(Vec<u8>, String)>) {
+    let (epoch, validator_set) = load_sync_checkpoint();
+
+    // Observer identity: the handshake proof key + the claimed peer
+    // id. The key is mandatory — an unauthenticated follower cannot
+    // join a production transport (`BlsPeerAuth` rejects it).
+    let key_path = parse_cli_flag("--observer-key-file").unwrap_or_else(|| {
+        eprintln!(
+            "oxide-fullnode: --consensus-peer requires --observer-key-file \
+             (this node's BLS key for the peer-handshake proof)"
+        );
+        std::process::exit(1);
+    });
+    let key_bytes = node::cli::load_secret_key_file(&key_path, node::cli::SecretKind::Bls)
+        .unwrap_or_else(|e| panic!("invalid observer key file {key_path}: {e}"));
+    let observer_key = crypto::BlsSecretKey::from_bytes(&key_bytes)
+        .unwrap_or_else(|e| panic!("invalid BLS secret key in {key_path}: {e:?}"));
+    let signer: std::sync::Arc<dyn crypto::ConsensusSigner> =
+        std::sync::Arc::new(observer_key.clone());
+    let own_id: Vec<u8> = match parse_cli_flag("--observer-id") {
+        Some(hex) => {
+            let bytes =
+                hex_decode(&hex).unwrap_or_else(|e| panic!("invalid --observer-id '{hex}': {e}"));
+            assert_eq!(bytes.len(), 20, "--observer-id must be a 20-byte address");
+            bytes
+        }
+        None => crypto::bls::validator_address(&observer_key.public_key()).0.to_vec(),
+    };
+    println!(
+        "oxide-fullnode: observer id {} — allowlist it on validators with \
+         --observer-peer {}=<pubkey>",
+        node::cli::hex_encode(&own_id),
+        node::cli::hex_encode(&own_id)
+    );
+
+    // Graceful shutdown: same supervised signal thread as the
+    // validator — SIGINT/SIGTERM flips the flag the pump polls.
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    let _ = primitives::supervision::spawn_supervised("signal-handler", false, move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("signal runtime");
+        rt.block_on(async {
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("sigterm handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = sigterm.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.expect("ctrl_c handler");
+            }
+            shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    });
+
+    // Optional certified-snapshot bootstrap: fetch, verify against
+    // the same checkpoint, and write to `<data_dir>/snapshot.bin` —
+    // `follower::run`'s `import_snapshot_if_present` picks it up on
+    // assembly. Writing the file (rather than importing into a
+    // throwaway executor) keeps the bootstrap artifact durable: a
+    // restart skips the download entirely.
+    if let Some(addr) = parse_cli_flag("--state-sync") {
+        let Some(ref dir) = config.durability_dir else {
+            eprintln!(
+                "oxide-fullnode: --state-sync in follower mode requires --data-dir \
+                 (the snapshot must persist for assembly to import it)"
+            );
+            std::process::exit(1);
+        };
+        std::fs::create_dir_all(dir)
+            .unwrap_or_else(|e| panic!("cannot create data dir {}: {e}", dir.display()));
+        fetch_certified_snapshot_to_file(&addr, epoch, &validator_set, dir);
+    }
+
+    let genesis_file = parse_cli_flag("--genesis-file").map(|p| {
+        config::genesis::Genesis::from_json_file(&PathBuf::from(&p))
+            .unwrap_or_else(|e| panic!("failed to load genesis file {p}: {e}"))
+    });
+    let genesis_alloc: Option<node::validator_net::GenesisAlloc> = genesis_file.map(|g| {
+        Box::new(move |m: &evm::EvmModule| apply_evm_alloc(m, &g))
+            as node::validator_net::GenesisAlloc
+    });
+
+    let rpc_listen = parse_cli_flag("--rpc-listen")
+        .or_else(|| cfg.rpc.as_ref().map(|r| r.listen_addr.clone()).filter(|l| !l.is_empty()));
+
+    node::follower::run(node::follower::FollowerSpec {
+        log_tag: "oxide-fullnode".to_string(),
+        validator_set,
+        epoch: primitives::Epoch::new(epoch),
+        own_id,
+        signer,
+        node_config: config.clone(),
+        wal_path: parse_cli_flag("--wal-file").map(PathBuf::from),
+        listen_addr: parse_cli_flag("--listen").unwrap_or_else(|| "127.0.0.1:0".to_string()),
+        peers: peers.clone(),
+        tls: resolve_tls_spec(&peers),
+        network: cfg.network.clone(),
+        genesis_alloc,
+        // The resolved data dir (`--data-dir` / `[storage]
+        // data_dir` → `durability_dir`) — block journal, certified
+        // journal, WAL, and the snapshot.bin import/export all hang
+        // off the same root.
+        data_dir: config.durability_dir.clone(),
+        rpc_listen,
+        rpc_config: cfg.rpc.clone().unwrap_or_default(),
+        repair_peers: parse_cli_flags("--repair-peer"),
+        shutdown,
+    });
+}
+
+/// Parse `--consensus-peer <addr_hex>=<host:port>` entries — same
+/// format `oxide-validator`'s `--peer` uses: the member's 20-byte
+/// staking address as peer id, its transport endpoint as host:port.
+fn resolve_consensus_peers() -> Vec<(Vec<u8>, String)> {
+    let mut peers: Vec<(Vec<u8>, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    for entry in parse_cli_flags("--consensus-peer") {
+        let Some((addr_hex, hostport)) = entry.split_once('=') else {
+            eprintln!(
+                "oxide-fullnode: invalid --consensus-peer '{entry}' — \
+                 expected <addr_hex>=<host:port>"
+            );
+            std::process::exit(1);
+        };
+        let addr_bytes = hex_decode(addr_hex)
+            .unwrap_or_else(|e| panic!("invalid consensus-peer address '{addr_hex}': {e}"));
+        assert_eq!(addr_bytes.len(), 20, "--consensus-peer address must be 20 bytes");
+        if seen.insert(addr_bytes.clone()) {
+            peers.push((addr_bytes, hostport.to_string()));
+        }
+    }
+    peers
+}
+
+/// `--tls-dir` resolves into the shared [`node::validator_net::TlsSpec`]:
+/// `cert.pem`/`key.pem` for this node, `peer-<addr-hex>.pem` per
+/// upstream member — the same layout the validator binary uses.
+fn resolve_tls_spec(peers: &[(Vec<u8>, String)]) -> Option<node::validator_net::TlsSpec> {
+    parse_cli_flag("--tls-dir").map(|tls_dir| {
+        let trusted_peer_certs = peers
+            .iter()
+            .map(|(id, _)| {
+                (
+                    id.clone(),
+                    PathBuf::from(format!("{tls_dir}/peer-{}.pem", node::cli::hex_encode(id))),
+                )
+            })
+            .collect();
+        node::validator_net::TlsSpec {
+            cert_path: PathBuf::from(format!("{tls_dir}/cert.pem")),
+            key_path: PathBuf::from(format!("{tls_dir}/key.pem")),
+            trusted_peer_certs,
+        }
+    })
+}
+
+/// Fetch a chunk-verified certified snapshot from `addr` and write
+/// it to `<data_dir>/snapshot.bin` — the file
+/// `import_snapshot_if_present` imports during follower assembly.
+/// Runs the full anchor chain: manifest → polled certificate →
+/// quorum verification against the checkpoint → chunk download.
+///
+/// # Panics
+///
+/// Panics on any verification or transport failure — bootstrapping
+/// an unverified snapshot is the exact failure this binary refuses.
+fn fetch_certified_snapshot_to_file(
+    addr: &str,
+    epoch: u64,
+    vset: &consensus::ValidatorSet,
+    data_dir: &std::path::Path,
+) {
+    let manifest = statesync::fetch_manifest(addr)
+        .unwrap_or_else(|e| panic!("state sync from {addr}: manifest fetch failed: {e}"));
+    assert!(
+        manifest.format_version <= executor::SNAPSHOT_FORMAT_VERSION,
+        "state sync from {addr}: snapshot format {} newer than supported {}",
+        manifest.format_version,
+        executor::SNAPSHOT_FORMAT_VERSION
+    );
+    let cert = poll_exec_certificate(addr, manifest.height);
+    consensus::verify_exec_cert(vset, primitives::Epoch::new(epoch), &cert)
+        .unwrap_or_else(|e| panic!("state sync from {addr}: certificate verification failed: {e}"));
+    assert_eq!(
+        cert.height.value(),
+        manifest.height,
+        "certificate covers height {} but the manifest is pinned to {}",
+        cert.height.value(),
+        manifest.height
+    );
+    assert_eq!(
+        cert.state_root, manifest.state_root,
+        "certified state root does not match the manifest's claimed root"
+    );
+    let blob = statesync::fetch_blob(addr, &manifest)
+        .unwrap_or_else(|e| panic!("state sync from {addr}: chunk download failed: {e}"));
+    let path = data_dir.join("snapshot.bin");
+    // Atomic write — a crash mid-write must not leave a torn
+    // snapshot the restart would try to decode.
+    let tmp = data_dir.join("snapshot.bin.tmp");
+    std::fs::write(&tmp, &blob).unwrap_or_else(|e| panic!("cannot write {}: {e}", tmp.display()));
+    std::fs::rename(&tmp, &path).unwrap_or_else(|e| panic!("cannot rename {}: {e}", tmp.display()));
+    println!(
+        "oxide-fullnode: fetched certified snapshot — height {}, {} bytes → {}",
+        manifest.height,
+        blob.len(),
+        path.display()
+    );
 }
 
 /// `--state-sync <host:port>` bootstrap: fetch a chunked snapshot
@@ -276,14 +534,18 @@ fn load_sync_checkpoint() -> (u64, consensus::ValidatorSet) {
 }
 
 /// Build a `consensus::ValidatorSet` from checkpoint/genesis
-/// validator records. Only `public_key` and `stake` participate in
-/// certificate verification — the bitmap indexes set order, so the
-/// file's validator order must match committee order (the order
-/// genesis lists them).
+/// validator records. `public_key` and `stake` drive certificate
+/// verification (the bitmap indexes set order, so the file's
+/// validator order must match committee order); `address` is the
+/// member's registered staking identity — required here so the
+/// follower's `BlsPeerAuth` can resolve a dialled member's claimed
+/// peer id (a staking address, NOT `validator_address(pk)`-derived
+/// on devnets that seat secp test identities).
 ///
 /// # Panics
 ///
-/// Panics on a missing/malformed `public_key` or an empty set.
+/// Panics on a missing/malformed `public_key` or `address`, or on
+/// an empty set.
 fn checkpoint_to_validator_set(
     validators: &[config::genesis::GenesisValidator],
     source: &str,
@@ -310,7 +572,19 @@ fn checkpoint_to_validator_set(
         })
         .collect();
     let stakes: Vec<u64> = validators.iter().map(|v| v.stake).collect();
-    consensus::ValidatorSet::new(pks, stakes)
+    let addresses: Vec<primitives::Address> = validators
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let bytes = hex_decode(&v.address).unwrap_or_else(|e| {
+                panic!("checkpoint {source} validator {i} bad address hex: {e}")
+            });
+            primitives::Address(<[u8; 20]>::try_from(bytes.as_slice()).unwrap_or_else(|_| {
+                panic!("checkpoint {source} validator {i} address must be 20 bytes")
+            }))
+        })
+        .collect();
+    consensus::ValidatorSet::with_addresses(pks, stakes, addresses)
         .unwrap_or_else(|e| panic!("checkpoint {source} is not a valid validator set: {e}"))
 }
 
@@ -360,7 +634,11 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 /// Load the node configuration from CLI flags, env vars, and TOML file.
 ///
 /// Priority: CLI > env vars > TOML > defaults.
-fn load_config() -> NodeConfig {
+///
+/// Returns `(config::Config, NodeConfig)`: the raw layered config
+/// carries `network`/`rpc`/`data_dir` (transport + RPC topology),
+/// the converted `NodeConfig` is what assembly consumes.
+fn load_config() -> (config::Config, NodeConfig) {
     let mut config = config::Config::default();
 
     // 1. Load from TOML file if --config is given.
@@ -458,7 +736,7 @@ fn load_config() -> NodeConfig {
 
     // Emit the effective configuration — the values actually running.
     println!("oxide-fullnode: effective node config: {node_config:?}");
-    node_config
+    (config, node_config)
 }
 
 /// Parse a `--flag value` pair from CLI args.
@@ -470,4 +748,74 @@ fn parse_cli_flag(flag: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Collect every `--flag value` pair — repeatable flags like
+/// `--consensus-peer` and `--repair-peer`.
+fn parse_cli_flags(flag: &str) -> Vec<String> {
+    let mut args = env::args().skip(1);
+    let mut values = Vec::new();
+    while let Some(arg) = args.next() {
+        if arg == flag
+            && let Some(value) = args.next()
+        {
+            values.push(value);
+        }
+    }
+    values
+}
+
+/// Apply a genesis file's `evm.alloc` map to the assembled EVM
+/// module: balances, nonces, code, and storage for pre-funded
+/// accounts and preinstalled contracts (Ethereum `genesis.json`
+/// convention). Mirrors `oxide-validator`'s copy — kept in the
+/// binary because the `node` crate deliberately stays free of the
+/// `alloy_primitives` dependency.
+///
+/// # Panics
+///
+/// Panics on malformed hex — genesis errors are fatal at startup.
+fn apply_evm_alloc(evm_module: &evm::EvmModule, genesis: &config::genesis::Genesis) {
+    for (addr_hex, account) in &genesis.evm.alloc {
+        let addr_bytes = hex_decode(addr_hex)
+            .unwrap_or_else(|e| panic!("genesis evm.alloc invalid address: {e}"));
+        let addr: [u8; 20] = addr_bytes
+            .try_into()
+            .unwrap_or_else(|_| panic!("genesis evm.alloc address must be 20 bytes"));
+        let balance = if let Some(hex) = account.balance.strip_prefix("0x") {
+            u128::from_str_radix(hex, 16)
+        } else {
+            account.balance.parse::<u128>()
+        }
+        .unwrap_or_else(|e| panic!("genesis evm.alloc invalid balance: {e}"));
+        let code = account
+            .code
+            .as_deref()
+            .map(|c| hex_decode(c).unwrap_or_else(|e| panic!("evm.alloc code: {e}")))
+            .unwrap_or_default();
+        let storage = account
+            .storage
+            .iter()
+            .map(|(slot, value)| {
+                let slot = alloy_primitives::U256::from_str_radix(
+                    slot.strip_prefix("0x").unwrap_or(slot),
+                    16,
+                )
+                .unwrap_or_else(|e| panic!("evm.alloc slot: {e}"));
+                let value = alloy_primitives::U256::from_str_radix(
+                    value.strip_prefix("0x").unwrap_or(value),
+                    16,
+                )
+                .unwrap_or_else(|e| panic!("evm.alloc storage value: {e}"));
+                (slot, value)
+            })
+            .collect();
+        evm_module.genesis_insert_account(
+            &primitives::Address(addr),
+            balance,
+            account.nonce,
+            code,
+            storage,
+        );
+    }
 }

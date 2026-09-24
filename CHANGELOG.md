@@ -227,6 +227,31 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Fullnode follower mode** (`oxide-fullnode --consensus-peer`):
+  the fullnode binary is now a real certified-block consumer that
+  mirrors committed chain state from validator peers — the
+  production-ready replication path the binary previously refused
+  to fake. It joins the authenticated transport as a non-committee
+  *observer* (new repeatable `--observer-peer <addr>=<bls_pubkey>`
+  allowlist flag on `oxide-validator`; committee identities always
+  win, so an observer can never shadow a member), pulls
+  `CertifiedBlock` records over the same block-sync protocol
+  validators use for restart catch-up, and verifies each one
+  through `apply_certified_block` — identical trust to a
+  validator: quorum signatures, body binding, proposer auth, epoch
+  pinning. The engine runs without a signer — no proposals, votes,
+  or signatures are reachable by construction. Mirrors RPC height
+  and state, keeps the consensus WAL + executor journal +
+  `snapshot.bin` export for durable resume, supports
+  `--state-sync` bootstrap and `--repair-peer` certified
+  divergence repair, serves certified history to other followers,
+  and follows epoch rotations through `drive_epoch_changes`.
+  - **In plain words:** a full node finally exists — you can run
+    one that watches the chain, checks every block's proof itself
+    instead of trusting the servers it copies from, survives a
+    restart where it left off, and still answers RPC queries like
+    a validator — it just never gets a say in consensus.
+
 - **Per-source-IP connection cap at the listener.** The accept loop
   now bounds simultaneous inbound connections from one source —
   IPv4 keyed exactly, IPv6 by /64 prefix — before a socket reaches

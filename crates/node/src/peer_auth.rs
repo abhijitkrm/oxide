@@ -61,6 +61,15 @@ pub struct BlsPeerAuth {
     validators: Arc<RwLock<ValidatorSet>>,
     /// Scheduled next-epoch committee during the activation window.
     pending: Arc<RwLock<Option<ValidatorSet>>>,
+    /// Operator-allowlisted non-committee endpoints — fullnode
+    /// followers — keyed by their claimed peer-id address. Checked
+    /// LAST, after the live and pending sets: an observer entry can
+    /// never shadow a member's address, so a misconfigured allowlist
+    /// cannot hijack committee identity. Observers prove key
+    /// possession with the same `Domain::PeerHandshake` signature —
+    /// the allowlist binds *which* key a non-member identity must
+    /// hold, nothing more; no committee privileges come with it.
+    observers: std::collections::HashMap<Address, crypto::PublicKey>,
 }
 
 impl std::fmt::Debug for BlsPeerAuth {
@@ -83,7 +92,21 @@ impl BlsPeerAuth {
         validators: Arc<RwLock<ValidatorSet>>,
         pending: Arc<RwLock<Option<ValidatorSet>>>,
     ) -> Self {
-        Self { signer, validators, pending }
+        Self { signer, validators, pending, observers: std::collections::HashMap::new() }
+    }
+
+    /// Attach the observer allowlist: `(address, key)` pairs for
+    /// non-committee endpoints permitted to complete the handshake.
+    /// An observer proves the registered key exactly like a member
+    /// proves its committee key — the difference is only which map
+    /// resolves the claimed address.
+    #[must_use]
+    pub fn with_observers(
+        mut self,
+        observers: std::collections::HashMap<Address, crypto::PublicKey>,
+    ) -> Self {
+        self.observers = observers;
+        self
     }
 
     /// Decode a peer ID into a staking address — exactly 20 bytes.
@@ -102,7 +125,10 @@ impl BlsPeerAuth {
 
     /// The key a peer claiming `peer_id` must prove: its address in
     /// the live set, else in the scheduled next-epoch set (the
-    /// pre-activation admission window), else it is not a member.
+    /// pre-activation admission window), else the operator's
+    /// observer allowlist (non-committee followers), else it is not
+    /// admitted. Committee maps always win — an observer entry for a
+    /// member's address is dead config, not a second identity.
     fn expected_key(&self, addr: &Address) -> Option<crypto::PublicKey> {
         if let Ok(set) = self.validators.read()
             && let Some(pk) = Self::key_for(&set, addr)
@@ -114,7 +140,7 @@ impl BlsPeerAuth {
         {
             return Self::key_for(set, addr);
         }
-        None
+        self.observers.get(addr).copied()
     }
 }
 
@@ -260,6 +286,70 @@ mod tests {
         assert!(
             auth.verify(&new_addr.0.to_vec(), transcript, &proof),
             "post-activation the new member verifies under the live set"
+        );
+    }
+
+    /// Observer allowlist: a non-committee endpoint proves its
+    /// registered key exactly like a member proves its committee
+    /// key — and an observer entry can never shadow a member's
+    /// address.
+    #[test]
+    fn observer_authenticates_under_allowlist_and_cannot_shadow_members() {
+        let (secrets, set) = committee();
+        let pending = Arc::new(RwLock::new(None));
+        // The follower endpoint: own BLS key, own 20-byte identity.
+        let observer_key = crate::cli::bls_key(77);
+        let observer_addr = crypto::bls::validator_address(&observer_key.public_key());
+        let auth =
+            BlsPeerAuth::new(Arc::new(secrets[0].clone()), Arc::clone(&set), Arc::clone(&pending))
+                .with_observers([(observer_addr, observer_key.public_key())].into_iter().collect());
+
+        let transcript = b"follower handshake";
+        let observer_auth = BlsPeerAuth::new(
+            Arc::new(observer_key.clone()),
+            Arc::clone(&set),
+            Arc::clone(&pending),
+        );
+        let proof = observer_auth.sign(transcript).expect("observer signs");
+        assert!(
+            auth.verify(&observer_addr.0.to_vec(), transcript, &proof),
+            "allowlisted observer must authenticate"
+        );
+        // Wrong key / wrong id / wrong transcript still fail closed.
+        assert!(
+            !auth.verify(&peer_id(&set, 0), transcript, &proof),
+            "observer proof must not pass under a member's id"
+        );
+        assert!(!auth.verify(&observer_addr.0.to_vec(), b"other", &proof));
+        let foreign_key = crate::cli::bls_key(78);
+        let foreign_proof =
+            BlsPeerAuth::new(Arc::new(foreign_key), Arc::clone(&set), Arc::clone(&pending))
+                .sign(transcript)
+                .expect("foreign key signs");
+        assert!(
+            !auth.verify(&observer_addr.0.to_vec(), transcript, &foreign_proof),
+            "a different key cannot claim the observer identity"
+        );
+
+        // Shadowing guard: an observer entry that names a MEMBER's
+        // address is dead config — the committee map resolves first,
+        // so the member's own key still verifies and the observer's
+        // key cannot usurp the address.
+        let member_addr = set.read().expect("set").validator_addresses()[1];
+        let shadowing =
+            BlsPeerAuth::new(Arc::new(secrets[0].clone()), Arc::clone(&set), Arc::clone(&pending))
+                .with_observers([(member_addr, observer_key.public_key())].into_iter().collect());
+        let member_proof =
+            BlsPeerAuth::new(Arc::new(secrets[1].clone()), Arc::clone(&set), Arc::clone(&pending))
+                .sign(transcript)
+                .expect("member signs");
+        assert!(
+            shadowing.verify(&member_addr.0.to_vec(), transcript, &member_proof),
+            "committee identity wins over a shadowing observer entry"
+        );
+        assert!(
+            !shadowing.verify(&member_addr.0.to_vec(), transcript, &proof),
+            "observer key cannot claim a member's address"
         );
     }
 }

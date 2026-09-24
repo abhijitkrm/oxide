@@ -329,6 +329,17 @@ fn run_validator_node() {
     // manual repair path — the halt stays terminal.
     let repair_peers = node::cli::parse_cli_flags("--repair-peer");
 
+    // Observer allowlist: `--observer-peer <addr_hex>=<bls_pubkey_hex>`
+    // repeatable — non-committee endpoints (fullnode followers) that
+    // may complete the peer handshake and pull certified history.
+    let observer_peers = node::cli::parse_cli_flags("--observer-peer")
+        .iter()
+        .map(|entry| {
+            node::cli::parse_observer_peer(entry)
+                .unwrap_or_else(|e| panic!("invalid --observer-peer '{entry}': {e}"))
+        })
+        .collect();
+
     node::validator_net::run(node::validator_net::ValidatorNetSpec {
         log_tag: "oxide-validator".to_string(),
         seat: usize::from(our_seat),
@@ -347,6 +358,7 @@ fn run_validator_node() {
         smoke_tx: None,
         shutdown,
         repair_peers,
+        observer_peers,
     });
 }
 

@@ -1044,6 +1044,23 @@ impl OxideBft {
         self
     }
 
+    /// Set the starting epoch (builder).
+    ///
+    /// Construction-time trust: a non-signing follower bootstrapping
+    /// from a validator-set checkpoint (`--trusted-validators`)
+    /// names the checkpoint's epoch — the committee it was handed is
+    /// only meaningful paired with the epoch that ratified it, and
+    /// `apply_certified_block` rejects records signed under any
+    /// other. Validators never use this (genesis is always epoch 0;
+    /// rotations move through `drive_epoch_changes`), and a WAL
+    /// recovery overrides it — the durable epoch is authoritative
+    /// over the configured one.
+    #[must_use]
+    pub fn with_epoch(mut self, epoch: Epoch) -> Self {
+        self.epoch = epoch;
+        self
+    }
+
     /// Set the proposal block budget (bytes + gas) the engine passes
     /// to `app.prepare_proposal` when this validator leads.
     ///
@@ -2525,7 +2542,15 @@ impl ConsensusEngine for OxideBft {
     }
 
     fn finalized_height(&self) -> Option<Height> {
-        self.finalized.keys().next_back().map(|&h| Height::new(h))
+        // `last_committed` is the authoritative high-water mark —
+        // it survives WAL recovery, while `finalized` is only the
+        // in-memory window of recently committed blocks. A
+        // restarted node that reports 0 here would misrepresent a
+        // recovered tip as unsynced (RPC `eth_blockNumber`, fleet
+        // progress logs) until the next commit lands.
+        let fin = self.finalized.keys().next_back().copied();
+        let committed = self.last_committed.map(|(_, h)| h.value());
+        fin.max(committed).map(Height::new)
     }
 
     fn finalized_block(&self, height: Height) -> Option<FinalizedBlock> {

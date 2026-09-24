@@ -21483,3 +21483,79 @@ says the speculation overhead doesn't pay for itself until the
 canonical-order merge goes multi-version (Phase 5 residual —
 this is now measured motivation, not hypothesis). Persistence
 flush adds ~1% — amortized across the batch.
+
+## Session: fullnode follower mode — the certified-block consumer
+
+**What landed.** `node::follower` + `oxide-fullnode
+--consensus-peer`: a production fullnode that mirrors committed
+chain state from validators over the authenticated peer transport.
+It is *not* a consensus participant — the engine is built without
+`.with_signer()` and no code path in the module calls
+propose/vote/timeout — but it runs the real `OxideBft` in
+consume-only mode, so every applied record clears the same
+verification bar a validator applies (`apply_certified_block`:
+certified pair, body binding, proposer signature, both QC
+aggregates against the checkpointed committee). Trust anchor is
+weak-subjectivity: `--genesis-file` or `--trusted-validators`
+supplies the committee + epoch; a peer can lie about heights but
+cannot forge quorum signatures.
+
+**The observer role.** `BlsPeerAuth` gained a third resolution
+tier: live committee → pending (rotation window) → an operator
+allowlist of `(address, BLS key)` pairs via a new repeatable
+`--observer-peer <addr>=<pubkey>` on `oxide-validator`. Committee
+entries always win — an observer entry that names a member is dead
+config, never a second identity, so an observer cannot shadow or
+displace a validator seat. The follower proves its registered key
+over the same `Domain::PeerHandshake` transcript members use; its
+identity is `validator_address(pk)` by default, printed at startup
+for allowlisting.
+
+**The consume path.** `MSG_BLOCK_REQ`/`MSG_BLOCK_RESP` — the same
+certified-sync protocol validators use for restart catch-up — is
+the liveness floor: an unconditional `ByRange` fetch at the
+engine's `sync_frontier()` every `SYNC_REQ_RETRY`, round-robin
+across `--consensus-peer`s. Proposal/QC gossip arriving on the
+accepted observer connection refines latency but is never
+required, never re-broadcast, and `admit_proposal` authenticates
+before it can aim the fetcher. Out-of-order pages buffer in a
+bounded `BTreeMap` and drain through `drain_sync_buffer` — the
+staging + commit-by-descent semantics the H5 fix established apply
+identically here. Verified records also feed `admit_exec_cert`, so
+the divergence latch + `attempt_state_repair` (certified-snapshot
+rebuild via `--repair-peer`) protect a mirror exactly like a
+signer — arguably more valuable, since convergence is the
+follower's whole product.
+
+**Durability.** Consensus WAL restores `last_committed` (the
+`finalized_height` accessor now reports the recovered anchor — an
+engine fix that also corrects validators' post-restart reported
+tip); the executor's block journal + `snapshot.bin` export on
+SIGTERM make restart resume at the durable frontier; the
+certified-block `SyncStore` journals served records so a follower
+can re-serve history to *other* followers. Epoch rotations ride
+`drive_epoch_changes` — the follower executes the same rotation
+blocks, so the shared validator-set handles republish for
+re-handshakes automatically.
+
+**Tests.** In-process: 3-validator `validator_net` fleet + follower
+over loopback TCP — mirror to height ≥3 via RPC; restart resumes
+(imported snapshot at h=3 → mirrored h=4 without re-walking).
+`peer_auth` unit coverage: observer authenticates, wrong key fails,
+member identity wins over a shadowing observer entry. Binary E2E
+(`crates/devnet/tests/fullnode_follower.rs`, `#[ignore]`d):
+`oxide-validator` fleet + real `oxide-fullnode` process — observed
+run: UnknownPeer during the ~2-3s handshake-settle window, then
+certified fetch/apply at fleet cadence (heights 10→14 in ~8s),
+SIGTERM → `exported snapshot` → restart reports ≥ tip immediately.
+
+**Operator surface.** `oxide-fullnode --consensus-peer
+<addr>=<host:port>` (repeatable) selects upstream validators;
+`--observer-key-file` is mandatory (the handshake proof);
+`--observer-id` overrides the derived identity; `--listen`,
+`--data-dir`, `--wal-file`, `--rpc-listen`, `--repair-peer`,
+`--state-sync`, `--tls-dir` mirror the validator flags. One
+permanent diagnostic added while debugging a startup-churn stall:
+when every configured upstream fails `send`, the follower logs it
+rate-bounded at the fetch cadence — silent-unreachable was
+undiagnosable before.

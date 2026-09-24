@@ -2862,14 +2862,17 @@ dependencies = [
 name = "oxide-fullnode"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "codec",
  "config",
  "consensus",
  "crypto",
+ "evm",
  "executor",
  "node",
  "primitives",
  "statesync",
+ "tokio",
  "types",
 ]
 

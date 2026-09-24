@@ -60,14 +60,14 @@ use codec::{Decode, Encode};
 // ── Wire message tags ───────────────────────────────────
 // One-byte type tags for the transport frame: the first byte of
 // each message identifies the payload type.
-const MSG_PROPOSAL: u8 = 0x00;
+pub(crate) const MSG_PROPOSAL: u8 = 0x00;
 const MSG_VOTE: u8 = 0x01;
-const MSG_QC: u8 = 0x02;
+pub(crate) const MSG_QC: u8 = 0x02;
 const MSG_TIMEOUT: u8 = 0x03; // timeout signature (view-change init)
 const MSG_TC: u8 = 0x04; // timeout certificate (view-change proof)
-const MSG_TX: u8 = 0x05; // raw tx envelope gossip (mempool propagation)
-const MSG_BLOCK_REQ: u8 = 0x06; // certified-block fetch (by hash or height range)
-const MSG_BLOCK_RESP: u8 = 0x07; // certified-block serve (QC-chain-verified records)
+pub(crate) const MSG_TX: u8 = 0x05; // raw tx envelope gossip (mempool propagation)
+pub(crate) const MSG_BLOCK_REQ: u8 = 0x06; // certified-block fetch (by hash/height)
+pub(crate) const MSG_BLOCK_RESP: u8 = 0x07; // certified-block serve (verified records)
 
 /// Idle heartbeat interval for the consensus pump (unit: wall-clock
 /// time). A leader with no pending work still owes the network a
@@ -90,7 +90,7 @@ const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
 /// and the pacemaker's 2s base timeout: slow enough that a healthy
 /// peer answers first, fast enough that a dropped response stalls
 /// catch-up for less than one view.
-const SYNC_REQ_RETRY: Duration = Duration::from_millis(750);
+pub(crate) const SYNC_REQ_RETRY: Duration = Duration::from_millis(750);
 
 /// Cap on out-of-order certified records buffered awaiting
 /// contiguity. Responses are requested in order, so a healthy flow
@@ -98,7 +98,7 @@ const SYNC_REQ_RETRY: Duration = Duration::from_millis(750);
 /// adversarial servers, not normal operation. 1024 records ≈ a few
 /// MiB of headers/QCs/bodies — a bounded soak, never a growth
 /// channel.
-const SYNC_PENDING_CAP: usize = 1024;
+pub(crate) const SYNC_PENDING_CAP: usize = 1024;
 
 /// Interval between full divergence-repair attempts (unit:
 /// wall-clock). Each attempt is a manifest fetch + certificate
@@ -108,7 +108,14 @@ const SYNC_PENDING_CAP: usize = 1024;
 /// cost of a halted validator to the fleet (missed leader turns
 /// burn whole views), and slow enough that a transient peer
 /// failure does not spin the download loop.
-const REPAIR_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+pub(crate) const REPAIR_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Gossip dedup cap: tx hashes already ingested (ours + peers').
+/// 100k entries covers several blocks' worth of txs; a duplicate
+/// arriving after eviction is re-ingested harmlessly (the
+/// executor's nonce-replay check still applies). Shared with the
+/// follower pump — the bound rationale is identical there.
+pub(crate) const GOSSIP_SEEN_CAP: usize = 100_000;
 
 /// Per-peer certificate poll budget during a repair attempt: a
 /// serving validator forms an exec cert within a few views of the
@@ -218,6 +225,16 @@ pub struct ValidatorNetSpec {
     /// RPC endpoints, not consensus transport addresses — the
     /// snapshot surface lives on the HTTP server.
     pub repair_peers: Vec<String>,
+    /// Observer allowlist: `(address, BLS public key)` for
+    /// non-committee endpoints permitted to complete the peer
+    /// handshake — fullnode followers that mirror committed state.
+    /// An observer authenticates exactly like a member (proof of its
+    /// registered key over the handshake transcript); the only
+    /// difference is which map resolves the claimed address, and
+    /// committee maps always win — an observer entry can never
+    /// shadow a member. Serving certified history to an observer is
+    /// safe: records are already public, quorum-verified data.
+    pub observer_peers: Vec<(primitives::Address, crypto::PublicKey)>,
 }
 
 /// Run a networked validator until `spec.shutdown` is set.
@@ -256,6 +273,7 @@ pub fn run(spec: ValidatorNetSpec) {
         smoke_tx,
         shutdown,
         repair_peers,
+        observer_peers,
     } = spec;
 
     // Peer identity is the validator's staking address — the stable
@@ -340,6 +358,7 @@ pub fn run(spec: ValidatorNetSpec) {
         signer,
         shared_validator_set.clone(),
         shared_next_validator_set.clone(),
+        observer_peers,
     );
 
     // Give connections time to establish. TLS handshakes take
@@ -461,7 +480,7 @@ pub fn run(spec: ValidatorNetSpec) {
 /// Panics if a `TlsSpec` is given but the TLS config cannot be built
 /// (missing cert/key files, invalid PEM, etc.).
 #[allow(clippy::too_many_arguments)]
-fn build_transport(
+pub(crate) fn build_transport(
     listen_addr: &str,
     log_tag: &str,
     own_id: Vec<u8>,
@@ -471,6 +490,7 @@ fn build_transport(
     signer: Arc<dyn crypto::ConsensusSigner>,
     validators: Arc<std::sync::RwLock<consensus::ValidatorSet>>,
     pending: Arc<std::sync::RwLock<Option<consensus::ValidatorSet>>>,
+    observers: Vec<(primitives::Address, crypto::PublicKey)>,
 ) -> p2p::tcp::TcpTransport {
     // Signed greeting: peer IDs are staking addresses bound to
     // committee keys, so a connection claiming member `a` must sign
@@ -478,9 +498,13 @@ fn build_transport(
     // self-claimed, and a duplicate connection is a
     // proven-same-identity reconnect, not a hijack. The shared sets
     // mean committee rotations take effect without a transport
-    // restart.
-    let auth: Arc<dyn p2p::tcp::PeerAuth> =
-        Arc::new(crate::peer_auth::BlsPeerAuth::new(signer, validators, pending));
+    // restart. `observers` carries the operator's non-committee
+    // allowlist (fullnode followers) — resolved after the live and
+    // pending sets so it can never shadow a member.
+    let auth: Arc<dyn p2p::tcp::PeerAuth> = Arc::new(
+        crate::peer_auth::BlsPeerAuth::new(signer, validators, pending)
+            .with_observers(observers.into_iter().collect()),
+    );
     let transport_config =
         p2p::tcp::TcpTransportConfig { peer_auth: Some(auth), ..to_transport_config(network) };
     // Admission control is always on in the shipped node: connection
@@ -557,7 +581,7 @@ impl rpc::ValidatorSetProvider for SharedValidatorSetProvider {
 ///
 /// The HTTP server is spawned on a dedicated tokio runtime thread so
 /// the consensus loop can run on the calling thread.
-fn start_rpc(
+pub(crate) fn start_rpc(
     rpc_config: &config::RpcConfig,
     rpc_listen: Option<String>,
     app: &Arc<executor::Executor>,
@@ -656,11 +680,7 @@ fn run_consensus_loop(
     sync_store: &mut crate::block_sync::SyncStore,
     repair_peers: &[String],
 ) {
-    // Gossip dedup cap: tx hashes we've already ingested (ours +
-    // peers'). 100k entries covers several blocks' worth of txs; a
-    // duplicate arriving after eviction is re-ingested harmlessly
-    // (the executor's nonce-replay check still applies).
-    const GOSSIP_SEEN_CAP: usize = 100_000;
+    // (cap documented at module scope — `GOSSIP_SEEN_CAP`)
     // Track proposals received from the network. Followers vote on
     // these proposals; the leader proposes locally.
     let mut pending_proposals: Vec<(types::BlockHeader, types::Proposal)> = Vec::new();
@@ -1690,7 +1710,7 @@ fn run_consensus_loop(
 /// interior record that stages but doesn't seal leaves the frontier
 /// advanced anyway, so the next buffered record applies immediately
 /// rather than waiting for the seal to land first.
-fn drain_sync_buffer(
+pub(crate) fn drain_sync_buffer(
     engine: &mut consensus::OxideBft,
     pending: &mut std::collections::BTreeMap<u64, types::CertifiedBlock>,
     log_tag: &str,
@@ -1699,7 +1719,17 @@ fn drain_sync_buffer(
         let next = engine.sync_frontier();
         let Some(record) = pending.remove(&next) else { break };
         match engine.apply_certified_block(&record) {
-            Ok(_) => {}
+            Ok(_) => {
+                // Admit the record's embedded execution certificate:
+                // it attests `next - 1`, which the apply just
+                // committed (or sealed) — feeding it here means a
+                // synced node's divergence check runs on certified
+                // history it fetched, not only on live proposals.
+                // Idempotent: `verified_exec_certs` dedupes.
+                if let Some(ref cert) = record.header.exec_cert {
+                    engine.admit_exec_cert(cert);
+                }
+            }
             Err(consensus::ConsensusError::SyncDeferred { .. }) => {
                 pending.insert(next, record);
                 break;
@@ -1732,7 +1762,7 @@ fn drain_sync_buffer(
 /// `CERT_POLL_INTERVAL`): the serving engine mirrors certs per tick
 /// so a healthy peer answers quickly, and an older binary without
 /// the endpoint only costs ~2s.
-fn attempt_state_repair(
+pub(crate) fn attempt_state_repair(
     peers: &[String],
     cursor: &mut usize,
     divergence: types::ExecDivergence,

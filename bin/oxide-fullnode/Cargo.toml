@@ -26,10 +26,20 @@ primitives = { workspace = true }
 # consensus/types/crypto: certificate-verified state sync — the
 # `--trusted-validators` checkpoint builds a `ValidatorSet` and
 # `consensus::verify_exec_cert` checks the served
-# `types::ExecCertificate`'s quorum signature over it.
+# `types::ExecCertificate`'s quorum signature over it; the follower's
+# observer key signs the peer-handshake proof.
 consensus = { workspace = true }
 types = { workspace = true }
 crypto = { workspace = true }
+# evm: the genesis-alloc hook applies `evm.alloc` to the assembled
+# module; alloy-primitives supplies the U256 storage-slot type (the
+# `node` crate deliberately avoids it — binaries own the parse).
+evm = { workspace = true }
+alloy-primitives = { workspace = true }
+# tokio: SIGINT/SIGTERM handling for the follower pump — a
+# current-thread runtime in the supervised signal thread, same
+# pattern as oxide-validator/oxide-devnet.
+tokio = { workspace = true }
 
 [lints]
 workspace = true

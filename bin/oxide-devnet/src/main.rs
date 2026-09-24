@@ -350,6 +350,18 @@ fn run_node(node_index_str: &str) {
         // test failure to debug, not a fault to paper over — the
         // halt must stay loud.
         repair_peers: Vec::new(),
+        // `--observer-peer <addr_hex>=<bls_pubkey_hex>` repeatable —
+        // allowlists non-committee endpoints (fullnode followers)
+        // for the peer handshake.
+        observer_peers: node::cli::parse_cli_flags("--observer-peer")
+            .iter()
+            .map(|entry| {
+                node::cli::parse_observer_peer(entry).unwrap_or_else(|e| {
+                    eprintln!("oxide-devnet[{node_index}]: invalid --observer-peer '{entry}': {e}");
+                    std::process::exit(1);
+                })
+            })
+            .collect(),
     });
 }
 

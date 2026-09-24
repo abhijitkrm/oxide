@@ -577,6 +577,33 @@ pub fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+/// Parse one `--observer-peer <addr_hex>=<bls_pubkey_hex>` entry into
+/// the `(address, public key)` pair the transport's observer
+/// allowlist consumes. The address is the follower's claimed peer
+/// id (20 bytes); the key is what its handshake proof must verify
+/// under — the allowlist binds *which* key a non-committee identity
+/// must hold.
+///
+/// # Errors
+///
+/// Returns `Err` naming the malformed half — operator config errors
+/// are fatal at startup, never silently ignored.
+pub fn parse_observer_peer(
+    entry: &str,
+) -> Result<(primitives::Address, crypto::PublicKey), String> {
+    let (addr_hex, key_hex) =
+        entry.split_once('=').ok_or_else(|| "expected <addr_hex>=<bls_pubkey_hex>".to_string())?;
+    let addr_bytes = hex_decode(addr_hex).map_err(|e| format!("address '{addr_hex}': {e}"))?;
+    let addr = primitives::Address(
+        <[u8; 20]>::try_from(addr_bytes.as_slice())
+            .map_err(|_| format!("address '{addr_hex}' must be 20 bytes"))?,
+    );
+    let key_bytes = hex_decode(key_hex).map_err(|e| format!("key '{key_hex}': {e}"))?;
+    let key = crypto::bls::PublicKey::from_slice(&key_bytes)
+        .map_err(|_| format!("key '{key_hex}' is not a valid BLS public key"))?;
+    Ok((addr, key))
+}
+
 /// Load a 32-byte secret key file in any accepted encoding:
 ///
 /// - **Encrypted keystore** (`crypto::keystore` magic): decrypted
