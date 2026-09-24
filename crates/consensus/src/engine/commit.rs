@@ -30,6 +30,17 @@ impl OxideBft {
     /// a QC for its *child* arrives — so the tip's own body state is
     /// irrelevant to this walk.
     pub(crate) fn commit_walk(&mut self, header: &BlockHeader) {
+        // Execution-lag throttle: while the app reports its lane
+        // saturated, defer the whole walk — finalizing into a lane
+        // that cannot keep up would grow its unexecuted debt past
+        // the bounded window. The deferral is safe because the walk
+        // re-runs on the next delivered QC or completed body, and it
+        // always re-collects from the newest tip down: nothing is
+        // memoized, so a deferred commit catches up in one pass once
+        // the lane drains.
+        if self.app.exec_saturated() {
+            return;
+        }
         // Collect the uncommitted ancestor chain, newest→oldest:
         // (block hash, bitmap of the QC certifying it). The
         // certifying QC for a block X is the embedded `high_qc`
@@ -121,6 +132,15 @@ impl OxideBft {
         // contiguous ascending prefix.
         if contiguous {
             for (hash, bitmap, _, _, _) in chain.iter().rev() {
+                // Per-block saturation check, not just at walk
+                // entry: one walk over a long certified chain could
+                // otherwise push arbitrarily many blocks past the
+                // lane's bounded window in a single pass. The
+                // uncommitted remainder stays stored and is
+                // re-collected by the next walk.
+                if self.app.exec_saturated() {
+                    break;
+                }
                 self.commit_block(*hash, bitmap);
             }
         }

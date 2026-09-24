@@ -1886,6 +1886,13 @@ impl OxideBft {
     /// Drive one propose-vote-QC-commit cycle (single-validator mode).
     /// Returns `true` if a block was proposed, `false` if idle.
     fn step(&mut self) -> bool {
+        // Solo mode pauses while the execution lane is saturated —
+        // the self-vote below bypasses `vote()`, so without this gate
+        // a solo validator would keep proposing (and queueing
+        // unexecutable blocks) while its own lane is behind.
+        if self.app.exec_saturated() {
+            return false;
+        }
         // Propose.
         let Some((header, proposal)) = self.propose() else {
             return false;

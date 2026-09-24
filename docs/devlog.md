@@ -20855,3 +20855,58 @@ Regression tests: `wal_fsyncs_once_per_signature_emission` counts
 instrumentation counter, and `deferred_wal_frames_ride_next_
 signature_fsync` proves a deferred adoption is durable after the
 next timeout signature's fsync.
+
+### Execution lane — the bound is a signal now, not a stall
+
+audit002 M2: the async lane's hand-off was a bounded
+`sync_channel` — once the queue filled, `finalize_block`'s
+`send()` blocked the consensus thread inside the commit path.
+That froze more than commits: the same thread services timeouts,
+QC adoption, and catch-up, so a backed-up lane turned "execution
+is slow" into "this validator is dead" (worse: it stalled the
+very catch-up traffic that would let it recover). The fix splits
+the mechanism from the policy:
+
+- The hand-off is now an unbounded `VecDeque` inside `ExecSync`,
+  condvar-signalled. A committed block can never be dropped, so
+  no channel bound could ever be honest — `finalize_block` pushes
+  and returns, always. Ordering and at-most-once are unchanged:
+  the worker pops strictly in commit order.
+- The bound moved to a *signal*: crossing `EXEC_LANE_DEPTH`
+  (clamped to `retention - 1`, so unexecuted heights always stay
+  inside the retained window for the inline drain) sets
+  `ExecSync::saturated`, surfaced through a new
+  `AppInterface::exec_saturated` port (default `false` —
+  synchronous executors have zero debt by construction).
+- The engine reads the flag at four points: `vote()` and
+  `vote_header()` withhold (the throttle that actually stops new
+  commits), `admit_proposal` refuses new body storage (bounds
+  `blocks` growth while debt drains), and `commit_walk` defers —
+  re-checked per block inside the commit loop, so one walk over a
+  long certified chain can't push arbitrarily deep past the
+  window. `step()` pauses too — solo mode's inlined self-vote
+  bypasses `vote()` and would otherwise keep proposing.
+  Timeouts, TC formation, QC adoption, and view catch-up are
+  deliberately untouched — that's the point of the fix.
+- Recovery is self-healing: withheld votes re-deliver on the next
+  proposal, refused bodies re-admit via `admit_proposal` (nothing
+  is memoized), and the next delivered QC re-runs the deferred
+  walk over the whole certified prefix.
+- Lane death is unchanged in spirit: `finalize_block` detects
+  `lane_dead`, clears the deque AND the flag (the inline drain is
+  the debt resolution — a stale flag would freeze solo mode, whose
+  gated `step` is the only thing that could trigger the drain),
+  and `execute_committed_backlog` replays as before — still
+  refusing the in-flight height the worker died inside.
+
+Regression tests: `exec_lane_saturates_without_blocking`
+(proves the push past the threshold returns immediately, the flag
+sets at `depth + 1`, and clears only on a full drain) and
+`exec_saturation_defers_commits_without_stalling` (a saturated
+follower withholds votes and stores nothing, still adopts the QC
+for catch-up, defers the walk even with every body stored, then
+commits the whole backlog in one walk after draining).
+Measured on `snapshot_vs_exec` (the lane-installed production
+shape): no statistically significant delta vs the old channel
+(717 µs → 733 µs on the 10k-account row, p = 0.48) — the win is
+liveness, not latency.

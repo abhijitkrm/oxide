@@ -44,6 +44,20 @@ impl OxideBft {
     /// BLS secret key is set (stage 5), the vote is signed with real
     /// BLS; otherwise `Signature::ZERO` is used (conformance mode).
     pub fn vote(&mut self, header: &BlockHeader, proposal: &Proposal) -> Option<Vote> {
+        // Execution-lag throttle: while the app reports its lane
+        // saturated, withhold the vote AND refuse admission (nothing
+        // stored → nothing new for a later commit walk to finalize).
+        // A committed block can never be dropped, so the only honest
+        // bound on execution debt is to stop committing — a withheld
+        // vote is the throttle, and it recovers on re-delivery once
+        // the lane drains. Crucially this *pauses* rather than
+        // blocks: the pump thread keeps servicing timeouts, QC
+        // adoption, and catch-up while debt drains — a consensus
+        // thread stalled inside `finalize_block` (the old bounded-
+        // channel send) could do none of that.
+        if self.app.exec_saturated() {
+            return None;
+        }
         // Authentication memoisation: a proposal's authenticity is a
         // pure function of its bytes, so re-deliveries must not
         // re-pay the proposer BLS verify + shard-commitment encode.
@@ -98,6 +112,10 @@ impl OxideBft {
     ///    the correct body upgrades it to `Complete` without
     ///    re-verifying the signature.
     ///  - authentic header + commitment-matching body → `Complete`.
+    ///  - saturated execution lane → `false` for anything not already
+    ///    stored: admitting new bodies while the app cannot execute
+    ///    would grow `blocks` without bound. `false` memoises
+    ///    nothing — re-delivery after the lane drains re-admits.
     pub fn admit_proposal(&mut self, header: &BlockHeader, proposal: &Proposal) -> bool {
         let block_hash = Self::block_hash(header);
         if self.rejected_headers.contains(&block_hash) {
@@ -105,6 +123,9 @@ impl OxideBft {
         }
         if let Some((_, BlockBody::Complete(_))) = self.blocks.get(&block_hash) {
             return true;
+        }
+        if self.app.exec_saturated() {
+            return false;
         }
         if !self.blocks.contains_key(&block_hash) {
             if self.authenticate_proposal(header).is_none() {
@@ -166,6 +187,12 @@ impl OxideBft {
     /// (parentage, QC-chain walk) work exactly as with a complete
     /// body — commit still defers until the body lands.
     pub fn vote_header(&mut self, header: &BlockHeader) -> Option<Vote> {
+        // Same saturation contract as `vote()`: withhold the vote and
+        // do not even park the header `Awaiting` — the shard re-gossip
+        // re-delivers it once the lane drains.
+        if self.app.exec_saturated() {
+            return None;
+        }
         // Same memoisation contract as `vote()`: a stored entry —
         // `Awaiting` or `Complete` — exists only for an authenticated
         // header, and `rejected_headers` covers the negative verdict.

@@ -150,6 +150,28 @@ pub trait AppInterface: Send + Sync {
     /// inside, so it simply certifies an older block).
     fn attest_latest(&self) -> Option<StateAttestation>;
 
+    /// `true` while the app's execution debt exceeds its bounded
+    /// window — the backpressure signal for an asynchronous
+    /// execution lane. A committed block can never be dropped, so
+    /// the lane's queue itself cannot be the bound; this flag is.
+    ///
+    /// The engine responds by withholding votes (throttling new
+    /// commits at the source) and deferring commit walks until the
+    /// flag clears — consensus stays live for catch-up, timeouts,
+    /// and QC adoption, but nothing new is finalized into a lane
+    /// that cannot keep up. This is deliberately a *pause*, not a
+    /// block: a consensus thread stalled inside `finalize_block`
+    /// cannot process timeouts and livelocks the pacemaker, while a
+    /// withheld vote recovers on the next delivered proposal once
+    /// the lane drains.
+    ///
+    /// The default returns `false`: synchronous executors apply
+    /// the block inside `finalize_block`, so their execution debt
+    /// is always zero.
+    fn exec_saturated(&self) -> bool {
+        false
+    }
+
     /// Drain the validator-set transition pending in the app's
     /// executed state — the staking module's recorded key changes,
     /// validator additions, and removals from finalized blocks.

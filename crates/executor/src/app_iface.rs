@@ -8,9 +8,9 @@
 //! boundary.
 
 use super::{
-    AcceptedTx, AppInterface, CommitAck, Executor, FinalizedBlock, HashMap, Height, InsertRetained,
-    MODULE_ID_OFFSET, MempoolAck, Proposal, StateAttestation, TxBytes, Verdict, is_signed_envelope,
-    module_payload, parse_module_id, parse_tx_context,
+    AcceptedTx, AppInterface, CommitAck, EXEC_LANE_DEPTH, Executor, FinalizedBlock, HashMap,
+    Height, InsertRetained, MODULE_ID_OFFSET, MempoolAck, Proposal, StateAttestation, TxBytes,
+    Verdict, is_signed_envelope, module_payload, parse_module_id, parse_tx_context,
 };
 
 impl AppInterface for Executor {
@@ -519,13 +519,17 @@ impl AppInterface for Executor {
         // committed tx can never be re-proposed by a `prepare` that
         // runs while the worker is still draining the backlog.
         primitives::sync::lock_state(&self.mempool).remove_committed(&block.txs);
-        if let Some(tx) = self.exec_lane_tx.get() {
+        let lane_spawned = {
+            let (lock, _cv) = &*self.exec_sync;
+            primitives::sync::lock_state(lock).lane_spawned
+        };
+        if lane_spawned {
             // Async execution lane: `finalized` and the proposal
             // height advance now — they record *ordering* finality,
             // which consensus already settled — while `state_roots`
             // is written by the worker (or the inline backlog drain
             // below) when execution lands. `finalized` is inserted
-            // BEFORE the send so the backlog drain can see this
+            // BEFORE the hand-off so the backlog drain can see this
             // block too.
             self.insert_finalized(block.height.value(), block.clone());
             *primitives::sync::lock_state(&self.next_proposal_height) =
@@ -533,17 +537,56 @@ impl AppInterface for Executor {
             let lane_dead = {
                 let (lock, cv) = &*self.exec_sync;
                 let mut s = primitives::sync::lock_state(lock);
+                // Non-blocking hand-off: push to the pending deque
+                // and wake the worker. A committed block can never
+                // be dropped, so the deque is unbounded — the bound
+                // lives in the `saturated` signal instead: crossing
+                // `EXEC_LANE_DEPTH` flips it, and the engine
+                // throttles new commits at the source (withheld
+                // votes + deferred commit walks) instead of this
+                // thread stalling inside a blocking channel send.
+                // Consensus keeps pumping — catch-up, timeouts, QC
+                // adoption all still work — while the backlog drains.
+                s.pending.push_back(block.clone());
                 s.enqueued = Some(block.height.value());
+                // Capping the threshold at `retention - 1` keeps the
+                // maximum backlog (deque + one in-flight) inside the
+                // retained history window even for tiny custom
+                // retentions — every unexecuted height stays
+                // reachable by the inline backlog drain.
+                let depth = EXEC_LANE_DEPTH.min(self.history_retention.saturating_sub(1)).max(1);
+                if !s.saturated && s.pending.len() > depth {
+                    s.saturated = true;
+                    eprintln!(
+                        "executor: execution lane saturated — {} committed blocks unexecuted; \
+                         consensus will withhold votes and defer commits until the backlog drains",
+                        s.pending.len()
+                    );
+                }
                 cv.notify_all();
                 s.lane_dead
             };
-            if lane_dead || tx.send(block.clone()).is_err() {
+            if lane_dead {
                 // The lane can never execute this block — drive
                 // every committed-but-unexecuted height inline.
                 // Executing only THIS block (the old behavior) left
                 // the height the worker died on permanently
                 // rootless: a hole no later commit can fill,
                 // stalling every exec-cert that references it.
+                // `pending` is cleared first: every queued block is
+                // in `finalized`, so the drain covers them all and
+                // no stale entry can be double-popped by a worker
+                // that no longer exists. `saturated` clears with it —
+                // the inline drain below IS the debt resolution, so a
+                // stale flag would otherwise throttle a solo engine
+                // into silence (its `step` gate pauses the very
+                // commits that trigger this drain).
+                {
+                    let (lock, _cv) = &*self.exec_sync;
+                    let mut s = primitives::sync::lock_state(lock);
+                    s.pending.clear();
+                    s.saturated = false;
+                }
                 self.execute_committed_backlog();
             }
         } else {
@@ -617,10 +660,11 @@ impl AppInterface for Executor {
         // `None` ("not executed") rather than blocking forever. The
         // `lane_dead` check is what makes a worker panic propagate
         // instead of hanging every attester.
-        if self.exec_lane_tx.get().is_some() {
+        {
             let (lock, cv) = &*self.exec_sync;
             let mut s = primitives::sync::lock_state(lock);
-            while !s.lane_dead
+            while s.lane_spawned
+                && !s.lane_dead
                 && s.enqueued.is_some_and(|e| height.value() <= e)
                 && s.executed.is_none_or(|x| x < height.value())
             {
@@ -648,12 +692,13 @@ impl AppInterface for Executor {
         // behind a lagging lane. On expiry the withheld vote is the
         // honest outcome — the proposal may be re-delivered after the
         // lane catches up.
-        if self.exec_lane_tx.get().is_some() {
+        {
             let deadline = start + max_wait;
             let (lock, cv) = &*self.exec_sync;
             let mut s = primitives::sync::lock_state(lock);
             loop {
-                let done = s.lane_dead
+                let done = !s.lane_spawned
+                    || s.lane_dead
                     || s.enqueued.is_none_or(|e| height.value() > e)
                     || s.executed.is_some_and(|x| x >= height.value());
                 if done {
@@ -674,6 +719,14 @@ impl AppInterface for Executor {
             recorder.record("attest_state", start.elapsed());
         }
         root.map(|root| StateAttestation { height, root })
+    }
+
+    fn exec_saturated(&self) -> bool {
+        // The lane's unexecuted debt exceeded `EXEC_LANE_DEPTH` —
+        // `finalize_block` sets it under the same lock on push, and
+        // the worker clears it only once the deque fully drains.
+        let (lock, _cv) = &*self.exec_sync;
+        primitives::sync::lock_state(lock).saturated
     }
 
     fn attest_latest(&self) -> Option<StateAttestation> {

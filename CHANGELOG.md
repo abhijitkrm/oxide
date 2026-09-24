@@ -72,6 +72,23 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **A backed-up execution lane no longer freezes consensus**
+  (`executor`, `consensus`): the async lane's hand-off was a bounded
+  channel — once it filled, `finalize_block` blocked the consensus
+  thread inside the commit path, stalling timeouts and catch-up along
+  with commits. Committed blocks now hand off to an unbounded pending
+  deque (they can never be dropped), and the bound became a signal:
+  past `EXEC_LANE_DEPTH` the executor reports `exec_saturated`, and
+  the engine withholds votes and defers commit walks until the deque
+  drains — pausing finalization while keeping catch-up, QC adoption,
+  and timeout handling live. Measured on the lane-installed
+  `snapshot_vs_exec` bench: no statistically significant hand-off
+  delta — the win is liveness, not latency.
+  - **In plain words:** when block execution fell behind, a validator
+    used to freeze solid — it couldn't even help the network recover.
+    Now it politely steps back from voting while it catches up, then
+    rejoins automatically.
+
 - **TLS peer writes no longer queue behind the reader's poll**
   (`p2p`, `tls` feature): the `SharedStream` mutex — one lock around
   the whole `rustls::StreamOwned`, held across the reader's blocking

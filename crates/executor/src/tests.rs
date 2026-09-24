@@ -2704,14 +2704,16 @@ fn finalized_pruning_pins_unexecuted_heights() {
 }
 
 #[test]
-fn exec_lane_queue_is_bounded() {
-    // The lane queue must bound how far consensus can outrun
-    // execution: once the channel holds `depth` unreceived
-    // blocks, `finalize_block` blocks until the worker drains —
-    // backpressure, not an unbounded backlog that outlives the
-    // retained history.
+fn exec_lane_saturates_without_blocking() {
+    // The lane must never stall the commit path: once the pending
+    // deque crosses the saturation depth, `exec_saturated` reports
+    // the backpressure to the engine (which withholds votes and
+    // defers commits) while `finalize_block` itself keeps returning
+    // immediately — a committed block can never be dropped, so the
+    // deque is unbounded and the flag is the bound. The old bounded
+    // channel made a backed-up lane freeze the whole consensus pump.
     let mut executor = test_executor(100).with_history_retention(5);
-    // lane depth = min(EXEC_LANE_DEPTH, retention - 1) = 4.
+    // saturation depth = min(EXEC_LANE_DEPTH, retention - 1) = 4.
     let module = Arc::new(GatedModule {
         gate: std::sync::atomic::AtomicBool::new(false),
         calls: Mutex::new(0),
@@ -2724,37 +2726,41 @@ fn exec_lane_queue_is_bounded() {
     executor.finalize_block(&finalized_block(0, 4, 0));
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    // h1..h4 fill the bounded queue (depth 4).
+    // h1..h4 fill the pending deque up to the threshold — the flag
+    // must still be clear at exactly `depth` entries.
     for h in 1..=4u64 {
         executor.finalize_block(&finalized_block(h, 4, h));
     }
+    assert!(!executor.exec_saturated(), "a deque at the threshold must not yet report saturation");
 
-    // h5 cannot be queued until the worker drains — its
-    // finalize must block.
+    // h5 pushes the deque past the threshold. `finalize_block` must
+    // still return immediately — the hand-off never blocks.
     let done = std::sync::mpsc::channel::<()>();
     let exec2 = executor.clone();
     let join = std::thread::spawn(move || {
         exec2.finalize_block(&finalized_block(5, 4, 5));
         let _ = done.0.send(());
     });
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    assert!(
-        done.1.try_recv().is_err(),
-        "a full lane queue must apply backpressure to the commit path"
-    );
-
-    // Release the worker: the backlog drains and h5 completes.
-    module.gate.store(true, std::sync::atomic::Ordering::SeqCst);
     done.1
         .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("h5 finalize must complete once the worker drains");
+        .expect("finalize must not block behind a saturated lane");
     join.join().expect("finalize thread must not panic");
+    assert!(
+        executor.exec_saturated(),
+        "crossing the threshold must raise the engine-facing signal"
+    );
+
+    // Release the worker: the backlog drains in commit order, every
+    // block executes exactly once, and the flag clears only once the
+    // deque is empty.
+    module.gate.store(true, std::sync::atomic::Ordering::SeqCst);
     executor.wait_exec_idle();
     assert_eq!(
         *primitives::sync::lock_state(&module.calls),
         6,
         "every committed block executed exactly once"
     );
+    assert!(!executor.exec_saturated(), "a fully drained lane must clear the saturation signal");
 }
 
 // ---- Mempool finality-custody tests ----

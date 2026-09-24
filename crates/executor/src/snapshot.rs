@@ -81,9 +81,9 @@ impl Executor {
     /// is mid-block. No-op when the lane is not installed or is
     /// already idle.
     pub(crate) fn wait_exec_idle(&self) {
-        if self.exec_lane_tx.get().is_some() {
-            let (lock, cv) = &*self.exec_sync;
-            let mut s = primitives::sync::lock_state(lock);
+        let (lock, cv) = &*self.exec_sync;
+        let mut s = primitives::sync::lock_state(lock);
+        if s.lane_spawned {
             while s.enqueued != s.executed {
                 s = cv.wait(s).unwrap_or_else(|_| {
                     panic!("state mutex poisoned: a holder panicked mid-mutation")

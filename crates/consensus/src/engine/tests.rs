@@ -395,6 +395,110 @@ fn multi_validator_two_chain_commits() {
     }
 }
 
+/// Execution-lane saturation must pause finalization without
+/// freezing consensus: a saturated follower withholds its vote
+/// (throttling new commits at the source), refuses new body
+/// admission, and defers commit walks — while QC adoption stays
+/// live so catch-up never stalls. Once the lane drains, the next
+/// delivered QC re-runs the deferred walk and the backlog commits
+/// in order. The regression this guards: the old bounded channel
+/// made `finalize_block` block the consensus thread inside the
+/// commit path, so a backed-up execution lane froze timeouts and
+/// catch-up along with commits.
+#[test]
+fn exec_saturation_defers_commits_without_stalling() {
+    let mut leader = make_multi_engine(0);
+    let f1_app = Arc::new(MockApp::new());
+    let mut f1 = OxideBft::with_index(f1_app.clone(), four_validator_set(), 1)
+        .without_signature_verification();
+    let mut f2 = make_multi_engine(2);
+    let mut f3 = make_multi_engine(3);
+
+    // Round 1 (healthy): h0@v0 earns its QC on every replica — f1
+    // stores the body.
+    drive_round(&mut leader, &mut [&mut f1, &mut f2, &mut f3], Some(TxBytes::new(vec![1])));
+    assert!(f1_app.attest_latest().is_none(), "2-chain: h0 cannot commit on its own QC");
+
+    // Saturate f1's execution lane.
+    f1_app.set_exec_saturated(true);
+
+    // Round 2 by hand to inspect the withheld vote: h1@v1 carries
+    // QC(h0) — its commit walk would finalize h0.
+    leader.submit_tx(TxBytes::new(vec![2]));
+    let (h1, p1) = leader.propose().expect("leader proposes");
+    let lv = leader.vote(&h1, &p1).expect("leader self-votes");
+    leader.collect_vote(0, lv).expect("collect leader vote");
+    assert!(f1.vote(&h1, &p1).is_none(), "a saturated executor must withhold the vote");
+    assert!(
+        !f1.blocks.contains_key(&OxideBft::block_hash(&h1)),
+        "saturated admission must not store unexecutable bodies"
+    );
+    for (i, f) in [&mut f2, &mut f3].iter_mut().enumerate() {
+        let v = f.vote(&h1, &p1).expect("healthy followers still vote");
+        leader.collect_vote(u16::try_from(i + 2).unwrap(), v).expect("collect");
+    }
+    let qc1 = leader.try_form_qc().expect("3 of 4 still reach quorum");
+    leader.deliver_qc(qc1.clone()).expect("deliver");
+    f2.deliver_qc(qc1.clone()).expect("deliver");
+    f3.deliver_qc(qc1.clone()).expect("deliver");
+
+    // QC adoption is unaffected — catch-up stays live under
+    // saturation — but nothing finalizes.
+    f1.deliver_qc(qc1.clone()).expect("QC adoption stays live under saturation");
+    assert_eq!(
+        f1.high_qc.as_ref().map(VerifiedQc::block_hash),
+        Some(OxideBft::block_hash(&h1)),
+        "the saturated follower must still adopt the QC"
+    );
+    assert!(f1_app.attest_latest().is_none(), "no commit may finalize while the lane is saturated");
+    for e in [&mut leader, &mut f1, &mut f2, &mut f3] {
+        e.advance_view();
+    }
+
+    // The lane drains. h1's body re-delivers (the block-sync seam):
+    // admission and voting resume.
+    f1_app.set_exec_saturated(false);
+    assert!(f1.admit_proposal(&h1, &p1), "drained lane must re-admit the body");
+
+    // Round 3: f1 votes on h2 (its body is now stored), then
+    // saturates again before the QC lands — QC(h2)'s walk would
+    // commit h0+h1 through the consecutive pair, so a deferral here
+    // isolates the commit gate from the admission gate.
+    leader.submit_tx(TxBytes::new(vec![3]));
+    let (h2, p2) = leader.propose().expect("leader proposes");
+    let lv = leader.vote(&h2, &p2).expect("leader self-votes");
+    leader.collect_vote(0, lv).expect("collect leader vote");
+    let f1v = f1.vote(&h2, &p2).expect("voting resumes once drained");
+    leader.collect_vote(1, f1v).expect("collect");
+    for (i, f) in [&mut f2, &mut f3].iter_mut().enumerate() {
+        let v = f.vote(&h2, &p2).expect("vote");
+        leader.collect_vote(u16::try_from(i + 2).unwrap(), v).expect("collect");
+    }
+    let qc2 = leader.try_form_qc().expect("quorum");
+    leader.deliver_qc(qc2.clone()).expect("deliver");
+    f2.deliver_qc(qc2.clone()).expect("deliver");
+    f3.deliver_qc(qc2.clone()).expect("deliver");
+    f1_app.set_exec_saturated(true);
+    f1.deliver_qc(qc2).expect("adopt QC while saturated");
+    assert!(
+        f1_app.attest_latest().is_none(),
+        "the commit walk itself must defer under saturation — the bodies are stored"
+    );
+    for e in [&mut leader, &mut f1, &mut f2, &mut f3] {
+        e.advance_view();
+    }
+
+    // Drain for good: the very next delivered QC re-runs the walk
+    // and commits the deferred backlog in order.
+    f1_app.set_exec_saturated(false);
+    drive_round(&mut leader, &mut [&mut f1, &mut f2, &mut f3], None);
+    assert_eq!(
+        f1_app.attest_latest().map(|a| a.height),
+        Some(Height::new(2)),
+        "the deferred backlog must commit in one walk once the lane drains"
+    );
+}
+
 /// Regression test (safety): a validator that voted for block A
 /// at height h must refuse a *different* block B at the same
 /// height, even in a later view. Without the per-height lock,

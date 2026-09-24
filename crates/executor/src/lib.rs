@@ -48,21 +48,27 @@ use crypto::hash::{Domain, Hasher};
 /// long-lived node doesn't grow memory without limit.
 const MAX_RETAINED_HISTORY: usize = 4096;
 
-/// Maximum committed-but-unreceived blocks the execution lane
-/// buffers — the bound on how far consensus may outrun execution.
+/// Saturation threshold for the execution lane's pending deque —
+/// the debt at which the executor reports `exec_saturated` and the
+/// engine starts withholding votes and deferring commit walks.
 ///
-/// Unit: committed blocks. The worker holds at most one additional
-/// in-flight block, so the total execution lag is at most
+/// Unit: committed-but-unexecuted blocks. A committed block can
+/// never be *dropped* — it must execute eventually — so the depth
+/// is a signal, not a queue bound: past it, the engine-side gates
+/// are what actually stop new commits from arriving (a withheld
+/// vote is the throttle; the pump thread itself never blocks on
+/// the lane). The worker holds at most one additional in-flight
+/// block, so the lag a saturated engine tolerates is roughly
 /// `EXEC_LANE_DEPTH + 1` heights — far inside the default
 /// [`MAX_RETAINED_HISTORY`] window, which keeps every unexecuted
 /// block reachable by the inline backlog drain. Origin: the audit
-/// requires "one block behind" to be *enforced* — an unbounded
-/// queue let consensus run arbitrarily ahead while `finalized`
-/// pruned to a fixed window, so a dead lane could leave committed
-/// heights already evicted and unexecutable. Tradeoff: a deeper
-/// queue absorbs commit bursts without stalling `finalize_block`;
-/// a shallower one tightens the lag bound and shrinks worst-case
-/// queued tx bytes. 64 keeps the stall rare (attestations already
+/// requires execution lag to be *bounded* — an unbounded queue let
+/// consensus run arbitrarily ahead while `finalized` pruned to a
+/// fixed window, so a dead lane could leave committed heights
+/// already evicted and unexecutable. Tradeoff: a deeper threshold
+/// absorbs commit bursts before the engine self-throttles; a
+/// shallower one tightens the lag bound and shrinks worst-case
+/// queued tx bytes. 64 keeps saturation rare (attestations already
 /// wait on execution, so deeper buffering buys nothing) while
 /// bounded enough that a stalled lane cannot hide.
 const EXEC_LANE_DEPTH: usize = 64;
@@ -1434,6 +1440,26 @@ struct ExecSync {
     /// instead of sending into a void. Terminal: the lane is never
     /// respawned (a second spawn is already a panic).
     lane_dead: bool,
+    /// `true` once [`Executor::spawn_exec_lane`] has installed the
+    /// worker thread — the async-lane gate `attest_state` and
+    /// `finalize_block` read (replacing the old channel-handle
+    /// `OnceLock`: the deque below is the hand-off now, so the only
+    /// question callers ask is "does a lane exist").
+    lane_spawned: bool,
+    /// Committed blocks handed to the worker but not yet popped —
+    /// the lane's work queue. Unbounded because a committed block
+    /// can never be dropped: the real bound is [`EXEC_LANE_DEPTH`]
+    /// as a *signal* — crossing it sets `saturated` and the engine
+    /// throttles new commits at the source. Condvar-signalled on
+    /// every push; drained strictly in commit order.
+    pending: std::collections::VecDeque<FinalizedBlock>,
+    /// `pending` exceeded [`EXEC_LANE_DEPTH`] — the engine reads
+    /// this via `exec_saturated` and withholds votes + defers
+    /// commit walks until the worker drains the deque empty. The
+    /// empty-to-clear rule gives hysteresis for free: a flap at the
+    /// threshold boundary means the lane is at the edge of
+    /// catching up, and only a fully drained queue proves it has.
+    saturated: bool,
     /// The height currently inside `execute_block` on the worker —
     /// `Some` only while module state is mid-mutation. When the
     /// lane dies with this set AND the height has no recorded root,
@@ -1503,13 +1529,13 @@ pub struct Executor {
     state_roots: Mutex<BTreeMap<u64, Hash>>,
     /// The next proposal height.
     next_proposal_height: Mutex<u64>,
-    /// Phase D: the execution-lane channel. `Some` once
-    /// [`Executor::spawn_exec_lane`] has installed the worker
-    /// thread; `None` means synchronous finalize (the default).
-    /// `OnceLock` so spawning races are refused loudly rather than
-    /// silently splitting the commit stream between two workers.
-    exec_lane_tx: std::sync::OnceLock<std::sync::mpsc::SyncSender<FinalizedBlock>>,
-    /// Execution progress shared with the worker. `attest_state`
+    /// Phase D: once-only spawn latch for the execution lane.
+    /// `spawn_exec_lane` sets it before installing the worker, so a
+    /// second spawn is refused loudly rather than silently splitting
+    /// the commit stream between two workers.
+    exec_lane_once: std::sync::OnceLock<()>,
+    /// Execution progress shared with the worker: watermarks, the
+    /// pending deque, and the saturation flag. `attest_state`
     /// waits on the condvar only while the requested height is
     /// enqueued-but-not-yet-executed — preserving the synchronous
     /// contract that an attested height's root exists, without
@@ -1659,12 +1685,15 @@ impl Executor {
             finalized: Mutex::new(BTreeMap::new()),
             state_roots: Mutex::new(BTreeMap::new()),
             next_proposal_height: Mutex::new(0),
-            exec_lane_tx: std::sync::OnceLock::new(),
+            exec_lane_once: std::sync::OnceLock::new(),
             exec_sync: std::sync::Arc::new((
                 Mutex::new(ExecSync {
                     enqueued: None,
                     executed: None,
                     lane_dead: false,
+                    lane_spawned: false,
+                    pending: std::collections::VecDeque::new(),
+                    saturated: false,
                     in_flight: None,
                 }),
                 std::sync::Condvar::new(),

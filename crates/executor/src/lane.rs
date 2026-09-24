@@ -9,7 +9,7 @@
 //! [`LaneDeath`] (declared in `lib.rs`) fails loudly rather than
 //! leaving finalized blocks unexecuted.
 
-use super::{EXEC_LANE_DEPTH, Executor, FinalizedBlock, InsertRetained, LaneDeath};
+use super::{Executor, FinalizedBlock, InsertRetained, LaneDeath};
 
 impl Executor {
     /// Phase D: enable the async execution lane.
@@ -49,34 +49,60 @@ impl Executor {
     /// Panics if called twice — a second lane would split the
     /// commit stream.
     pub fn spawn_exec_lane(self: &std::sync::Arc<Self>) {
-        // Bound the lane's queue: at most `depth` committed blocks
-        // may sit unreceived. `finalize_block`'s blocking send then
-        // *enforces* bounded execution lag — a worker that falls
-        // behind stalls the commit path rather than silently
-        // accumulating a backlog the drain could never replay.
-        // Capping at `retention - 1` keeps the maximum possible
-        // backlog (queue + one in-flight) inside the retained
-        // history window even for tiny custom retentions.
-        let depth = EXEC_LANE_DEPTH.min(self.history_retention.saturating_sub(1)).max(1);
-        let (tx, rx) = std::sync::mpsc::sync_channel::<FinalizedBlock>(depth);
-        self.exec_lane_tx.set(tx).expect("exec lane already spawned");
+        // Once-only: two workers would split the commit stream.
+        self.exec_lane_once.set(()).expect("exec lane already spawned");
         let weak = std::sync::Arc::downgrade(self);
         let sync = self.exec_sync.clone();
+        {
+            let (lock, _cv) = &*sync;
+            primitives::sync::lock_state(lock).lane_spawned = true;
+        }
         // Supervised + critical: this lane is the only path from
         // finalized block to executed state root. A panic here means
         // `attest_state`/`drain` can never complete — fail fast so the
         // supervisor restarts rather than livelock on withheld votes.
         primitives::supervision::spawn_supervised("exec-lane", true, move || {
             // RAII: ANY worker exit — panic unwind or clean
-            // channel disconnect — marks the lane dead and wakes
+            // disconnect — marks the lane dead and wakes
             // every waiter. Without this, a panic mid-`execute_block`
             // left `attest_state` waiting forever on a watermark
             // that could never advance, and the death surfaced
             // only as unexplained withheld votes.
             let _death = LaneDeath { sync: sync.clone() };
-            while let Ok(block) = rx.recv() {
-                // If the executor is gone there is no one left
-                // to serve — exit rather than resurrect it.
+            loop {
+                // Pop the oldest committed block, waiting on the
+                // condvar while the deque is empty. The commit path
+                // pushes under the same lock and never blocks — the
+                // `saturated` flag (not a full queue) is what throttles
+                // consensus when we fall behind.
+                let block = {
+                    let (lock, cv) = &*sync;
+                    let mut s = primitives::sync::lock_state(lock);
+                    loop {
+                        if let Some(block) = s.pending.pop_front() {
+                            // Fully drained = caught up: clear the
+                            // saturation signal so the engine resumes
+                            // voting and committing. Clearing only on
+                            // empty (not merely below the threshold)
+                            // keeps the flag honest — a half-drained
+                            // backlog is still debt.
+                            if s.pending.is_empty() {
+                                s.saturated = false;
+                            }
+                            break block;
+                        }
+                        // If the executor is gone there is no one left
+                        // to serve — exit rather than resurrect it.
+                        if weak.upgrade().is_none() {
+                            return;
+                        }
+                        s = cv.wait(s).unwrap_or_else(|_| {
+                            panic!("state mutex poisoned: a holder panicked mid-mutation")
+                        });
+                    }
+                };
+                // The upgrade is redone post-pop: the executor could
+                // have dropped between the wait check and here.
                 let Some(executor) = weak.upgrade() else { return };
                 let height = block.height.value();
                 // Mark the block in-flight BEFORE executing: if

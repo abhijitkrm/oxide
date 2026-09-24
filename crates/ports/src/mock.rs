@@ -51,6 +51,11 @@ pub struct MockApp {
     /// protocol: a real app produces these from executed staking
     /// transactions; the mock lets a test script them.
     pending_epoch_changes: Mutex<Vec<types::EpochChanges>>,
+    /// Scripted `exec_saturated` answer — tests flip this to
+    /// exercise the engine's execution-lag throttle (withheld
+    /// votes, deferred commit walks) without standing up a real
+    /// async lane.
+    saturated: std::sync::atomic::AtomicBool,
 }
 
 impl MockApp {
@@ -61,7 +66,15 @@ impl MockApp {
             state_roots: Mutex::new(BTreeMap::new()),
             next_proposal_height: Mutex::new(0),
             pending_epoch_changes: Mutex::new(Vec::new()),
+            saturated: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Script the `exec_saturated` answer — the engine reads it on
+    /// every vote/commit decision, so a test can open and close the
+    /// throttle mid-scenario.
+    pub fn set_exec_saturated(&self, saturated: bool) {
+        self.saturated.store(saturated, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Stage a validator-set transition for the next
@@ -178,6 +191,10 @@ impl AppInterface for MockApp {
             .iter()
             .next_back()
             .map(|(h, root)| StateAttestation { height: Height::new(*h), root: *root })
+    }
+
+    fn exec_saturated(&self) -> bool {
+        self.saturated.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
