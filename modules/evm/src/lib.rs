@@ -62,7 +62,7 @@ use framework::{Balances, module_id};
 use primitives::{Address, Hash, Height};
 // Ceiling 1: the chain-configured block gas limit is the single
 // source of truth for the EVM's block gas limit too.
-use parallel::{CoinbaseObs, GroupExecResult, SharedCacheDB, SpecTx};
+use parallel::{CoinbaseObs, GroupExecResult, SharedCacheDB, SpecTx, WriteSplit, classify_state};
 use trie::{encode_trie_leaf, sparse_walk};
 use types::CHAIN_BLOCK_GAS_LIMIT;
 // rayon: parallel secp256k1 sender recovery in `handle_batch`.
@@ -507,6 +507,13 @@ pub struct EvmModule {
     ///
     /// `pub(crate)` for `ledger.rs` (`Balances` impl).
     pub(crate) touched: Mutex<std::collections::BTreeSet<revm::primitives::Address>>,
+    /// Diagnostic counter: txs that re-executed canonically inside
+    /// `handle_batch_parallel*` after failing conflict validation.
+    /// Written only on the (cold) re-execution path; read by tests to
+    /// prove slot-granular conflict detection avoids spurious
+    /// re-execution, and by operators to measure speculation hit rate.
+    /// `Relaxed` — a metric, never a consensus input.
+    parallel_reexecs: std::sync::atomic::AtomicUsize,
     /// Wall-clock bound applied to read-only simulations
     /// (`eth_call`/`eth_estimateGas`/`eth_createAccessList`/
     /// `debug_traceCall`) — the geth `--rpc.evmtimeout` equivalent.
@@ -646,6 +653,7 @@ impl EvmModule {
             sim_timeout: DEFAULT_SIM_TIMEOUT,
             fee_recipient: None,
             touched: Mutex::new(std::collections::BTreeSet::new()),
+            parallel_reexecs: std::sync::atomic::AtomicUsize::new(0),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
@@ -680,6 +688,7 @@ impl EvmModule {
             sim_timeout: DEFAULT_SIM_TIMEOUT,
             fee_recipient: None,
             touched: Mutex::new(std::collections::BTreeSet::new()),
+            parallel_reexecs: std::sync::atomic::AtomicUsize::new(0),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
@@ -741,6 +750,7 @@ impl EvmModule {
             sim_timeout: DEFAULT_SIM_TIMEOUT,
             fee_recipient: None,
             touched: Mutex::new(std::collections::BTreeSet::new()),
+            parallel_reexecs: std::sync::atomic::AtomicUsize::new(0),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
@@ -1152,6 +1162,14 @@ impl EvmModule {
     #[doc(hidden)]
     pub fn mark_touched_for_test(&self, addr: &Address) {
         framework::lock_state(&self.touched).insert(alloy_primitives_address(addr.0));
+    }
+
+    /// Number of txs `handle_batch_parallel*` re-executed canonically
+    /// after conflict validation — test/bench instrumentation for the
+    /// slot-granular conflict detector's hit rate.
+    #[doc(hidden)]
+    pub fn parallel_reexec_count_for_test(&self) -> usize {
+        self.parallel_reexecs.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Reset the leaf cache so the next `state_root` call performs

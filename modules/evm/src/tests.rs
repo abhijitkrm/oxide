@@ -1180,6 +1180,403 @@ fn handle_batch_parallel_preserves_unread_storage() {
     assert_eq!(m_serial.state_root(), m_par.state_root(), "serial and parallel roots must match");
 }
 
+/// Contract that increments storage slot `calldata[0..32]` — a
+/// read-modify-write whose read AND write footprint is the same
+/// calldata-chosen slot. Two txs choosing different slots share the
+/// contract account but commute.
+///
+/// `PUSH1 0 CALLDATALOAD DUP1 SLOAD PUSH1 1 ADD SWAP1 SSTORE STOP`.
+const COUNTER_RUNTIME: &[u8] = &[0x60, 0x00, 0x35, 0x80, 0x54, 0x60, 0x01, 0x01, 0x90, 0x55, 0x00];
+
+/// Build a `Call` to a contract whose calldata selects a storage slot
+/// (32-byte slot key, left-aligned in calldata[0..32]).
+fn slot_call(privkey: &[u8], nonce: u64, to: revm::primitives::Address, slot: u8) -> Vec<u8> {
+    let mut data = [0u8; 32];
+    data[31] = slot;
+    signed_tx(privkey, nonce, tx::TxKind::Call(to), &data)
+}
+
+/// Slot-granular conflict detection: two senders read-modify-write
+/// DISJOINT slots of the same contract. Account-granular detection
+/// treated this as a conflict (both txs touched and wrote the same
+/// account); slot tracking must merge both speculations with zero
+/// re-executions — the ERC-20-hot-contract case the whole mechanism
+/// exists for.
+#[test]
+fn handle_batch_parallel_disjoint_slots_skip_reexec() {
+    let (pk_a, addr_a) = test_keypair();
+    let (pk_b, addr_b) = test_keypair();
+    let contract = workload_contract(9);
+    let contract_evm = revm::primitives::Address::from(contract.0);
+
+    let setup = || {
+        let m = make_module();
+        m.genesis_insert_account(
+            &contract,
+            0,
+            1,
+            COUNTER_RUNTIME.to_vec(),
+            vec![(U256::from(3), U256::from(100)), (U256::from(4), U256::from(200))],
+        );
+        fund(&m, &addr_a);
+        fund(&m, &addr_b);
+        m
+    };
+
+    // A increments slot 3; B increments slot 4. Disjoint.
+    let txs = vec![slot_call(&pk_a, 0, contract_evm, 3), slot_call(&pk_b, 0, contract_evm, 4)];
+
+    let m_serial = setup();
+    m_serial.begin_block(Height::new(1));
+    for raw in &txs {
+        m_serial.handle(&dummy_ctx(), raw).expect("serial tx");
+    }
+    m_serial.end_block(Height::new(1));
+
+    let m_par = setup();
+    m_par.begin_block(Height::new(1));
+    let results = m_par.handle_batch_parallel(&dummy_ctx(), &txs);
+    m_par.end_block(Height::new(1));
+
+    assert!(results.iter().all(std::result::Result::is_ok), "all parallel txs must succeed");
+    assert_eq!(
+        m_par.parallel_reexec_count_for_test(),
+        0,
+        "disjoint slot writes must not force re-execution"
+    );
+    assert_eq!(m_par.storage_at(&contract, &U256::from(3)), U256::from(101));
+    assert_eq!(m_par.storage_at(&contract, &U256::from(4)), U256::from(201));
+    assert_eq!(m_serial.state_root(), m_par.state_root(), "parallel root diverged");
+}
+
+/// Two senders incrementing the SAME slot is a genuine read-write
+/// conflict: B's speculative `slot + 1` was computed on the pre-A
+/// value and must be re-executed so the counter lands at +2, not +1.
+#[test]
+fn handle_batch_parallel_same_slot_still_conflicts() {
+    let (pk_a, addr_a) = test_keypair();
+    let (pk_b, addr_b) = test_keypair();
+    let contract = workload_contract(10);
+    let contract_evm = revm::primitives::Address::from(contract.0);
+
+    let setup = || {
+        let m = make_module();
+        m.genesis_insert_account(
+            &contract,
+            0,
+            1,
+            COUNTER_RUNTIME.to_vec(),
+            vec![(U256::from(7), U256::from(100))],
+        );
+        fund(&m, &addr_a);
+        fund(&m, &addr_b);
+        m
+    };
+
+    let txs = vec![slot_call(&pk_a, 0, contract_evm, 7), slot_call(&pk_b, 0, contract_evm, 7)];
+
+    let m_serial = setup();
+    m_serial.begin_block(Height::new(1));
+    for raw in &txs {
+        m_serial.handle(&dummy_ctx(), raw).expect("serial tx");
+    }
+    m_serial.end_block(Height::new(1));
+
+    let m_par = setup();
+    m_par.begin_block(Height::new(1));
+    let results = m_par.handle_batch_parallel(&dummy_ctx(), &txs);
+    m_par.end_block(Height::new(1));
+
+    assert!(results.iter().all(std::result::Result::is_ok), "all parallel txs must succeed");
+    assert!(
+        m_par.parallel_reexec_count_for_test() >= 1,
+        "same-slot read-modify-write must re-execute the later tx"
+    );
+    assert_eq!(m_par.storage_at(&contract, &U256::from(7)), U256::from(102));
+    assert_eq!(m_serial.state_root(), m_par.state_root(), "parallel root diverged");
+}
+
+/// Contract that copies one calldata-chosen slot into another:
+/// `SSTORE(calldata[32..64], SLOAD(calldata[0..32]))` — one slot read,
+/// one slot write, both caller-selected. Lets one address host both
+/// halves of a read-write conflict.
+///
+/// `PUSH1 0 CALLDATALOAD SLOAD PUSH1 0x20 CALLDATALOAD SSTORE STOP`.
+const COPY_RUNTIME: &[u8] = &[0x60, 0x00, 0x35, 0x54, 0x60, 0x20, 0x35, 0x55, 0x00];
+
+/// Read-vs-write at slot granularity: B reads the very slot A wrote
+/// earlier in canonical order. B's speculative read observed the
+/// pre-write value, so B must re-execute and land A's value.
+#[test]
+fn handle_batch_parallel_slot_read_write_conflicts() {
+    let (pk_a, addr_a) = test_keypair();
+    let (pk_b, addr_b) = test_keypair();
+    let contract = workload_contract(11);
+    let contract_evm = revm::primitives::Address::from(contract.0);
+
+    let setup = || {
+        let m = make_module();
+        m.genesis_insert_account(
+            &contract,
+            0,
+            1,
+            COPY_RUNTIME.to_vec(),
+            vec![(U256::from(9), U256::from(42))],
+        );
+        fund(&m, &addr_a);
+        fund(&m, &addr_b);
+        m
+    };
+    let copy_call = |pk: &[u8], nonce: u64, read_slot: u8, write_slot: u8| {
+        let mut data = [0u8; 64];
+        data[31] = read_slot;
+        data[63] = write_slot;
+        signed_tx(pk, nonce, tx::TxKind::Call(contract_evm), &data)
+    };
+
+    // A writes slot 7 (source slot 9 holds 42); B reads slot 7 into
+    // slot 8. B speculated on slot7=0 and must re-execute to see 42.
+    let txs = vec![copy_call(&pk_a, 0, 9, 7), copy_call(&pk_b, 0, 7, 8)];
+
+    let m_serial = setup();
+    m_serial.begin_block(Height::new(1));
+    for raw in &txs {
+        m_serial.handle(&dummy_ctx(), raw).expect("serial tx");
+    }
+    m_serial.end_block(Height::new(1));
+
+    let m_par = setup();
+    m_par.begin_block(Height::new(1));
+    let results = m_par.handle_batch_parallel(&dummy_ctx(), &txs);
+    m_par.end_block(Height::new(1));
+
+    assert!(results.iter().all(std::result::Result::is_ok), "all parallel txs must succeed");
+    assert!(
+        m_par.parallel_reexec_count_for_test() >= 1,
+        "a read of a slot written earlier in canonical order must re-execute"
+    );
+    // B's re-executed copy saw A's write: slot 8 == 42, not the
+    // speculative 0.
+    assert_eq!(m_par.storage_at(&contract, &U256::from(7)), U256::from(42));
+    assert_eq!(m_par.storage_at(&contract, &U256::from(8)), U256::from(42));
+    assert_eq!(m_serial.state_root(), m_par.state_root(), "parallel root diverged");
+}
+
+/// The read and write halves stay disjoint across both txs — nobody
+/// reads a slot anyone else wrote. Even with every tx touching the
+/// same contract, no re-execution may occur.
+#[test]
+fn handle_batch_parallel_disjoint_slot_accesses_skip_reexec() {
+    let (pk_a, addr_a) = test_keypair();
+    let (pk_b, addr_b) = test_keypair();
+    let contract = workload_contract(12);
+    let contract_evm = revm::primitives::Address::from(contract.0);
+
+    let setup = || {
+        let m = make_module();
+        m.genesis_insert_account(
+            &contract,
+            0,
+            1,
+            COPY_RUNTIME.to_vec(),
+            vec![(U256::from(1), U256::from(11)), (U256::from(2), U256::from(22))],
+        );
+        fund(&m, &addr_a);
+        fund(&m, &addr_b);
+        m
+    };
+    let copy_call = |pk: &[u8], nonce: u64, read_slot: u8, write_slot: u8| {
+        let mut data = [0u8; 64];
+        data[31] = read_slot;
+        data[63] = write_slot;
+        signed_tx(pk, nonce, tx::TxKind::Call(contract_evm), &data)
+    };
+
+    // A: read 1 → write 5. B: read 2 → write 6. Fully disjoint.
+    let txs = vec![copy_call(&pk_a, 0, 1, 5), copy_call(&pk_b, 0, 2, 6)];
+
+    let m_serial = setup();
+    m_serial.begin_block(Height::new(1));
+    for raw in &txs {
+        m_serial.handle(&dummy_ctx(), raw).expect("serial tx");
+    }
+    m_serial.end_block(Height::new(1));
+
+    let m_par = setup();
+    m_par.begin_block(Height::new(1));
+    let results = m_par.handle_batch_parallel(&dummy_ctx(), &txs);
+    m_par.end_block(Height::new(1));
+
+    assert!(results.iter().all(std::result::Result::is_ok), "all parallel txs must succeed");
+    assert_eq!(
+        m_par.parallel_reexec_count_for_test(),
+        0,
+        "disjoint slot accesses must not re-execute"
+    );
+    assert_eq!(m_par.storage_at(&contract, &U256::from(5)), U256::from(11));
+    assert_eq!(m_par.storage_at(&contract, &U256::from(6)), U256::from(22));
+    assert_eq!(m_serial.state_root(), m_par.state_root(), "parallel root diverged");
+}
+
+/// A minimal ERC-20-style balance-mapping contract:
+/// `balances[caller] -= v; balances[to] += v` where `balances[x]`
+/// lives at `keccak256(pad32(x) || pad32(0))` — the storage layout a
+/// real `mapping(address => uint256)` produces. Each call performs
+/// two dependent slot read-modify-writes on the SAME contract —
+/// the workload that defeated account-granular conflict detection.
+const ERC20_RUNTIME: &[u8] = &[
+    // balances[caller] -= v: SHA3(mem[0..64]) → slot; SLOAD; subtract
+    // calldata v; SWAP1 puts the slot on top for SSTORE(key, value).
+    0x33, 0x60, 0x00, 0x52, 0x60, 0x00, 0x60, 0x20, 0x52, 0x60, 0x40, 0x60, 0x00, 0x20, 0x80, 0x54,
+    0x60, 0x00, 0x35, 0x90, 0x03, 0x90, 0x55,
+    // balances[to] += v: same with the calldata recipient.
+    0x60, 0x20, 0x35, 0x60, 0x00, 0x52, 0x60, 0x40, 0x60, 0x00, 0x20, 0x80, 0x54, 0x60, 0x00, 0x35,
+    0x01, 0x90, 0x55, 0x00,
+];
+
+/// `keccak256(pad32(addr) || pad32(0))` — `balances[addr]`'s slot for
+/// a mapping at position 0 (Solidity layout).
+fn balance_slot(addr: revm::primitives::Address) -> U256 {
+    let mut preimage = [0u8; 64];
+    preimage[12..32].copy_from_slice(addr.as_slice());
+    U256::from_be_bytes(revm::primitives::keccak256(preimage).0)
+}
+
+/// The M5 target workload end-to-end: 8 senders, each debiting its
+/// own `balances` slot and crediting a distinct recipient's slot on
+/// the SAME token contract — every slot write pairwise disjoint.
+/// Slot-granular conflict detection must merge all speculations with
+/// zero re-executions; the balances must match serial execution.
+#[test]
+fn handle_batch_parallel_erc20_disjoint_balances() {
+    const N: usize = 8;
+    let keys: Vec<([u8; 32], Address)> = (0..N).map(|_| test_keypair()).collect();
+    let token = workload_contract(13);
+    let token_evm = revm::primitives::Address::from(token.0);
+
+    let setup = || {
+        let m = make_module();
+        // Seed every sender's `balances` slot so the debit is a real
+        // transfer, not a wraparound.
+        let seeded: Vec<(U256, U256)> = keys
+            .iter()
+            .map(|(_, a)| {
+                (balance_slot(revm::primitives::Address::from(a.0)), U256::from(1_000_000u64))
+            })
+            .collect();
+        m.genesis_insert_account(&token, 0, 1, ERC20_RUNTIME.to_vec(), seeded);
+        for (_, a) in &keys {
+            fund(&m, a);
+        }
+        m
+    };
+    let mut txs = Vec::new();
+    for (i, (pk, _)) in keys.iter().enumerate() {
+        let mut data = [0u8; 64];
+        data[31] = 100u8; // value
+        let mut r = [0x55u8; 20];
+        r[18..20].copy_from_slice(&u16::try_from(i).expect("sender index fits u16").to_be_bytes());
+        data[44..64].copy_from_slice(&r); // recipient (right-aligned)
+        txs.push(signed_tx(pk, 0, tx::TxKind::Call(token_evm), &data));
+    }
+
+    let m_serial = setup();
+    m_serial.begin_block(Height::new(1));
+    for raw in &txs {
+        m_serial.handle(&dummy_ctx(), raw).expect("serial tx");
+    }
+    m_serial.end_block(Height::new(1));
+
+    let m_par = setup();
+    m_par.begin_block(Height::new(1));
+    let results = m_par.handle_batch_parallel(&dummy_ctx(), &txs);
+    m_par.end_block(Height::new(1));
+
+    assert!(results.iter().all(std::result::Result::is_ok), "all parallel txs must succeed");
+    assert_eq!(
+        m_par.parallel_reexec_count_for_test(),
+        0,
+        "disjoint ERC-20 balance slots must not re-execute"
+    );
+    // Sender slots debited by 100; each recipient credited 100.
+    for (i, (_, a)) in keys.iter().enumerate() {
+        let mut r = [0x55u8; 20];
+        r[18..20].copy_from_slice(&u16::try_from(i).expect("sender index fits u16").to_be_bytes());
+        assert_eq!(
+            m_par.storage_at(&token, &balance_slot(revm::primitives::Address::from(a.0))),
+            U256::from(1_000_000u64 - 100),
+            "sender {i} balance slot"
+        );
+        assert_eq!(
+            m_par.storage_at(&token, &balance_slot(revm::primitives::Address::from_slice(&r))),
+            U256::from(100u64),
+            "recipient {i} balance slot"
+        );
+    }
+    assert_eq!(m_serial.state_root(), m_par.state_root(), "parallel root diverged");
+}
+
+/// Same workload but every tx credits ONE recipient — the shared
+/// `balances[recipient]` slot serializes the batch: every later tx
+/// must re-execute and the total must still match serial execution.
+#[test]
+fn handle_batch_parallel_erc20_shared_slot_conflicts() {
+    const N: usize = 8;
+    let keys: Vec<([u8; 32], Address)> = (0..N).map(|_| test_keypair()).collect();
+    let token = workload_contract(14);
+    let token_evm = revm::primitives::Address::from(token.0);
+    let shared_recipient = revm::primitives::Address::from_slice(&[0x66; 20]);
+
+    let setup = || {
+        let m = make_module();
+        let seeded: Vec<(U256, U256)> = keys
+            .iter()
+            .map(|(_, a)| {
+                (balance_slot(revm::primitives::Address::from(a.0)), U256::from(1_000_000u64))
+            })
+            .collect();
+        m.genesis_insert_account(&token, 0, 1, ERC20_RUNTIME.to_vec(), seeded);
+        for (_, a) in &keys {
+            fund(&m, a);
+        }
+        m
+    };
+    let mut txs = Vec::new();
+    for (pk, _) in &keys {
+        let mut data = [0u8; 64];
+        data[31] = 100u8;
+        data[44..64].copy_from_slice(shared_recipient.as_slice());
+        txs.push(signed_tx(pk, 0, tx::TxKind::Call(token_evm), &data));
+    }
+
+    let m_serial = setup();
+    m_serial.begin_block(Height::new(1));
+    for raw in &txs {
+        m_serial.handle(&dummy_ctx(), raw).expect("serial tx");
+    }
+    m_serial.end_block(Height::new(1));
+
+    let m_par = setup();
+    m_par.begin_block(Height::new(1));
+    let results = m_par.handle_batch_parallel(&dummy_ctx(), &txs);
+    m_par.end_block(Height::new(1));
+
+    assert!(results.iter().all(std::result::Result::is_ok), "all parallel txs must succeed");
+    // N-1 txs re-execute (the first commits; each successor read the
+    // shared slot pre-write).
+    assert_eq!(
+        m_par.parallel_reexec_count_for_test(),
+        N - 1,
+        "shared balance slot must serialize via re-execution"
+    );
+    assert_eq!(
+        m_par.storage_at(&token, &balance_slot(shared_recipient)),
+        U256::from(100u64 * N as u64),
+        "shared recipient must hold the full sum"
+    );
+    assert_eq!(m_serial.state_root(), m_par.state_root(), "parallel root diverged");
+}
+
 /// Every EVM entry path must produce identical state on a
 /// contract-heavy multi-sender workload: serial `handle`,
 /// `handle_batch`, `handle_batch_parallel`, and

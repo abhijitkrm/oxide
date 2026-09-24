@@ -21052,3 +21052,67 @@ inside the view-timeout budget.
 toggleable stub signer proves live signing produces verifiable
 QCs, a downed signer withholds proposals and votes, and recovery
 resumes without a restart.
+## Session N+40 (cont.) — slot-granular conflict detection for the parallel EVM
+
+The parallel batch path's conflict detector was account-granular:
+every transaction that touched a contract's account counted as a
+writer, so two ERC-20-style calls crediting *different* `balances`
+slots on the same token re-executed each other — the exact workload
+parallel execution exists for.
+
+`SpecTx` now carries a slot-granular decomposition produced by a new
+`classify_state` (parallel.rs), run against the *pre-commit* group
+cache so the diff's `is_touched` accounts are split correctly:
+
+- `reads` — journal-loaded accounts (info-level accesses; stays
+  conservative: a slot's host account counts as an info read);
+- `slot_reads` — every accessed `(account, slot)` pair, which is
+  exact because revm's journal inserts SLOAD targets into
+  `account.storage` alongside SSTOREs;
+- `slot_writes` — slots with `present_value != original_value`
+  (a same-value SSTORE is state-neutral and registers nothing);
+- `info_writes` — touched accounts whose balance/nonce/code_hash
+  actually changed vs the pre-tx cache entry;
+- `destructive` — `selfdestruct`/`create`, the only writes whose
+  conflict radius covers the whole account (storage wipe).
+
+Phase 5's single `writers` map became three registries
+(`info_writers`, `slot_writers`, `destructive_writers`), each keeping
+the first-writer/multi-sender semantics. The predicate is now: info
+writes conflict with info accesses only (a balance change cannot move
+a slot), slot writes conflict with same-`(account, slot)` accesses
+only, and destructive writes conflict with any access to the address.
+Canonical re-executions register their write sets through the same
+classifier so the semantics stay symmetric on both paths.
+
+Two implementation details worth recording:
+
+1. `info_writes` needs the pre-tx `AccountInfo`, which the group
+   cache holds *before* `evm.commit(rs.state)` — classification
+   happens inside the evm-borrow window via
+   `evm.ctx.journaled_state.database.cache`.
+2. A `parallel_reexecs` counter on `EvmModule` (relaxed atomic, cold
+   path only) lets tests and the bench assert the hit rate directly —
+   `parallel_reexec_count_for_test` is the instrumentation surface.
+
+Caught during bring-up, by that counter: the hand-assembled test
+contract had `SSTORE`'s operands inverted (missing `SWAP1`), so every
+tx wrote the *value* as its slot key — 999900 and 100 — producing a
+total-order conflict that looked exactly like a detector bug.
+Fixing the bytecode took the disjoint mix from 7/8 re-executions to
+zero.
+
+Measured (`batch_parallel_hot_contract`, new bench; 1000 txs, 50
+senders, mapping-layout `balances` transfers on one contract):
+parallel 16.4 → 12.5 ms (−24%) vs the displaced account-granular
+code, reaching parity with serial `handle_batch` (12.3 ms) instead of
++34% speculation waste; `shared_slot` (all credits to one recipient)
+stays ~17 ms — real conflicts must serialize. The residual serial
+cost is Phase 5's canonical merge itself; a multi-version store is
+the follow-up if more parallelism is needed.
+
+Regression tests: `disjoint_slots_skip_reexec`,
+`same_slot_still_conflicts`, `slot_read_write_conflicts`,
+`disjoint_slot_accesses_skip_reexec`, `erc20_disjoint_balances`,
+`erc20_shared_slot_conflicts` — all asserting exact re-execution
+counts plus serial root parity.

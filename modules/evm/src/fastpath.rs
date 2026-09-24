@@ -711,17 +711,19 @@ impl EvmModule {
         reads.insert(caller);
         reads.insert(recipient);
 
-        let mut writes: std::collections::HashSet<revm::primitives::Address> =
+        // Fast paths only ever modify `info` (balance, nonce) — never
+        // storage — so every write registers at info level and the
+        // slot sets stay empty.
+        let mut info_writes: std::collections::HashSet<revm::primitives::Address> =
             std::collections::HashSet::with_capacity(2);
         // The merge payload: `EvmState` entries equivalent to what the
-        // interpreter would record. Fast paths only ever modify `info`
-        // (balance, nonce) — never storage — so the slot-wise `commit`
-        // merge preserves every slot the account holds but this tx
-        // never loaded. (`commit` extends storage; it never truncates
-        // it for a merely-Touched account.)
+        // interpreter would record. The slot-wise `commit` merge
+        // preserves every slot the account holds but this tx never
+        // loaded. (`commit` extends storage; it never truncates it for
+        // a merely-Touched account.)
         let mut state = revm::state::EvmState::default();
         for addr in [caller, recipient] {
-            if addr == coinbase || !writes.insert(addr) {
+            if addr == coinbase || !info_writes.insert(addr) {
                 continue;
             }
             if let Some(dba) = db.cache.accounts.get(&addr) {
@@ -740,7 +742,10 @@ impl EvmModule {
             sender: caller,
             result: Ok((result, Some(frame))),
             reads,
-            writes,
+            slot_reads: std::collections::HashSet::new(),
+            info_writes,
+            slot_writes: std::collections::HashSet::new(),
+            destructive: std::collections::HashSet::new(),
             state,
             coinbase_before,
             coinbase_delta: coinbase_after - coinbase_before,

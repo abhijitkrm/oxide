@@ -12,6 +12,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Parallel EVM execution on shared contracts** (`evm`):
+  `handle_batch_parallel*` conflict detection is now slot-granular
+  instead of account-granular. Transactions writing *different*
+  storage slots of the same contract — the ERC-20 `balances`
+  pattern — no longer conflict: each speculative record decomposes
+  into account-info writes, per-slot writes, and destructive writes
+  (selfdestruct/create), and the canonical-order validator checks
+  them against three registries. Measured on a mapping-layout token
+  workload (1000 txs, 50 senders, one contract): parallel batch
+  execution improved 16.4 ms → 12.5 ms (−24%) versus the previous
+  account-granular detector — parity with serial execution instead
+  of a +34% penalty — with zero re-executions (a new
+  `parallel_reexecs` counter proves it). A shared-recipient batch
+  still serializes correctly at ~17 ms.
+  - **In plain words:** blocks full of token transfers on the same
+    contract no longer waste time redoing every transaction — the
+    parallel executor now sees that different accounts' balances are
+    different storage slots and merges them directly.
+
 - **Per-operation heap allocations** (`matcher`): the new
   `alloc_accounting` bench counts allocations through the
   production paths. The authenticated server paths are already

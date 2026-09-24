@@ -11,10 +11,37 @@
 use super::{
     Arc, CacheDB, CoinbaseObs, DecodedTx, Event, EvmModule, ExecError, ExecuteCommitEvm,
     GroupExecResult, InspectEvm, IntoParallelRefIterator, ParallelIterator, PreverifiedTx,
-    SharedCacheDB, SpecTx, TracedResult, TxContext, alloy_primitives_address, history, receipts,
-    trace, tx, versioned,
+    SharedCacheDB, SpecTx, TracedResult, TxContext, WriteSplit, alloy_primitives_address,
+    classify_state, history, receipts, trace, tx, versioned,
 };
 use revm::state::EvmState;
+
+/// Register `key` as written by `sender` in a `(first-writer,
+/// multi-sender)` conflict map.
+///
+/// The map records the *first* sender to write each key plus a flag
+/// that latches once a second sender writes it. A later tx conflicts
+/// iff the recorded writer differs from its own sender or the key was
+/// multi-written — same-sender predecessors are exempt because the
+/// group's sequential speculation already observed them.
+fn mark_written<K>(
+    map: &mut std::collections::HashMap<K, (revm::primitives::Address, bool)>,
+    key: K,
+    sender: revm::primitives::Address,
+) where
+    K: std::hash::Hash + Eq + Copy,
+{
+    match map.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut o) => {
+            if o.get().0 != sender {
+                o.get_mut().1 = true;
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert((sender, false));
+        }
+    }
+}
 
 impl EvmModule {
     /// Execute a batch of signed EVM transactions with **parallel
@@ -485,9 +512,15 @@ impl EvmModule {
     ///
     /// # Limitations
     ///
-    /// - Conflict detection is account-granular: two txs touching
-    ///   different storage slots of the same account are treated as
-    ///   conflicting. Per-storage-slot tracking is future work.
+    /// - Conflict detection is slot-granular: two txs writing
+    ///   different storage slots of the same account merge
+    ///   independently. The residual over-approximation is at the
+    ///   *account-info* level — an account loaded only as a slot's
+    ///   host still counts as an info read, and any balance/nonce
+    ///   change conflicts with all of its readers.
+    /// - Validation and the canonical merge run sequentially in
+    ///   Phase 5 — the bound on parallel speedup for workloads whose
+    ///   per-tx work is smaller than the merge cost.
     /// - Re-execution cascades within a sender: one invalid
     ///   speculative tx re-executes all its same-sender successors
     ///   (their speculation depended on its outcome).
@@ -894,6 +927,25 @@ impl EvmModule {
                                 // speculative one.
                                 let mut spec_state = rs.state.clone();
                                 spec_state.remove(&coinbase);
+                                // Slot-granular conflict sets —
+                                // classified BEFORE `commit` writes
+                                // the diff into the group cache, so
+                                // `evm.ctx..database.cache` still
+                                // holds each account's pre-tx info
+                                // (reads populate the cache but never
+                                // mutate `info`; only `commit` does).
+                                // That pre-image is what distinguishes
+                                // an info write from a storage-only or
+                                // state-neutral touch.
+                                let split = classify_state(&spec_state, &coinbase, |a| {
+                                    evm.ctx
+                                        .journaled_state
+                                        .database
+                                        .cache
+                                        .accounts
+                                        .get(a)
+                                        .map(|d| &d.info)
+                                });
                                 // Commit into the group scratch cache
                                 // — deliberately WITHOUT the
                                 // canonical zero-slot sweep: a zero
@@ -907,7 +959,12 @@ impl EvmModule {
                                     blocked,
                                     cb_read,
                                     call_trace,
-                                    Some((spec_state, accessed_coinbase, coinbase_nontrivial)),
+                                    Some((
+                                        spec_state,
+                                        accessed_coinbase,
+                                        coinbase_nontrivial,
+                                        split,
+                                    )),
                                 )
                             }
                             Err(e) => (Err(e), blocked, cb_read, call_trace, None),
@@ -916,7 +973,7 @@ impl EvmModule {
 
                     match result {
                         Ok(exec_result) => {
-                            let (spec_state, accessed_coinbase, coinbase_nontrivial) =
+                            let (spec_state, accessed_coinbase, coinbase_nontrivial, split) =
                                 loaded.expect("Ok carries the loaded state");
 
                             // The coinbase delta captures the tx's
@@ -930,30 +987,25 @@ impl EvmModule {
                                 .map_or(parent_coinbase, |a| a.info.balance);
 
                             // `spec_state` keys are every account the
-                            // journal loaded — the exact read set
-                            // (the coinbase was stripped at capture).
-                            // The write set is the `is_touched()`
-                            // subset: precisely the accounts
-                            // `DatabaseCommit::commit` will modify on
-                            // merge, matching sequential
-                            // `commit_account` semantics.
-                            let mut reads: std::collections::HashSet<revm::primitives::Address> =
-                                std::collections::HashSet::with_capacity(spec_state.len());
-                            let mut writes: std::collections::HashSet<revm::primitives::Address> =
-                                std::collections::HashSet::new();
-                            for (addr, account) in &spec_state {
-                                reads.insert(*addr);
-                                if account.is_touched() {
-                                    writes.insert(*addr);
-                                }
-                            }
+                            // journal loaded — the exact info-level
+                            // read set (the coinbase was stripped at
+                            // capture). The slot-level sets come from
+                            // `classify_state`, run pre-commit against
+                            // the group cache's pre-tx infos.
+                            let reads: std::collections::HashSet<revm::primitives::Address> =
+                                spec_state.keys().copied().collect();
+                            let WriteSplit { slot_access, info_writes, slot_writes, destructive } =
+                                split;
 
                             spec_txs.push(SpecTx {
                                 idx,
                                 sender: caller,
                                 result: Ok((exec_result, call_trace)),
                                 reads,
-                                writes,
+                                slot_reads: slot_access,
+                                info_writes,
+                                slot_writes,
+                                destructive,
                                 state: spec_state,
                                 coinbase_before,
                                 coinbase_delta: coinbase_after - coinbase_before,
@@ -979,7 +1031,10 @@ impl EvmModule {
                                     "evm transact failed: {e:?}"
                                 ))),
                                 reads,
-                                writes: std::collections::HashSet::new(),
+                                slot_reads: std::collections::HashSet::new(),
+                                info_writes: std::collections::HashSet::new(),
+                                slot_writes: std::collections::HashSet::new(),
+                                destructive: std::collections::HashSet::new(),
                                 state: EvmState::default(),
                                 coinbase_before,
                                 coinbase_delta: revm::primitives::U256::ZERO,
@@ -1021,10 +1076,27 @@ impl EvmModule {
         // otherwise it is re-executed against the main DB, which at
         // that point holds exactly the canonical pre-state.
         //
-        // `writers` maps each written account to its first writer's
-        // sender plus a "multiple senders" flag; a tx conflicts when
-        // any account in `reads ∪ writes` was written by a different
-        // sender. Same-sender writes are excluded because the group's
+        // Conflict detection is slot-granular (Block-STM-flavored):
+        // three write registries, each mapping a written key to its
+        // first writer's sender plus a "multiple senders" flag. A tx
+        // conflicts when any key it *accessed* was written by a
+        // different sender:
+        //
+        // - `info_writers`: accounts whose balance, nonce, code_hash
+        //   changed. Conflicts with the later tx's *info* reads
+        //   (`reads`) — but NOT its slot accesses: a balance change
+        //   cannot move a storage slot.
+        // - `slot_writes`: `(address, slot)` pairs whose value
+        //   changed. Conflicts only with accesses to the same pair —
+        //   two txs writing disjoint slots of the same hot contract
+        //   (e.g. different `balances` keys on one token) no longer
+        //   re-execute, which was the account-granular scheme's
+        //   dominant false-conflict source.
+        // - `destructive_writers`: selfdestructed/created accounts.
+        //   These replace the account wholesale — storage included —
+        //   so they conflict with ANY access to the address.
+        //
+        // Same-sender writes are excluded because the group's
         // sequential speculation already observed them — but only up
         // to the first re-execution: once a tx re-executes, its
         // same-group successors speculated on its speculative
@@ -1050,7 +1122,15 @@ impl EvmModule {
             }
         }
 
-        let mut writers: std::collections::HashMap<
+        let mut info_writers: std::collections::HashMap<
+            revm::primitives::Address,
+            (revm::primitives::Address, bool),
+        > = std::collections::HashMap::new();
+        let mut slot_writers: std::collections::HashMap<
+            (revm::primitives::Address, revm::primitives::U256),
+            (revm::primitives::Address, bool),
+        > = std::collections::HashMap::new();
+        let mut destructive_writers: std::collections::HashMap<
             revm::primitives::Address,
             (revm::primitives::Address, bool),
         > = std::collections::HashMap::new();
@@ -1088,10 +1168,39 @@ impl EvmModule {
                 .get(&coinbase)
                 .map_or(revm::primitives::U256::ZERO, |a| a.info.balance);
 
+            // A speculation is valid iff nothing it could have
+            // *observed* was changed by a canonically-earlier tx from
+            // a different sender. The access sets are closed under
+            // writes (a write implies the journal loaded the key), so
+            // checking reads ∪ writes keeps the predicate sound even
+            // if a future code path records one without the other.
             let account_conflict =
-                st.reads.iter().chain(st.writes.iter()).any(|addr| match writers.get(addr) {
-                    Some(&(writer, multi)) => writer != st.sender || multi,
-                    None => false,
+                // Info-level accesses vs earlier info/destructive
+                // writes on the same account.
+                st.reads
+                    .iter()
+                    .chain(st.info_writes.iter())
+                    .chain(st.destructive.iter())
+                    .any(|a| {
+                        info_writers
+                            .get(a)
+                            .or_else(|| destructive_writers.get(a))
+                            .is_some_and(|&(w, multi)| w != st.sender || multi)
+                    })
+                // Slot-level accesses vs earlier writes to the same
+                // (account, slot) pair.
+                || st.slot_reads.iter().any(|k| {
+                    slot_writers
+                        .get(k)
+                        .is_some_and(|&(w, multi)| w != st.sender || multi)
+                })
+                // Slot-level accesses vs a destructive write on the
+                // host account — selfdestruct/create replaces the
+                // whole account, invalidating every slot view.
+                || st.slot_reads.iter().any(|(a, _)| {
+                    destructive_writers
+                        .get(a)
+                        .is_some_and(|&(w, multi)| w != st.sender || multi)
                 });
             // The speculative coinbase observation is only valid if
             // the balance it saw equals the canonical running total.
@@ -1101,6 +1210,7 @@ impl EvmModule {
             if st.must_reexec || broken.contains(&st.sender) || account_conflict || stale_coinbase {
                 // Re-execute this tx against the canonical DB.
                 broken.insert(st.sender);
+                self.parallel_reexecs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 coinbase_dirty |= st.coinbase.nontrivial;
                 let caller = st.sender;
                 let signed = signed_by_idx[i].expect("speculative tx has signed bytes");
@@ -1119,31 +1229,13 @@ impl EvmModule {
                     coinbase_dirty |= caller == coinbase;
                     all_touched.insert(caller);
                     all_touched.insert(coinbase);
-                    for addr in [caller] {
-                        match writers.entry(addr) {
-                            Entry::Occupied(mut o) => {
-                                if o.get().0 != caller {
-                                    o.get_mut().1 = true;
-                                }
-                            }
-                            Entry::Vacant(v) => {
-                                v.insert((caller, false));
-                            }
-                        }
-                    }
+                    // Fast paths only ever modify `info` (balance,
+                    // nonce) — the writes register at info level.
+                    mark_written(&mut info_writers, caller, caller);
                     if let tx::TxKind::Call(addr) = signed.to() {
                         let rcp = revm::primitives::Address::from(addr.0);
                         all_touched.insert(rcp);
-                        match writers.entry(rcp) {
-                            Entry::Occupied(mut o) => {
-                                if o.get().0 != caller {
-                                    o.get_mut().1 = true;
-                                }
-                            }
-                            Entry::Vacant(v) => {
-                                v.insert((caller, false));
-                            }
-                        }
+                        mark_written(&mut info_writers, rcp, caller);
                     }
                     let frame = Self::fast_path_frame(signed, caller, &result);
                     final_results[i] = Some(Ok((result, Some(frame))));
@@ -1164,29 +1256,11 @@ impl EvmModule {
                     coinbase_dirty |= caller == coinbase;
                     all_touched.insert(caller);
                     all_touched.insert(coinbase);
-                    match writers.entry(caller) {
-                        Entry::Occupied(mut o) => {
-                            if o.get().0 != caller {
-                                o.get_mut().1 = true;
-                            }
-                        }
-                        Entry::Vacant(v) => {
-                            v.insert((caller, false));
-                        }
-                    }
+                    mark_written(&mut info_writers, caller, caller);
                     if let tx::TxKind::Call(addr) = signed.to() {
                         let rcp = revm::primitives::Address::from(addr.0);
                         all_touched.insert(rcp);
-                        match writers.entry(rcp) {
-                            Entry::Occupied(mut o) => {
-                                if o.get().0 != caller {
-                                    o.get_mut().1 = true;
-                                }
-                            }
-                            Entry::Vacant(v) => {
-                                v.insert((caller, false));
-                            }
-                        }
+                        mark_written(&mut info_writers, rcp, caller);
                     }
                     let frame = Self::fast_path_frame(signed, caller, &result);
                     final_results[i] = Some(Ok((result, Some(frame))));
@@ -1228,6 +1302,19 @@ impl EvmModule {
                                     evm.ctx.journaled_state.database.cache.accounts.get(addr),
                                 );
                             }
+                            // Slot-granular write sets — classified
+                            // while `evm`'s database cache still holds
+                            // pre-tx infos (undo capture above ran at
+                            // the same point for the same reason).
+                            let split = classify_state(&rs.state, &coinbase, |a| {
+                                evm.ctx
+                                    .journaled_state
+                                    .database
+                                    .cache
+                                    .accounts
+                                    .get(a)
+                                    .map(|d| &d.info)
+                            });
                             evm.precompiles.clear_native_journal();
                             let call_trace = evm.inspector.1.take_root();
                             // Canonical re-execution commits to the
@@ -1236,27 +1323,16 @@ impl EvmModule {
                             let zeroed = Self::zero_slot_writers(&rs.state);
                             evm.commit(rs.state);
                             Self::prune_zero_slots(evm.ctx.journaled_state.database, &zeroed);
-                            // Mark the tx's actual write set — accounts
-                            // the commit marked modified — as written
-                            // by this sender.
-                            for addr in &state_keys {
-                                if *addr == coinbase {
-                                    continue;
-                                }
-                                if db.cache.accounts.get(addr).is_some_and(|a| {
-                                    a.account_state != revm::database::AccountState::None
-                                }) {
-                                    match writers.entry(*addr) {
-                                        Entry::Occupied(mut o) => {
-                                            if o.get().0 != caller {
-                                                o.get_mut().1 = true;
-                                            }
-                                        }
-                                        Entry::Vacant(v) => {
-                                            v.insert((caller, false));
-                                        }
-                                    }
-                                }
+                            // Mark the tx's actual write set so later
+                            // positions conflict-check against it.
+                            for addr in &split.info_writes {
+                                mark_written(&mut info_writers, *addr, caller);
+                            }
+                            for slot in &split.slot_writes {
+                                mark_written(&mut slot_writers, *slot, caller);
+                            }
+                            for addr in &split.destructive {
+                                mark_written(&mut destructive_writers, *addr, caller);
                             }
                             final_results[i] = Some(Ok((r, call_trace)));
                         }
@@ -1283,6 +1359,12 @@ impl EvmModule {
             for (addr, account) in &st.state {
                 if account.is_touched() {
                     committed_undo.capture(*addr, db.cache.accounts.get(addr));
+                    // `all_touched` stays account-granular — the
+                    // state-root incremental patcher needs every
+                    // account the commit may have modified, which is
+                    // exactly `state`'s `is_touched` subset (including
+                    // state-neutral bare touches).
+                    all_touched.insert(*addr);
                 }
             }
             Self::commit_state(&mut *db, st.state);
@@ -1316,18 +1398,16 @@ impl EvmModule {
                 coinbase_account.account_state = revm::database::AccountState::Touched;
                 all_touched.insert(coinbase);
             }
-            for w in &st.writes {
-                match writers.entry(*w) {
-                    Entry::Occupied(mut o) => {
-                        if o.get().0 != st.sender {
-                            o.get_mut().1 = true;
-                        }
-                    }
-                    Entry::Vacant(v) => {
-                        v.insert((st.sender, false));
-                    }
-                }
-                all_touched.insert(*w);
+            // Register the tx's write sets so later positions
+            // conflict-check against them.
+            for a in &st.info_writes {
+                mark_written(&mut info_writers, *a, st.sender);
+            }
+            for s in &st.slot_writes {
+                mark_written(&mut slot_writers, *s, st.sender);
+            }
+            for a in &st.destructive {
+                mark_written(&mut destructive_writers, *a, st.sender);
             }
             final_results[i] = Some(st.result);
         }
