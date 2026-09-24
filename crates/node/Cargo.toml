@@ -57,6 +57,11 @@ statesync = { workspace = true }
 # tokio: the RPC HTTP server runs on a dedicated current-thread
 # runtime spawned by `validator_net`'s `start_rpc`.
 tokio = { workspace = true }
+# crossbeam-channel: bounded MPMC queue feeding the consensus
+# signature-verify worker pool — std::sync::mpsc is single-consumer,
+# so N workers cannot share one Receiver. Already vendored for the
+# matcher; GPL-compatible (MIT/Apache-2.0), published 2018+.
+crossbeam-channel = { workspace = true }
 # alloy-primitives: `B256` appears in the rpc crate's public API
 # (`record_pending_tx`) — already a transitive dep via revm/evm, so
 # this adds nothing to the compiled graph.

@@ -227,6 +227,31 @@ impl OxideBft {
         )
     }
 
+    /// Resolve the crypto material a peer's timeout signature
+    /// verifies against — the voter's key under the live committee
+    /// and the `(view, epoch, qc_high)` signing message — for the
+    /// node's signature pool. Pure read; the pool runs the pairing
+    /// off-thread and the pump applies the verdict through
+    /// [`OxideBft::collect_timeout_signature_preverified`].
+    ///
+    /// `None` in conformance mode (nothing to offload — callers
+    /// fall back to `verify_timeout_signature_for`) or when the
+    /// voter index is out of bounds.
+    #[must_use]
+    pub fn timeout_verify_context(
+        &self,
+        voter: ValidatorIndex,
+        view: View,
+        epoch: Epoch,
+        high_qc: Option<&QuorumCertificate>,
+    ) -> Option<(crypto::bls::PublicKey, [u8; 57])> {
+        if !self.verify_signatures {
+            return None;
+        }
+        let pk = *self.validator_set.validator(voter).ok()?;
+        Some((pk, crate::verify::timeout_signing_message(view, epoch, high_qc)))
+    }
+
     /// Validator: collect a timeout signature from `voter` for the
     /// current view. `qc_high` is the evidence the signature binds —
     /// it is stored into the TC's per-signer record verbatim, so a
@@ -298,6 +323,60 @@ impl OxideBft {
                     .map_err(|_| ConsensusError::InvalidVoteSignature { voter })?;
             }
         }
+        self.collect_timeout_verified(voter, signature, qc_high)
+    }
+
+    /// [`collect_timeout_signature`] with the wire crypto already
+    /// screened by the node's signature pool: the pool verified
+    /// `signature` over `(current_view, epoch, qc_high)` — the pump
+    /// applies a verdict only while those coordinates still hold —
+    /// and verified each carried claim, reported as the `qc_high`
+    /// verdict.
+    ///
+    /// The live-state screens re-run here unconditionally: the
+    /// claimed QC must still be same-epoch and at-or-below the
+    /// current view, and its verdict must be
+    /// [`QcVerdict::Current`] — a `Pending` verdict is contradictory
+    /// for a same-epoch claim and `Invalid` means the pool proved
+    /// the claim forged. A signature-verdict failure never reaches
+    /// this function at all: the pump drops the whole timeout
+    /// record upstream.
+    ///
+    /// # Errors
+    ///
+    /// Same set as [`collect_timeout_signature`]:
+    /// [`ConsensusError::InvalidVoteSignature`] for a failed or
+    /// inconsistent claim verdict,
+    /// [`ConsensusError::SignerOutOfBounds`] for an out-of-range
+    /// voter.
+    pub fn collect_timeout_signature_preverified(
+        &mut self,
+        voter: ValidatorIndex,
+        signature: Signature,
+        qc_high: Option<(QuorumCertificate, crate::verify::QcVerdict)>,
+    ) -> Result<Option<TimeoutCertificate>, ConsensusError> {
+        if self.verify_signatures
+            && let Some((qc, verdict)) = &qc_high
+            && (qc.epoch != self.epoch
+                || qc.view > self.current_view
+                || !matches!(verdict, crate::verify::QcVerdict::Current))
+        {
+            return Err(ConsensusError::InvalidVoteSignature { voter });
+        }
+        self.collect_timeout_verified(voter, signature, qc_high.map(|(qc, _)| qc))
+    }
+
+    /// The post-verification tail both timeout-collection entries
+    /// share: store the (already authenticated) record, feed the
+    /// pacemaker, and drive TC formation + view advancement. No
+    /// signature work runs here — the caller authenticated the
+    /// record first, inline or via the pool.
+    fn collect_timeout_verified(
+        &mut self,
+        voter: ValidatorIndex,
+        signature: Signature,
+        qc_high: Option<QuorumCertificate>,
+    ) -> Result<Option<TimeoutCertificate>, ConsensusError> {
         // Store the verified record so the TC carries the signer's
         // evidence verbatim when it forms.
         let idx = usize::from(voter);
@@ -389,6 +468,14 @@ impl OxideBft {
         &mut self,
         tc: &TimeoutCertificate,
     ) -> Result<(), ConsensusError> {
+        // A TC is only meaningful for the epoch it claims — view
+        // spaces restart per epoch, so a foreign-epoch certificate
+        // is stale evidence even when a carried-over committee's
+        // keys would make its signatures verify. Same gate the
+        // preverified entry applies, before any crypto.
+        if tc.epoch != self.epoch {
+            return Err(ConsensusError::InvalidTcSignature);
+        }
         // Structural + quorum + per-signer verification in one
         // pass — see `crate::verify::verify_tc_signature` for the
         // exact checks. Enforced unconditionally: a TC is only a
@@ -396,6 +483,43 @@ impl OxideBft {
         // is what `last_tc` stores — a view we entered via TC only
         // ever re-embeds a certificate that passed verification.
         let verified = self.verify_tc_signature(tc)?;
+        self.on_tc_verified(verified);
+        Ok(())
+    }
+
+    /// [`on_timeout_certificate`] with the per-signer crypto already
+    /// screened by the node's signature pool: `verified_ok` asserts
+    /// every record's timeout signature and every distinct carried
+    /// QC verified under the committee the pump resolved at intake
+    /// (via `tc_verify_context`). The structural half —
+    /// `check_tc_structure`: distinct in-bounds voters, evidence
+    /// view/epoch bounds, quorum power — re-runs here against the
+    /// *live* set, and `tc.epoch` must still be ours: a verdict
+    /// computed under a rotated committee can never move the view.
+    ///
+    /// # Errors
+    ///
+    /// Same gates as [`on_timeout_certificate`]; a failed verdict
+    /// reports [`ConsensusError::InvalidTcSignature`].
+    pub fn on_timeout_certificate_preverified(
+        &mut self,
+        tc: &TimeoutCertificate,
+        verified_ok: bool,
+    ) -> Result<(), ConsensusError> {
+        if tc.epoch != self.epoch || !verified_ok {
+            return Err(ConsensusError::InvalidTcSignature);
+        }
+        crate::verify::check_tc_structure(&self.validator_set, tc)?;
+        self.on_tc_verified(crate::verify::VerifiedTc::from_trusted(tc.clone()));
+        Ok(())
+    }
+
+    /// The post-verification tail both TC entry points share: feed
+    /// the pacemaker's certificate, apply the view transition it
+    /// yields, and adopt the certificate's evidence. `verified` is
+    /// the caller's authenticated token — minted by
+    /// `verify_tc_signature` inline or from a pooled verdict.
+    fn on_tc_verified(&mut self, verified: crate::verify::VerifiedTc) {
         if let Some(crate::pacemaker::PacemakerEvent::AdvanceView { new_view, .. }) =
             self.pacemaker.on_timeout_certificate(verified.tc())
         {
@@ -411,34 +535,38 @@ impl OxideBft {
             self.clear_per_view_state();
             // Record the TC that brought us into this view so the
             // next proposal embeds it as successor evidence.
-            self.last_tc = Some(verified);
+            self.last_tc = Some(verified.clone());
             // Adopt the TC's max evidence before it can constrain
             // (or be ignored by) the next vote — see
             // [`adopt_tc_evidence`](Self::adopt_tc_evidence).
-            self.adopt_tc_evidence(tc);
+            self.adopt_tc_evidence(verified.tc());
         }
-        Ok(())
     }
 
     /// Adopt the highest `qc_high` carried in a verified TC.
     ///
     /// This is the receiver half of the Jolteon entry rule: the
     /// TC proves a quorum reported these locks, so the max evidence
-    /// is the chain the next proposal must extend. Adoption goes
-    /// through `deliver_qc` — the QC is already verified inside the
-    /// TC, and the ordinary path handles monotonicity, WAL, and the
-    /// commit walk if the evidence completes a certified chain.
+    /// is the chain the next proposal must extend. The carried QC
+    /// was already verified *inside* the TC's own verification —
+    /// `verify_tc_signature` checks every distinct `high_qc`
+    /// aggregate under the current set before `on_tc_verified` ever
+    /// runs — so adoption goes through `deliver_qc_preverified`
+    /// with a `Current` verdict rather than re-paying the pairing.
+    /// The live monotonicity/epoch gates still apply there, and the
+    /// commit walk still fires if the evidence completes a
+    /// certified chain.
     fn adopt_tc_evidence(&mut self, tc: &TimeoutCertificate) {
         let Some(max_qc) =
             tc.signers.iter().filter_map(|s| s.high_qc.as_ref()).max_by_key(|qc| qc.view.value())
         else {
             return;
         };
-        // `StaleQc` (evidence at or below our own high QC) and any
-        // verification re-check failure are both safe to ignore:
-        // the TC is still a valid view-change certificate, and the
-        // vote predicate re-derives the floor from the TC itself.
-        let _ = self.deliver_qc(max_qc.clone());
+        // `StaleQc` (evidence at or below our own high QC) and a
+        // contradictory verdict are both safe to ignore: the TC is
+        // still a valid view-change certificate, and the vote
+        // predicate re-derives the floor from the TC itself.
+        let _ = self.deliver_qc_preverified(max_qc.clone(), crate::verify::QcVerdict::Current);
     }
 
     /// The header's timeout certificate iff it is the legitimate
@@ -450,6 +578,18 @@ impl OxideBft {
         let tc = header.timeout_cert.as_ref()?;
         if tc.epoch != self.epoch || tc.view.saturating_next() != header.view {
             return None;
+        }
+        // The TC that carried us into this view is already verified
+        // — a proposal entering via the same certificate reuses its
+        // token instead of re-verifying every signer record per
+        // vote. `last_tc` holds exactly that certificate (it is
+        // only ever set by the TC-entry path), so equality is the
+        // full check — the fallback covers a TC that entered a
+        // *different* replica and only reaches us embedded.
+        if let Some(last) = &self.last_tc
+            && last.tc() == tc
+        {
+            return Some(last.clone());
         }
         self.verify_tc_signature(tc).ok()
     }
@@ -469,5 +609,35 @@ impl OxideBft {
     /// if a signature or record does not verify.
     fn verify_tc_signature(&self, tc: &TimeoutCertificate) -> Result<VerifiedTc, ConsensusError> {
         crate::verify::verify_tc_signature(&self.validator_set, self.verify_signatures, tc)
+    }
+
+    /// Resolve the wire-authentication material of `tc` for the
+    /// signature pool — each signer record's key + `(view, epoch,
+    /// qc_high)` message + signature, and one QC material per
+    /// distinct carried certificate, all under the live committee.
+    /// Mirrors `verify_tc_signature`'s crypto half exactly; the
+    /// structural half (`check_tc_structure`) stays on the apply
+    /// side in `on_timeout_certificate_preverified`.
+    ///
+    /// `None` in conformance mode (callers fall back to
+    /// `on_timeout_certificate`) or when any record's voter is out
+    /// of bounds — an unresolvable record yields no job rather than
+    /// a partial one, and the apply side reports the structural
+    /// error.
+    #[must_use]
+    pub fn tc_verify_context(
+        &self,
+        tc: &TimeoutCertificate,
+    ) -> Option<crate::verify::TcVerifyMaterial> {
+        if !self.verify_signatures {
+            return None;
+        }
+        // Foreign-epoch TCs route to the inline path, whose epoch
+        // gate rejects them before any crypto — they must not burn
+        // a pool job either.
+        if tc.epoch != self.epoch {
+            return None;
+        }
+        crate::verify::tc_verify_material(&self.validator_set, tc)
     }
 }

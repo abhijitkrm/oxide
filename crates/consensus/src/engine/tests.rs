@@ -7675,3 +7675,554 @@ fn chain_params_drive_live_block_budget() {
     let bare = make_engine();
     assert_eq!(bare.block_budget(), types::CHAIN_BLOCK_BUDGET);
 }
+
+// ── Pooled-verification apply entries ─────────────────────────
+//
+// The node's signature pool verifies wire crypto off the
+// consensus thread; the `*_preverified` entries apply the
+// verdict. These tests pin the safety contract: a verdict
+// replaces ONLY the pairing — every state-dependent check
+// (epoch, view monotonicity, leader schedule, quorum structure)
+// re-runs against live state, so a verdict that was true at
+// intake but stale or contradictory at apply time can never
+// move consensus.
+
+/// Build a real quorum-signed QC for `block_hash` under the
+/// `signed_committee` keys — the same artifact `try_form_qc`
+/// emits, constructed directly so tests don't drive a round.
+fn signed_qc(
+    keys: &[crypto::BlsSecretKey],
+    view: u64,
+    epoch: u64,
+    block_hash: Hash,
+    signers: &[u16],
+) -> QuorumCertificate {
+    let msg = crate::verify::vote_signing_message(
+        Epoch::new(epoch),
+        View::new(view),
+        VotePhase::Prepare as u8,
+        &block_hash,
+    );
+    let sigs: Vec<Signature> = signers
+        .iter()
+        .map(|&i| keys[usize::from(i)].sign(crypto::hash::Domain::Vote, &msg))
+        .collect();
+    let width = signers.iter().max().map_or(0usize, |m| usize::from(*m) / 8 + 1);
+    let mut bitmap = vec![0u8; width];
+    for &i in signers {
+        bitmap[usize::from(i) / 8] |= 1 << (i % 8);
+    }
+    QuorumCertificate {
+        view: View::new(view),
+        phase: VotePhase::Prepare,
+        block_hash,
+        epoch: Epoch::new(epoch),
+        signer_bitmap: bitmap,
+        aggregate_signature: crypto::aggregate(&sigs).expect("aggregate"),
+    }
+}
+
+/// The intake-resolve step produces material a worker's pure
+/// check proves — `proposal_verify_context`,
+/// `qc_verify_context`, `timeout_verify_context`, and
+/// `tc_verify_context` each mirror the crypto half of their
+/// inline counterparts exactly.
+#[test]
+fn verify_context_material_runs_the_same_crypto_workers_would() {
+    let (mut engines, keys) = signed_committee();
+    // Proposal: a real signed header resolves material, and the
+    // worker-side verify over it passes.
+    let (header, _proposal) = engines[0].propose().expect("leader proposes");
+    let follower = &mut engines[1];
+    let material = follower.proposal_verify_context(&header).expect("resolves");
+    assert!(
+        crypto::verify(
+            header.proposer_signature.as_ref().expect("signed"),
+            crypto::hash::Domain::Proposal,
+            material.signing_hash.as_bytes(),
+            &material.leader_pk,
+        )
+        .is_ok(),
+        "material proves the real signature"
+    );
+    // A header claiming a different proposer resolves nothing —
+    // the context can never prove a forged claim.
+    let mut forged = header.clone();
+    forged.proposer = proposer_hash(3);
+    assert!(follower.proposal_verify_context(&forged).is_none());
+
+    // QC: a real quorum QC resolves live-committee material that
+    // the worker's exact check (`qc_material_verifies`) proves.
+    let qc = signed_qc(&keys, 0, 0, Hash([3; 32]), &[0, 1, 2]);
+    let materials = follower.qc_verify_context(&qc).expect("resolves");
+    assert_eq!(materials.len(), 1, "same-epoch QC resolves the live set only");
+    assert!(!materials[0].pending_set);
+    assert!(crate::verify::qc_material_verifies(&materials[0], &qc));
+
+    // Timeout: the resolved (key, message) pair verifies a real
+    // timeout signature over the same claim.
+    let (pk, msg) = follower
+        .timeout_verify_context(1, View::new(0), Epoch::new(0), Some(&qc))
+        .expect("resolves");
+    assert_eq!(pk, keys[1].public_key());
+    let sig = sign_timeout_claim(&keys[1], View::new(0), Epoch::new(0), Some(&qc));
+    assert!(crypto::verify(&sig, crypto::hash::Domain::Timeout, &msg, &pk).is_ok());
+
+    // TC: per-record material plus one deduplicated material per
+    // distinct carried QC — every piece verifies.
+    let tc = make_tc(
+        0,
+        0,
+        &[(0, &keys[0], Some(qc.clone())), (1, &keys[1], Some(qc.clone())), (2, &keys[2], None)],
+    );
+    let tm = follower.tc_verify_context(&tc).expect("resolves");
+    assert_eq!(tm.records.len(), 3);
+    assert_eq!(tm.qcs.len(), 1, "identical carried QCs deduplicate");
+    for (pk, msg, sig) in &tm.records {
+        assert!(crypto::verify(sig, crypto::hash::Domain::Timeout, msg, pk).is_ok());
+    }
+    for (qc, m) in &tm.qcs {
+        assert!(crate::verify::qc_material_verifies(m, qc));
+    }
+}
+
+/// `admit_preverified` stores a proposal only when both verdicts
+/// pass — and a false verdict memoizes the rejection exactly as
+/// the inline path does.
+#[test]
+fn admit_preverified_verdicts_gate_proposal_storage() {
+    let (mut engines, _keys) = signed_committee();
+    // engines[0] leads view 0 — a real signed header + matching
+    // shard commitment.
+    let (header, proposal) = engines[0].propose().expect("propose");
+    let hash = OxideBft::block_hash(&header);
+
+    // The truthful verdict admits and stores the body.
+    let f0 = &mut engines[1];
+    assert!(f0.admit_preverified(&header, &proposal, true, true));
+    assert!(
+        matches!(f0.blocks.get(&hash), Some((_, BlockBody::Complete(_)))),
+        "verified body stores Complete"
+    );
+
+    // sig_ok = false: the verdict is the crypto word — a failing
+    // verdict rejects the real signature too (fail closed), and
+    // the rejection memoizes.
+    let f1 = &mut engines[2];
+    assert!(!f1.admit_preverified(&header, &proposal, false, true));
+    assert!(
+        !f1.admit_preverified(&header, &proposal, true, true),
+        "a later 'verified' verdict cannot un-reject a memoized rejection"
+    );
+
+    // commit_ok = false: the signature parks the header Awaiting
+    // but the mismatched body never stores Complete.
+    let f2 = &mut engines[3];
+    assert!(!f2.admit_preverified(&header, &proposal, true, false));
+    assert!(
+        matches!(f2.blocks.get(&hash), Some((_, BlockBody::Awaiting))),
+        "bad body leaves the header parked, never Complete"
+    );
+}
+
+/// A verdict can never admit a proposal the live schedule
+/// rejects: the effective-leader check re-runs at apply, so a
+/// 'verified' verdict attached to a non-leader's claim — or one
+/// computed under a rotated committee — fails closed.
+#[test]
+fn admit_preverified_reruns_leader_check_on_live_state() {
+    let (mut engines, _keys) = signed_committee();
+    let (header, proposal) = engines[0].propose().expect("propose");
+    let follower = &mut engines[1];
+    // Claim a proposer that isn't the effective leader for view 0.
+    let mut forged = header.clone();
+    forged.proposer = proposer_hash(3);
+    assert!(!follower.admit_preverified(&forged, &proposal, true, true));
+    // And a header stripped of its signature field can't ride a
+    // 'verified' verdict either.
+    let mut unsigned = header.clone();
+    unsigned.proposer_signature = None;
+    assert!(!follower.admit_preverified(&unsigned, &proposal, true, true));
+}
+
+/// `deliver_qc_preverified` applies a `Current` verdict on a real
+/// QC — and fails closed on `Invalid` or on a contradictory
+/// `Pending` (the staged committee cannot sign its own epoch).
+#[test]
+fn deliver_qc_preverified_gates_on_verdict() {
+    use crate::verify::QcVerdict;
+    let (mut engines, keys) = signed_committee();
+    let engine = &mut engines[1];
+    let qc = signed_qc(&keys, 0, 0, Hash([7; 32]), &[0, 1, 2]);
+
+    assert!(
+        matches!(
+            engine.deliver_qc_preverified(qc.clone(), QcVerdict::Invalid),
+            Err(ConsensusError::InvalidQcSignature)
+        ),
+        "a failing verdict rejects the real aggregate too"
+    );
+    assert!(
+        matches!(
+            engine.deliver_qc_preverified(qc.clone(), QcVerdict::Pending),
+            Err(ConsensusError::InvalidQcSignature)
+        ),
+        "Pending on a same-epoch QC is contradictory"
+    );
+    engine
+        .deliver_qc_preverified(qc.clone(), QcVerdict::Current)
+        .expect("the truthful verdict admits");
+    assert_eq!(engine.high_qc().map(|q| q.view), Some(View::new(0)));
+}
+
+/// Stale verdict: the pool proved a QC that was ahead at intake,
+/// but `high_qc` moved past it before the verdict applied. The
+/// admission gates re-run on live state — the QC dies as stale.
+#[test]
+fn deliver_qc_preverified_stale_verdict_dies_at_live_gates() {
+    use crate::verify::QcVerdict;
+    let (mut engines, keys) = signed_committee();
+    let engine = &mut engines[1];
+    let hash = Hash([9; 32]);
+    let qc_v1 = signed_qc(&keys, 1, 0, hash, &[0, 1, 2]);
+    let qc_v2 = signed_qc(&keys, 2, 0, hash, &[0, 1, 2]);
+    engine.deliver_qc_preverified(qc_v2, QcVerdict::Current).expect("v2 admitted");
+    assert!(
+        matches!(
+            engine.deliver_qc_preverified(qc_v1, QcVerdict::Current),
+            Err(ConsensusError::StaleQc { .. })
+        ),
+        "a verdict that was valid at intake is stale at apply"
+    );
+}
+
+/// `collect_timeout_signature_preverified` collects on a truthful
+/// `Current` claim verdict and fails closed on `Pending`,
+/// `Invalid`, or a claim the live view/epoch can't support.
+#[test]
+fn collect_timeout_signature_preverified_enforces_claim_verdicts() {
+    use crate::verify::QcVerdict;
+    let (mut engines, keys) = signed_committee();
+    let engine = &mut engines[1];
+    let qc = signed_qc(&keys, 0, 0, Hash([5; 32]), &[0, 1, 2]);
+
+    // Truthful verdict on a real claim collects (no TC yet).
+    let sig0 = sign_timeout_claim(&keys[0], View::new(0), Epoch::new(0), Some(&qc));
+    assert!(matches!(
+        engine.collect_timeout_signature_preverified(
+            0,
+            sig0,
+            Some((qc.clone(), QcVerdict::Current))
+        ),
+        Ok(None)
+    ));
+
+    // `Pending` on a same-epoch claim is contradictory.
+    let sig1 = sign_timeout_claim(&keys[1], View::new(0), Epoch::new(0), Some(&qc));
+    assert!(matches!(
+        engine.collect_timeout_signature_preverified(
+            1,
+            sig1,
+            Some((qc.clone(), QcVerdict::Pending))
+        ),
+        Err(ConsensusError::InvalidVoteSignature { .. })
+    ));
+
+    // `Invalid` — the pool proved the claimed QC forged.
+    let sig2 = sign_timeout_claim(&keys[2], View::new(0), Epoch::new(0), Some(&qc));
+    assert!(matches!(
+        engine.collect_timeout_signature_preverified(
+            2,
+            sig2,
+            Some((qc.clone(), QcVerdict::Invalid))
+        ),
+        Err(ConsensusError::InvalidVoteSignature { .. })
+    ));
+
+    // A claim the live state can't support: the QC's view is
+    // beyond ours — dies at the re-run live gate even with a
+    // `Current` verdict.
+    let future_qc = signed_qc(&keys, 7, 0, Hash([5; 32]), &[0, 1, 2]);
+    let sig3 = sign_timeout_claim(&keys[3], View::new(0), Epoch::new(0), Some(&future_qc));
+    assert!(matches!(
+        engine.collect_timeout_signature_preverified(
+            3,
+            sig3,
+            Some((future_qc, QcVerdict::Current))
+        ),
+        Err(ConsensusError::InvalidVoteSignature { .. })
+    ));
+}
+
+/// `on_timeout_certificate_preverified` applies a truthful
+/// verdict and advances the view — a false verdict never moves
+/// state even when the certificate would verify inline.
+#[test]
+fn on_timeout_certificate_preverified_gates_on_verdict() {
+    let (mut engines, keys) = signed_committee();
+    let engine = &mut engines[1];
+    let tc = make_tc(0, 0, &[(0, &keys[0], None), (1, &keys[1], None), (2, &keys[2], None)]);
+    assert!(
+        matches!(
+            engine.on_timeout_certificate_preverified(&tc, false),
+            Err(ConsensusError::InvalidTcSignature)
+        ),
+        "a false verdict never applies"
+    );
+    engine
+        .on_timeout_certificate_preverified(&tc, true)
+        .expect("the truthful verdict advances the view");
+    assert_eq!(engine.current_view(), View::new(1));
+}
+
+/// A `verified = true` verdict only covers the crypto: the
+/// structural half — quorum power, distinct in-bounds voters,
+/// epoch match — re-runs against the live set at apply. A forged
+/// 'true' verdict cannot conjure quorum or cross an epoch.
+#[test]
+fn on_timeout_certificate_preverified_reruns_structure_on_live_state() {
+    let (mut engines, keys) = signed_committee();
+    let engine = &mut engines[1];
+
+    // Sub-quorum: 2 of 4 equal-stake signers (quorum is 3).
+    let thin_tc = make_tc(0, 0, &[(0, &keys[0], None), (1, &keys[1], None)]);
+    assert!(
+        matches!(
+            engine.on_timeout_certificate_preverified(&thin_tc, true),
+            Err(ConsensusError::InsufficientQuorum { .. })
+        ),
+        "a 'verified' verdict cannot conjure quorum"
+    );
+
+    // Duplicate voter: malformed regardless of verdict.
+    let dup_tc = TimeoutCertificate {
+        view: View::new(0),
+        epoch: Epoch::new(0),
+        signers: [0u16, 0, 1, 2]
+            .iter()
+            .map(|&v| types::TimeoutSigner {
+                voter: v,
+                high_qc: None,
+                signature: sign_timeout_claim(
+                    &keys[usize::from(v)],
+                    View::new(0),
+                    Epoch::new(0),
+                    None,
+                ),
+            })
+            .collect(),
+    };
+    assert!(matches!(
+        engine.on_timeout_certificate_preverified(&dup_tc, true),
+        Err(ConsensusError::InvalidTcSignature)
+    ));
+
+    // Wrong epoch: a verdict resolved pre-rotation can never move
+    // the view under a different epoch.
+    let wrong_epoch =
+        make_tc(0, 9, &[(0, &keys[0], None), (1, &keys[1], None), (2, &keys[2], None)]);
+    assert!(matches!(
+        engine.on_timeout_certificate_preverified(&wrong_epoch, true),
+        Err(ConsensusError::InvalidTcSignature)
+    ));
+
+    // Out-of-bounds voter: the structural pass reports the
+    // roster violation even when the verdict claims verified.
+    let oob_tc = TimeoutCertificate {
+        view: View::new(0),
+        epoch: Epoch::new(0),
+        signers: vec![
+            types::TimeoutSigner {
+                voter: 0,
+                high_qc: None,
+                signature: sign_timeout_claim(&keys[0], View::new(0), Epoch::new(0), None),
+            },
+            types::TimeoutSigner {
+                voter: 1,
+                high_qc: None,
+                signature: sign_timeout_claim(&keys[1], View::new(0), Epoch::new(0), None),
+            },
+            types::TimeoutSigner { voter: 99, high_qc: None, signature: Signature::ZERO },
+        ],
+    };
+    assert!(matches!(
+        engine.on_timeout_certificate_preverified(&oob_tc, true),
+        Err(ConsensusError::SignerOutOfBounds)
+    ));
+}
+
+/// `collect_vote_pooled` collects the vote immediately and returns
+/// the attestation's verify material — the verdict inserts through
+/// `apply_attest_verdict` and still forms the cert at quorum,
+/// exactly as the inline harvest did.
+#[test]
+fn collect_vote_pooled_defers_attestation_and_forms_cert() {
+    let (mut engines, keys) = signed_committee();
+    let leader = &mut engines[0];
+    // The votes must name a block the leader stored — the
+    // phantom-block guard drops first-votes for unknown hashes.
+    leader.submit_tx(TxBytes::new(vec![1]));
+    let (header, _proposal) = leader.propose().expect("leader proposes");
+    let block_hash = OxideBft::block_hash(&header);
+    let height = Height::new(7);
+    let root = Hash([0x77; 32]);
+
+    for i in 1u16..=3 {
+        let att = StateAttestation { height, root };
+        let att_msg = leader.attestation_signing_message(height, &root);
+        let att_sig = keys[usize::from(i)].sign(crypto::hash::Domain::ExecAttest, &att_msg);
+        let vote_msg = leader.vote_signing_message(View::new(0), 0, &block_hash);
+        let vote_sig = keys[usize::from(i)].sign(crypto::hash::Domain::Vote, &vote_msg);
+        let (res, task) = leader.collect_vote_pooled(
+            i,
+            Vote {
+                view: View::new(0),
+                phase: VotePhase::Prepare,
+                block_hash,
+                signature: vote_sig,
+                attestation: Some(att),
+                attestation_sig: Some(att_sig),
+            },
+        );
+        res.expect("vote collects before its attestation verifies");
+        let task = task.expect("harvest-eligible attestation emits material");
+        assert_eq!(task.voter, i);
+        // The worker-side check the pool runs — the verdict
+        // applies only when it passes.
+        let verified =
+            crypto::verify(&task.signature, crypto::hash::Domain::ExecAttest, &task.msg, &task.pk)
+                .is_ok();
+        assert!(verified, "real attestation signature must verify");
+        leader.apply_attest_verdict(task.voter, task.attestation, task.signature, verified);
+    }
+    let cert = leader.exec_certs.get(&7).expect("cert forms from pooled verdicts");
+    assert_eq!(cert.state_root, root);
+
+    // Stale verdict: a late attestation for a height whose cert
+    // already formed inserts nothing — the live gate re-runs.
+    let late = StateAttestation { height, root: Hash([0x99; 32]) };
+    leader.apply_attest_verdict(0, late, Signature::ZERO, true);
+    assert!(
+        leader.exec_attest_pool.get(&7).is_none_or(|roots| !roots.contains_key(&late.root)),
+        "a stale verdict can never write into the attestation pool"
+    );
+}
+
+/// A failing attestation verdict drops the attestation — the vote
+/// itself already collected and still counts toward quorum.
+#[test]
+fn attest_verdict_failure_drops_attestation_not_vote() {
+    let (mut engines, keys) = signed_committee();
+    let leader = &mut engines[0];
+    leader.submit_tx(TxBytes::new(vec![1]));
+    let (header, _proposal) = leader.propose().expect("leader proposes");
+    let block_hash = OxideBft::block_hash(&header);
+    let att = StateAttestation { height: Height::new(3), root: Hash([1; 32]) };
+    let att_msg = leader.attestation_signing_message(att.height, &att.root);
+    let att_sig = keys[1].sign(crypto::hash::Domain::ExecAttest, &att_msg);
+    let vote_msg = leader.vote_signing_message(View::new(0), 0, &block_hash);
+    let vote_sig = keys[1].sign(crypto::hash::Domain::Vote, &vote_msg);
+    let (res, task) = leader.collect_vote_pooled(
+        1,
+        Vote {
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            block_hash,
+            signature: vote_sig,
+            attestation: Some(att),
+            attestation_sig: Some(att_sig),
+        },
+    );
+    res.expect("vote collects");
+    let task = task.expect("attestation emits material");
+    // A false verdict — e.g. the pool found a bad signature —
+    // inserts nothing while the vote stands.
+    leader.apply_attest_verdict(task.voter, task.attestation, task.signature, false);
+    assert!(!leader.exec_attest_pool.contains_key(&3), "a failing verdict never writes the pool");
+    assert_eq!(leader.vote_count, 1, "the vote still collected");
+}
+
+/// Intake routing: `*_verify_context` returns `None` for cases the
+/// cheap inline path already handles — a stale QC, a foreign-epoch
+/// TC, a memoized-rejected header, or a stored-complete proposal
+/// must never burn a pool job.
+#[test]
+fn verify_contexts_route_cheap_cases_inline() {
+    let (mut engines, keys) = signed_committee();
+    let engine = &mut engines[1];
+
+    // Stale QC: high_qc at v2 makes v1's context refuse.
+    let qc_v1 = signed_qc(&keys, 1, 0, Hash([9; 32]), &[0, 1, 2]);
+    let qc_v2 = signed_qc(&keys, 2, 0, Hash([9; 32]), &[0, 1, 2]);
+    engine.deliver_qc(qc_v2).expect("v2 delivers");
+    assert!(engine.qc_verify_context(&qc_v1).is_none(), "a stale QC resolves no job");
+    // And the inline path rejects it before any crypto.
+    assert!(matches!(engine.deliver_qc(qc_v1), Err(ConsensusError::StaleQc { .. })));
+
+    // Foreign-epoch TC: the context resolves nothing and the
+    // inline gate rejects it.
+    let foreign_tc =
+        make_tc(0, 9, &[(0, &keys[0], None), (1, &keys[1], None), (2, &keys[2], None)]);
+    assert!(engine.tc_verify_context(&foreign_tc).is_none(), "a foreign-epoch TC resolves no job");
+    assert!(matches!(
+        engine.on_timeout_certificate(&foreign_tc),
+        Err(ConsensusError::InvalidTcSignature)
+    ));
+
+    // Rejected headers resolve nothing — `admit_proposal` already
+    // memoized the verdict.
+    let (header, proposal) = engines[0].propose().expect("propose");
+    let engine = &mut engines[1];
+    let mut forged = header.clone();
+    forged.proposer = proposer_hash(3);
+    assert!(!engine.admit_proposal(&forged, &proposal), "forged claim rejects");
+    assert!(
+        engine.proposal_verify_context(&forged).is_none(),
+        "a memoized rejection resolves no job"
+    );
+
+    // Stored-complete proposals resolve nothing — the inline memo
+    // admits them without re-verifying.
+    assert!(engine.admit_proposal(&header, &proposal), "the real proposal admits");
+    assert!(
+        engine.proposal_verify_context(&header).is_none(),
+        "a stored-complete proposal resolves no job"
+    );
+}
+
+/// A timeout's carried QC is lock evidence, not a delivery — the
+/// admission gate that rejects a stale QC for `deliver_qc` must
+/// not suppress its verification material. Regression for a live
+/// stall: an honest timeout carrying its already-adopted `high_qc`
+/// resolved no material under the admission-gated context, folded
+/// to `Invalid`, and was rejected — TCs could never form.
+#[test]
+fn qc_evidence_verify_context_resolves_stale_carried_qc() {
+    use crate::verify::QcVerdict;
+    let (mut engines, keys) = signed_committee();
+    let engine = &mut engines[1];
+
+    // Adopt a QC — it is now stale for admission (its view is at
+    // or below our high_qc).
+    let qc = signed_qc(&keys, 1, 0, Hash([9; 32]), &[0, 1, 2]);
+    engine.deliver_qc(qc.clone()).expect("deliver");
+    assert!(engine.qc_verify_context(&qc).is_none(), "the carried QC is stale for admission");
+
+    // The evidence context still resolves verifiable material
+    // under the live committee — exactly the crypto half the
+    // inline path runs.
+    let materials = engine.qc_evidence_verify_context(&qc).expect("resolves material");
+    assert_eq!(materials.len(), 1, "live-committee candidate only");
+    assert!(
+        materials.iter().all(|m| crate::verify::qc_material_verifies(m, &qc)),
+        "the real QC verifies"
+    );
+
+    // The full pooled path collects the honest timeout: verdict
+    // `Current`, live screens pass, signature collects.
+    let sig = sign_timeout_claim(&keys[0], engine.current_view(), Epoch::new(0), Some(&qc));
+    assert!(matches!(
+        engine.collect_timeout_signature_preverified(0, sig, Some((qc, QcVerdict::Current))),
+        Ok(None)
+    ));
+}

@@ -837,6 +837,15 @@ fn run_consensus_loop(
     // a connection at all.
     let mut proposal_verify_budget: std::collections::HashMap<Vec<u8>, (std::time::Instant, u32)> =
         std::collections::HashMap::new();
+    // Bounded signature-verification pool: every BLS-bearing wire
+    // message — proposals, timeouts + their QC/TC evidence, QCs,
+    // TCs — resolves its crypto material here, verifies on pool
+    // workers, and applies the verdict on the drain below. The
+    // engine stays single-writer; workers see only immutable
+    // material. Without this, the cheap gates bound *how much*
+    // junk arrives but each admitted verification still blocked
+    // the pump inside pairing code.
+    let mut verify_pool = crate::verify_pool::VerifyPool::spawn();
     let mut voted_views: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut proposed_views: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut last_reported_height: u64 = 0;
@@ -1013,6 +1022,13 @@ fn run_consensus_loop(
                         // have `vote()` re-verify all of them on
                         // every iteration.
                         let proposal_view = header.view.value();
+                        // Already verified-and-stored: re-deliveries
+                        // must not re-pay a pool job — the dedupe
+                        // key is only ever claimed post-verdict, so
+                        // a hit here means the body is in `blocks`.
+                        if seen_proposals.contains(&(proposal_view, header.proposer)) {
+                            continue;
+                        }
                         if !engine.proposal_admissible(&header) {
                             continue;
                         }
@@ -1044,40 +1060,32 @@ fn run_consensus_loop(
                         // leader would park it and the genuine
                         // proposal would be dropped as a "duplicate"
                         // — the flood becomes censorship. Only a
-                        // verified proposal may occupy the slot;
-                        // `admit_proposal` memoises both verdicts so
-                        // re-deliveries are free.
-                        let admitted = engine.admit_proposal(&header, &proposal);
-                        if admitted && seen_proposals.insert((proposal_view, header.proposer)) {
-                            // A verified leader proposal above our
-                            // verified frontier proves committed
-                            // history we never saw — start (or
-                            // refresh) a certified-block fetch
-                            // toward the gap. `admit_proposal` ran
-                            // first, so `header.height` is a real
-                            // signed leader height, not a forged
-                            // trigger. The frontier (not the bare
-                            // committed tip) is the fetch origin so
-                            // records already verified-and-staged
-                            // under `apply_certified_block`'s seal
-                            // rule are never re-requested.
-                            let need = engine.sync_frontier();
-                            if header.height.value() > need {
-                                sync_target = sync_target.max(header.height.value());
-                                if sync_last_req.is_none_or(|t| t.elapsed() >= SYNC_REQ_RETRY) {
-                                    let mut buf = Vec::with_capacity(16);
-                                    buf.push(MSG_BLOCK_REQ);
-                                    buf.extend_from_slice(&crate::block_sync::encode_request(
-                                        &crate::block_sync::FetchRequest::ByRange {
-                                            from: need,
-                                            count: crate::block_sync::SYNC_PAGE_CAP,
-                                        },
-                                    ));
-                                    let _ = transport.send(&msg.from, &buf);
-                                    sync_last_req = Some(std::time::Instant::now());
-                                }
-                            }
-                            pending_proposals.push((header, proposal));
+                        // verified proposal may occupy the slot —
+                        // and verification now runs on the pool:
+                        // the verdict lands on the drain below and
+                        // claims the key *after* it proves.
+                        if let Some(material) = engine.proposal_verify_context(&header) {
+                            let task = crate::verify_pool::proposal_job(header, proposal, material);
+                            // Queue full / peer capped / submit
+                            // budget spent → drop: the proposal
+                            // re-arrives via gossip, and nothing
+                            // unverified was stored.
+                            let _ = verify_pool.submit(&msg.from, msg.bytes.len(), task);
+                        } else if engine.admit_proposal(&header, &proposal) {
+                            // Conformance mode (or a claim the
+                            // context refuses): the inline path
+                            // applies the same checks.
+                            on_admitted_proposal(
+                                engine,
+                                transport,
+                                &mut seen_proposals,
+                                &mut pending_proposals,
+                                &mut sync_target,
+                                &mut sync_last_req,
+                                &msg.from,
+                                header,
+                                proposal,
+                            );
                         }
                     }
                 }
@@ -1099,29 +1107,38 @@ fn run_consensus_loop(
                             .ok()
                             .and_then(|a| engine.validator_set().index_of(&a));
                         if let Some(voter_idx) = voter {
-                            let _ = engine.collect_vote(voter_idx, vote);
+                            // The vote collects immediately — QC
+                            // formation is latency-critical — while
+                            // its attestation's BLS verify goes to
+                            // the pool: one bounded job per voter
+                            // per view (the dedup above bounds the
+                            // submit rate), never a flood channel.
+                            let (res, task) = engine.collect_vote_pooled(voter_idx, vote);
+                            let _ = res;
+                            if let Some(task) = task {
+                                let job = crate::verify_pool::attest_job(task);
+                                let _ = verify_pool.submit(&msg.from, msg.bytes.len(), job);
+                            }
                         }
                     }
                 }
                 MSG_QC => {
                     if let Ok(qc) = types::QuorumCertificate::decode(&mut reader) {
-                        // A QC certifying a block we never saw is a
-                        // gap signal the height alone can't give us
-                        // (the QC carries only the hash). Fetch the
-                        // certified record by hash — if the peer has
-                        // already finalized it, the proof comes back
-                        // verified-ready; if not, range sync picks
-                        // it up once the peer commits it.
-                        let unknown = !engine.has_block(&qc.block_hash);
-                        let qc_hash = qc.block_hash;
-                        let _ = engine.deliver_qc(qc);
-                        if unknown {
-                            let mut buf = Vec::with_capacity(36);
-                            buf.push(MSG_BLOCK_REQ);
-                            buf.extend_from_slice(&crate::block_sync::encode_request(
-                                &crate::block_sync::FetchRequest::ByHash(qc_hash),
-                            ));
-                            let _ = transport.send(&msg.from, &buf);
+                        // The aggregate verify goes to the pool:
+                        // bitmap→keys resolution happened at intake
+                        // inside `qc_verify_context` (it reads the
+                        // live committee), so the worker runs only
+                        // the threshold check + pairing. The verdict
+                        // lands on the drain and is applied by
+                        // `deliver_qc_preverified`.
+                        if let Some(materials) = engine.qc_verify_context(&qc) {
+                            let task = crate::verify_pool::qc_job(qc, materials);
+                            let _ = verify_pool.submit(&msg.from, msg.bytes.len(), task);
+                        } else {
+                            // Conformance mode — nothing to offload,
+                            // the inline path enforces the same
+                            // structural gates.
+                            on_inbound_qc(engine, transport, qc, &msg.from, None);
                         }
                     }
                 }
@@ -1205,17 +1222,60 @@ fn run_consensus_loop(
                         } else {
                             None
                         };
+                        // Foreign-epoch timeout sigs are dead on
+                        // arrival — `on_verified_timeout` drops them
+                        // at its own epoch gate, so don't pay a
+                        // context resolution or a pool job for them.
+                        if sig_epoch != engine.epoch().value() {
+                            continue;
+                        }
                         if let Ok(sig) = crypto::Signature::decode(&mut reader) {
                             // Authenticate the evidence BEFORE acting
-                            // on it. Everything below mutates
+                            // on it — and authenticate it OFF the
+                            // pump: the signature plus every attached
+                            // certificate verify on the pool, and the
+                            // drain applies the verdicts through the
+                            // preverified entries. Nothing mutates
                             // consensus state — the pacemaker timer,
-                            // the vote buffer, high_qc — so a peer
-                            // claiming a high view with a garbage
-                            // signature must be rejected here rather
-                            // than after the damage is done. The
-                            // signature is checked against the
-                            // (view, epoch) the sender actually signed,
-                            // never against our own current view.
+                            // the vote buffer, high_qc — before the
+                            // verdict lands.
+                            let sig_ctx = engine.timeout_verify_context(
+                                voter_idx,
+                                primitives::View::new(sig_view),
+                                primitives::Epoch::new(sig_epoch),
+                                qc_ev.as_ref(),
+                            );
+                            if let Some(sig_ctx) = sig_ctx {
+                                let qc_part = qc_ev.map(|qc| {
+                                    // The carried QC is lock
+                                    // evidence, not a delivery —
+                                    // resolve through the
+                                    // admission-free evidence
+                                    // context. `qc_verify_context`
+                                    // would refuse the signer's
+                                    // `high_qc` as stale-for-
+                                    // adoption and fold the honest
+                                    // timeout to Invalid.
+                                    let materials =
+                                        engine.qc_evidence_verify_context(&qc).unwrap_or_default();
+                                    (qc, materials)
+                                });
+                                let tc_part = tc_ev.map(|tc| {
+                                    let ctx = engine.tc_verify_context(&tc);
+                                    (tc, ctx)
+                                });
+                                let task = crate::verify_pool::timeout_job(
+                                    voter_idx, sig, sig_view, sig_epoch, sig_ctx, qc_part, tc_part,
+                                );
+                                let _ = verify_pool.submit(&msg.from, msg.bytes.len(), task);
+                                continue;
+                            }
+                            // Conformance mode (or an unresolvable
+                            // voter): the inline path authenticates
+                            // and applies identically — the signature
+                            // is checked against the (view, epoch)
+                            // the sender actually signed, never
+                            // against our own current view.
                             if engine
                                 .verify_timeout_signature_for(
                                     voter_idx,
@@ -1228,81 +1288,44 @@ fn run_consensus_loop(
                             {
                                 continue;
                             }
-                            let my_epoch = engine.epoch().value();
-                            // Ignore timeout sigs from a different
-                            // epoch — they are not valid for this epoch.
-                            if sig_epoch != my_epoch {
-                                continue;
-                            }
-                            // Bounded catch-up: feed the attached
-                            // certificate evidence through the
-                            // verified ingestion paths first — a
-                            // timeout signature alone cannot move
-                            // our view; only real QC/TC evidence
-                            // can. After this, a collectible sig
-                            // must claim exactly our current view.
-                            let view_before = engine.current_view().value();
-                            engine.deliver_timeout_evidence(qc_ev.clone(), tc_ev);
-                            // If the sig is for a past view, ignore it
-                            // (stale — the sender is behind us); if it
-                            // is for a view the evidence didn't reach,
-                            // ignore it — an unjustified jump (the
-                            // old code synced to the claimed view
-                            // unconditionally, letting one peer pull
-                            // the node to an arbitrary view).
-                            if sig_view != engine.current_view().value() {
-                                continue;
-                            }
-                            // Reset the view timer only when the
-                            // evidence actually moved us — resetting
-                            // on every same-view sig would let a peer
-                            // starve our own timeout.
-                            if engine.current_view().value() != view_before {
-                                view_start = std::time::Instant::now();
-                                timeout_sent_for_view = None;
-                            }
-                            match engine.collect_timeout_signature(voter_idx, sig, qc_ev) {
-                                Ok(Some(tc)) => {
-                                    // TC formed — broadcast to all peers.
-                                    eprintln!(
-                                        "{log_tag}: TC formed after collecting timeout sig from voter={voter_idx} view={}",
-                                        engine.current_view().value()
-                                    );
-                                    let mut tc_buf = Vec::with_capacity(1 + 200);
-                                    tc_buf.push(MSG_TC);
-                                    tc.encode(&mut tc_buf);
-                                    for addr in engine.validator_set().validator_addresses() {
-                                        if *addr != our_addr {
-                                            let _ = transport.send(&addr.0.to_vec(), &tc_buf);
-                                        }
-                                    }
-                                    view_start = std::time::Instant::now();
-                                    timeout_sent_for_view = None;
-                                }
-                                Ok(None) => {
-                                    // Timeout sig collected but
-                                    // no TC yet — no log needed
-                                    // (this is the common case).
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "{log_tag}: timeout sig from voter={voter_idx} rejected: {e:?}"
-                                    );
-                                }
-                            }
+                            on_verified_timeout(
+                                engine,
+                                transport,
+                                &mut view_start,
+                                &mut timeout_sent_for_view,
+                                log_tag,
+                                our_addr,
+                                voter_idx,
+                                sig,
+                                sig_view,
+                                sig_epoch,
+                                qc_ev.map(|qc| (qc, None)),
+                                tc_ev.map(|tc| (tc, None)),
+                            );
                         }
                     }
                 }
                 MSG_TC => {
-                    // Timeout certificate from a peer — advance the view.
+                    // Timeout certificate from a peer — the
+                    // per-signer records and every carried QC
+                    // verify on the pool; the drain applies the
+                    // verdict. Conformance mode (context returns
+                    // `None`) or an unresolvable record falls back
+                    // to the inline path, which reports the
+                    // structural error.
                     if let Ok(tc) = types::TimeoutCertificate::decode(&mut reader) {
-                        match engine.on_timeout_certificate(&tc) {
-                            Ok(()) => {
-                                view_start = std::time::Instant::now();
-                                timeout_sent_for_view = None;
-                            }
-                            Err(e) => {
-                                eprintln!("{log_tag}: TC rejected: {e:?}");
+                        if let Some(material) = engine.tc_verify_context(&tc) {
+                            let task = crate::verify_pool::tc_job(tc, material);
+                            let _ = verify_pool.submit(&msg.from, msg.bytes.len(), task);
+                        } else {
+                            match engine.on_timeout_certificate(&tc) {
+                                Ok(()) => {
+                                    view_start = std::time::Instant::now();
+                                    timeout_sent_for_view = None;
+                                }
+                                Err(e) => {
+                                    eprintln!("{log_tag}: TC rejected: {e:?}");
+                                }
                             }
                         }
                     }
@@ -1453,6 +1476,89 @@ fn run_consensus_loop(
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Phase 3a: apply verify-pool verdicts. Every BLS-bearing
+        // intake submitted a job instead of verifying inline; the
+        // completed verdicts land here and are applied through the
+        // engine's `*_preverified` entries — which re-run every
+        // state-dependent check (epoch, leader schedule, view
+        // ordering, quorum structure) against *live* state, so a
+        // stale or contradictory verdict can never move consensus.
+        while let Some(done) = verify_pool.try_recv() {
+            use crate::verify_pool::VerifyOutcome;
+            match done.outcome {
+                VerifyOutcome::Proposal { header, proposal, sig_ok, commit_ok } => {
+                    // The dedupe key is claimed only by a verdict
+                    // that admits — `on_admitted_proposal` owns the
+                    // insert — so a forged frame that raced the real
+                    // leader's slot never parks it.
+                    if engine.admit_preverified(&header, &proposal, sig_ok, commit_ok) {
+                        on_admitted_proposal(
+                            engine,
+                            transport,
+                            &mut seen_proposals,
+                            &mut pending_proposals,
+                            &mut sync_target,
+                            &mut sync_last_req,
+                            &done.peer,
+                            *header,
+                            *proposal,
+                        );
+                    }
+                }
+                VerifyOutcome::Timeout {
+                    voter,
+                    signature,
+                    sig_view,
+                    sig_epoch,
+                    sig_ok,
+                    qc_ev,
+                    tc_ev,
+                } => {
+                    // A failed signature verdict drops the whole
+                    // frame — the attached evidence never reaches a
+                    // verified path, exactly as the inline gate did.
+                    if !sig_ok {
+                        continue;
+                    }
+                    on_verified_timeout(
+                        engine,
+                        transport,
+                        &mut view_start,
+                        &mut timeout_sent_for_view,
+                        log_tag,
+                        our_addr,
+                        voter,
+                        signature,
+                        sig_view,
+                        sig_epoch,
+                        qc_ev.map(|(qc, v)| (qc, Some(v))),
+                        tc_ev.map(|(tc, ok)| (tc, Some(ok))),
+                    );
+                }
+                VerifyOutcome::Qc { qc, verdict } => {
+                    on_inbound_qc(engine, transport, qc, &done.peer, Some(verdict));
+                }
+                VerifyOutcome::Tc { tc, verified } => {
+                    match engine.on_timeout_certificate_preverified(&tc, verified) {
+                        Ok(()) => {
+                            view_start = std::time::Instant::now();
+                            timeout_sent_for_view = None;
+                        }
+                        Err(e) => {
+                            eprintln!("{log_tag}: TC rejected: {e:?}");
+                        }
+                    }
+                }
+                VerifyOutcome::Attest { voter, attestation, signature, verified } => {
+                    // The vote collected at intake; only the
+                    // attestation's pool insert rides the verdict —
+                    // `apply_attest_verdict` re-checks the live
+                    // cert-existence gate and voter bounds.
+                    engine.apply_attest_verdict(voter, attestation, signature, verified);
+                }
             }
         }
 
@@ -1864,6 +1970,202 @@ fn run_consensus_loop(
 /// interior record that stages but doesn't seal leaves the frontier
 /// advanced anyway, so the next buffered record applies immediately
 /// rather than waiting for the seal to land first.
+/// What the pump does with a verified, admitted proposal — shared
+/// by the inline intake path and the verify-pool drain so both
+/// claim the dedupe slot, trigger gap sync, and queue the vote
+/// identically.
+///
+/// The `(view, proposer)` key is claimed HERE — after `admit_*`
+/// returned true — never at intake: `header.proposer` is a public
+/// claim, so an unverified frame that parked the key would let a
+/// racing flood censor the genuine leader's proposal as a
+/// "duplicate". A verified leader proposal above the verified
+/// frontier proves committed history we never saw — start (or
+/// refresh) a certified-block fetch toward the gap, origin at the
+/// frontier so records already verified-and-staged under
+/// `apply_certified_block`'s seal rule are never re-requested.
+#[allow(clippy::too_many_arguments)]
+fn on_admitted_proposal(
+    engine: &mut consensus::OxideBft,
+    transport: &mut p2p::tcp::TcpTransport,
+    seen_proposals: &mut std::collections::HashSet<(u64, primitives::Hash)>,
+    pending_proposals: &mut Vec<(types::BlockHeader, types::Proposal)>,
+    sync_target: &mut u64,
+    sync_last_req: &mut Option<std::time::Instant>,
+    peer: &Vec<u8>,
+    header: types::BlockHeader,
+    proposal: types::Proposal,
+) {
+    if !seen_proposals.insert((header.view.value(), header.proposer)) {
+        return;
+    }
+    let need = engine.sync_frontier();
+    if header.height.value() > need {
+        *sync_target = (*sync_target).max(header.height.value());
+        if sync_last_req.is_none_or(|t| t.elapsed() >= SYNC_REQ_RETRY) {
+            let mut buf = Vec::with_capacity(16);
+            buf.push(MSG_BLOCK_REQ);
+            buf.extend_from_slice(&crate::block_sync::encode_request(
+                &crate::block_sync::FetchRequest::ByRange {
+                    from: need,
+                    count: crate::block_sync::SYNC_PAGE_CAP,
+                },
+            ));
+            let _ = transport.send(peer, &buf);
+            *sync_last_req = Some(std::time::Instant::now());
+        }
+    }
+    pending_proposals.push((header, proposal));
+}
+
+/// Inbound QC handling shared by the inline intake and the
+/// verify-pool drain: deliver through the matching engine entry
+/// (inline verify or pooled verdict), then — when the QC certifies
+/// a block we never saw — fetch the certified record by hash. The
+/// hash is a gap signal the height alone can't give; if the peer
+/// already finalized it the proof comes back verified-ready, else
+/// range sync picks it up once committed.
+fn on_inbound_qc(
+    engine: &mut consensus::OxideBft,
+    transport: &mut p2p::tcp::TcpTransport,
+    qc: types::QuorumCertificate,
+    peer: &Vec<u8>,
+    verdict: Option<consensus::QcVerdict>,
+) {
+    let unknown = !engine.has_block(&qc.block_hash);
+    let qc_hash = qc.block_hash;
+    match verdict {
+        Some(v) => {
+            let _ = engine.deliver_qc_preverified(qc, v);
+        }
+        None => {
+            let _ = engine.deliver_qc(qc);
+        }
+    }
+    if unknown {
+        let mut buf = Vec::with_capacity(36);
+        buf.push(MSG_BLOCK_REQ);
+        buf.extend_from_slice(&crate::block_sync::encode_request(
+            &crate::block_sync::FetchRequest::ByHash(qc_hash),
+        ));
+        let _ = transport.send(peer, &buf);
+    }
+}
+
+/// Apply an authenticated timeout frame: deliver the attached
+/// certificate evidence, then collect the signature if it names
+/// the (possibly new) current view. Shared by the inline path
+/// (conformance — evidence carries `None` verdicts and goes
+/// through the verifying entries) and the verify-pool drain
+/// (evidence carries the pooled verdicts and goes through
+/// `*_preverified`).
+///
+/// Ordering is the safety-critical part and matches the old inline
+/// body exactly: the signature was already authenticated upstream
+/// (inline verify or pool verdict), THEN the epoch gate, THEN the
+/// evidence — a timeout signature alone can never move our view;
+/// only real QC/TC evidence can. Only after evidence does the
+/// collect gate on the sig claiming our now-current view — an
+/// unjustified jump is ignored rather than synced to.
+#[allow(clippy::too_many_arguments)]
+fn on_verified_timeout(
+    engine: &mut consensus::OxideBft,
+    transport: &mut p2p::tcp::TcpTransport,
+    view_start: &mut std::time::Instant,
+    timeout_sent_for_view: &mut Option<u64>,
+    log_tag: &str,
+    our_addr: primitives::Address,
+    voter_idx: consensus::ValidatorIndex,
+    signature: crypto::Signature,
+    sig_view: u64,
+    sig_epoch: u64,
+    qc_ev: Option<(types::QuorumCertificate, Option<consensus::QcVerdict>)>,
+    tc_ev: Option<(types::TimeoutCertificate, Option<bool>)>,
+) {
+    // Ignore timeout sigs from a different epoch — they are not
+    // valid for this epoch.
+    if sig_epoch != engine.epoch().value() {
+        return;
+    }
+    // Bounded catch-up: feed the attached certificate evidence
+    // through the verified ingestion paths first — a timeout
+    // signature alone cannot move our view; only real QC/TC
+    // evidence can. After this, a collectible sig must claim
+    // exactly our current view.
+    let view_before = engine.current_view().value();
+    if let Some((qc, verdict)) = qc_ev.clone()
+        && qc.epoch == engine.epoch()
+    {
+        match verdict {
+            Some(v) => {
+                let _ = engine.deliver_qc_preverified(qc, v);
+            }
+            None => {
+                let _ = engine.deliver_qc(qc);
+            }
+        }
+    }
+    if let Some((tc, ok)) = tc_ev
+        && tc.epoch == engine.epoch()
+    {
+        match ok {
+            Some(v) => {
+                let _ = engine.on_timeout_certificate_preverified(&tc, v);
+            }
+            None => {
+                let _ = engine.on_timeout_certificate(&tc);
+            }
+        }
+    }
+    // If the sig is for a past view, ignore it (stale — the sender
+    // is behind us); if it is for a view the evidence didn't
+    // reach, ignore it — an unjustified jump (the old code synced
+    // to the claimed view unconditionally, letting one peer pull
+    // the node to an arbitrary view).
+    if sig_view != engine.current_view().value() {
+        return;
+    }
+    // Reset the view timer only when the evidence actually moved
+    // us — resetting on every same-view sig would let a peer
+    // starve our own timeout.
+    if engine.current_view().value() != view_before {
+        *view_start = std::time::Instant::now();
+        *timeout_sent_for_view = None;
+    }
+    let collect = match qc_ev {
+        Some((qc, Some(verdict))) => {
+            engine.collect_timeout_signature_preverified(voter_idx, signature, Some((qc, verdict)))
+        }
+        other => engine.collect_timeout_signature(voter_idx, signature, other.map(|(qc, _)| qc)),
+    };
+    match collect {
+        Ok(Some(tc)) => {
+            // TC formed — broadcast to all peers.
+            eprintln!(
+                "{log_tag}: TC formed after collecting timeout sig from voter={voter_idx} view={}",
+                engine.current_view().value()
+            );
+            let mut tc_buf = Vec::with_capacity(1 + 200);
+            tc_buf.push(MSG_TC);
+            tc.encode(&mut tc_buf);
+            for addr in engine.validator_set().validator_addresses() {
+                if *addr != our_addr {
+                    let _ = transport.send(&addr.0.to_vec(), &tc_buf);
+                }
+            }
+            *view_start = std::time::Instant::now();
+            *timeout_sent_for_view = None;
+        }
+        Ok(None) => {
+            // Timeout sig collected but no TC yet — no log needed
+            // (this is the common case).
+        }
+        Err(e) => {
+            eprintln!("{log_tag}: timeout sig from voter={voter_idx} rejected: {e:?}");
+        }
+    }
+}
+
 pub(crate) fn drain_sync_buffer(
     engine: &mut consensus::OxideBft,
     pending: &mut std::collections::BTreeMap<u64, types::CertifiedBlock>,

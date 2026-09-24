@@ -63,6 +63,7 @@ pub mod peer_auth;
 pub mod remote_signer;
 pub mod rpc_adapters;
 pub mod validator_net;
+pub mod verify_pool;
 
 /// The consensus engine selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -111,6 +111,18 @@ impl VerifiedTc {
     pub(crate) fn max_evidence(&self) -> Option<&QuorumCertificate> {
         self.tc.signers.iter().filter_map(|s| s.high_qc.as_ref()).max_by_key(|qc| qc.view.value())
     }
+
+    /// Wrap a certificate the caller guarantees was already
+    /// verified — the verify-pool mirror of
+    /// [`VerifiedQc::from_trusted`]. A pooled verdict asserts the
+    /// per-record signatures and carried QCs verified under the
+    /// committee the pump resolved at intake; the *structural*
+    /// half (`check_tc_structure`) still runs on the live engine
+    /// before this is minted, so the token is only ever built over
+    /// a certificate that passed both halves.
+    pub(crate) fn from_trusted(tc: TimeoutCertificate) -> Self {
+        Self { tc }
+    }
 }
 
 /// Resolve a certificate's signer bitmap into the signers' public
@@ -449,21 +461,68 @@ pub(crate) fn verify_tc_signature(
     verify_signatures: bool,
     tc: &TimeoutCertificate,
 ) -> Result<VerifiedTc, ConsensusError> {
+    check_tc_structure(vset, tc)?;
+    if verify_signatures {
+        // Carried QCs are deduplicated for verification: honest
+        // quorum members overwhelmingly report the *same* high QC
+        // (the chain's tip), so the common case verifies one
+        // certificate regardless of signer count.
+        let mut verified_qcs: std::collections::HashSet<(u64, Hash)> =
+            std::collections::HashSet::new();
+        for entry in &tc.signers {
+            if let Some(qc) = &entry.high_qc
+                && verified_qcs.insert((qc.view.value(), qc.block_hash))
+            {
+                verify_qc_signature(vset, tc.epoch, qc)?;
+            }
+            // Voter bounds were asserted by `check_tc_structure`;
+            // a failure here would mean the set changed under us,
+            // which a `&ValidatorSet` borrow rules out — but there
+            // is no `unwrap` on the wire path, so map to the same
+            // malformed-certificate error.
+            let pk = vset.validator(entry.voter).map_err(|_| ConsensusError::InvalidTcSignature)?;
+            let msg = timeout_signing_message(tc.view, tc.epoch, entry.high_qc.as_ref());
+            crypto::bls_signer::verify(&entry.signature, crypto::hash::Domain::Timeout, &msg, pk)
+                .map_err(|_| ConsensusError::InvalidTcSignature)?;
+        }
+    }
+    Ok(VerifiedTc { tc: tc.clone() })
+}
+
+/// The non-cryptographic half of [`verify_tc_signature`] — every
+/// check that reads only the certificate's structure and the
+/// validator set's roster: non-empty records, distinct in-bounds
+/// voters, each carried QC's `(view <= tc.view, epoch == tc.epoch)`
+/// bound, and quorum voting power.
+///
+/// Split out so the engine's verify-pool apply path
+/// (`on_timeout_certificate_preverified`) can re-run exactly these
+/// checks against *live* state while the signatures were verified
+/// off-thread — structure is a function of the committee the engine
+/// holds *now*, which a pooled job can never see.
+///
+/// # Errors
+///
+/// Returns [`ConsensusError::InvalidTcSignature`] if `tc` has no
+/// signers, a duplicate voter, or a carried QC from a later view or
+/// a different epoch; [`ConsensusError::SignerOutOfBounds`] if a
+/// voter index is out of range; or
+/// [`ConsensusError::InsufficientQuorum`] if the combined voting
+/// power is below quorum.
+pub(crate) fn check_tc_structure(
+    vset: &ValidatorSet,
+    tc: &TimeoutCertificate,
+) -> Result<(), ConsensusError> {
     if tc.signers.is_empty() {
         return Err(ConsensusError::InvalidTcSignature);
     }
     let mut seen = std::collections::HashSet::with_capacity(tc.signers.len());
     let mut voting_power = 0u64;
-    // Carried QCs are deduplicated for verification: honest quorum
-    // members overwhelmingly report the *same* high QC (the chain's
-    // tip), so the common case verifies one certificate regardless
-    // of signer count.
-    let mut verified_qcs: std::collections::HashSet<(u64, Hash)> = std::collections::HashSet::new();
     for entry in &tc.signers {
         if !seen.insert(entry.voter) {
             return Err(ConsensusError::InvalidTcSignature);
         }
-        let pk = vset.validator(entry.voter).map_err(|_| ConsensusError::SignerOutOfBounds)?;
+        vset.validator(entry.voter).map_err(|_| ConsensusError::SignerOutOfBounds)?;
         voting_power = voting_power.saturating_add(
             vset.stake(entry.voter).map_err(|_| ConsensusError::SignerOutOfBounds)?,
         );
@@ -476,19 +535,164 @@ pub(crate) fn verify_tc_signature(
             if qc.view.value() > tc.view.value() || qc.epoch != tc.epoch {
                 return Err(ConsensusError::InvalidTcSignature);
             }
-            if verify_signatures && verified_qcs.insert((qc.view.value(), qc.block_hash)) {
-                verify_qc_signature(vset, tc.epoch, qc)?;
-            }
-        }
-        if verify_signatures {
-            let msg = timeout_signing_message(tc.view, tc.epoch, entry.high_qc.as_ref());
-            crypto::bls_signer::verify(&entry.signature, crypto::hash::Domain::Timeout, &msg, pk)
-                .map_err(|_| ConsensusError::InvalidTcSignature)?;
         }
     }
     let required = vset.quorum_stake();
     if voting_power < required {
         return Err(ConsensusError::InsufficientQuorum { voting_power, required });
     }
-    Ok(VerifiedTc { tc: tc.clone() })
+    Ok(())
+}
+
+/// The pure crypto inputs for verifying a [`QuorumCertificate`]
+/// under one candidate committee — resolved pump-side from live
+/// engine state via [`OxideBft::qc_verify_context`], verified by
+/// the node's signature pool off the consensus thread.
+///
+/// A material carries no engine state: the bitmap has already been
+/// resolved to keys and summed stake, and the signing message is
+/// prebuilt. Verifying it is a pure function — exactly what a
+/// bounded worker can run without any access to engine internals.
+///
+/// [`OxideBft::qc_verify_context`]: crate::engine::OxideBft::qc_verify_context
+#[derive(Debug)]
+pub struct QcVerifyMaterial {
+    /// Bitmap-resolved signer keys under this candidate committee.
+    pub signer_pks: Vec<crypto::bls::PublicKey>,
+    /// The signers' combined voting power under this candidate —
+    /// checked against `required_power` as part of the verdict.
+    pub voting_power: u64,
+    /// The stake quorum under this candidate committee.
+    pub required_power: u64,
+    /// `vote_signing_message(qc.epoch, qc.view, qc.phase,
+    /// qc.block_hash)` — the exact 49-byte payload
+    /// `verify_qc_signature` checks the aggregate against.
+    pub msg: [u8; 49],
+    /// Whether this candidate was resolved from the staged
+    /// `next_validator_set` — the certified-epoch-adoption case
+    /// `deliver_qc` tries second. `false` for the live committee.
+    pub pending_set: bool,
+}
+
+/// Which candidate committee a pooled QC verification proved — the
+/// verdict half of [`QcVerifyMaterial`], reported back to the pump
+/// for `deliver_qc_preverified` to apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QcVerdict {
+    /// The aggregate verified under the live committee's material.
+    Current,
+    /// The aggregate verified only under the staged next committee
+    /// — the epoch-adoption candidate. Only meaningful for a QC
+    /// claiming an epoch beyond the engine's (the pending material
+    /// is resolved in that case alone); `deliver_qc_preverified`
+    /// rejects it otherwise.
+    Pending,
+    /// No candidate's material verified — bitmap unresolved,
+    /// sub-quorum stake, or a bad aggregate. Equivalent to
+    /// `deliver_qc`'s signature-failure rejection.
+    Invalid,
+}
+
+/// The pure crypto inputs for verifying a [`TimeoutCertificate`]'s
+/// wire authentication — resolved by
+/// [`OxideBft::tc_verify_context`], verified by the signature pool.
+///
+/// The evidence-binding shape forces per-record verification (each
+/// signer signs its own `qc_high` claim, so BLS same-message
+/// aggregation cannot apply), plus one [`QcVerifyMaterial`] per
+/// *distinct* carried QC — deduplicated exactly the way
+/// `verify_tc_signature` deduplicates them.
+///
+/// [`OxideBft::tc_verify_context`]: crate::engine::OxideBft::tc_verify_context
+#[derive(Debug)]
+pub struct TcVerifyMaterial {
+    /// One `(key, signing message, signature)` triple per signer
+    /// record — the key resolved under the live committee, the
+    /// message bound to that record's own `qc_high` claim.
+    pub records: Vec<(crypto::bls::PublicKey, [u8; 57], Signature)>,
+    /// One `(certificate, material)` pair per distinct
+    /// `(view, block_hash)` carried QC, all under the live
+    /// committee (`pending_set` is always `false` — TC-carried QCs
+    /// never epoch-adopt). The certificate travels with its
+    /// material because `qc_material_verifies` needs the
+    /// aggregate signature it verifies against.
+    pub qcs: Vec<(QuorumCertificate, QcVerifyMaterial)>,
+}
+
+/// Resolve `qc`'s verification material under `set` — the bitmap's
+/// signer keys + summed power, the quorum threshold, and the
+/// signing message for `epoch`. `pending_set` marks which
+/// committee `set` was (for the verdict's bookkeeping only).
+///
+/// `None` when the bitmap doesn't resolve under `set` (an
+/// out-of-range bit) or resolves empty — the candidate simply
+/// cannot verify and contributes no material.
+pub(crate) fn qc_verify_material(
+    set: &ValidatorSet,
+    epoch: Epoch,
+    qc: &QuorumCertificate,
+    pending_set: bool,
+) -> Option<QcVerifyMaterial> {
+    let (signer_pks, voting_power) = signer_keys_and_power(set, &qc.signer_bitmap).ok()?;
+    if signer_pks.is_empty() {
+        return None;
+    }
+    Some(QcVerifyMaterial {
+        signer_pks,
+        voting_power,
+        required_power: set.quorum_stake(),
+        msg: vote_signing_message(epoch, qc.view, qc.phase as u8, &qc.block_hash),
+        pending_set,
+    })
+}
+
+/// Run the crypto half of `verify_qc_signature` against resolved
+/// material — pure: no validator set, no engine state, safe to run
+/// on a worker thread. `true` iff the signers' power reaches the
+/// quorum threshold AND the aggregate signature verifies over the
+/// material's message.
+pub fn qc_material_verifies(material: &QcVerifyMaterial, qc: &QuorumCertificate) -> bool {
+    material.voting_power >= material.required_power
+        && crypto::aggregate_verify(
+            &qc.aggregate_signature,
+            crypto::hash::Domain::Vote,
+            &material.msg,
+            &material.signer_pks,
+        )
+        .is_ok()
+}
+
+/// Resolve the wire-authentication material of `tc` under `vset`:
+/// each signer record's key + `(view, epoch, qc_high)` signing
+/// message + signature, and one [`QcVerifyMaterial`] per distinct
+/// carried QC. Mirrors the crypto half of `verify_tc_signature`
+/// exactly — including the `(view, block_hash)` QC dedup — so a
+/// pooled verdict over this material is the same pass/fail the
+/// inline path would compute.
+///
+/// `None` when any voter index is out of bounds — the structural
+/// pass reports `SignerOutOfBounds` for the same condition, so an
+/// unresolvable record yields no material rather than a partial
+/// job.
+pub(crate) fn tc_verify_material(
+    vset: &ValidatorSet,
+    tc: &TimeoutCertificate,
+) -> Option<TcVerifyMaterial> {
+    let mut records = Vec::with_capacity(tc.signers.len());
+    let mut qcs = Vec::new();
+    let mut seen_qcs: std::collections::HashSet<(u64, Hash)> = std::collections::HashSet::new();
+    for entry in &tc.signers {
+        let pk = *vset.validator(entry.voter).ok()?;
+        records.push((
+            pk,
+            timeout_signing_message(tc.view, tc.epoch, entry.high_qc.as_ref()),
+            entry.signature,
+        ));
+        if let Some(qc) = &entry.high_qc
+            && seen_qcs.insert((qc.view.value(), qc.block_hash))
+        {
+            qcs.push((qc.clone(), qc_verify_material(vset, tc.epoch, qc, false)?));
+        }
+    }
+    Some(TcVerifyMaterial { records, qcs })
 }

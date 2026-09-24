@@ -27,12 +27,14 @@ mod verify;
 pub mod wal;
 
 pub use engine::{
-    ConsensusError, EpochRotationError, OxideBft, PROPOSAL_FUTURE_VIEWS, PROPOSAL_PAST_VIEWS,
-    PROPOSAL_VERIFY_BUDGET_PER_SEC, RepairOutcome, SyncReject, proposer_hash,
+    AttestVerifyTask, ConsensusError, EpochRotationError, OxideBft, PROPOSAL_FUTURE_VIEWS,
+    PROPOSAL_PAST_VIEWS, PROPOSAL_VERIFY_BUDGET_PER_SEC, ProposalVerifyMaterial, RepairOutcome,
+    SyncReject, proposer_hash,
 };
 pub use pacemaker::{Pacemaker, PacemakerEvent, PacemakerState};
 pub use sequencer::SequencerEngine;
 pub use types::ExecDivergence;
 pub use validator::{ValidatorIndex, ValidatorSet};
 pub use verify::verify_exec_cert;
+pub use verify::{QcVerdict, QcVerifyMaterial, TcVerifyMaterial, qc_material_verifies};
 pub use wal::{Wal, WalEntry, WalError};

@@ -227,6 +227,34 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Bounded signature-verification pool for the consensus pump**
+  (`node::verify_pool` + engine `*_preverified` entries). Every
+  BLS-bearing wire message — proposals (proposer signature +
+  shard commitment), standalone QCs, timeout signatures and their
+  attached QC/TC evidence, timeout certificates, and vote
+  execution attestations — used to verify inline on the
+  single-threaded consensus loop, so one Byzantine peer feeding
+  admissible forged frames could stall honest verification inside
+  pairing code. The pump now resolves pure crypto material at
+  intake, runs pairings on a bounded worker pool (128-job /
+  64-MiB global queue, 8 in-flight per peer, 128 submits/s/peer),
+  and applies verdicts through entries that re-run every
+  state-dependent check — epoch, leader schedule, view
+  monotonicity, quorum structure — against live state: a stale,
+  contradictory, or forged verdict is a no-op, never a mutation.
+  Verdict-*gated* checks (a proposal's embedded exec certificate
+  and entry TC) stay inline by design — the vote depends on the
+  outcome, and each is cached to one pairing per unique
+  certificate per epoch.
+  - **In plain words:** checking signatures used to happen on the
+    same thread that runs consensus, so a bad peer could waste
+    the network's time with expensive-but-worthless signature
+    checks. Now the expensive work happens on a small set of
+    helper threads with strict per-peer limits, and the consensus
+    thread only applies the results — after double-checking
+    everything itself. A bad peer can still send junk, but it can
+    no longer make everyone else wait behind it.
+
 - **Governed parameters for every module** (`staking.*`,
   `perps.*`, `governance.*`, `chain.*`): governance proposals can
   now enact changes beyond the exchange fee vault — the only sink

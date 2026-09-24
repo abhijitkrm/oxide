@@ -21784,3 +21784,90 @@ refuses a conflicting pair across sessions;
 `validator_fleet_runs_through_remote_signer` re-verified end to
 end through the authenticated link (the test's daemon and
 validator now carry `--link-key-file`/`--signer-link-key-file`).
+
+## Signature verification off the consensus pump
+
+Every BLS-bearing wire message — proposals (proposer signature +
+shard commitment), standalone QC aggregates, timeout signatures
+and their attached QC/TC evidence, timeout certificates' per-
+signer records, and vote execution attestations — used to verify
+*inline* on the single-threaded consensus loop. The cheap gates
+bounded how much junk reached verification, but each admitted
+verify still blocked the pump inside pairing code: one Byzantine
+peer feeding admissible forged frames could stall honest
+verification behind milliseconds-per-frame pairings.
+
+**Three-phase boundary.** The pump now resolves pure crypto
+material from live engine state (`*_verify_context`: leader key +
+signing hash + shard parameters, bitmap→keys + quorum thresholds
++ the 49/57-byte signing messages, per-record TC material), runs
+the pairings on a bounded worker pool (`crates/node/src/
+verify_pool.rs`), and applies verdicts through `*_preverified`
+engine entries that re-run every state-dependent check — epoch,
+leader schedule, view monotonicity, quorum structure, storage
+decisions — against *live* state. A verdict is crypto evidence,
+never an admission decision: a verdict computed under a committee
+that rotated since intake, or naming a QC the `high_qc` already
+passed, dies at the same gates the inline path enforced. Workers
+hold only immutable material — they cannot see, be influenced by,
+or mutate engine state; the engine stays single-writer.
+
+**Fairness.** The pool bounds the backlog globally (128 jobs,
+64 MiB of queued payload — proposal jobs carry block bodies for
+the commitment check), per authenticated peer (8 in-flight), and
+by submit rate (128 jobs/s/peer — the in-flight cap alone can't
+bound a peer cycling instantly-failing jobs). A flooding peer
+holds at most its slice; every bound's failure mode is a drop,
+which is safe because consensus messages re-arrive via gossip or
+sync and an unsubmitted job mutates nothing.
+
+**Attestations.** `collect_vote` splits at the attestation's BLS
+pairing: the vote collects immediately (QC formation is latency-
+critical and a vote is never gated on its attestation), the
+attestation's verify material returns for the pool, and
+`apply_attest_verdict` re-checks the live cert-existence gate and
+voter bounds before inserting — so a verdict that went stale
+between intake and apply can never write the attestation pool.
+The vote's own signature stays governed by `verify_per_vote` and
+inline when enabled — a collected vote can't be unwound.
+
+**Deliberate residuals.** Verdict-*gated* verification stays
+inline: a proposal's embedded exec-cert check and entry-TC check
+decide whether a vote is emitted at all — deferring them means
+holding un-emitted vote state, and both are bounded (one pairing
+per unique cert/TC per epoch, cached). Certified-block sync
+verifies inline too — recovery-bounded by fetched records, not a
+steady-state channel.
+
+**Tests.** Pool bounds (global queue, byte cap, per-peer
+in-flight, submit rate), fairness under flood (a byz peer
+saturating its slice can't starve an honest job — real pairings,
+bounded completion), forged/stale verdicts at every `*_preverified`
+entry (Invalid/ Pending/ wrong-epoch/ sub-quorum/ duplicate-voter/
+stale-QC/ non-leader all fail closed at the live gates), context
+material runs the identical crypto workers would, the vote
+attestation deferral forms certs identically to the inline path,
+and a full intake→pool→drain→apply-under-flood test on a live
+engine.
+
+**The stale-evidence stall (found by the flood E2E).** The first
+wiring reused `qc_verify_context` for a timeout's *carried* QC —
+and that resolver gates on `check_qc_admission`, which rejects a
+QC at-or-below our `high_qc` as stale. Correct for a standalone
+delivery (don't pay crypto for a QC we'd drop), wrong for lock
+evidence: an honest timeout's `high_qc` is almost always a QC we
+have *already adopted*. Every carried QC resolved to empty
+material, folded to `Invalid`, and `collect_timeout_signature_
+preverified` rejected every honest timeout sig — TCs never formed
+and the flood test stalled at height 4. Unit tests missed it
+because none carried an already-adopted QC through the intake.
+Fix: `qc_evidence_verify_context` resolves the carried QC under
+the live committee with no admission gate — mirroring
+`collect_timeout_signature`'s inline screen exactly (current-set
+only; the apply side's same-epoch check still rejects anything
+the staged set could claim). `tc_verify_context` never had the
+bug — it resolves carried QCs through `tc_verify_material`
+directly. Regression test: a timeout carrying an adopted QC
+verifies `Current` and collects; the proposal-flood E2E (6 real
+nodes + an authenticated Byzantine peer, 38k junk frames) now
+passes with TCs forming under the flood.

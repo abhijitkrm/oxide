@@ -162,6 +162,60 @@ const MAX_REJECTED_HEADERS: usize = 4096;
 /// the activation height is identical everywhere.
 pub const ROTATION_ACTIVATION_DELAY: u64 = 2;
 
+/// The crypto material a proposal's wire authentication needs —
+/// resolved by [`OxideBft::proposal_verify_context`] against live
+/// committee state at intake, verified by the node's signature
+/// pool off the consensus thread.
+///
+/// Every field is a pure value: verifying it requires no access to
+/// engine state, so a bounded worker can run the BLS pairing and
+/// the shard-commitment encode without touching the single-writer
+/// engine. The apply half (`admit_preverified`) re-runs all
+/// state-dependent checks before storing.
+#[derive(Debug)]
+pub struct ProposalVerifyMaterial {
+    /// The effective leader's BLS key for `header.view` — effective
+    /// because the reputation schedule may skip excluded validators,
+    /// and only the effective leader's signature authenticates.
+    pub leader_pk: crypto::bls::PublicKey,
+    /// `proposal_signing_hash(header)` — the domain-bound 32-byte
+    /// digest the proposer signs.
+    pub signing_hash: Hash,
+    /// Live validator-set size — the shard commitment's `n`.
+    pub shard_count: usize,
+    /// `erasure_k` under the live set — the commitment's
+    /// reconstruction threshold.
+    pub shard_threshold: usize,
+}
+
+/// The crypto material a vote's execution attestation verifies
+/// against — resolved by [`OxideBft::collect_vote_pooled`] at
+/// intake, verified by the node's signature pool off the
+/// consensus thread, applied via [`OxideBft::apply_attest_verdict`].
+///
+/// Every field is a pure value: the worker needs no engine state
+/// to run the pairing, and the apply half re-checks the live
+/// cert-existence gate and voter bounds before inserting, so a
+/// verdict that went stale since intake can never write into the
+/// attestation pool.
+#[derive(Debug)]
+pub struct AttestVerifyTask {
+    /// The attesting committee seat — resolved at intake from the
+    /// authenticated peer.
+    pub voter: ValidatorIndex,
+    /// The claim the signature covers — carried to the apply side
+    /// so the verdict binds exactly what was verified.
+    pub attestation: types::StateAttestation,
+    /// The voter's `Domain::ExecAttest` signature over `msg`.
+    pub signature: Signature,
+    /// The voter's BLS key under the live committee.
+    pub pk: crypto::bls::PublicKey,
+    /// `attestation_signing_message(epoch, attestation.height,
+    /// attestation.root)` — the exact 48-byte payload the
+    /// attestation path verifies against.
+    pub msg: [u8; 48],
+}
+
 /// A block that has a QC but hasn't been committed yet — waiting for
 /// the 2-chain commit rule to fire.
 ///
@@ -1369,6 +1423,49 @@ impl OxideBft {
         header.proposer == proposer_hash(self.effective_leader(header.view))
     }
 
+    /// Resolve the crypto material the node's signature pool needs
+    /// to authenticate `header` off-thread: the effective leader's
+    /// BLS key, the proposal signing hash, and the shard-commitment
+    /// parameters — all read from *live* committee state at intake.
+    ///
+    /// `None` when `verify_signatures` is off (conformance mode —
+    /// there is no crypto to offload), when `header.proposer` is
+    /// not the effective leader for `header.view` (the context can
+    /// never prove a forged claim), or when the signature field is
+    /// absent. Callers fall back to `admit_proposal`, which applies
+    /// the identical checks inline.
+    ///
+    /// The matching apply half is `admit_preverified`: it re-runs
+    /// every state-dependent check (leader schedule, height bound,
+    /// saturation, storage) so a verdict computed under a rotated
+    /// committee can never store a proposal.
+    #[must_use]
+    pub fn proposal_verify_context(&self, header: &BlockHeader) -> Option<ProposalVerifyMaterial> {
+        if !self.verify_signatures {
+            return None;
+        }
+        // Already decided: a rejected header fails cheap inside
+        // `admit_proposal` and a stored-complete one admits cheap —
+        // neither should re-pay a pool job for the same bytes.
+        let block_hash = Self::block_hash(header);
+        if self.rejected_headers.contains(&block_hash)
+            || matches!(self.blocks.get(&block_hash), Some((_, BlockBody::Complete(_))))
+        {
+            return None;
+        }
+        let leader = self.effective_leader(header.view);
+        if header.proposer != proposer_hash(leader) || header.proposer_signature.is_none() {
+            return None;
+        }
+        let leader_pk = *self.validator_set.validator(leader).ok()?;
+        Some(ProposalVerifyMaterial {
+            leader_pk,
+            signing_hash: Self::proposal_signing_hash(header),
+            shard_count: self.validator_set.n(),
+            shard_threshold: self.erasure_k(),
+        })
+    }
+
     /// The highest QC the engine has seen, if any.
     ///
     /// Used by pipelined drivers to check whether the leader for the
@@ -2156,43 +2253,7 @@ impl OxideBft {
     /// [`ConsensusError::StaleQc`] if the QC's view is not greater
     /// than the current `high_qc`'s view.
     pub fn deliver_qc(&mut self, qc: QuorumCertificate) -> Result<(), ConsensusError> {
-        // Certified epoch adoption. A QC claiming an epoch beyond
-        // ours is verifiable only if a committee we already hold
-        // produced it: the signed message binds `(view, phase,
-        // block_hash, epoch)`, so a quorum of a KNOWN validator set
-        // certifying epoch E is itself the handoff proof — adopt
-        // E. A node holding neither matching committee fails the
-        // verification (the bitmap resolves to the wrong keys) and
-        // rejects the QC — fail-closed, as before.
-        //
-        // A QC from a PAST epoch is dead evidence: its signer bitmap
-        // indexes a committee we no longer hold, and its view numbers
-        // the old epoch's restarted view space, so it can neither
-        // verify nor safely update `high_qc`. Rejected before any
-        // state touches it.
-        if qc.epoch < self.epoch {
-            return Err(ConsensusError::PastEpochQc { qc_epoch: qc.epoch, epoch: self.epoch });
-        }
-        let adopts_epoch = qc.epoch > self.epoch;
-        // Hardening: enforce monotonic view progression. A QC for a
-        // view ≤ the current high_qc's view is stale — a byzantine
-        // leader could replay it to regress the engine's state.
-        // Exception: the first QC (when high_qc is None) is always
-        // accepted.
-        //
-        // This check runs only for same-epoch QCs: a new epoch's
-        // views restart at 0, so comparing the QC's view against the
-        // old epoch's `high_qc` would reject the new epoch's first
-        // certificate on arrival.
-        if !adopts_epoch
-            && let Some(current_high_qc) = &self.high_qc
-            && qc.view.value() <= current_high_qc.view().value()
-        {
-            return Err(ConsensusError::StaleQc {
-                qc_view: qc.view,
-                high_qc_view: current_high_qc.view(),
-            });
-        }
+        let adopts_epoch = self.check_qc_admission(&qc)?;
 
         // Committee selection + quorum + signature verification.
         // A same-epoch QC admits under the current set only. A
@@ -2231,6 +2292,119 @@ impl OxideBft {
                 }
             }
         };
+        self.deliver_qc_tail(qc, verified, adopts_epoch, adopts_pending_set);
+        Ok(())
+    }
+
+    /// [`deliver_qc`] with the aggregate signature already screened
+    /// by the node's signature-verification pool: `verdict` names
+    /// which candidate committee's [`crate::verify::QcVerifyMaterial`]
+    /// verified — the same current-then-pending order this function
+    /// tries inline. The live admission gates (`check_qc_admission`)
+    /// re-run exactly as in the verified path: a pooled verdict is
+    /// crypto evidence, never an admission decision, so a verdict
+    /// computed under a committee that rotated since intake still
+    /// dies at the epoch/stale gates.
+    ///
+    /// [`QcVerdict::Pending`] is meaningful only for an epoch-
+    /// adopting QC — the pending material is resolved in that case
+    /// alone. For a same-epoch QC it is contradictory (the pending
+    /// committee could not have signed its own epoch) and fails
+    /// closed; a `Pending` verdict also requires the staged set to
+    /// still be there, so a verdict issued pre-rotation cannot
+    /// adopt twice.
+    ///
+    /// # Errors
+    ///
+    /// Same gates as [`deliver_qc`]. The signature-failure case
+    /// collapses to [`ConsensusError::InvalidQcSignature`] for any
+    /// verdict naming no verifying candidate — the specific
+    /// structural reason was computed pump-side at context
+    /// resolution and is not a safety distinction.
+    pub fn deliver_qc_preverified(
+        &mut self,
+        qc: QuorumCertificate,
+        verdict: crate::verify::QcVerdict,
+    ) -> Result<(), ConsensusError> {
+        use crate::verify::QcVerdict;
+        let adopts_epoch = self.check_qc_admission(&qc)?;
+        let adopts_pending_set = match verdict {
+            QcVerdict::Current => false,
+            QcVerdict::Pending if adopts_epoch && self.next_validator_set.is_some() => true,
+            QcVerdict::Pending | QcVerdict::Invalid => {
+                return Err(ConsensusError::InvalidQcSignature);
+            }
+        };
+        let verified = crate::verify::VerifiedQc::from_trusted(qc.clone());
+        self.deliver_qc_tail(qc, verified, adopts_epoch, adopts_pending_set);
+        Ok(())
+    }
+
+    /// The live-state admission gates every QC entry point shares —
+    /// extracted so `deliver_qc` and `deliver_qc_preverified` apply
+    /// the identical ordering and no pooled verdict can bypass it.
+    /// Returns whether `qc` claims an epoch beyond ours (the
+    /// certified-adoption case the callers then handle).
+    ///
+    /// # Errors
+    ///
+    /// [`ConsensusError::PastEpochQc`] for a certificate from a
+    /// finished epoch, [`ConsensusError::StaleQc`] for a same-epoch
+    /// QC at-or-below the current `high_qc` view.
+    fn check_qc_admission(&self, qc: &QuorumCertificate) -> Result<bool, ConsensusError> {
+        // Certified epoch adoption. A QC claiming an epoch beyond
+        // ours is verifiable only if a committee we already hold
+        // produced it: the signed message binds `(view, phase,
+        // block_hash, epoch)`, so a quorum of a KNOWN validator set
+        // certifying epoch E is itself the handoff proof — adopt
+        // E. A node holding neither matching committee fails the
+        // verification (the bitmap resolves to the wrong keys) and
+        // rejects the QC — fail-closed, as before.
+        //
+        // A QC from a PAST epoch is dead evidence: its signer bitmap
+        // indexes a committee we no longer hold, and its view numbers
+        // the old epoch's restarted view space, so it can neither
+        // verify nor safely update `high_qc`. Rejected before any
+        // state touches it.
+        if qc.epoch < self.epoch {
+            return Err(ConsensusError::PastEpochQc { qc_epoch: qc.epoch, epoch: self.epoch });
+        }
+        let adopts_epoch = qc.epoch > self.epoch;
+        // Hardening: enforce monotonic view progression. A QC for a
+        // view ≤ the current high_qc's view is stale — a byzantine
+        // leader could replay it to regress the engine's state.
+        // Exception: the first QC (when high_qc is None) is always
+        // accepted.
+        //
+        // This check runs only for same-epoch QCs: a new epoch's
+        // views restart at 0, so comparing the QC's view against the
+        // old epoch's `high_qc` would reject the new epoch's first
+        // certificate on arrival.
+        if !adopts_epoch
+            && let Some(current_high_qc) = &self.high_qc
+            && qc.view.value() <= current_high_qc.view().value()
+        {
+            return Err(ConsensusError::StaleQc {
+                qc_view: qc.view,
+                high_qc_view: current_high_qc.view(),
+            });
+        }
+        Ok(adopts_epoch)
+    }
+
+    /// The post-verification tail `deliver_qc` and
+    /// `deliver_qc_preverified` share: epoch adoption, `high_qc`
+    /// update, deferred WAL append, view catch-up, and the commit
+    /// walk. `verified` is the certificate the caller already
+    /// authenticated (inline via `verify_qc_with`, or minted from a
+    /// pooled verdict); nothing in here re-checks signatures.
+    fn deliver_qc_tail(
+        &mut self,
+        qc: QuorumCertificate,
+        verified: VerifiedQc,
+        adopts_epoch: bool,
+        adopts_pending_set: bool,
+    ) {
         if adopts_epoch {
             // The staged committee produced this QC — install it
             // before the epoch-adoption re-seat reads the live set.
@@ -2316,7 +2490,6 @@ impl OxideBft {
             // commit pair the walk collects.
             self.commit_walk(&header, &qc);
         }
-        Ok(())
     }
 
     /// Drain the certified commit records produced since the last
@@ -2433,6 +2606,84 @@ impl OxideBft {
         } else {
             Ok(VerifiedQc::from_trusted(qc.clone()))
         }
+    }
+
+    /// Resolve the crypto material the node's signature pool needs
+    /// to verify `qc` off-thread — one [`crate::verify::QcVerifyMaterial`]
+    /// per candidate committee, in the order `deliver_qc` tries
+    /// them: the live set first, then the staged `next_validator_set`
+    /// when `qc` claims an epoch beyond ours (certified-epoch
+    /// adoption — the second candidate exists for that case alone).
+    ///
+    /// `None` in conformance mode (no crypto to offload — callers
+    /// fall back to `deliver_qc`); an empty `Vec` when no
+    /// candidate's bitmap resolves under any held set — the pool
+    /// reports [`crate::verify::QcVerdict::Invalid`] for it, which
+    /// is also the right verdict for a sub-quorum or bad-aggregate
+    /// QC.
+    ///
+    /// The bitmap→keys resolution happens here, pump-side, because
+    /// it reads the live committee; the worker only runs the
+    /// threshold check + pairing over the resolved material.
+    #[must_use]
+    pub fn qc_verify_context(
+        &self,
+        qc: &QuorumCertificate,
+    ) -> Option<Vec<crate::verify::QcVerifyMaterial>> {
+        if !self.verify_signatures {
+            return None;
+        }
+        // Admission-doomed QCs route to the cheap inline path —
+        // `deliver_qc` rejects a past-epoch or stale QC before any
+        // crypto, so they must not burn a pool job either. The
+        // apply side re-runs this gate on live state regardless.
+        if self.check_qc_admission(qc).is_err() {
+            return None;
+        }
+        let mut materials = Vec::with_capacity(2);
+        if let Some(m) = crate::verify::qc_verify_material(&self.validator_set, qc.epoch, qc, false)
+        {
+            materials.push(m);
+        }
+        if qc.epoch > self.epoch
+            && let Some(pending) = self.next_validator_set.as_ref()
+            && let Some(m) = crate::verify::qc_verify_material(pending, qc.epoch, qc, true)
+        {
+            materials.push(m);
+        }
+        Some(materials)
+    }
+
+    /// Resolve the crypto material a timeout signature's carried
+    /// `qc_high` verifies against. The carried QC's role here is
+    /// *evidence of a lock the signer held*, not a view-advancing
+    /// delivery — so [`OxideBft::qc_verify_context`]'s admission
+    /// gate must not apply: the signer's `high_qc` is typically a
+    /// QC we have already adopted, which admission would reject as
+    /// stale, yet the timeout signature binds it and the TC it
+    /// joins must carry it verbatim.
+    ///
+    /// Mirrors `collect_timeout_signature`'s inline screen exactly:
+    /// material is resolved under the live committee only — the
+    /// apply side's same-epoch check rejects anything the staged
+    /// set could claim, so `Pending` verdicts cannot arise here.
+    /// `None` in conformance mode (callers fall back to the inline
+    /// path); an empty `Vec` when the bitmap does not resolve, which
+    /// the pool correctly reports as
+    /// [`crate::verify::QcVerdict::Invalid`].
+    #[must_use]
+    pub fn qc_evidence_verify_context(
+        &self,
+        qc: &QuorumCertificate,
+    ) -> Option<Vec<crate::verify::QcVerifyMaterial>> {
+        if !self.verify_signatures {
+            return None;
+        }
+        Some(
+            crate::verify::qc_verify_material(&self.validator_set, qc.epoch, qc, false)
+                .into_iter()
+                .collect(),
+        )
     }
 
     /// Advance to the next view (happy path: one view per block).

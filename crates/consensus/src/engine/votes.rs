@@ -13,9 +13,9 @@
 //! cleared quorum, which `deliver_qc` re-checks.
 
 use super::{
-    AggregateSignature, BlockBody, BlockHeader, ConsensusError, Encode, ExecCertificate, Hash,
-    Height, OxideBft, Proposal, QuorumCertificate, Signature, StateAttestation, ValidatorIndex,
-    Verdict, View, Vote, VotePhase, proposer_hash,
+    AggregateSignature, AttestVerifyTask, BlockBody, BlockHeader, ConsensusError, Encode,
+    ExecCertificate, Hash, Height, OxideBft, Proposal, QuorumCertificate, Signature,
+    StateAttestation, ValidatorIndex, Verdict, View, Vote, VotePhase, proposer_hash,
 };
 use crate::verify::VerifiedTc;
 use types::ExecDivergence;
@@ -117,6 +117,42 @@ impl OxideBft {
     ///    would grow `blocks` without bound. `false` memoises
     ///    nothing — re-delivery after the lane drains re-admits.
     pub fn admit_proposal(&mut self, header: &BlockHeader, proposal: &Proposal) -> bool {
+        self.admit_proposal_inner(header, proposal, None)
+    }
+
+    /// [`admit_proposal`] with the wire crypto already screened by
+    /// the node's bounded signature pool: `sig_ok` replaces the
+    /// proposer-signature verify and `commit_ok` the shard-
+    /// commitment encode — both computed off-thread by
+    /// [`OxideBft::proposal_verify_context`]'s material.
+    ///
+    /// Nothing else is offloaded. Every state-dependent check —
+    /// the saturation gate, the height bound, the effective-leader
+    /// schedule, the storage decision — still runs here against
+    /// *live* engine state, so a verdict computed under a committee
+    /// that has since rotated can never store a proposal: the
+    /// leader check re-derives the expected proposer at apply time
+    /// and rejects the stale claim.
+    pub fn admit_preverified(
+        &mut self,
+        header: &BlockHeader,
+        proposal: &Proposal,
+        sig_ok: bool,
+        commit_ok: bool,
+    ) -> bool {
+        self.admit_proposal_inner(header, proposal, Some((sig_ok, commit_ok)))
+    }
+
+    /// Shared admission body for [`admit_proposal`] and
+    /// [`admit_preverified`]. `verdict` is `Some((sig_ok,
+    /// commit_ok))` when the pool already ran the crypto; `None`
+    /// computes both inline exactly as before.
+    fn admit_proposal_inner(
+        &mut self,
+        header: &BlockHeader,
+        proposal: &Proposal,
+        verdict: Option<(bool, bool)>,
+    ) -> bool {
         let block_hash = Self::block_hash(header);
         if self.rejected_headers.contains(&block_hash) {
             return false;
@@ -128,7 +164,8 @@ impl OxideBft {
             return false;
         }
         if !self.blocks.contains_key(&block_hash) {
-            if self.authenticate_proposal(header).is_none() {
+            if self.authenticate_proposal_inner(header, verdict.map(|(sig_ok, _)| sig_ok)).is_none()
+            {
                 self.reject_header(block_hash);
                 return false;
             }
@@ -150,11 +187,15 @@ impl OxideBft {
         // signature checks); the shard path enforces the binding
         // unconditionally at `supply_body`.
         if self.verify_signatures {
-            let mut buf = Vec::new();
-            proposal.encode(&mut buf);
-            if types::shard::commitment(&buf, self.validator_set.n(), self.erasure_k())
-                != header.body_commitment
-            {
+            let commit_ok = if let Some((_, commit_ok)) = verdict {
+                commit_ok
+            } else {
+                let mut buf = Vec::new();
+                proposal.encode(&mut buf);
+                types::shard::commitment(&buf, self.validator_set.n(), self.erasure_k())
+                    == header.body_commitment
+            };
+            if !commit_ok {
                 return false;
             }
         }
@@ -238,6 +279,21 @@ impl OxideBft {
     /// AND must not store anything — an unauthenticated header is
     /// worthless for both voting and the commit walk.
     pub(crate) fn authenticate_proposal(&mut self, header: &BlockHeader) -> Option<Hash> {
+        self.authenticate_proposal_inner(header, None)
+    }
+
+    /// [`authenticate_proposal`] with the proposer-signature verify
+    /// already run by the signature pool: `sig_verdict` asserts the
+    /// pool's pass/fail for `header.proposer_signature` over the
+    /// signing hash under the intake-resolved leader key. The
+    /// leader-identity check and the height bound re-run here on
+    /// live state regardless — the verdict only replaces the BLS
+    /// pairing, never the schedule lookup.
+    fn authenticate_proposal_inner(
+        &mut self,
+        header: &BlockHeader,
+        sig_verdict: Option<bool>,
+    ) -> Option<Hash> {
         // Sanity bound (C1 fix): reject proposals with height near
         // u64::MAX before learning it. Such a height is never
         // legitimate (at 10 blk/s, u64::MAX is ~58 billion years),
@@ -277,10 +333,28 @@ impl OxideBft {
             let Some(sig) = &header.proposer_signature else {
                 return None;
             };
+            // The leader key is re-resolved under the *live* set:
+            // if the committee rotated between intake and apply,
+            // the expected leader for this view may differ and the
+            // pooled verdict (computed under the old key) no longer
+            // stands — the claim fails the leader check above
+            // first, so a stale verdict can never admit.
             let leader_pk = self.validator_set.validator(expected_leader).map_err(|_| ()).ok()?;
-            let signing_hash = Self::proposal_signing_hash(header);
-            crypto::verify(sig, crypto::hash::Domain::Proposal, signing_hash.as_bytes(), leader_pk)
-                .ok()?;
+            let verified = if let Some(ok) = sig_verdict {
+                ok
+            } else {
+                let signing_hash = Self::proposal_signing_hash(header);
+                crypto::verify(
+                    sig,
+                    crypto::hash::Domain::Proposal,
+                    signing_hash.as_bytes(),
+                    leader_pk,
+                )
+                .is_ok()
+            };
+            if !verified {
+                return None;
+            }
         }
         // Height sync: learn the chain's progression from this
         // proposal. Even if we reject the proposal (tail-fork
@@ -1008,9 +1082,137 @@ impl OxideBft {
         voter: ValidatorIndex,
         vote: Vote,
     ) -> Result<(), ConsensusError> {
+        let (res, attest) = self.collect_vote_split(voter, vote);
+        if let Some(task) = attest
+            && crypto::verify(
+                &task.signature,
+                crypto::hash::Domain::ExecAttest,
+                &task.msg,
+                &task.pk,
+            )
+            .is_ok()
+        {
+            self.apply_verified_attestation(task.voter, task.attestation, task.signature);
+        }
+        res
+    }
+
+    /// [`collect_vote`] with the attestation's BLS verify deferred
+    /// to the node's signature pool: the vote collects immediately
+    /// — QC formation is latency-critical and a vote is never
+    /// gated on its attestation — while the attestation's verify
+    /// material returns for a worker to run. The verdict applies
+    /// through [`OxideBft::apply_attest_verdict`].
+    ///
+    /// Everything else matches `collect_vote` exactly — including
+    /// the `verify_per_vote` vote-signature check, which stays
+    /// inline: a collected vote can't be unwound on a late
+    /// verdict, so it is never deferred.
+    pub fn collect_vote_pooled(
+        &mut self,
+        voter: ValidatorIndex,
+        vote: Vote,
+    ) -> (Result<(), ConsensusError>, Option<AttestVerifyTask>) {
+        self.collect_vote_split(voter, vote)
+    }
+
+    /// Apply a pooled attestation verdict: a passing verdict
+    /// inserts exactly as the inline path does; a failing one
+    /// drops the attestation — the vote itself already collected
+    /// (attestations are best-effort and individually droppable).
+    pub fn apply_attest_verdict(
+        &mut self,
+        voter: ValidatorIndex,
+        attestation: StateAttestation,
+        signature: Signature,
+        verified: bool,
+    ) {
+        if verified {
+            self.apply_verified_attestation(voter, attestation, signature);
+        }
+    }
+
+    /// Insert a signature-verified attestation into the
+    /// aggregation pool and form the [`ExecCertificate`] at stake
+    /// quorum — the tail `collect_vote` and `apply_attest_verdict`
+    /// share. The cert-existence gate and voter bounds re-run
+    /// against *live* state: a verdict that went stale between
+    /// intake and apply — a cert formed meanwhile, or the
+    /// committee rotated — can never insert.
+    fn apply_verified_attestation(
+        &mut self,
+        voter: ValidatorIndex,
+        attestation: StateAttestation,
+        signature: Signature,
+    ) {
+        let att = &attestation;
+        // Skip when a cert already exists for this height —
+        // quorum is proven, so further attestations are redundant.
+        // Attestations for the committed tip are NOT redundant:
+        // the normal steady state is voters attesting their newest
+        // executed (= committed) block, and that is precisely the
+        // root the next proposals certify. Re-checked at apply
+        // because a pooled verdict can land after the cert formed.
+        if self.exec_certs.contains_key(&att.height.value())
+            || self.validator_set.validator(voter).is_err()
+        {
+            return;
+        }
+        let sig = signature;
+        let bucket = self
+            .exec_attest_pool
+            .entry(att.height.value())
+            .or_default()
+            .entry(att.root)
+            .or_default();
+        if bucket.iter().any(|(v, _)| *v == voter) {
+            return;
+        }
+        bucket.push((voter, sig));
+        // Quorum of identical attestations measured in voting
+        // power — the same stake-weighted threshold the cert will
+        // be validated against downstream. Checked on every
+        // insert; the `exec_certs.contains_key` gate above makes a
+        // formed cert stop absorbing further attestations, so this
+        // aggregates exactly once.
+        let bucket_power: u64 =
+            bucket.iter().map(|(v, _)| self.validator_set.stake(*v).unwrap_or(0)).sum();
+        if bucket_power >= self.validator_set.quorum_stake() {
+            let sigs: Vec<Signature> = bucket.iter().map(|(_, s)| *s).collect();
+            if let Ok(aggregate_signature) = crypto::aggregate(&sigs) {
+                let bitmap_len = self.validator_set.n().div_ceil(8);
+                let mut signer_bitmap = vec![0u8; bitmap_len];
+                for (v, _) in bucket.iter() {
+                    let i = usize::from(*v);
+                    signer_bitmap[i / 8] |= 1u8 << (i % 8);
+                }
+                self.exec_certs.insert(
+                    att.height.value(),
+                    ExecCertificate {
+                        height: att.height,
+                        state_root: att.root,
+                        epoch: self.epoch,
+                        signer_bitmap,
+                        aggregate_signature,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The collection body `collect_vote` and `collect_vote_pooled`
+    /// share: every gate and state mutation runs here except the
+    /// attestation's BLS pairing, which is returned as
+    /// [`AttestVerifyTask`] material for the caller to run (inline
+    /// or pooled) and feed through `apply_verified_attestation`.
+    fn collect_vote_split(
+        &mut self,
+        voter: ValidatorIndex,
+        vote: Vote,
+    ) -> (Result<(), ConsensusError>, Option<AttestVerifyTask>) {
         let idx = usize::from(voter);
         if idx >= self.votes.len() {
-            return Err(ConsensusError::InvalidVoteSignature { voter });
+            return (Err(ConsensusError::InvalidVoteSignature { voter }), None);
         }
         // Reject votes not for the current view. Stale votes
         // (view < current_view) are leftovers from a previous round.
@@ -1024,11 +1226,11 @@ impl OxideBft {
         // is safe — the voter will resend, or we'll catch up via QC
         // delivery and then accept votes for the new current_view.
         if vote.view != self.current_view {
-            return Ok(());
+            return (Ok(()), None);
         }
         // Already collected — idempotent (not an error, just a no-op).
         if self.votes[idx].is_some() {
-            return Ok(());
+            return (Ok(()), None);
         }
 
         // C1 fix: verify the vote's BLS signature against the voter's
@@ -1045,14 +1247,14 @@ impl OxideBft {
         // validator set (structural check below) and the vote is for
         // the current view (C2 fix above) regardless of this flag.
         if self.verify_signatures && self.verify_per_vote {
-            let pk = self
-                .validator_set
-                .validator(voter)
-                .map_err(|_| ConsensusError::InvalidVoteSignature { voter })?;
+            let Some(pk) = self.validator_set.validator(voter).ok() else {
+                return (Err(ConsensusError::InvalidVoteSignature { voter }), None);
+            };
             let phase_byte = vote.phase as u8;
             let msg = self.vote_signing_message(vote.view, phase_byte, &vote.block_hash);
-            crypto::verify(&vote.signature, crypto::hash::Domain::Vote, &msg, pk)
-                .map_err(|_| ConsensusError::InvalidVoteSignature { voter })?;
+            if crypto::verify(&vote.signature, crypto::hash::Domain::Vote, &msg, pk).is_err() {
+                return (Err(ConsensusError::InvalidVoteSignature { voter }), None);
+            }
         }
 
         // Phantom-block guard: the first buffered vote fixes the
@@ -1074,7 +1276,7 @@ impl OxideBft {
                 .get(&vote.block_hash)
                 .is_some_and(|(stored_header, _)| stored_header.view == vote.view);
             if !stored_for_view {
-                return Ok(());
+                return (Ok(()), None);
             }
         }
 
@@ -1085,80 +1287,46 @@ impl OxideBft {
         if let Some(first) = self.votes.iter().find_map(Option::as_ref)
             && (first.view != vote.view || first.block_hash != vote.block_hash)
         {
-            return Err(ConsensusError::ConflictingVote {
-                voter,
-                view: vote.view,
-                expected_block: first.block_hash,
-                actual_block: vote.block_hash,
-            });
+            return (
+                Err(ConsensusError::ConflictingVote {
+                    voter,
+                    view: vote.view,
+                    expected_block: first.block_hash,
+                    actual_block: vote.block_hash,
+                }),
+                None,
+            );
         }
 
-        // Harvest the execution attestation (if any) for exec-cert
-        // aggregation. Only signature-verified attestations count —
-        // a forged attestation that slipped into an aggregate would
-        // make the resulting cert fail verification at proposal
-        // time, letting one byzantine voter poison a whole block's
+        // Harvest-eligible attestations return as verify material
+        // — the caller runs the BLS pairing (inline via
+        // `collect_vote`, pooled via `collect_vote_pooled`) and
+        // applies the verdict through `apply_verified_attestation`.
+        // Only signature-verified attestations ever count: a forged
+        // attestation that slipped into an aggregate would make the
+        // resulting cert fail verification at proposal time,
+        // letting one byzantine voter poison a whole block's
         // embedded cert. The vote itself is unaffected either way:
         // attestations ride along as best-effort signals and are
         // dropped individually when invalid.
-        if self.verify_signatures
+        let attest = if self.verify_signatures
             && let (Some(att), Some(sig)) = (&vote.attestation, &vote.attestation_sig)
+            // Skip emitting a job when a cert already exists for
+            // this height — the same redundancy gate the inline
+            // path applied before paying the pairing.
+            && !self.exec_certs.contains_key(&att.height.value())
+            && let Ok(pk) = self.validator_set.validator(voter)
         {
-            // Skip the BLS verify (~1.5ms) when a cert already
-            // exists for this height — quorum is proven, so
-            // further attestations are redundant. Attestations
-            // for the committed tip are NOT redundant: the
-            // normal steady state is voters attesting their
-            // newest executed (= committed) block, and that is
-            // precisely the root the next proposals certify.
-            let valid = !self.exec_certs.contains_key(&att.height.value())
-                && self.validator_set.validator(voter).is_ok_and(|pk| {
-                    let msg = self.attestation_signing_message(att.height, &att.root);
-                    crypto::verify(sig, crypto::hash::Domain::ExecAttest, &msg, pk).is_ok()
-                });
-            if valid {
-                let bucket = self
-                    .exec_attest_pool
-                    .entry(att.height.value())
-                    .or_default()
-                    .entry(att.root)
-                    .or_default();
-                if !bucket.iter().any(|(v, _)| *v == voter) {
-                    bucket.push((voter, *sig));
-                    // Quorum of identical attestations measured
-                    // in voting power — the same stake-weighted
-                    // threshold the cert will be validated
-                    // against downstream. Checked on every
-                    // insert; the `exec_certs.contains_key` gate
-                    // above makes a formed cert stop absorbing
-                    // further attestations, so this aggregates
-                    // exactly once.
-                    let bucket_power: u64 =
-                        bucket.iter().map(|(v, _)| self.validator_set.stake(*v).unwrap_or(0)).sum();
-                    if bucket_power >= self.validator_set.quorum_stake() {
-                        let sigs: Vec<Signature> = bucket.iter().map(|(_, s)| *s).collect();
-                        if let Ok(aggregate_signature) = crypto::aggregate(&sigs) {
-                            let bitmap_len = self.validator_set.n().div_ceil(8);
-                            let mut signer_bitmap = vec![0u8; bitmap_len];
-                            for (v, _) in bucket.iter() {
-                                let i = usize::from(*v);
-                                signer_bitmap[i / 8] |= 1u8 << (i % 8);
-                            }
-                            self.exec_certs.insert(
-                                att.height.value(),
-                                ExecCertificate {
-                                    height: att.height,
-                                    state_root: att.root,
-                                    epoch: self.epoch,
-                                    signer_bitmap,
-                                    aggregate_signature,
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-        }
+            Some(AttestVerifyTask {
+                voter,
+                attestation: *att,
+                signature: *sig,
+                pk: *pk,
+                msg: self.attestation_signing_message(att.height, &att.root),
+            })
+        } else {
+            None
+        };
 
         self.votes[idx] = Some(vote);
         self.vote_count += 1;
@@ -1166,7 +1334,7 @@ impl OxideBft {
         // so the stake lookup cannot fail.
         self.vote_stake =
             self.vote_stake.saturating_add(self.validator_set.stake(voter).unwrap_or(0));
-        Ok(())
+        (Ok(()), attest)
     }
 
     /// Whether `aggregate` verifies against the public keys of the
