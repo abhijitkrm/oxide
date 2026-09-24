@@ -18,10 +18,12 @@
 //!
 //! Because it runs the real engine in consume-only mode, the
 //! follower also gets the safety machinery for free: the
-//! divergence latch (`admit_exec_cert` on every certified record's
-//! embedded attestation certificate), WAL persistence of the
-//! committed tip, epoch rotations via `drive_epoch_changes`, and
-//! certified-snapshot repair (`--repair-peer`).
+//! divergence latch (`confirm_exec_cert` on every certified
+//! record's embedded attestation certificate — verification plus
+//! the local-root comparison the vote path applies), WAL
+//! persistence of the committed tip, epoch rotations via
+//! `drive_epoch_changes`, and certified-snapshot repair
+//! (`--repair-peer`).
 //!
 //! # What it deliberately does not do
 //!
@@ -383,7 +385,7 @@ pub fn run(spec: FollowerSpec) {
                             if h == next {
                                 match engine.apply_certified_block(&record) {
                                     Ok(_) => {
-                                        // Admit the embedded exec
+                                        // Confirm the embedded exec
                                         // cert — attests `h - 1`,
                                         // which the apply just
                                         // committed/sealed. The
@@ -392,7 +394,7 @@ pub fn run(spec: FollowerSpec) {
                                         // commits, so both paths
                                         // run the divergence check.
                                         if let Some(ref cert) = record.header.exec_cert {
-                                            engine.admit_exec_cert(cert);
+                                            engine.confirm_exec_cert(cert);
                                         }
                                         drain_sync_buffer(&mut engine, &mut sync_pending, &log_tag);
                                     }
@@ -681,13 +683,12 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    /// One POST to the follower's JSON-RPC `eth_blockNumber` —
-    /// the honest external probe: the mirrored committed height is
-    /// exactly what a real client would read.
-    fn rpc_block_number(addr: &str) -> Option<u64> {
+    /// One POST to a JSON-RPC endpoint returning a hex `result`
+    /// (`eth_blockNumber`, `eth_getBlockTransactionCountByNumber`) —
+    /// the honest external probe: what a real client would read.
+    fn rpc_hex(addr: &str, body: &str) -> Option<u64> {
         let mut stream = TcpStream::connect(addr).ok()?;
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-        let body = r#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#;
         write!(
             stream,
             "POST / HTTP/1.0\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n{body}",
@@ -697,12 +698,51 @@ mod tests {
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).ok()?;
         let text = String::from_utf8_lossy(&raw);
-        // `"result":"0x..."` — hex height or null.
+        // `"result":"0x..."` — hex value or null.
         let marker = text.find("\"result\":")? + "\"result\":".len();
         let rest = &text[marker..];
         let start = rest.find('"')? + 1;
         let end = start + rest[start..].find('"')?;
         u64::from_str_radix(rest[start..end].trim_start_matches("0x"), 16).ok()
+    }
+
+    /// `eth_blockNumber` probe.
+    fn rpc_block_number(addr: &str) -> Option<u64> {
+        rpc_hex(addr, r#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#)
+    }
+
+    /// `eth_getBlockTransactionCountByNumber` probe — how many
+    /// transactions the committed block at `height` carried.
+    fn rpc_block_tx_count(addr: &str, height: u64) -> Option<u64> {
+        rpc_hex(
+            addr,
+            &format!(
+                r#"{{"jsonrpc":"2.0","method":"eth_getBlockTransactionCountByNumber","params":["0x{height:x}"],"id":1}}"#
+            ),
+        )
+    }
+
+    /// `eth_getBalance` probe on the sink account — u128 result.
+    fn rpc_balance(addr: &str, account: &str) -> Option<u128> {
+        let mut stream = TcpStream::connect(addr).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_getBalance","params":["{account}","latest"],"id":1}}"#
+        );
+        write!(
+            stream,
+            "POST / HTTP/1.0\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .ok()?;
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).ok()?;
+        let text = String::from_utf8_lossy(&raw);
+        let marker = text.find("\"result\":")? + "\"result\":".len();
+        let rest = &text[marker..];
+        let start = rest.find('"')? + 1;
+        let end = start + rest[start..].find('"')?;
+        u128::from_str_radix(rest[start..end].trim_start_matches("0x"), 16).ok()
     }
 
     /// The devnet committee convention: validator `i` ↔ `bls_key(i+1)`
@@ -728,6 +768,8 @@ mod tests {
         base_port: u16,
         observer: (primitives::Address, crypto::PublicKey),
         shutdown: Arc<AtomicBool>,
+        tx_inject: Option<crate::validator_net::TxInject>,
+        fund: Option<primitives::Address>,
     ) {
         let n = committee.n();
         let peers: Vec<(Vec<u8>, String)> = (0..n)
@@ -750,7 +792,11 @@ mod tests {
             peers,
             tls: None,
             network: config::NetworkConfig::default(),
-            genesis_alloc: None,
+            genesis_alloc: fund.map(|addr| {
+                Box::new(move |m: &evm::EvmModule| {
+                    m.fund_account_for_test(&addr, u128::MAX);
+                }) as crate::validator_net::GenesisAlloc
+            }),
             data_dir: None,
             rpc_listen: None,
             rpc_config: config::RpcConfig::default(),
@@ -758,6 +804,7 @@ mod tests {
             shutdown,
             repair_peers: Vec::new(),
             observer_peers: vec![observer],
+            tx_inject,
         };
         std::thread::spawn(move || crate::validator_net::run(spec));
     }
@@ -783,6 +830,8 @@ mod tests {
                 base,
                 (observer_addr, observer_key.public_key()),
                 shutdown.clone(),
+                None,
+                None,
             );
         }
 
@@ -844,6 +893,132 @@ mod tests {
         );
     }
 
+    /// The `TxInject` path end to end: a validator with a configured
+    /// injector emits signed staking txs on a fixed schedule, they
+    /// enter its mempool, gossip to peers, land in proposals, and
+    /// commit — observed through the follower's mirrored
+    /// `eth_getBlockTransactionCountByNumber`, the same surface a
+    /// load harness reads.
+    #[test]
+    fn validator_tx_inject_commits_signed_txs() {
+        let (secrets, set) = devnet_committee(3);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let base = 26500u16;
+        let rpc_port = 26510u16;
+
+        // Seat 0 injects signed EVM transfers: sender identity 0 is
+        // the devnet-funded account; 50 offered tx/s — well above
+        // the ~1.5 blk/s finalization cadence, so blocks must batch.
+        let sender = crypto::secp::test_identity_address(0).expect("devnet identity");
+        let key = crypto::secp::test_identity_key(0);
+        let inject = crate::validator_net::TxInject::evm_transfers(50.0, key, sender, 1);
+
+        let observer_key = crate::cli::bls_key(97);
+        let observer_addr = crypto::bls::validator_address(&observer_key.public_key());
+        let mut inject = Some(inject);
+        for seat in 0..3 {
+            spawn_validator(
+                seat,
+                &secrets,
+                &set,
+                base,
+                (observer_addr, observer_key.public_key()),
+                shutdown.clone(),
+                if seat == 0 { inject.take() } else { None },
+                // EVERY validator funds `sender`: execution must be
+                // identical fleet-wide — a funded-only-on-one-node
+                // account would execute on that node and skip on the
+                // rest (the divergence-latch case). The
+                // `dev-identities`-gated default funding doesn't
+                // cover this crate's own test build, so the spec
+                // funds the account explicitly — mirroring the
+                // uniform `evm.alloc` the real harness provisions.
+                Some(sender),
+            );
+        }
+
+        let follower_peers: Vec<(Vec<u8>, String)> = (0..3)
+            .map(|i| {
+                (
+                    set.validator_addresses()[i].0.to_vec(),
+                    format!("127.0.0.1:{}", base + u16::try_from(i).unwrap()),
+                )
+            })
+            .collect();
+        let follower_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            run(FollowerSpec {
+                log_tag: "follower".to_string(),
+                validator_set: set,
+                epoch: primitives::Epoch::new(0),
+                own_id: observer_addr.0.to_vec(),
+                signer: Arc::new(observer_key),
+                node_config: crate::NodeConfig::default(),
+                wal_path: None,
+                listen_addr: "127.0.0.1:26504".to_string(),
+                peers: follower_peers,
+                tls: None,
+                network: config::NetworkConfig::default(),
+                // The follower must fund the injector's sender too —
+                // it re-executes every committed tx, so an unfunded
+                // account diverges its EVM state from the fleet
+                // (the production path gets this from `evm.alloc`
+                // in the shared genesis file).
+                genesis_alloc: Some(Box::new(move |m: &evm::EvmModule| {
+                    m.fund_account_for_test(&sender, u128::MAX);
+                }) as crate::validator_net::GenesisAlloc),
+                data_dir: None,
+                rpc_listen: Some(format!("127.0.0.1:{rpc_port}")),
+                rpc_config: config::RpcConfig::default(),
+                repair_peers: Vec::new(),
+                shutdown: follower_shutdown,
+            });
+        });
+
+        // Wait for the mirror to reach height ≥ 4, then require at
+        // least one committed block carrying injected txs — a block
+        // count alone can't distinguish empty heartbeat commits
+        // from real load.
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        let mut reached = 0u64;
+        while std::time::Instant::now() < deadline {
+            if let Some(h) = rpc_block_number(&format!("127.0.0.1:{rpc_port}"))
+                && h > reached
+            {
+                reached = h;
+            }
+            if reached >= 4 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert!(reached >= 4, "follower mirrored only height {reached}");
+
+        let mut committed_txs = 0u64;
+        for h in 1..=reached {
+            committed_txs += rpc_block_tx_count(&format!("127.0.0.1:{rpc_port}"), h).unwrap_or(0);
+        }
+        // The transfers carry 1 wei each — a nonzero sink balance is
+        // the state-level proof the committed txs actually executed
+        // on the follower (not merely that history was recorded).
+        let sink_balance = rpc_balance(
+            &format!("127.0.0.1:{rpc_port}"),
+            "0x7777777777777777777777777777777777777777",
+        )
+        .unwrap_or(0);
+        shutdown.store(true, Ordering::Relaxed);
+        assert!(
+            committed_txs > 0,
+            "no committed block carried injected txs over {reached} mirrored heights — \
+             the injector path (submit + gossip + proposal) is broken"
+        );
+        assert!(
+            sink_balance > 0,
+            "committed txs never landed in the follower's EVM state (sink balance 0 \
+             after {committed_txs} counted txs) — execution diverged from the fleet"
+        );
+    }
+
     /// A restarted follower resumes at its durable frontier instead
     /// of re-walking the chain: `data_dir` gives the executor
     /// journal + `snapshot.bin` export, the WAL restores
@@ -868,6 +1043,8 @@ mod tests {
                 base,
                 (observer_addr, observer_key.public_key()),
                 shutdown.clone(),
+                None,
+                None,
             );
         }
 

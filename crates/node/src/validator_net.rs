@@ -125,6 +125,12 @@ const CERT_POLL_ATTEMPTS: u32 = 10;
 /// See [`CERT_POLL_ATTEMPTS`].
 const CERT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Bounded per-pass catch-up for the `TxInject` schedule: a stalled
+/// pump (view change, fsync spike) owes backlogged ticks, but
+/// replaying an unbounded debt is a flood, not offered load — the
+/// schedule fast-forwards after this many emissions in one pass.
+const INJECT_CATCHUP_CAP: u32 = 64;
+
 /// mTLS material for the peer transport — resolved file paths.
 ///
 /// Peer certificates are required per expected peer: a peer without
@@ -145,6 +151,91 @@ pub struct TlsSpec {
 /// Genesis `evm.alloc` application hook — see
 /// [`ValidatorNetSpec::genesis_alloc`].
 pub type GenesisAlloc = Box<dyn FnOnce(&evm::EvmModule) + Send>;
+
+/// Sustained-load transaction injector — test/load harnesses only.
+///
+/// When [`ValidatorNetSpec::tx_inject`] is `Some`, the consensus pump
+/// submits `build(nonce)` envelopes to the local mempool on a fixed
+/// wall-clock schedule and fans each accepted one out to the
+/// committee as `MSG_TX` — the same admission + gossip path an
+/// `eth_sendRawTransaction` submission takes through
+/// `GossipingTxSubmitter`, minus the HTTP hop. The multi-host
+/// TLS+WAL throughput harness uses it to drive real signed load
+/// through the production pipeline from inside each validator
+/// process: envelopes are secp256k1-signed, verified at admission,
+/// proposed, executed, and journaled exactly like client traffic.
+///
+/// Production validators pass `None` — a validator must not
+/// originate transactions under public test identities.
+pub struct TxInject {
+    /// Account whose *executed* nonce seeds the counter, read from
+    /// committed executor state at pump start — a restarted injector
+    /// resumes past consumed nonces instead of replaying them into
+    /// `NonceTooLow` rejections.
+    pub sender: primitives::Address,
+    /// Wall-clock interval between injected transactions (the
+    /// reciprocal of the offered rate).
+    pub interval: std::time::Duration,
+    /// `nonce → signed module-transaction envelope bytes`. The
+    /// closure owns the sender's secp256k1 key, chain id, module
+    /// route, and payload template; the pump owns pacing.
+    pub build: Box<dyn FnMut(u64) -> Vec<u8> + Send>,
+}
+
+impl TxInject {
+    /// A signed-EVM-transfer injector at `rate` tx/s — the load
+    /// shape the throughput harness and integration tests share:
+    /// each owed tick signs a fresh 21 000-gas legacy transfer of
+    /// 1 wei to a fixed sink at 10 gwei (the same bid
+    /// `evm_workload` uses), wrapped in the standard EVM envelope.
+    /// Transfers are the honest load shape — secp recovery + gas
+    /// metering + a balance write per tx — and they land in EVM
+    /// history where `eth_getBlockTransactionCountByNumber` sees
+    /// them. A fixed sink keeps the account set bounded; distinct
+    /// recipients would grow state for no measurement gain.
+    ///
+    /// `sender` must be funded in the EVM account store on EVERY
+    /// node (the genesis `evm.alloc` path) — an account funded on
+    /// one replica only executes there and skips elsewhere, which
+    /// is exactly the divergence the exec-cert check latches on.
+    ///
+    /// # Panics
+    /// The build closure panics if `key` cannot sign — impossible
+    /// for `crypto::secp::test_identity_key` output; callers passing
+    /// arbitrary key material must validate it first.
+    #[must_use]
+    pub fn evm_transfers(
+        rate: f64,
+        key: [u8; 32],
+        sender: primitives::Address,
+        chain_id: u64,
+    ) -> Self {
+        let sink = alloy_primitives::Address::from([0x77; 20]);
+        Self {
+            sender,
+            interval: Duration::from_secs_f64(1.0 / rate),
+            build: Box::new(move |nonce: u64| {
+                let tx = evm::tx::TxLegacy {
+                    fields: evm::tx::TxFields {
+                        nonce,
+                        gas_limit: 21_000,
+                        to: evm::tx::TxKind::Call(sink),
+                        value: alloy_primitives::U256::from(1u64),
+                        data: alloy_primitives::Bytes::new(),
+                        chain_id,
+                    },
+                    gas_price: alloy_primitives::U256::from(10_000_000_000u64),
+                };
+                let signed =
+                    evm::tx::SignedTx::sign_legacy(tx, &key).expect("injection key must sign");
+                // The envelope fee field is exempted for EVM txs
+                // (`pays_own_fee` — gas covers it); the value
+                // mirrors `evm_workload`'s convention.
+                evm::wrap_evm_tx_envelope(&sender, nonce, 10_000_000_000, &signed.encode_to_bytes())
+            }),
+        }
+    }
+}
 
 /// Everything [`run`] needs, already resolved.
 ///
@@ -235,6 +326,9 @@ pub struct ValidatorNetSpec {
     /// shadow a member. Serving certified history to an observer is
     /// safe: records are already public, quorum-verified data.
     pub observer_peers: Vec<(primitives::Address, crypto::PublicKey)>,
+    /// Optional sustained-load injector — see [`TxInject`].
+    /// `None` on production validators.
+    pub tx_inject: Option<TxInject>,
 }
 
 /// Run a networked validator until `spec.shutdown` is set.
@@ -274,6 +368,7 @@ pub fn run(spec: ValidatorNetSpec) {
         shutdown,
         repair_peers,
         observer_peers,
+        tx_inject,
     } = spec;
 
     // Peer identity is the validator's staking address — the stable
@@ -443,6 +538,7 @@ pub fn run(spec: ValidatorNetSpec) {
         &gossip_rx,
         &mut sync_store,
         &repair_peers,
+        tx_inject,
     );
     // Flush any batched certified-record appends before the data
     // dir is handed to the snapshot exporter.
@@ -646,6 +742,41 @@ fn to_transport_config(network: &config::NetworkConfig) -> p2p::tcp::TcpTranspor
         ..Default::default()
     }
 }
+/// Record a locally-originated transaction in the gossip dedup set
+/// and broadcast it to every committee peer as an `MSG_TX` frame.
+/// Shared by the RPC-gossip drain and the `TxInject` path — both
+/// emit "this node accepted a tx" traffic with identical semantics.
+///
+/// The tx hash enters `seen_txs`/`seen_txs_fifo` BEFORE the send so
+/// a peer that somehow reflects the frame back is dropped; the FIFO
+/// evicts at `GOSSIP_SEEN_CAP` to bound memory under sustained load.
+fn fanout_tx(
+    engine: &consensus::OxideBft,
+    transport: &mut p2p::tcp::TcpTransport,
+    our_addr: primitives::Address,
+    seen_txs: &mut std::collections::HashSet<primitives::Hash>,
+    seen_txs_fifo: &mut std::collections::VecDeque<primitives::Hash>,
+    tx_bytes: &[u8],
+) {
+    let tx_hash = crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, tx_bytes);
+    if seen_txs.insert(tx_hash) {
+        seen_txs_fifo.push_back(tx_hash);
+        if seen_txs_fifo.len() > GOSSIP_SEEN_CAP
+            && let Some(old) = seen_txs_fifo.pop_front()
+        {
+            seen_txs.remove(&old);
+        }
+    }
+    let mut buf = Vec::with_capacity(1 + tx_bytes.len());
+    buf.push(MSG_TX);
+    buf.extend_from_slice(tx_bytes);
+    for addr in engine.validator_set().validator_addresses() {
+        if *addr != our_addr {
+            let _ = transport.send(&addr.0.to_vec(), &buf);
+        }
+    }
+}
+
 /// The consensus message pump loop: proposes, votes, drains the
 /// transport, forms QCs, advances views, and syncs heights.
 ///
@@ -679,6 +810,7 @@ fn run_consensus_loop(
     gossip_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
     sync_store: &mut crate::block_sync::SyncStore,
     repair_peers: &[String],
+    mut tx_inject: Option<TxInject>,
 ) {
     // (cap documented at module scope — `GOSSIP_SEEN_CAP`)
     // Track proposals received from the network. Followers vote on
@@ -757,6 +889,15 @@ fn run_consensus_loop(
     // One-shot log latch for the unconfigured case — a halted node
     // with no repair peers is page-worthy once, not every tick.
     let mut repair_unconfigured_logged = false;
+
+    // ── Sustained-load injector state ────────────────────
+    // `inject_nonce` seeds from the sender's EXECUTED nonce (the
+    // committed account counter, not the mempool view) so a restart
+    // resumes past consumed nonces instead of replaying them into
+    // rejections. `inject_next` is a fixed schedule: missed ticks
+    // are owed and fire as a bounded catch-up burst next pass.
+    let mut inject_nonce = tx_inject.as_ref().map(|i| app.executed_nonce_of(&i.sender));
+    let mut inject_next = std::time::Instant::now();
 
     loop {
         // Graceful shutdown: SIGINT/SIGTERM sets the flag, we break
@@ -1322,25 +1463,38 @@ fn run_consensus_loop(
         // iteration — each send is a channel push to the peer's
         // writer task, non-blocking.
         while let Ok(tx_bytes) = gossip_rx.try_recv() {
-            // Record locally-originated txs in the dedup set too, so a
-            // peer that somehow reflects our frame back is dropped.
-            let tx_hash =
-                crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, &tx_bytes);
-            if seen_txs.insert(tx_hash) {
-                seen_txs_fifo.push_back(tx_hash);
-                if seen_txs_fifo.len() > GOSSIP_SEEN_CAP
-                    && let Some(old) = seen_txs_fifo.pop_front()
-                {
-                    seen_txs.remove(&old);
+            fanout_tx(engine, transport, our_addr, &mut seen_txs, &mut seen_txs_fifo, &tx_bytes);
+        }
+
+        // Phase 3c: sustained-load injector — `TxInject` builds the
+        // next signed envelope per owed tick; local admission decides
+        // whether the copy also gossips (a locally-rejected tx is
+        // rejected everywhere else too — flooding it would be pure
+        // waste). Ticks missed during a stall are owed, capped per
+        // pass at `INJECT_CATCHUP_CAP`; deeper backlog fast-forwards
+        // the schedule rather than amortizing into a flood.
+        if let (Some(inject), Some(nonce)) = (&mut tx_inject, &mut inject_nonce) {
+            let now = std::time::Instant::now();
+            let mut emitted = 0u32;
+            while inject_next <= now && emitted < INJECT_CATCHUP_CAP {
+                let tx_bytes = (inject.build)(*nonce);
+                *nonce += 1;
+                inject_next += inject.interval;
+                emitted += 1;
+                let ack = engine.submit_tx(types::TxBytes::new(tx_bytes.clone()));
+                if matches!(ack, types::MempoolAck::Accepted) {
+                    fanout_tx(
+                        engine,
+                        transport,
+                        our_addr,
+                        &mut seen_txs,
+                        &mut seen_txs_fifo,
+                        &tx_bytes,
+                    );
                 }
             }
-            let mut buf = Vec::with_capacity(1 + tx_bytes.len());
-            buf.push(MSG_TX);
-            buf.extend_from_slice(&tx_bytes);
-            for addr in engine.validator_set().validator_addresses() {
-                if *addr != our_addr {
-                    let _ = transport.send(&addr.0.to_vec(), &buf);
-                }
+            if inject_next <= now {
+                inject_next = now + inject.interval;
             }
         }
 
@@ -1720,14 +1874,17 @@ pub(crate) fn drain_sync_buffer(
         let Some(record) = pending.remove(&next) else { break };
         match engine.apply_certified_block(&record) {
             Ok(_) => {
-                // Admit the record's embedded execution certificate:
-                // it attests `next - 1`, which the apply just
-                // committed (or sealed) — feeding it here means a
-                // synced node's divergence check runs on certified
-                // history it fetched, not only on live proposals.
-                // Idempotent: `verified_exec_certs` dedupes.
+                // Confirm the record's embedded execution
+                // certificate: it attests `next - 1`, which the
+                // apply just committed (or sealed) — feeding it
+                // here means a synced node's divergence check runs
+                // on certified history it fetched, not only on live
+                // proposals. `confirm_exec_cert` (not bare
+                // `admit_exec_cert`) so a verified-but-mismatched
+                // root latches divergence — a syncing node must not
+                // keep extending state it provably disagrees with.
                 if let Some(ref cert) = record.header.exec_cert {
-                    engine.admit_exec_cert(cert);
+                    engine.confirm_exec_cert(cert);
                 }
             }
             Err(consensus::ConsensusError::SyncDeferred { .. }) => {

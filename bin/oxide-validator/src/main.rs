@@ -359,6 +359,9 @@ fn run_validator_node() {
         shutdown,
         repair_peers,
         observer_peers,
+        // A production validator never originates transactions —
+        // injection is a devnet/test-harness surface.
+        tx_inject: None,
     });
 }
 
@@ -1061,15 +1064,17 @@ fn read_pubkey_file(path: &str) -> Vec<String> {
 /// testnet but NOT production. For production, generate certificates
 /// from a proper CA (e.g., `step ca`, `HashiCorp` Vault PKI, or
 /// cloud-native `cert-manager`) and distribute via `--tls-dir` with
-/// the CA's certificate chain in each `peer-{i}.pem`.
+/// the CA's certificate chain in each `peer-<id>.pem`.
 /// - `--genesis-file <path>`: generate certs keyed by the genesis
 ///   committee's staking addresses — peer files are written as
 ///   `peer-<addr-hex>.pem` (the production `validator_net` naming)
 ///   and each cert's peer id is the member's 20-byte address. This
-///   is the mode `oxide-validator --validator --tls-dir` consumes.
-/// - Without `--genesis-file`: the devnet layout — index-byte peer
-///   ids and `peer-{j}.pem` files, matching `oxide-devnet`'s
-///   `peer-{committee-index}.pem` convention.
+///   is the mode `oxide-validator --validator --tls-dir` and
+///   `oxide-devnet --tls-dir` consume.
+/// - Without `--genesis-file`: index-byte peer ids and
+///   `peer-{j}.pem` files — a legacy layout kept for transport-level
+///   debugging; no shipped binary consumes it anymore (devnet peer
+///   ids are staking addresses too).
 fn run_tls_gen(args: &[String]) {
     let mut num_nodes: usize = 4;
     let mut output_dir = "tls".to_string();
@@ -1103,10 +1108,10 @@ fn run_tls_gen(args: &[String]) {
 
     // Generate a cert+key pair per member. Peer ids: genesis mode
     // uses the member's staking address (what `validator_net`'s
-    // transport expects); the no-genesis path keeps the index-byte
-    // convention `oxide-devnet`'s `peer-{i}.pem` files pair with —
-    // the cert's CN is cosmetic either way: `TlsConfig` binds
-    // cert-DER → peer-id through its trusted-peers map.
+    // transport expects); the no-genesis path keeps the legacy
+    // index-byte convention — the cert's CN is cosmetic either way:
+    // `TlsConfig` binds cert-DER → peer-id through its
+    // trusted-peers map.
     let members: Vec<(Vec<u8>, String)> = if let Some(path) = genesis_path {
         let genesis = config::genesis::Genesis::from_json_file(&PathBuf::from(&path))
             .unwrap_or_else(|e| panic!("failed to load genesis file {path}: {e}"));

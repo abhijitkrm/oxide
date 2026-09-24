@@ -21559,3 +21559,62 @@ permanent diagnostic added while debugging a startup-churn stall:
 when every configured upstream fails `send`, the follower logs it
 rate-bounded at the fetch cadence — silent-unreachable was
 undiagnosable before.
+
+## Session: pump-side transaction injection + the follower divergence blind spot
+
+Two pieces, one root discovery. The multi-host TLS+WAL throughput
+measurement needs sustained signed load through the *production*
+pipeline — mempool admission, gossip, proposal, execution, WAL —
+not an in-process bench. `ValidatorNetSpec.tx_inject` adds it at
+the shared runner: a fixed wall-clock schedule inside the pump,
+each owed tick building a signed envelope via `build(nonce)`
+(nonce seeded from `Executor::executed_nonce_of` so a restarted
+injector resumes past consumed nonces), submitted through
+`engine.submit_tx` and fanned out over the existing `MSG_TX`
+gossip path only on local acceptance — a locally-rejected tx is
+rejected everywhere, so flooding it would be pure waste. Missed
+ticks are owed, capped per pass (`INJECT_CATCHUP_CAP = 64`) so a
+stall's backlog fast-forwards instead of amortizing into a flood.
+
+`oxide-devnet --tx-inject-rate <tx/s>` exposes it; each node
+signs EIP-155 legacy transfers as its own test identity
+(`TxInject::evm_transfers` — shared with the integration test so
+the harness and the test can't drift). Supporting work:
+`oxide-devnet genesis` emits a committee genesis that binds the
+deterministic `bls_key(i+1)` public keys AND funds each node's
+injector identity through `evm.alloc`; devnet peer-cert naming
+moved to `peer-<staking-addr-hex>.pem`, matching what
+`oxide-validator tls-gen --genesis-file` writes (peer ids ARE
+staking addresses — the filename can't drift from the
+handshake-authenticated id).
+
+**The discovery the test surfaced.** The inject E2E (3 validators
++ follower over loopback) failed oddly: proposals selected
+injected txs, votes succeeded, QCs formed, committed blocks
+carried them — yet the follower's EVM state stayed empty. Cause:
+the test funded the injector's sender on the validators but not
+the follower (`genesis_alloc: None`), so the follower skipped
+every tx as `LackOfFundForMaxFee` — a provable state divergence
+it mirrored for 16 heights without complaint. Root defect:
+`admit_exec_cert` on the consume path only *verifies* embedded
+exec certs — the local-root comparison lives inside the vote
+path, which a follower never runs. A diverged follower (or a
+syncing validator mid-catch-up) had no divergence signal.
+
+**Fix.** `OxideBft::confirm_exec_cert` — the non-voting analog of
+the vote-path gate: verify the cert (same cached checks), then
+require `attest_state_bounded(cert.height)` to match
+`cert.state_root`; a verified-but-mismatched root latches
+`divergence` through a new shared `latch_divergence` (extracted
+from the vote path — same CRITICAL log, WAL-first persistence,
+first-write-wins anchor). Both consume-path feeds call it
+(`drain_sync_buffer`, the follower's `MSG_BLOCK_RESP` apply), so
+the existing Phase-3 halt + RPC surfacing + certified repair now
+cover fetched history too, not just live proposals. Engine tests
+cover confirm/latch/first-write-wins/forged-cert-no-latch.
+
+**Observed, not fixed here:** pipelined proposals duplicate the
+mempool's pending txs — committed replays skip deterministically
+as `NonceTooLow`. Wasteful block space under sustained load;
+executed-tx throughput (not committed bytes) is the honest
+metric the harness reports.

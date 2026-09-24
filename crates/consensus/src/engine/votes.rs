@@ -632,38 +632,11 @@ impl OxideBft {
                 // while operators saw only a slowing chain. The
                 // latch survives rotation — a new epoch does not
                 // repair diverged state; certified resync does.
-                if self.divergence.is_none() {
-                    let detail = ExecDivergence {
-                        height: cert.height,
-                        local_root: local.root,
-                        certified_root: cert.state_root,
-                    };
-                    // Display, not Debug: `Hash`'s Debug truncates
-                    // to 12 hex chars, and the certified root in
-                    // this line is the operator's `--trusted-root`
-                    // repair value — it must be complete.
-                    eprintln!(
-                        "oxideBFT: CRITICAL — execution divergence at height {}: \
-                         local root 0x{} != quorum-certified root 0x{}; \
-                         signing halted — repair via --state-sync with \
-                         --trusted-height {} --trusted-root 0x{}",
-                        detail.height.value(),
-                        detail.local_root,
-                        detail.certified_root,
-                        detail.height.value(),
-                        detail.certified_root,
-                    );
-                    // First write wins: a second divergent cert is
-                    // the same condition, and the earliest mismatch
-                    // is the better repair anchor.
-                    self.divergence = Some(detail);
-                    // Persist the latch BEFORE returning — a crash
-                    // between detection and the next routine append
-                    // must not wake up signing over the same
-                    // diverged state. A failed append sets
-                    // `wal_failed`, which halts signing identically.
-                    let _ = self.append_wal();
-                }
+                self.latch_divergence(ExecDivergence {
+                    height: cert.height,
+                    local_root: local.root,
+                    certified_root: cert.state_root,
+                });
                 return None;
             }
         }
@@ -925,6 +898,80 @@ impl OxideBft {
         }
         self.verified_exec_certs.insert(cert.height.value(), cert.clone());
         true
+    }
+
+    /// Latch a confirmed execution divergence — the shared halt for
+    /// both paths that compare a verified certificate against local
+    /// state: the vote gate above and the consume-path
+    /// [`OxideBft::confirm_exec_cert`]. First write wins (the
+    /// earliest mismatch is the better repair anchor), and the WAL
+    /// append persists the latch before it is reported — a crash
+    /// between detection and the next routine append must not
+    /// restart into signing or serving over the same diverged
+    /// state. A failed append latches `wal_failed`, which halts
+    /// signing identically, so the failure mode stays closed.
+    fn latch_divergence(&mut self, detail: ExecDivergence) {
+        if self.divergence.is_some() {
+            return;
+        }
+        // Display, not Debug: `Hash`'s Debug truncates to 12 hex
+        // chars, and the certified root in this line is the
+        // operator's `--trusted-root` repair value — it must be
+        // complete.
+        eprintln!(
+            "oxideBFT: CRITICAL — execution divergence at height {}: \
+             local root 0x{} != quorum-certified root 0x{}; \
+             signing halted — repair via --state-sync with \
+             --trusted-height {} --trusted-root 0x{}",
+            detail.height.value(),
+            detail.local_root,
+            detail.certified_root,
+            detail.height.value(),
+            detail.certified_root,
+        );
+        self.divergence = Some(detail);
+        let _ = self.append_wal();
+    }
+
+    /// Consume-path divergence check — the non-voting analog of the
+    /// exec-cert gate inside [`OxideBft::vote`]. Verifies `cert`
+    /// (epoch, bitmap bounds, quorum power, aggregate signature —
+    /// cached in `verified_exec_certs`), then requires the locally
+    /// executed root at `cert.height` to match the attested root.
+    ///
+    /// [`OxideBft::admit_exec_cert`] alone only verifies signatures
+    /// and never compares local state: that is correct for the
+    /// repair flow (which proves the rebuilt root later through
+    /// `mark_repaired`), but a replica that never votes — a
+    /// follower or indexer consuming certified blocks — would
+    /// mirror diverged state forever with no signal. Calling this
+    /// instead runs the same local-root comparison voters get,
+    /// with identical latch semantics on a confirmed mismatch.
+    ///
+    /// Returns `true` only when the cert verifies and local state
+    /// confirms it. An unverifiable cert returns `false`; a height
+    /// not yet executed locally returns `false` too — transient
+    /// execution lag, never a confirmed divergence (the bounded
+    /// wait matches the vote path's `EXEC_ATTEST_WAIT`). A verified
+    /// cert attesting a root this engine did not compute latches
+    /// `divergence` and returns `false`; callers gate the consume
+    /// path on [`OxideBft::divergence`].
+    pub fn confirm_exec_cert(&mut self, cert: &ExecCertificate) -> bool {
+        if !self.exec_cert_verified(cert) {
+            return false;
+        }
+        let Some(local) = self.app.attest_state_bounded(cert.height, EXEC_ATTEST_WAIT) else {
+            return false;
+        };
+        if local.root == cert.state_root {
+            return true;
+        }
+        self.latch_divergence(ExecDivergence {
+            height: cert.height,
+            local_root: local.root,
+            certified_root: cert.state_root,
+        });
+        false
     }
 
     /// Leader: collect a vote from validator `voter`. Stores the vote

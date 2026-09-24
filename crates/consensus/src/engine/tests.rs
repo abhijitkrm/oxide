@@ -3860,6 +3860,84 @@ fn verified_exec_cert_is_cached_per_identity() {
 }
 
 #[test]
+fn confirm_exec_cert_compares_local_root_and_latches_divergence() {
+    // The consume-path check followers run instead of voting: a
+    // verified cert whose attested root local state did not
+    // compute is confirmed divergence and must latch — bare
+    // `admit_exec_cert` (verify-only) would have let a diverged
+    // replica mirror wrong state forever.
+    let app = Arc::new(MockApp::new());
+    let sk = bls_key(1);
+    let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+    let mut engine = OxideBft::new(app, vs).with_secret_key(sk.clone());
+
+    let mk_cert = |height: u64, root: Hash| {
+        let msg =
+            crate::verify::attestation_signing_message(Epoch::new(0), Height::new(height), &root);
+        let sig = sk.sign(crypto::hash::Domain::ExecAttest, &msg);
+        ExecCertificate {
+            height: Height::new(height),
+            state_root: root,
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: crypto::aggregate(&[sig]).expect("aggregate"),
+        }
+    };
+
+    // MockApp attests `mock_state_root(5) == Hash([5;32])` — a cert
+    // attesting exactly that root confirms cleanly and latches
+    // nothing.
+    let good = mk_cert(5, Hash([5u8; 32]));
+    assert!(engine.confirm_exec_cert(&good), "matching local root must confirm");
+    assert!(engine.divergence().is_none(), "no divergence on agreement");
+
+    // A fully verified cert attesting a root local state did not
+    // compute at height 6 (MockApp computes `Hash([6;32])`) is
+    // confirmed divergence — the latch must record the anchor a
+    // certified repair would trust.
+    let bad = mk_cert(6, Hash([0xee; 32]));
+    assert!(!engine.confirm_exec_cert(&bad), "a mismatched verified root must not confirm");
+    let d = *engine.divergence().expect("divergence must latch on confirmed mismatch");
+    assert_eq!(d.height, Height::new(6));
+    assert_eq!(d.certified_root, Hash([0xee; 32]));
+    assert_eq!(d.local_root, Hash([6u8; 32]), "the latch records what WE computed");
+
+    // First write wins: a second divergent cert must not overwrite
+    // the earliest repair anchor.
+    let later = mk_cert(7, Hash([0xcc; 32]));
+    assert!(!engine.confirm_exec_cert(&later));
+    assert_eq!(
+        engine.divergence().expect("still latched").height,
+        Height::new(6),
+        "the earliest divergence is the repair anchor"
+    );
+}
+
+#[test]
+fn confirm_exec_cert_rejects_unverifiable_certs_without_latching() {
+    // A forged cert (signature over a different message) fails
+    // verification — `false`, but NOT a latched divergence: an
+    // unproven claim is not evidence of execution disagreement.
+    let app = Arc::new(MockApp::new());
+    let sk = bls_key(1);
+    let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+    let mut engine = OxideBft::new(app, vs).with_secret_key(sk.clone());
+
+    let msg = engine.attestation_signing_message(Height::new(3), &Hash([3u8; 32]));
+    let sig = sk.sign(crypto::hash::Domain::ExecAttest, &msg);
+    let forged = ExecCertificate {
+        height: Height::new(3),
+        // Attests a root the signature does not cover.
+        state_root: Hash([0xaa; 32]),
+        epoch: Epoch::new(0),
+        signer_bitmap: vec![0b0000_0001],
+        aggregate_signature: crypto::aggregate(&[sig]).expect("aggregate"),
+    };
+    assert!(!engine.confirm_exec_cert(&forged), "an unverifiable cert must not confirm");
+    assert!(engine.divergence().is_none(), "a forged cert is not divergence evidence");
+}
+
+#[test]
 fn rotation_clears_exec_cert_state() {
     // Certs, pooled attestations, and cached verifications are
     // bound to the signing epoch's validator set — none may

@@ -31,6 +31,15 @@ fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    // `oxide-devnet genesis` emits the deterministic-committee
+    // genesis file the TLS+WAL testnet provisions from — it owns
+    // the devnet identities, so it (not `oxide-validator genesis`)
+    // can fund them through `evm.alloc`.
+    if std::env::args().nth(1).is_some_and(|a| a == "genesis") {
+        run_genesis(&std::env::args().skip(2).collect::<Vec<_>>());
+        return;
+    }
+
     // `oxide-devnet --node <i>` is required: this binary is one
     // validator process in a multi-node devnet, spawned by
     // `devnet::multiprocess::MultiProcessDevnet` or by hand.
@@ -42,6 +51,83 @@ fn main() {
         std::process::exit(2);
     });
     run_node(&node_index_str);
+}
+
+/// `oxide-devnet genesis` — write the deterministic-committee
+/// genesis file for the TLS+WAL multi-host testnet.
+///
+/// Committee: `bls_key(i + 1)` public keys (the same derivation
+/// `--node i` loads when no `--bls-key-file` is given) over
+/// `Genesis::devnet`'s `[0x0a + i; 20]` staking addresses.
+/// Funding: every `test_identity_address(i)` for `i < --num-nodes`
+/// gets an `evm.alloc` balance so each node's `--tx-inject-rate`
+/// sender can pay fees; the byte-pattern `[i; 20]` accounts are
+/// funded too for RPC-side tooling.
+///
+/// Flags: `--num-nodes <N>` (default 4), `--chain-id <id>`
+/// (default 1), `-o|--output <path>` (default `genesis.json`),
+/// `--fund-balance <units>` (default 10^12 base units).
+fn run_genesis(args: &[String]) {
+    let mut num_nodes: usize = 4;
+    let mut chain_id: u64 = 1;
+    let mut output = "genesis.json".to_string();
+    let mut balance: u64 = 1_000_000_000_000;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--num-nodes" | "--validators" => {
+                num_nodes = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(4);
+                i += 2;
+            }
+            "--chain-id" => {
+                chain_id = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1);
+                i += 2;
+            }
+            "--output" | "-o" => {
+                if let Some(v) = args.get(i + 1) {
+                    output.clone_from(v);
+                }
+                i += 2;
+            }
+            "--fund-balance" => {
+                balance = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1_000_000_000_000);
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+
+    // Standard devnet shape: 32 byte-pattern `[i; 20]` accounts stay
+    // funded for RPC-side tooling (`eth_getBalance`, harness checks);
+    // the signable identities are added on top below.
+    let mut genesis = config::genesis::Genesis::devnet(chain_id, num_nodes, 32, balance);
+
+    // Bind the deterministic BLS keys `load_bls_key(i)` derives —
+    // committee seat i ↔ `bls_key(i + 1)`.
+    for (idx, validator) in genesis.staking.validators.iter_mut().enumerate() {
+        let key = node::cli::bls_key(u8::try_from(idx + 1).expect("index + 1 fits in u8"));
+        validator.public_key =
+            Some(format!("0x{}", node::cli::hex_encode(key.public_key().as_bytes())));
+    }
+
+    // Fund each node's injector sender: `test_identity_address(i)`
+    // is what `--tx-inject-rate` on `--node i` signs as.
+    for i in 0..num_nodes {
+        let sender = crypto::secp::test_identity_address(
+            u8::try_from(i).expect("node index fits u8 for test identities"),
+        )
+        .expect("valid devnet identity");
+        genesis.add_balance(&format!("0x{}", node::cli::hex_encode(&sender.0)), balance);
+    }
+
+    let path = PathBuf::from(&output);
+    genesis.to_json_file(&path).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!(
+        "oxide-devnet genesis: wrote {} (chain_id={chain_id}, validators={num_nodes}, \
+         funded {} test identities)",
+        path.display(),
+        num_nodes,
+    );
 }
 
 /// Run a single validator node in a multi-process testnet.
@@ -65,7 +151,7 @@ fn main() {
 /// | `--config <path>` | TOML config file |
 /// | `--genesis-file <path>` | `genesis.json` (validator set + balances) |
 /// | `--bls-key-file <path>` | BLS secret key (hex or raw 32 bytes) |
-/// | `--tls-dir <dir>` | TLS directory (`cert.pem`, `key.pem`, `peer-{i}.pem`) |
+/// | `--tls-dir <dir>` | TLS directory (`cert.pem`, `key.pem`, `peer-<addr hex>.pem`) |
 /// | `--wal-file <path>` | Consensus WAL file path |
 /// | `--rpc-listen <addr>` | RPC listen address (default: from config) |
 /// | `--export-snapshot <path>` | Export snapshot to file and exit |
@@ -103,10 +189,10 @@ fn main() {
 /// `--tls-dir` points to a directory containing:
 /// - `cert.pem` — this node's X.509 certificate (PEM)
 /// - `key.pem` — this node's private key (PEM)
-/// - `peer-{i}.pem` — the certificate of committee member `i`
-/// - `peer-<addr hex>.pem` — the certificate of a `--peer` endpoint
-///   that is not a genesis committee member (e.g. a pending member
-///   being admitted before its rotation activates)
+/// - `peer-<addr hex>.pem` — the certificate of the peer whose
+///   staking address is `<addr hex>` (committee members and
+///   `--peer` extras alike — `oxide-validator tls-gen` names them
+///   the same way)
 ///
 /// mTLS is enforced: both sides of every connection authenticate
 /// via certificates bound to peer IDs (C4).
@@ -213,9 +299,11 @@ fn run_node(node_index_str: &str) {
     // post-rotation committees use --peer), then any non-committee
     // overrides appended so pending members are reachable early.
     let mut peers: Vec<(Vec<u8>, String)> = Vec::new();
-    // peer-id → TLS cert filename (peer-<i>.pem for committee
-    // members; peer-<addr-hex>.pem for explicit extras) — the
-    // transport consumes it when --tls-dir is set.
+    // peer-id → TLS cert filename: `peer-<addr-hex>.pem` for every
+    // peer — the name `oxide-validator tls-gen` writes keyed by the
+    // member's staking address (peer ids ARE staking addresses, so
+    // the file name and the handshake-authenticated id can't drift).
+    // The transport consumes the map when --tls-dir is set.
     let mut peer_cert_names: std::collections::HashMap<Vec<u8>, String> =
         std::collections::HashMap::new();
     for (i, addr) in validator_set.validator_addresses().iter().enumerate() {
@@ -230,18 +318,19 @@ fn run_node(node_index_str: &str) {
             let port = base_port + u16::try_from(i).expect("port fits in u16");
             format!("{host}:{port}")
         });
-        peer_cert_names.insert(addr.0.to_vec(), format!("peer-{i}.pem"));
+        peer_cert_names
+            .insert(addr.0.to_vec(), format!("peer-{}.pem", node::cli::hex_encode(&addr.0)));
         peers.push((addr.0.to_vec(), hostport));
     }
     for (addr, hostport) in peer_overrides {
-        peer_cert_names.insert(addr.0.to_vec(), format!("peer-{}", node::cli::hex_encode(&addr.0)));
+        peer_cert_names
+            .insert(addr.0.to_vec(), format!("peer-{}.pem", node::cli::hex_encode(&addr.0)));
         peers.push((addr.0.to_vec(), hostport));
     }
 
-    // mTLS material — devnet cert convention: `peer-<i>.pem` for
-    // committee members, `peer-<addr hex>.pem` for explicit `--peer`
-    // endpoints. A peer without a cert file gets no trusted-peers
-    // entry and so can never complete mTLS.
+    // mTLS material — `peer-<addr hex>.pem` per expected peer: a
+    // peer without a cert file gets no trusted-peers entry and so
+    // can never complete mTLS.
     let tls = node::cli::parse_cli_flag("--tls-dir").map(|tls_dir| {
         let trusted_peer_certs = peer_cert_names
             .iter()
@@ -313,6 +402,32 @@ fn run_node(node_index_str: &str) {
         None
     };
 
+    // `--tx-inject-rate <txs/sec>` — sustained signed load driven
+    // from inside the pump (see `TxInject`). Each node signs
+    // EIP-155-style legacy transfers as its own devnet test
+    // identity — funded through `evm.alloc` in the `--genesis-file`
+    // this flag pairs with (the deterministic no-genesis devnet
+    // funds only identity 0, so a nonzero `--node` injector's
+    // envelopes reject at admission). Transfers are the honest load
+    // shape: secp recovery + gas metering + a balance write per tx,
+    // and they land in EVM history where block-tx-count probes see
+    // them.
+    let tx_inject = node::cli::parse_cli_flag("--tx-inject-rate").map(|v| {
+        let rate: f64 = v.parse().unwrap_or_else(|_| {
+            eprintln!("oxide-devnet[{node_index}]: invalid --tx-inject-rate '{v}'");
+            std::process::exit(1);
+        });
+        if !(rate > 0.0 && rate.is_finite()) {
+            eprintln!("oxide-devnet[{node_index}]: --tx-inject-rate must be positive");
+            std::process::exit(1);
+        }
+        let identity =
+            u8::try_from(node_index).expect("node index fits u8 for devnet test identities");
+        let key = crypto::secp::test_identity_key(identity);
+        let sender = crypto::secp::test_identity_address(identity).expect("valid devnet identity");
+        node::validator_net::TxInject::evm_transfers(rate, key, sender, cfg.node.chain_id)
+    });
+
     // `--wal-file` overrides the derived `<data_dir>/consensus.wal`
     // path; when neither is set the WAL stays in-memory.
     let wal_path = node::cli::parse_cli_flag("--wal-file").map(PathBuf::from);
@@ -362,6 +477,7 @@ fn run_node(node_index_str: &str) {
                 })
             })
             .collect(),
+        tx_inject,
     });
 }
 
