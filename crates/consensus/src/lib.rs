@@ -28,7 +28,7 @@ pub mod wal;
 
 pub use engine::{
     ConsensusError, EpochRotationError, OxideBft, PROPOSAL_FUTURE_VIEWS, PROPOSAL_PAST_VIEWS,
-    PROPOSAL_VERIFY_BUDGET_PER_SEC, proposer_hash,
+    PROPOSAL_VERIFY_BUDGET_PER_SEC, SyncReject, proposer_hash,
 };
 pub use pacemaker::{Pacemaker, PacemakerEvent, PacemakerState};
 pub use sequencer::SequencerEngine;

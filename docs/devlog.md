@@ -21267,3 +21267,92 @@ converges. `RemoteSigner::connect` retries ~5s so daemon/validator
 boot order doesn't matter. Fleet tests now kill spawned processes
 on drop and run on disjoint port ranges — a failed run can no
 longer orphan ports into the next.
+
+## Session — certified block sync, and the two transport bugs its E2E surfaced
+
+A restarted-behind validator now catches up over authenticated
+certified records instead of staying dead at its WAL watermark.
+The work landed in three layers — the record + verification, the
+durable serve store + wire protocol, and the pump's gap detection —
+plus two transport fixes the fleet E2E forced out.
+
+**The record.** `types::CertifiedBlock {header, proposal, child,
+qc}`: the committed block, its body, the certifying child header,
+and the QC on that child — the Jolteon two-chain proof, carried
+per-block. `commit_walk` now carries the committing pair per link
+and `record_committed` emits one `CertifiedBlock` per committed
+height into a `take_certified` drain queue, whether the commit was
+live or synced (a synced node re-serves what it learned).
+
+**The verifier.** `apply_certified_block` re-derives every link
+locally — frontier contiguity + anchor binding, pair structure,
+body binding, proposer signature, both QC aggregates — then
+*stages* verified records and commits the contiguous prefix
+through the newest consecutive-view seal. The seal rule is the
+safety load-bearing step and it is exactly `commit_walk`'s
+descent: an interior record's child can legitimately sit several
+views ahead (the intervening views went to TCs), so a strict
+`child.view == header.view + 1` on every record — the first
+implementation — rejected every churned history while also being
+the wrong check (a notarized block can still be orphaned; the
+consecutive pair is what commits it). Regression coverage:
+`apply_certified_block_stages_interior_links_until_the_seal`
+(stages an unsealed link, commits the run on the seal, commits
+nothing on a run that never seals), the ten-case reject matrix,
+and a real-BLS crypto test (forged proposer sig and sub-quorum
+bitmap both refuse).
+
+**The store + wire.** `node::block_sync::SyncStore` journals every
+emitted record (height index + hash index; boot replay restores
+serving). `MSG_BLOCK_REQ`/`MSG_BLOCK_RESP` carry `ByHash` /
+`ByRange` fetches; responses include the server's retention
+`floor`, certified records, and an optional notarized tail — the
+certified-but-uncommitted tip a `ByHash` resolves to, admitted via
+`admit_proposal` so the synced node can vote on the next round
+instead of knowing history it cannot extend.
+
+**The pump.** Gap detection fires on three signals: an
+authenticated proposal above the verified frontier, a QC naming
+an unknown block (by-hash fetch), and a periodic round-robin
+retry across the committee so a dropped response or a peer with
+nothing yet cannot stall sync. All gating is on
+`engine.sync_frontier()` (committed tip + staged run) — staged
+records are verified work and are never re-fetched. A record
+below the peer's `floor`, or a foreign-epoch record, logs the
+state-sync fallback once — certified snapshots are the designed
+recovery for gaps that deep.
+
+**Transport bug 1 — the TLS deframer.** `TlsReadHalf::read_frame`
+treated a partial `read_tls` consume as fatal. Partial consumes
+are normal rustls deframer backpressure: an incomplete-record
+tail stays buffered and a big socket read overflows the deframer's
+free space. A restarted validator triggers exactly this pattern —
+peers' writers batch its missed frames into large ciphertext
+blobs. All three reader threads died ~2s after restart while the
+sockets stayed ESTABLISHED; sends returned `UnknownPeer` or
+queued into dead writers, and the node went dark mid-catch-up.
+The fix drains the deframer and re-offers the remainder; `used ==
+0` with no forward progress is the only honest desync left.
+
+**Transport bug 2 — the stale-teardown race.** A dying
+connection's reader-exit did an unconditional
+`streams.remove(peer)` — evicting a *newer* same-peer connection's
+writer that installed meanwhile. The reconnect sequence made it
+deterministic: node restarts → dials out → the peer installs a
+replacement → the old socket's teardown deletes the fresh slot →
+`send` reports `UnknownPeer` forever on a healthy socket. Every
+map entry is now tagged with a process-unique `conn_id`, and
+`remove_slot_if_current` deletes a slot only while it still
+belongs to the exiting connection (check-and-remove under one
+guard). `remove_slot_if_current_never_evicts_a_replacement`
+covers the interleave directly.
+
+**E2E.** `validator_fleet_converges_and_recovers` now asserts real
+catch-up on the production binary: member 3 stops, the quorum
+advances ~8 heights, member 3 restarts, recovers durable state,
+fetches and applies the missed prefix, reaches the fleet tip
+(minus the 2-chain lag), and resumes live finalization. The
+failure that started the hunt — a restarted node frozen at height
+0 with live connections — was the two transport bugs layered on
+top of the over-strict seal check; all three needed fixing for
+the gate to pass.

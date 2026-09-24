@@ -53,8 +53,9 @@ use crypto::hash::{Domain, Hasher};
 use ports::{AppInterface, ConsensusEngine};
 use primitives::{Address, Epoch, Hash, Height, View};
 use types::{
-    BlockHeader, ExecCertificate, ExecDivergence, FinalizedBlock, MempoolAck, Proposal,
-    QuorumCertificate, StateAttestation, TimeoutCertificate, TxBytes, Verdict, Vote, VotePhase,
+    BlockHeader, CertifiedBlock, ExecCertificate, ExecDivergence, FinalizedBlock, MempoolAck,
+    Proposal, QuorumCertificate, StateAttestation, TimeoutCertificate, TxBytes, Verdict, Vote,
+    VotePhase,
 };
 
 use crate::validator::{ValidatorIndex, ValidatorSet};
@@ -351,6 +352,70 @@ pub enum ConsensusError {
     /// The persisted consensus state could not be restored — the
     /// byte buffer is malformed, truncated, or corrupted (C9 fix).
     InvalidState,
+    /// A fetched `CertifiedBlock` failed a structural or
+    /// cryptographic check in `apply_certified_block`. Sync only
+    /// ever *adds* committed history, so rejection is always safe:
+    /// the node keeps its tip and can retry from an honest peer.
+    SyncRejected {
+        /// The height the record claimed.
+        height: u64,
+        /// Which check failed — a stable tag for logs and tests.
+        reason: SyncReject,
+    },
+    /// The record verified but the execution lane is saturated —
+    /// finalizing would grow the lane's unexecuted debt past its
+    /// bound. Retry when the lane drains; the record stays valid.
+    SyncDeferred {
+        /// The height the record claimed.
+        height: u64,
+    },
+    /// The record's epoch differs from the engine's: the QC bitmap
+    /// indexes a committee this engine does not hold, so the proof
+    /// cannot be verified here. The caller must use certified state
+    /// sync (a weak-subjectivity checkpoint) for cross-epoch gaps.
+    SyncEpoch {
+        /// The height the record claimed.
+        height: u64,
+        /// The epoch the record was certified under.
+        record_epoch: Epoch,
+        /// The engine's current epoch.
+        epoch: Epoch,
+    },
+}
+
+/// Which check a [`ConsensusError::SyncRejected`] record failed —
+/// one variant per `apply_certified_block` rule, in check order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncReject {
+    /// Not the direct successor of the verified frontier (committed
+    /// tip or staged tail) — the caller buffers or re-fetches; not
+    /// evidence of malice.
+    NotNext,
+    /// `header.prev_block` does not match the frontier parent hash —
+    /// the record claims our height but extends a different parent.
+    AnchorMismatch,
+    /// `child.prev_block != hash(header)` — the certified child does
+    /// not extend the block it claims to commit.
+    BrokenPair,
+    /// `child.view <= header.view` — a certifying child must sit at
+    /// a strictly later view. Forward gaps (`child.view > header.
+    /// view + 1`) are LEGAL interior links under commit-by-descent
+    /// and stage rather than reject.
+    NonConsecutiveViews,
+    /// `qc` does not certify `child` (`block_hash`/`view`/`epoch`
+    /// mismatch), or `child.height != header.height + 1` — the
+    /// commit certificate is malformed.
+    MalformedCertificate,
+    /// `child.high_qc` is absent or does not certify `header` —
+    /// the notarization link of the pair is broken.
+    BrokenNotarization,
+    /// `proposal` does not match `header` — height, `tx_root`, or
+    /// `body_commitment` mismatch; the body is not what quorum
+    /// certified.
+    BodyMismatch,
+    /// The proposer seat does not resolve in the committee or the
+    /// proposal signature does not verify under its key.
+    BadProposerSignature,
 }
 
 impl std::fmt::Display for ConsensusError {
@@ -409,6 +474,23 @@ impl std::fmt::Display for ConsensusError {
                 write!(f, "block body failed certification: {block_hash}")
             }
             Self::InvalidState => write!(f, "invalid persisted consensus state"),
+            Self::SyncRejected { height, reason } => {
+                write!(f, "certified sync record at height {height} rejected: {reason:?}")
+            }
+            Self::SyncDeferred { height } => {
+                write!(
+                    f,
+                    "certified sync record at height {height} deferred: execution lane saturated"
+                )
+            }
+            Self::SyncEpoch { height, record_epoch, epoch } => {
+                write!(
+                    f,
+                    "certified sync record at height {height} is epoch {} — engine is at epoch {}",
+                    record_epoch.value(),
+                    epoch.value()
+                )
+            }
         }
     }
 }
@@ -532,6 +614,29 @@ pub struct OxideBft {
     /// iteration (the conformance suite checks the height sequence).
     /// Bounded to `MAX_RETAINED_FINALIZED` — old blocks are pruned.
     finalized: BTreeMap<u64, FinalizedBlock>,
+    /// Certified commit records waiting for the node layer to drain
+    /// into its durable serve store. Every `record_committed` — live
+    /// commit or verified sync — pushes the [`CertifiedBlock`] that
+    /// carries the block's full Jolteon two-chain proof, so a peer
+    /// can verify served history without trusting this node. Capped
+    /// at `MAX_RETAINED_FINALIZED`; the pump drains each loop
+    /// iteration, so the cap only binds engines nobody drains
+    /// (tests, sims), where dropping oldest is sound.
+    certified_out: std::collections::VecDeque<CertifiedBlock>,
+    /// Verified sync records staged above the committed anchor,
+    /// awaiting a consecutive-view *seal*. Sync verification mirrors
+    /// `commit_walk`'s commit-by-descent: a record's `(child, qc)`
+    /// pair proves its header and child are notarized chain links,
+    /// but the header commits only when a *consecutive* pair closes
+    /// somewhere above it (`child.view == header.view + 1`). During
+    /// timeout churn, interior committed blocks legitimately have
+    /// non-consecutive children (their commit rode on the run's
+    /// tail seal), so a strict per-record adjacency check would
+    /// reject valid history forever — the exact failure this
+    /// staging exists to prevent. Bounded by fetch-side flow
+    /// control: entries only enter contiguously from the committed
+    /// frontier, each fully verified before staging.
+    sync_staged: std::collections::BTreeMap<u64, CertifiedBlock>,
     /// Optional commit listener. Called with each committed block
     /// before it's added to `finalized`. Used by devnet harnesses to
     /// observe all commits (the `finalized` map prunes old entries,
@@ -801,6 +906,8 @@ impl OxideBft {
             voted_at_height: BTreeMap::new(),
             blocks: HashMap::new(),
             finalized: BTreeMap::new(),
+            certified_out: std::collections::VecDeque::new(),
+            sync_staged: std::collections::BTreeMap::new(),
             commit_listener: None,
             last_committed: None,
             next_height: Height::new(0),
@@ -1620,7 +1727,18 @@ impl OxideBft {
         // valid height — stay idle until gossip delivers the block.
         let (height, prev_block) = match &self.high_qc {
             Some(qc) => {
-                let Some((parent, _)) = self.blocks.get(&qc.block_hash()) else {
+                if let Some((parent, _)) = self.blocks.get(&qc.block_hash()) {
+                    (parent.height.saturating_next(), qc.block_hash())
+                } else if let Some((anchor_hash, anchor_height)) = self.last_committed
+                    && anchor_hash == qc.block_hash()
+                {
+                    // The QC'd tip is already committed — reachable
+                    // after certified block sync, whose records
+                    // finalize without entering `blocks`. Extend the
+                    // anchor directly; the alternative (returning
+                    // None) leaves a caught-up leader silent forever.
+                    (anchor_height.saturating_next(), anchor_hash)
+                } else {
                     if std::env::var_os("OXIDE_DEBUG_PROPOSE").is_some() {
                         eprintln!(
                             "propose() blocked: view={:?} highqc_view={:?} highqc_block={:?} unknown — waiting for block",
@@ -1630,8 +1748,7 @@ impl OxideBft {
                         );
                     }
                     return None;
-                };
-                (parent.height.saturating_next(), qc.block_hash())
+                }
             }
             // No highQC: extend the committed anchor — genesis at
             // height 0, or the last committed block across an epoch
@@ -1829,7 +1946,9 @@ impl OxideBft {
         if let Some(qc) = self.high_qc.clone()
             && let Some((tip, _)) = self.blocks.get(&qc.block_hash()).cloned()
         {
-            self.commit_walk(&tip);
+            // `qc` certifies `tip` — it is the outer link of the
+            // first commit pair the walk collects.
+            self.commit_walk(&tip, qc.qc());
         }
         Ok(())
     }
@@ -2028,9 +2147,68 @@ impl OxideBft {
         // height order (oldest first) — the app requires in-order
         // finalization.
         if let Some((header, _)) = self.blocks.get(&qc.block_hash).cloned() {
-            self.commit_walk(&header);
+            // `qc` certifies `header` — the outer link of the first
+            // commit pair the walk collects.
+            self.commit_walk(&header, &qc);
         }
         Ok(())
+    }
+
+    /// Drain the certified commit records produced since the last
+    /// call — the block-sync server's feed.
+    ///
+    /// Every committed height emits exactly one [`CertifiedBlock`]
+    /// carrying its Jolteon two-chain proof (header, body, certifying
+    /// child, QC on the child), whether the block committed through
+    /// the live walk or through `apply_certified_block` — synced
+    /// records are re-emitted so a caught-up node re-serves them.
+    /// The node layer journals these into its durable serve store;
+    /// the queue itself is bounded (`MAX_RETAINED_FINALIZED`) and
+    /// drops oldest when never drained.
+    pub fn take_certified(&mut self) -> Vec<CertifiedBlock> {
+        self.certified_out.drain(..).collect()
+    }
+
+    /// The committed tip — hash and height of the last block this
+    /// engine finalized. Unlike `finalized_height` (which reads the
+    /// in-memory `finalized` map, empty after a restart), this is
+    /// the WAL-restored anchor: a post-restart engine reports its
+    /// true committed height here even before it re-commits
+    /// anything. The block-sync layer uses it as the catch-up floor.
+    pub fn committed_anchor(&self) -> Option<(Hash, Height)> {
+        self.last_committed
+    }
+
+    /// Whether `hash` names a block this engine holds — committed or
+    /// still in the uncommitted store. The sync layer uses it to
+    /// decide whether a QC's `block_hash` must be fetched by hash
+    /// from the QC's sender. Only the committed *tip's* hash is
+    /// tracked (`last_committed`); a QC naming an older committed
+    /// block is stale evidence and needs no fetch regardless.
+    pub fn has_block(&self, hash: &Hash) -> bool {
+        self.blocks.contains_key(hash)
+            || self.last_committed.is_some_and(|(h, _)| h == *hash)
+            || self.certified_out.iter().any(|r| Self::block_hash(&r.header) == *hash)
+    }
+
+    /// The stored `(header, proposal)` for `hash` when the body is
+    /// complete — the live, not-yet-committed edge a certified record
+    /// cannot cover. The block-sync serve path answers `ByHash`
+    /// requests for the QC'd tip from here: the block is certified
+    /// (a QC names it) but commits only through its child's QC, so
+    /// no `CertifiedBlock` exists for it yet. Receivers authenticate
+    /// the served bytes through `admit_proposal` exactly as they
+    /// would a gossiped proposal — serving carries no authority.
+    /// `Awaiting` bodies are never answers: a header without its
+    /// certified body is worth nothing to a peer.
+    #[must_use]
+    pub fn get_proposal(&self, hash: &Hash) -> Option<(BlockHeader, Proposal)> {
+        match self.blocks.get(hash) {
+            Some((header, BlockBody::Complete(proposal))) => {
+                Some((header.clone(), proposal.clone()))
+            }
+            _ => None,
+        }
     }
 
     /// Verify a QC's aggregate signature against the signer bitmap

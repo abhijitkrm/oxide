@@ -494,6 +494,83 @@ impl<'a> Decode<'a> for FinalizedBlock {
     }
 }
 
+/// A finalized block plus the consensus evidence that finalized it —
+/// the unit of certified block sync.
+///
+/// A lagging or restarting validator cannot trust a bare block: the
+/// sender could serve any bytes at any height. What it *can* verify
+/// is the Jolteon commit chain (arXiv:2106.10362 §3): a block commits
+/// when a certified pair `(X, X')` with `X'.view == X.view + 1` and
+/// `X'.prev == X` exists at-or-above it — commit-by-descent. Each
+/// record carries one *certified link* of that chain plus the body,
+/// so a receiver can verify the whole chain of custody locally:
+///
+/// - `header` — the committed block itself (height, view, epoch,
+///   `prev_block` linkage, `tx_root`, proposer signature).
+/// - `proposal` — the committed body; the receiver recomputes
+///   `tx_root`/`body_commitment` against `header` before executing,
+///   so the served bytes are the ones quorum attested.
+/// - `child` — the block's certified successor on the committed
+///   chain: `child.prev_block == hash(header)` and
+///   `child.height == header.height + 1`. Its embedded `high_qc` is
+///   the QC *on `header`* — the notarization link. The QC contents
+///   are committed by `child`'s hash, so they cannot be swapped
+///   without invalidating `qc` below. `child.view` is strictly
+///   greater than `header.view` — for the run's tip record it is
+///   exactly +1 (the consecutive seal); interior ancestors carry
+///   whatever view their real successor landed at, since timeout
+///   churn can insert TC'd views between a block and its child.
+/// - `qc` — the quorum certificate on `child`: `qc.block_hash ==
+///   hash(child)`, `qc.view == child.view`. Verifying its aggregate
+///   signature against the epoch's committee proves quorum accepted
+///   `child` — and a contiguous run of these links ending in a
+///   consecutive seal is what makes the prefix committed, without
+///   the receiver trusting the sender at all.
+///
+/// Attendance is derivable rather than carried: `FinalizedBlock::
+/// signers` resolves from `child.high_qc.signer_bitmap` (the QC on
+/// `header`), exactly as the live commit path resolves it.
+///
+/// Only *finalized* blocks are ever served in this form — the proof
+/// fields exist precisely because uncommitted proposals carry no such
+/// evidence. A node never serves an in-flight proposal as canonical
+/// history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertifiedBlock {
+    /// The finalized block's header.
+    pub header: BlockHeader,
+    /// The finalized block's body (`height`, ordered txs, attestation)
+    /// — the bytes `header.tx_root` and `header.body_commitment`
+    /// commit to.
+    pub proposal: Proposal,
+    /// The block's certified successor on the committed chain —
+    /// carries `header`'s QC in `high_qc`. For the run's tip record
+    /// it is the consecutive child that seals the commit.
+    pub child: BlockHeader,
+    /// The quorum certificate certifying `child`.
+    pub qc: QuorumCertificate,
+}
+
+impl Encode for CertifiedBlock {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        self.header.encode(buf);
+        self.proposal.encode(buf);
+        self.child.encode(buf);
+        self.qc.encode(buf);
+    }
+}
+
+impl<'a> Decode<'a> for CertifiedBlock {
+    fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            header: BlockHeader::decode(reader)?,
+            proposal: Proposal::decode(reader)?,
+            child: BlockHeader::decode(reader)?,
+            qc: QuorumCertificate::decode(reader)?,
+        })
+    }
+}
+
 /// The application's reception assertion for a finalized block. Returned
 /// from `finalize_block`; asserts reception, *not* execution (execution
 /// is async by design — oai-spec.md §2).

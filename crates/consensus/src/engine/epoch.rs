@@ -164,6 +164,10 @@ impl OxideBft {
     /// - `rejected_headers`: a header correctly refused under epoch
     ///   N may be authentic under N+1 (rotated-in leader's first
     ///   proposal), so the memo must not outlive its set.
+    /// - `sync_staged`: staged sync records bind the signing
+    ///   committee — after a rotation they can never verify or
+    ///   commit, so retaining them would only pin memory and stall
+    ///   the frontier.
     pub(crate) fn clear_epoch_scoped_state(&mut self) {
         self.last_voted_view = None;
         self.timeout_signed_view = None;
@@ -178,6 +182,11 @@ impl OxideBft {
         self.exec_certs.clear();
         self.verified_exec_certs.clear();
         self.rejected_headers.clear();
+        // Staged sync records are signed under the outgoing
+        // committee — unverifiable (and uncommittable) after the
+        // boundary. The committed anchor is untouched: the new
+        // epoch's chain still extends it.
+        self.sync_staged.clear();
     }
 
     /// Adopt a QC-certified epoch when this engine's committee is

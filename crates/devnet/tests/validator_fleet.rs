@@ -20,11 +20,11 @@
 //! 3. A SIGTERM'd validator exports a durable snapshot, and its
 //!    remaining three peers keep finalizing (3-of-4 is quorum).
 //! 4. The restarted node recovers its durable state (`snapshot
-//!    Some(h)`, WAL reloaded) and rejoins the consensus machinery.
-//!    It cannot re-finalize heights it missed — block fetch is the
-//!    documented sync gap, not a failure of this path — so the gate
-//!    is that restart *succeeds* and the node re-attaches, not that
-//!    it catches up.
+//!    Some(h)`, WAL reloaded) and *catches up*: certified block
+//!    sync fetches the missed committed prefix from its peers
+//!    (each record's Jolteon commit proof verified locally), then
+//!    the node rejoins live consensus — its finalized height
+//!    reaches the fleet's tip, not just the WAL's stale mark.
 //!
 //! # Running
 //!
@@ -297,13 +297,16 @@ fn validator_fleet_converges_and_recovers() {
     }
 
     // 4. Stop member 3; the remaining three are quorum and must keep
-    //    finalizing.
+    //    finalizing. Let the gap grow to ~8 heights — deep enough
+    //    that restart catch-up exercises certified block sync for
+    //    a real prefix, not a one-block edge.
     let mut stopped = nodes.pop().expect("node 3");
     terminate(&mut stopped);
-    let survivors_converged = Instant::now() + Duration::from_secs(20);
+    let survivors_converged = Instant::now() + Duration::from_secs(30);
     let stop_height = nodes[0].height.load(Ordering::Relaxed);
+    let gap_target = stop_height + 8;
     loop {
-        let advanced = nodes.iter().all(|n| n.height.load(Ordering::Relaxed) >= stop_height + 2);
+        let advanced = nodes.iter().all(|n| n.height.load(Ordering::Relaxed) >= gap_target);
         if advanced {
             break;
         }
@@ -315,11 +318,14 @@ fn validator_fleet_converges_and_recovers() {
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    // 5. Restart member 3 — durable recovery must re-attach it to
-    //    the fleet. Catching up on the missed blocks needs block
-    //    sync (a separate protocol); the gate here is that restart
-    //    succeeds and the node rejoins consensus, not that it
-    //    re-finalizes.
+    // 5. Restart member 3 — the H5 acceptance gate: it must recover
+    //    its durable state AND catch up. Certified block sync
+    //    fetches the missed committed prefix (verified per-block by
+    //    the Jolteon commit proofs, not trusted from the serving
+    //    peer), after which the node rejoins live consensus — so
+    //    its finalized height must reach the fleet's committed tip
+    //    (minus the 2-chain lag), not stall at its WAL-restored mark.
+    let fleet_tip = nodes.iter().map(|n| n.height.load(Ordering::Relaxed)).max().unwrap_or(0);
     let mut restarted = spawn_validator(3, &dir, &bin, None);
     let rejoin_deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -332,6 +338,39 @@ fn validator_fleet_converges_and_recovers() {
             "restarted validator did not recover durable state:\n{log}"
         );
         std::thread::sleep(Duration::from_millis(200));
+    }
+    let sync_deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let tip_now = nodes.iter().map(|n| n.height.load(Ordering::Relaxed)).max().unwrap_or(0);
+        let caught = restarted.height.load(Ordering::Relaxed);
+        // 2-chain lag: the newest committed height trails the newest
+        // certified proposal by ~2, so "caught up" is within the lag.
+        if caught >= fleet_tip.saturating_sub(3) && caught >= tip_now.saturating_sub(3) {
+            break;
+        }
+        assert!(
+            Instant::now() < sync_deadline && restarted.child.try_wait().expect("wait").is_none(),
+            "restarted validator did not catch up (stopped at {stop_height}, \
+             fleet tip {tip_now}, restarted at {caught})\nrestarted log:\n{}",
+            restarted.lines.lock().expect("lines").join("\n")
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    // And it must keep finalizing with the fleet — a node that
+    // backfilled but cannot rejoin the live protocol is still a
+    // failed catch-up.
+    let resume_deadline = Instant::now() + Duration::from_secs(20);
+    let resume_from = restarted.height.load(Ordering::Relaxed);
+    loop {
+        if restarted.height.load(Ordering::Relaxed) >= resume_from + 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < resume_deadline,
+            "caught-up validator did not resume live finalization: {:?}",
+            heights(&nodes)
+        );
+        std::thread::sleep(Duration::from_millis(300));
     }
 
     terminate(&mut restarted);

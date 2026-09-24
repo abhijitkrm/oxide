@@ -6853,3 +6853,483 @@ fn hidden_qc_timeout_release_cannot_fork() {
         assert_eq!(f0.txs[0].as_bytes(), [0xA0], "engine {i} committed P at h0");
     }
 }
+
+// ---- Certified block sync (H5) ----
+//
+// A partitioned or restarted validator catches up on *proofs*, not
+// trust: every committed block ships a `CertifiedBlock` — header,
+// body, certifying child, QC on the child — and the receiver runs
+// the full Jolteon pair check itself (`apply_certified_block`).
+// These tests prove the emission path produces verifiable records
+// and the intake path accepts exactly the well-formed ones.
+
+/// Drive `rounds` on a 4-engine conformance fleet with leader 0 and
+/// harvest every `CertifiedBlock` the leader emits. Each `drive_round`
+/// commits the previous round's block (2-chain lag), so `rounds`
+/// yields `rounds - 1` records.
+fn harvest_certified(rounds: usize) -> Vec<types::CertifiedBlock> {
+    let mut leader = make_multi_engine(0);
+    let mut f1 = make_multi_engine(1);
+    let mut f2 = make_multi_engine(2);
+    let mut f3 = make_multi_engine(3);
+    let mut followers = [&mut f1, &mut f2, &mut f3];
+    let mut out = Vec::new();
+    for r in 0..rounds {
+        drive_round(
+            &mut leader,
+            &mut followers,
+            Some(TxBytes::new(vec![u8::try_from(r).unwrap_or(0)])),
+        );
+        out.extend(leader.take_certified());
+    }
+    out
+}
+
+/// The commit path must emit one `CertifiedBlock` per committed
+/// height, each carrying a well-formed Jolteon pair: child extends
+/// the block one view later, `qc` certifies the child, and the
+/// child's embedded `high_qc` certifies the block.
+#[test]
+fn commit_emits_certified_block_with_valid_proof() {
+    let records = harvest_certified(3);
+    assert_eq!(records.len(), 2, "3 rounds commit 2 blocks");
+    for (i, rec) in records.iter().enumerate() {
+        let block_hash = OxideBft::block_hash(&rec.header);
+        let child_hash = OxideBft::block_hash(&rec.child);
+        assert_eq!(rec.header.height, Height::new(i as u64), "record {i} height");
+        assert_eq!(rec.child.prev_block, block_hash, "record {i}: child must extend the block");
+        assert_eq!(
+            rec.child.view,
+            rec.header.view.saturating_next(),
+            "record {i}: pair must be consecutive views"
+        );
+        assert_eq!(rec.qc.block_hash, child_hash, "record {i}: qc must certify the child");
+        assert_eq!(rec.qc.view, rec.child.view, "record {i}: qc view must match the child's");
+        let notary = rec.child.high_qc.as_ref().expect("record {i}: child must carry high_qc");
+        assert_eq!(notary.block_hash, block_hash, "record {i}: high_qc must certify the block");
+        assert_eq!(notary.view, rec.header.view, "record {i}: notary view must match");
+    }
+    // The queue is per-commit: a fresh fleet's first round emits
+    // nothing (the 2-chain rule needs a certified pair), the second
+    // emits exactly the first block's record.
+    let mut leader = make_multi_engine(0);
+    let mut f1 = make_multi_engine(1);
+    let mut f2 = make_multi_engine(2);
+    let mut f3 = make_multi_engine(3);
+    let mut followers = [&mut f1, &mut f2, &mut f3];
+    drive_round(&mut leader, &mut followers, Some(TxBytes::new(vec![1])));
+    assert!(leader.take_certified().is_empty(), "nothing commits after one round");
+    drive_round(&mut leader, &mut followers, None);
+    assert_eq!(leader.take_certified().len(), 1, "second round commits the first block");
+}
+
+/// A node that never saw the proposals finalizes the exact committed
+/// prefix by applying certified records — the sync path must produce
+/// identical `FinalizedBlock`s (txs, signers, context) as the live
+/// commit path.
+#[test]
+fn apply_certified_block_commits_the_verified_prefix() {
+    let records = harvest_certified(3);
+    let mut syncer = make_multi_engine(3);
+    for rec in &records {
+        assert!(
+            syncer.apply_certified_block(rec).expect("valid record must apply"),
+            "height {} must commit",
+            rec.header.height.value()
+        );
+    }
+    for (i, rec) in records.iter().enumerate() {
+        let committed =
+            syncer.finalized_block(rec.header.height).expect("synced height must be finalized");
+        assert_eq!(committed.txs, rec.proposal.txs, "height {i}: body must be the certified one");
+    }
+    let (_, tip) = syncer.committed_anchor().expect("anchor set after sync");
+    assert_eq!(tip, records.last().expect("records").header.height);
+    // Idempotent: redelivery of an already-committed record is a
+    // no-op, not an error — retries under loss are normal.
+    assert!(
+        !syncer.apply_certified_block(&records[0]).expect("duplicate apply"),
+        "re-delivered record must be idempotent"
+    );
+    assert!(!syncer.apply_certified_block(records.last().expect("records")).expect("dup tip"));
+}
+
+/// After syncing the committed prefix, the node must rejoin the live
+/// protocol: a proposal extending the synced tip is votable once the
+/// certified-but-uncommitted tip block lands (the notarized tail of
+/// a `ByHash` response). One fleet drives the whole scenario so the
+/// timestamps — and therefore the block hashes — chain correctly.
+#[test]
+fn synced_node_votes_past_the_synced_anchor() {
+    let mut leader = make_multi_engine(0);
+    let mut f1 = make_multi_engine(1);
+    let mut f2 = make_multi_engine(2);
+    let mut f3 = make_multi_engine(3);
+    let mut followers = [&mut f1, &mut f2, &mut f3];
+    let mut records = Vec::new();
+    for r in 0..3u8 {
+        drive_round(&mut leader, &mut followers, Some(TxBytes::new(vec![r])));
+        records.extend(leader.take_certified());
+    }
+    assert_eq!(records.len(), 2, "3 rounds commit heights 0 and 1");
+    // The certified-but-uncommitted tip is the newest record's child;
+    // its body still sits in the leader's block store — exactly what
+    // a `ByHash` response tail carries over the wire.
+    let tip_header = records.last().expect("records").child.clone();
+    let tip_hash = OxideBft::block_hash(&tip_header);
+    let tip_body = leader
+        .get_proposal(&tip_hash)
+        .map(|(_, p)| p)
+        .expect("the certified tip must still be stored");
+    // The continuation the network produces next: extends the tip.
+    let (next_header, next_proposal) = leader.propose().expect("leader proposes next");
+    assert_eq!(next_header.prev_block, tip_hash, "must extend the certified tip");
+
+    // The syncer: apply the committed prefix, then adopt the QC that
+    // certifies the tip — adoption advances `current_view` to the
+    // view the continuation proposal lands in.
+    let mut syncer = make_multi_engine(3);
+    for rec in &records {
+        assert!(syncer.apply_certified_block(rec).expect("apply"));
+    }
+    syncer.deliver_qc(records.last().expect("records").qc.clone()).expect("adopt tip QC");
+    assert_eq!(
+        next_header.view,
+        syncer.current_view(),
+        "QC adoption must land the syncer in the proposal's view"
+    );
+    // Without the tail block stored, the proposal's parent is
+    // unresolvable: it extends the certified tip, not the committed
+    // anchor — no vote.
+    assert!(
+        syncer.vote(&next_header, &next_proposal).is_none(),
+        "proposal over an unknown parent must not be votable"
+    );
+    // The tail fetch delivers the tip block; admit_proposal
+    // authenticates and stores it, and the continuation is votable.
+    assert!(syncer.admit_proposal(&tip_header, &tip_body));
+    assert!(
+        syncer.vote(&next_header, &next_proposal).is_some(),
+        "with the notarized tail stored, the continuation is votable"
+    );
+}
+
+/// The reject matrix: every structural mutation of a valid record
+/// must fail with the specific `SyncReject` reason — a catch-all
+/// accept would let a crafted record slip a forged body or a broken
+/// proof past verification.
+///
+/// Hash bindings cascade: mutating `header` changes `hash(header)`,
+/// which `child.prev_block` and `child.high_qc.block_hash` must keep
+/// naming or an *earlier* check fires instead of the one under test.
+/// The mutators below re-point the downstream bindings where needed
+/// so each case isolates exactly one fault (conformance mode makes
+/// this possible — QCs carry real bitmaps but unsigned aggregates).
+/// Re-point the bindings a mutated `header` breaks so the fault
+/// under test is the first to fire.
+fn repoint_header(r: &mut types::CertifiedBlock) {
+    let bh = OxideBft::block_hash(&r.header);
+    r.child.prev_block = bh;
+    if let Some(q) = &mut r.child.high_qc {
+        q.block_hash = bh;
+    }
+    r.qc.block_hash = OxideBft::block_hash(&r.child);
+}
+
+/// Same for a mutated `child`: only the outer QC re-points —
+/// the notary binding stays whatever the mutation left.
+fn repoint_child(r: &mut types::CertifiedBlock) {
+    r.qc.block_hash = OxideBft::block_hash(&r.child);
+    r.qc.view = r.child.view;
+}
+
+type RejectCase = (&'static str, Box<dyn Fn(&mut types::CertifiedBlock)>, SyncReject);
+
+fn reject_cases() -> Vec<RejectCase> {
+    vec![
+        (
+            "NotNext",
+            Box::new(|r: &mut types::CertifiedBlock| {
+                r.header.height = r.header.height.saturating_next();
+                r.proposal.height = r.header.height;
+            }),
+            SyncReject::NotNext,
+        ),
+        (
+            "AnchorMismatch",
+            Box::new(|r: &mut types::CertifiedBlock| {
+                r.header.prev_block = Hash([0xEE; 32]);
+            }),
+            SyncReject::AnchorMismatch,
+        ),
+        (
+            "BrokenPair",
+            Box::new(|r: &mut types::CertifiedBlock| {
+                r.child.prev_block = Hash([0xEE; 32]);
+            }),
+            SyncReject::BrokenPair,
+        ),
+        (
+            "NonConsecutiveViews",
+            Box::new(|r: &mut types::CertifiedBlock| {
+                // View regression: a child at-or-below its parent's
+                // view is impossible in any honest chain. (Forward
+                // gaps — `child.view > header.view + 1` — are LEGAL
+                // interior links under commit-by-descent and stage
+                // rather than reject; `..._stages_interior_links`
+                // covers them.)
+                r.child.view = r.header.view;
+            }),
+            SyncReject::NonConsecutiveViews,
+        ),
+        (
+            "MalformedCertificate",
+            Box::new(|r: &mut types::CertifiedBlock| {
+                r.qc.block_hash = Hash([0xEE; 32]);
+            }),
+            SyncReject::MalformedCertificate,
+        ),
+        (
+            "ChildHeightSkips",
+            Box::new(|r: &mut types::CertifiedBlock| {
+                // The certifying child must be the direct successor —
+                // a height jump means the pair skips a link.
+                r.child.height = r.child.height.saturating_next();
+            }),
+            SyncReject::MalformedCertificate,
+        ),
+        (
+            "MissingNotarization",
+            Box::new(|r: &mut types::CertifiedBlock| {
+                r.child.high_qc = None;
+                repoint_child(r);
+            }),
+            SyncReject::BrokenNotarization,
+        ),
+        (
+            "WrongNotaryTarget",
+            Box::new(|r: &mut types::CertifiedBlock| {
+                if let Some(qc) = &mut r.child.high_qc {
+                    qc.block_hash = Hash([0xEE; 32]);
+                }
+                repoint_child(r);
+            }),
+            SyncReject::BrokenNotarization,
+        ),
+        (
+            "BodyTxMismatch",
+            Box::new(|r: &mut types::CertifiedBlock| {
+                r.proposal.txs.push(TxBytes::new(vec![0xFF]));
+            }),
+            SyncReject::BodyMismatch,
+        ),
+        (
+            "BodyRootMismatch",
+            Box::new(|r: &mut types::CertifiedBlock| {
+                r.header.tx_root = Hash([0xEE; 32]);
+                repoint_header(r);
+            }),
+            SyncReject::BodyMismatch,
+        ),
+        (
+            "BodyCommitmentMismatch",
+            Box::new(|r: &mut types::CertifiedBlock| {
+                r.header.body_commitment = Hash([0xEE; 32]);
+                repoint_header(r);
+            }),
+            SyncReject::BodyMismatch,
+        ),
+    ]
+}
+
+#[test]
+fn apply_certified_block_reject_matrix() {
+    let records = harvest_certified(3);
+    let valid = records[1].clone(); // height 1 — needs record[0] applied first
+    for (name, mutate, want) in reject_cases() {
+        let mut syncer = make_multi_engine(3);
+        syncer.apply_certified_block(&records[0]).expect("prefix applies");
+        let mut bad = valid.clone();
+        mutate(&mut bad);
+        match syncer.apply_certified_block(&bad) {
+            Err(ConsensusError::SyncRejected { reason, .. }) => {
+                assert_eq!(reason, want, "{name}: wrong reject reason");
+            }
+            other => panic!("{name}: expected SyncRejected({want:?}), got {other:?}"),
+        }
+        // The rejected record must not have committed the height.
+        assert!(
+            syncer.finalized_block(valid.header.height).is_none(),
+            "{name}: rejected record must not finalize"
+        );
+    }
+    // Sanity: the unmutated record still applies on the same prefix.
+    let mut syncer = make_multi_engine(3);
+    syncer.apply_certified_block(&records[0]).expect("prefix applies");
+    assert!(syncer.apply_certified_block(&valid).expect("valid applies"));
+}
+
+/// Commit-by-descent on the sync path: an interior record whose
+/// certifying child is NOT view-consecutive (a timeout-certificate
+/// gap intervened) is still a valid certified link — it stages, and
+/// commits when the run's tail seal lands. A strict per-record
+/// adjacency requirement (the original check) rejected every
+/// churned history and made partition-recovery unsyncable.
+#[test]
+fn apply_certified_block_stages_interior_links_until_the_seal() {
+    let records = harvest_certified(4); // heights 0, 1, 2
+    assert_eq!(records.len(), 3, "4 rounds commit 3 blocks");
+    // Simulate churn on the interior record: h0's certifier (h1)
+    // landed two views later — `child.view = header.view + 2`. The
+    // pair is still well-formed: the QC certifies the child at the
+    // child's real view (conformance mode doesn't cryptographically
+    // bind the view, matching how the reject matrix re-points it).
+    let mut interior = records[0].clone();
+    interior.child.view = interior.header.view.saturating_next().saturating_next();
+    interior.qc.view = interior.child.view;
+    interior.qc.block_hash = OxideBft::block_hash(&interior.child);
+
+    let mut syncer = make_multi_engine(3);
+    // Interior link: verified, staged — but no seal exists yet, so
+    // NOTHING may commit. Marking it committed here would be the
+    // unsafe half of the old behavior (a notarized block can still
+    // be orphaned by a later TC unlock).
+    assert!(
+        !syncer.apply_certified_block(&interior).expect("valid link applies"),
+        "unsealed interior record must stage, not commit"
+    );
+    assert!(syncer.finalized_block(Height::new(0)).is_none(), "staged record must not finalize");
+    assert_eq!(syncer.sync_frontier(), 1, "staging advances the verified frontier");
+    // Idempotent while staged: redelivery is a no-op.
+    assert!(!syncer.apply_certified_block(&interior).expect("dup"));
+
+    // The tail seal lands: records[1] carries its own consecutive
+    // pair — descent commits the whole staged prefix through it.
+    assert!(
+        syncer.apply_certified_block(&records[1]).expect("seal applies"),
+        "the seal commits the run"
+    );
+    assert!(
+        syncer.finalized_block(Height::new(0)).is_some(),
+        "descent commits the interior ancestor"
+    );
+    assert!(syncer.finalized_block(Height::new(1)).is_some(), "the sealed record commits itself");
+
+    // A run whose tail never seals commits nothing even when every
+    // record is a valid link — the unsafe case the seal rule guards.
+    let mut stalled = make_multi_engine(3);
+    let mut unsealed_tail = records[1].clone();
+    unsealed_tail.child.view = unsealed_tail.header.view.saturating_next().saturating_next();
+    unsealed_tail.qc.view = unsealed_tail.child.view;
+    unsealed_tail.qc.block_hash = OxideBft::block_hash(&unsealed_tail.child);
+    assert!(!stalled.apply_certified_block(&interior).expect("link"));
+    assert!(!stalled.apply_certified_block(&unsealed_tail).expect("link"));
+    assert!(
+        stalled.finalized_block(Height::new(0)).is_none()
+            && stalled.finalized_block(Height::new(1)).is_none(),
+        "an unsealed run must commit nothing"
+    );
+    assert_eq!(stalled.sync_frontier(), 2, "the staged run still extends the frontier");
+}
+
+/// A record signed under a different epoch cannot be checked against
+/// this committee — `SyncEpoch` (the state-sync signal), not a
+/// structural rejection.
+#[test]
+fn apply_certified_block_rejects_foreign_epoch() {
+    let records = harvest_certified(3);
+    let mut syncer = make_multi_engine(3);
+    let mut bad = records[0].clone();
+    bad.header.epoch = Epoch::new(9);
+    match syncer.apply_certified_block(&bad) {
+        Err(ConsensusError::SyncEpoch { .. }) => {}
+        other => panic!("expected SyncEpoch, got {other:?}"),
+    }
+}
+
+/// The crypto arms: under real BLS verification a valid record's
+/// proposer signature and both QC aggregates must verify, and a
+/// forged proposer signature or sub-quorum bitmap must fail.
+#[test]
+fn apply_certified_block_verifies_real_crypto() {
+    // Real-key fleet: drive two rounds so height 0 commits.
+    let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+    let pks: Vec<crypto::bls::PublicKey> =
+        keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+    let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+    let mut engines: Vec<OxideBft> = (0..4u16)
+        .map(|i| {
+            OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), i)
+                .with_secret_key(keys[usize::from(i)].clone())
+        })
+        .collect();
+
+    let mut records = Vec::new();
+    for round in 0..3u8 {
+        // The engine whose seat is the reputation-effective leader
+        // proposes — `header.proposer` stamps that seat and the
+        // signature must verify under *its* key, so only the real
+        // leader can produce a record the syncer accepts. The tx
+        // keeps the conveyor busy (an empty pipeline idles out).
+        let leader_idx = (0..4).position(|i| engines[i].is_leader()).expect("a leader exists");
+        engines[leader_idx].submit_tx(TxBytes::new(vec![round]));
+        let (h, p) = engines[leader_idx].propose().expect("leader proposes");
+        let votes: Vec<(u16, types::Vote)> = engines
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, e)| e.vote(&h, &p).map(|v| (u16::try_from(i).expect("idx"), v)))
+            .collect();
+        for (idx, v) in votes {
+            engines[leader_idx].collect_vote(idx, v).expect("vote collects");
+        }
+        let qc = engines[leader_idx].try_form_qc().expect("quorum");
+        for e in &mut engines {
+            e.deliver_qc(qc.clone()).expect("deliver qc");
+        }
+        for e in &mut engines {
+            e.advance_view();
+        }
+        records.extend(engines[0].take_certified());
+    }
+    assert!(!records.is_empty(), "real-key fleet must commit");
+
+    // A fresh real-verifying engine (a committee member that missed
+    // every round) applies the records.
+    let mut syncer = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 3)
+        .with_secret_key(keys[3].clone());
+    for rec in &records {
+        assert!(syncer.apply_certified_block(rec).expect("real record must verify"));
+    }
+
+    // Forged proposer signature: sign the header with the WRONG key.
+    // The signature is part of `hash(header)`, so the downstream
+    // bindings must be re-pointed for the sig check to be the first
+    // failure reached.
+    let mut bad = records[0].clone();
+    let wrong = bls_key(7);
+    bad.header.proposer_signature = Some(wrong.sign(
+        crypto::hash::Domain::Proposal,
+        OxideBft::proposal_signing_hash(&bad.header).as_bytes(),
+    ));
+    let bh = OxideBft::block_hash(&bad.header);
+    bad.child.prev_block = bh;
+    if let Some(q) = &mut bad.child.high_qc {
+        q.block_hash = bh;
+    }
+    bad.qc.block_hash = OxideBft::block_hash(&bad.child);
+    let mut syncer2 = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 3)
+        .with_secret_key(keys[3].clone());
+    match syncer2.apply_certified_block(&bad) {
+        Err(ConsensusError::SyncRejected { reason: SyncReject::BadProposerSignature, .. }) => {}
+        other => panic!("expected BadProposerSignature, got {other:?}"),
+    }
+
+    // Sub-quorum outer QC: trim the bitmap to a single signer — the
+    // aggregate still verifies structurally but quorum fails first.
+    let mut bad2 = records[0].clone();
+    bad2.qc.signer_bitmap = vec![1];
+    match syncer2.apply_certified_block(&bad2) {
+        Err(ConsensusError::InsufficientQuorum { .. } | ConsensusError::SyncRejected { .. }) => {}
+        other => panic!("sub-quorum qc must fail, got {other:?}"),
+    }
+}

@@ -21,9 +21,18 @@
 //! # Wire protocol
 //!
 //! One-byte message tags on the transport frame: `MSG_PROPOSAL`,
-//! `MSG_VOTE`, `MSG_QC`, `MSG_TIMEOUT`, `MSG_TC`, `MSG_TX`. This IS
-//! the production consensus wire format — a change here is a
-//! protocol change, not a devnet tweak.
+//! `MSG_VOTE`, `MSG_QC`, `MSG_TIMEOUT`, `MSG_TC`, `MSG_TX`,
+//! `MSG_BLOCK_REQ`, `MSG_BLOCK_RESP`. This IS the production
+//! consensus wire format — a change here is a protocol change, not
+//! a devnet tweak.
+//!
+//! # Block sync
+//!
+//! `MSG_BLOCK_REQ`/`MSG_BLOCK_RESP` close the catch-up gap: a node
+//! that missed committed history fetches [`types::CertifiedBlock`]
+//! records by hash or height range, verifies each one's Jolteon
+//! commit proof locally (`OxideBft::apply_certified_block`), and
+//! finalizes the contiguous prefix — see [`crate::block_sync`].
 //!
 //! # Routing convention
 //!
@@ -57,6 +66,8 @@ const MSG_QC: u8 = 0x02;
 const MSG_TIMEOUT: u8 = 0x03; // timeout signature (view-change init)
 const MSG_TC: u8 = 0x04; // timeout certificate (view-change proof)
 const MSG_TX: u8 = 0x05; // raw tx envelope gossip (mempool propagation)
+const MSG_BLOCK_REQ: u8 = 0x06; // certified-block fetch (by hash or height range)
+const MSG_BLOCK_RESP: u8 = 0x07; // certified-block serve (QC-chain-verified records)
 
 /// Idle heartbeat interval for the consensus pump (unit: wall-clock
 /// time). A leader with no pending work still owes the network a
@@ -69,6 +80,25 @@ const MSG_TX: u8 = 0x05; // raw tx envelope gossip (mempool propagation)
 /// blocks (fresher liveness evidence, more I/O); higher = fewer
 /// blocks but closer to timeout churn.
 const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// Minimum interval between outgoing block-fetch requests for the
+/// same gap (unit: wall-clock). The fetch trigger fires on every
+/// gapped proposal — at tip pace that's one per view — so without a
+/// throttle each proposal would re-send the same range request
+/// while the previous response is still in flight. 750ms sits
+/// between the transport's expected RTT (~ms on LAN, ~100ms WAN)
+/// and the pacemaker's 2s base timeout: slow enough that a healthy
+/// peer answers first, fast enough that a dropped response stalls
+/// catch-up for less than one view.
+const SYNC_REQ_RETRY: Duration = Duration::from_millis(750);
+
+/// Cap on out-of-order certified records buffered awaiting
+/// contiguity. Responses are requested in order, so a healthy flow
+/// never buffers — the cap exists for interleaved pages and
+/// adversarial servers, not normal operation. 1024 records ≈ a few
+/// MiB of headers/QCs/bodies — a bounded soak, never a growth
+/// channel.
+const SYNC_PENDING_CAP: usize = 1024;
 
 /// mTLS material for the peer transport — resolved file paths.
 ///
@@ -343,6 +373,12 @@ pub fn run(spec: ValidatorNetSpec) {
     println!("{log_tag}: finalized height = {height:?}");
     println!("{log_tag}: node running");
 
+    // The certified-block serve store: replays the durable journal
+    // under `<data_dir>/certified-journal/` so a restarted validator
+    // can still serve the history it finalized before the crash.
+    // Drained from the engine's `certified_out` queue every loop.
+    let mut sync_store = crate::block_sync::SyncStore::open(data_dir.as_deref());
+
     // Run the consensus message pump loop until shutdown.
     run_consensus_loop(
         &mut engine,
@@ -354,7 +390,11 @@ pub fn run(spec: ValidatorNetSpec) {
         &shared_validator_set,
         &shared_next_validator_set,
         &gossip_rx,
+        &mut sync_store,
     );
+    // Flush any batched certified-record appends before the data
+    // dir is handed to the snapshot exporter.
+    sync_store.flush();
 
     // Graceful shutdown: if a data dir is configured, export the
     // current state to `<dir>/snapshot.bin` so a restart can resume
@@ -579,6 +619,7 @@ fn run_consensus_loop(
     shared_validator_set: &std::sync::RwLock<consensus::ValidatorSet>,
     shared_next_validator_set: &std::sync::RwLock<Option<consensus::ValidatorSet>>,
     gossip_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    sync_store: &mut crate::block_sync::SyncStore,
 ) {
     // Gossip dedup cap: tx hashes we've already ingested (ours +
     // peers'). 100k entries covers several blocks' worth of txs; a
@@ -629,6 +670,26 @@ fn run_consensus_loop(
         std::collections::HashSet::with_capacity(GOSSIP_SEEN_CAP.min(4096));
     let mut seen_txs_fifo: std::collections::VecDeque<primitives::Hash> =
         std::collections::VecDeque::new();
+    // ── Certified block sync state ────────────────────────
+    // `sync_pending` buffers fetched records that are not yet the
+    // contiguous next height — pages can interleave across peers.
+    // Entries are verified at drain time (apply_certified_block is
+    // the single verification authority); the cap bounds the soak
+    // an adversarial server could cause.
+    let mut sync_pending: std::collections::BTreeMap<u64, types::CertifiedBlock> =
+        std::collections::BTreeMap::new();
+    // `sync_target` is the highest committed-adjacent height a
+    // verified proposal has revealed — the catch-up goal.
+    let mut sync_target: u64 = 0;
+    // Throttle state for outgoing fetch requests; see SYNC_REQ_RETRY.
+    let mut sync_last_req: Option<std::time::Instant> = None;
+    // Round-robin cursor over the committee for periodic re-requests
+    // (the trigger path prefers the peer that revealed the gap).
+    let mut sync_peer_cursor: usize = 0;
+    // One-shot log latch: set when a peer's retention floor is above
+    // the height we need — the gap is beyond block sync's window and
+    // certified state sync is the designed recovery.
+    let mut sync_below_floor_logged = false;
 
     loop {
         // Graceful shutdown: SIGINT/SIGTERM sets the flag, we break
@@ -778,9 +839,36 @@ fn run_consensus_loop(
                         // verified proposal may occupy the slot;
                         // `admit_proposal` memoises both verdicts so
                         // re-deliveries are free.
-                        if engine.admit_proposal(&header, &proposal)
-                            && seen_proposals.insert((proposal_view, header.proposer))
-                        {
+                        let admitted = engine.admit_proposal(&header, &proposal);
+                        if admitted && seen_proposals.insert((proposal_view, header.proposer)) {
+                            // A verified leader proposal above our
+                            // verified frontier proves committed
+                            // history we never saw — start (or
+                            // refresh) a certified-block fetch
+                            // toward the gap. `admit_proposal` ran
+                            // first, so `header.height` is a real
+                            // signed leader height, not a forged
+                            // trigger. The frontier (not the bare
+                            // committed tip) is the fetch origin so
+                            // records already verified-and-staged
+                            // under `apply_certified_block`'s seal
+                            // rule are never re-requested.
+                            let need = engine.sync_frontier();
+                            if header.height.value() > need {
+                                sync_target = sync_target.max(header.height.value());
+                                if sync_last_req.is_none_or(|t| t.elapsed() >= SYNC_REQ_RETRY) {
+                                    let mut buf = Vec::with_capacity(16);
+                                    buf.push(MSG_BLOCK_REQ);
+                                    buf.extend_from_slice(&crate::block_sync::encode_request(
+                                        &crate::block_sync::FetchRequest::ByRange {
+                                            from: need,
+                                            count: crate::block_sync::SYNC_PAGE_CAP,
+                                        },
+                                    ));
+                                    let _ = transport.send(&msg.from, &buf);
+                                    sync_last_req = Some(std::time::Instant::now());
+                                }
+                            }
                             pending_proposals.push((header, proposal));
                         }
                     }
@@ -809,7 +897,24 @@ fn run_consensus_loop(
                 }
                 MSG_QC => {
                     if let Ok(qc) = types::QuorumCertificate::decode(&mut reader) {
+                        // A QC certifying a block we never saw is a
+                        // gap signal the height alone can't give us
+                        // (the QC carries only the hash). Fetch the
+                        // certified record by hash — if the peer has
+                        // already finalized it, the proof comes back
+                        // verified-ready; if not, range sync picks
+                        // it up once the peer commits it.
+                        let unknown = !engine.has_block(&qc.block_hash);
+                        let qc_hash = qc.block_hash;
                         let _ = engine.deliver_qc(qc);
+                        if unknown {
+                            let mut buf = Vec::with_capacity(36);
+                            buf.push(MSG_BLOCK_REQ);
+                            buf.extend_from_slice(&crate::block_sync::encode_request(
+                                &crate::block_sync::FetchRequest::ByHash(qc_hash),
+                            ));
+                            let _ = transport.send(&msg.from, &buf);
+                        }
                     }
                 }
                 MSG_TX => {
@@ -991,6 +1096,151 @@ fn run_consensus_loop(
                             Err(e) => {
                                 eprintln!("{log_tag}: TC rejected: {e:?}");
                             }
+                        }
+                    }
+                }
+                MSG_BLOCK_REQ => {
+                    // Certified-block fetch from a peer. Certified
+                    // records serve strictly out of the committed
+                    // store — an in-flight proposal has no commit
+                    // proof and is never served as one. The one live-
+                    // edge exception is `ByHash`: when the hash names
+                    // the certified-but-uncommitted tip (a QC names
+                    // it; its own commit needs the grandchild's QC),
+                    // the stored proposal goes back as the response
+                    // tail — authentication is the receiver's job,
+                    // through `admit_proposal` like any gossip.
+                    if let Some(req) = crate::block_sync::decode_request(&msg.bytes[1..]) {
+                        let mut resp = crate::block_sync::FetchResponse {
+                            floor: sync_store.floor().unwrap_or(u64::MAX),
+                            records: Vec::new(),
+                            tail: None,
+                        };
+                        match req {
+                            crate::block_sync::FetchRequest::ByHash(hash) => {
+                                if let Some(record) = sync_store.get_by_hash(&hash) {
+                                    resp.records.push(record.clone());
+                                } else {
+                                    resp.tail = engine.get_proposal(&hash);
+                                }
+                            }
+                            crate::block_sync::FetchRequest::ByRange { from, count } => {
+                                resp.records = sync_store.range(from, count);
+                            }
+                        }
+                        let mut buf = Vec::with_capacity(16 + resp.records.len() * 600);
+                        buf.push(MSG_BLOCK_RESP);
+                        buf.extend_from_slice(&crate::block_sync::encode_response(&resp));
+                        let _ = transport.send(&msg.from, &buf);
+                    }
+                }
+                MSG_BLOCK_RESP => {
+                    if let Some(resp) = crate::block_sync::decode_response(&msg.bytes[1..]) {
+                        // The server's retention floor: if the height
+                        // we need is below it, this gap is beyond
+                        // block sync's window — certified state sync
+                        // is the designed recovery, and the log must
+                        // say so once instead of retrying forever.
+                        let need = engine.committed_anchor().map_or(0, |(_, h)| h.value() + 1);
+                        if resp.floor != u64::MAX && resp.floor > need && !sync_below_floor_logged {
+                            eprintln!(
+                                "{log_tag}: sync gap starts at height {need} but peer's \
+                                 certified store floor is {} — the missing prefix is \
+                                 below the retention window; certified state sync \
+                                 (snapshot) is the recovery path for gaps this deep",
+                                resp.floor
+                            );
+                            sync_below_floor_logged = true;
+                        }
+                        for record in resp.records {
+                            let h = record.header.height.value();
+                            // The apply gate is the verified
+                            // frontier — committed tip + staged run —
+                            // so a record contiguous with the staged
+                            // tail stages immediately instead of
+                            // bouncing through `sync_pending` while
+                            // its seal is still in flight.
+                            let next = engine.sync_frontier();
+                            if h < next {
+                                continue; // already committed — retries are normal
+                            }
+                            if h == next {
+                                match engine.apply_certified_block(&record) {
+                                    // Whether this record committed
+                                    // (`true`) or staged awaiting its
+                                    // seal (`false`), the verified
+                                    // frontier may have advanced —
+                                    // the next buffered record is now
+                                    // appliable, so the drain must run
+                                    // either way. Skipping it on a
+                                    // staged record would strand the
+                                    // seal itself inside the buffer.
+                                    Ok(_) => drain_sync_buffer(engine, &mut sync_pending, log_tag),
+                                    // Lane saturated: the record was
+                                    // verified — re-buffer it at its
+                                    // height so the drain retries when
+                                    // the next apply frees the lane.
+                                    Err(consensus::ConsensusError::SyncDeferred { .. }) => {
+                                        sync_pending.insert(h, record);
+                                    }
+                                    // Different epoch: the record is
+                                    // not *invalid* — it is signed by
+                                    // a committee we no longer hold.
+                                    // Per-block sync cannot bridge a
+                                    // rotation; the certified-snapshot
+                                    // path (weak subjectivity) is the
+                                    // designed recovery. Log once via
+                                    // the same latch as the floor case.
+                                    Err(e @ consensus::ConsensusError::SyncEpoch { .. }) => {
+                                        if !sync_below_floor_logged {
+                                            eprintln!(
+                                                "{log_tag}: certified block {h} crosses an \
+                                                 epoch boundary this node cannot verify \
+                                                 locally ({e}) — certified state sync is \
+                                                 the recovery path"
+                                            );
+                                            sync_below_floor_logged = true;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("{log_tag}: certified block {h} rejected: {e}");
+                                    }
+                                }
+                            } else if sync_pending.len() < SYNC_PENDING_CAP {
+                                // Out-of-order: a by-hash fetch (or an
+                                // interleaved page) landed above the
+                                // gap. Buffer it AND aim the range
+                                // fetcher at the hole — without the
+                                // target update the periodic re-request
+                                // never fires and the record sits
+                                // buffered forever.
+                                sync_target = sync_target.max(h);
+                                sync_pending.insert(h, record);
+                            }
+                        }
+                        // The notarized tail: a `ByHash` fetch that
+                        // resolved to the live tip returns the bare
+                        // proposal. `admit_proposal` runs the full
+                        // authentication (proposer sig + body
+                        // commitment); a stored body is all the commit
+                        // walk needs, and if its view is current the
+                        // pending queue votes on it next iteration.
+                        if let Some((tail_header, tail_proposal)) = resp.tail
+                            && engine.admit_proposal(&tail_header, &tail_proposal)
+                        {
+                            // The tail carries an authenticated leader
+                            // height — the same gap signal the direct
+                            // proposal arm uses. Without it, a lagging
+                            // node that only ever sees QC gossip (a
+                            // fleet mid-timeout-churn proposes nothing
+                            // new) learns the uncommitted tip but never
+                            // aims the range fetcher at the committed
+                            // hole beneath it.
+                            let need = engine.sync_frontier();
+                            if tail_header.height.value() > need {
+                                sync_target = sync_target.max(tail_header.height.value());
+                            }
+                            pending_proposals.push((tail_header, tail_proposal));
                         }
                     }
                 }
@@ -1184,6 +1434,45 @@ fn run_consensus_loop(
             rpc.record_exec_certificates(engine.exec_certificates());
         }
 
+        // Feed the certified serve store: every committed height —
+        // committed locally or imported via sync — emits one
+        // CertifiedBlock through `take_certified`. Journaling here is
+        // what lets a restarted node keep serving pre-crash history.
+        for record in engine.take_certified() {
+            sync_store.insert(record);
+        }
+
+        // Periodic catch-up re-request: a dropped response or a peer
+        // that had nothing yet must not stall sync until the next
+        // proposal happens to reveal the gap. Round-robin across the
+        // committee so a lagging node doesn't pin one peer. The fetch
+        // origin is the verified frontier: heights already staged
+        // under the seal rule are verified work — re-requesting them
+        // only re-pays the crypto.
+        let frontier = engine.sync_frontier();
+        if sync_target >= frontier && sync_last_req.is_none_or(|t| t.elapsed() >= SYNC_REQ_RETRY) {
+            let addrs = engine.validator_set().validator_addresses();
+            if !addrs.is_empty() {
+                for _ in 0..addrs.len() {
+                    let addr = addrs[sync_peer_cursor % addrs.len()];
+                    sync_peer_cursor = sync_peer_cursor.wrapping_add(1);
+                    if addr != our_addr {
+                        let mut buf = Vec::with_capacity(16);
+                        buf.push(MSG_BLOCK_REQ);
+                        buf.extend_from_slice(&crate::block_sync::encode_request(
+                            &crate::block_sync::FetchRequest::ByRange {
+                                from: frontier,
+                                count: crate::block_sync::SYNC_PAGE_CAP,
+                            },
+                        ));
+                        let _ = transport.send(&addr.0.to_vec(), &buf);
+                        sync_last_req = Some(std::time::Instant::now());
+                        break;
+                    }
+                }
+            }
+        }
+
         // Compact proposal bookkeeping (keep last
         // PROPOSAL_PAST_VIEWS views — the same bound the intake
         // gate applies, so a set entry and its pending slot age
@@ -1277,5 +1566,39 @@ fn run_consensus_loop(
         // the sleep is never reached. The sleep only fires when the
         // transport is idle (waiting for the next network round).
         std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Apply buffered certified records while they sit at the verified
+/// frontier — the drain half of the sync buffer.
+///
+/// `apply_certified_block` is the verification authority: a buffered
+/// record that fails is dropped (and logged), after which the buffer
+/// stops — the remaining entries are above the new gap and stay
+/// buffered until a valid record for it arrives. `SyncDeferred`
+/// re-queues the record and stops: the execution lane is saturated,
+/// not the record invalid, so retrying later is correct. The
+/// frontier (committed tip + staged run) is the drain point: an
+/// interior record that stages but doesn't seal leaves the frontier
+/// advanced anyway, so the next buffered record applies immediately
+/// rather than waiting for the seal to land first.
+fn drain_sync_buffer(
+    engine: &mut consensus::OxideBft,
+    pending: &mut std::collections::BTreeMap<u64, types::CertifiedBlock>,
+    log_tag: &str,
+) {
+    loop {
+        let next = engine.sync_frontier();
+        let Some(record) = pending.remove(&next) else { break };
+        match engine.apply_certified_block(&record) {
+            Ok(_) => {}
+            Err(consensus::ConsensusError::SyncDeferred { .. }) => {
+                pending.insert(next, record);
+                break;
+            }
+            Err(e) => {
+                eprintln!("{log_tag}: buffered certified block {next} rejected: {e}");
+            }
+        }
     }
 }

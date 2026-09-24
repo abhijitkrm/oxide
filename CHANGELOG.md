@@ -91,6 +91,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Two transport bugs that black-holed a restarted validator's
+  traffic** (`p2p`, `tls` feature): first, `TlsReadHalf` treated a
+  partial `read_tls` consume — normal rustls deframer backpressure
+  when a big ciphertext read arrives behind an incomplete-record
+  tail — as a fatal desync and killed the reader thread; a
+  restarted peer's batched backlog triggered exactly this pattern,
+  leaving sockets ESTABLISHED while every inbound frame silently
+  vanished. The read loop now drains the deframer and re-offers
+  the remainder. Second, a dying connection's teardown removed the
+  peer's send-slot unconditionally — evicting a *newer*
+  replacement connection's writer that installed meanwhile, so
+  `send` reported `UnknownPeer` forever on a healthy socket. Map
+  entries are now tagged per connection and a teardown only
+  removes a slot that still belongs to it.
+  - **In plain words:** when a validator restarted and reconnected,
+    it could end up fully connected yet receive nothing and be sent
+    nothing — looking alive but deaf. Both root causes are fixed,
+    and restart recovery now works over the real network path.
+
 - **A fleet whose first leader never boots no longer livelocks**
   (`consensus`, `node`): the networked pump required an existing
   `high_qc` before a leader would propose — but with the view-0
@@ -183,6 +202,32 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     vote to skip the dead turn and keep going, as designed.
 
 ### Added
+
+- **Certified block sync — a behind validator catches up
+  cryptographically.** `types::CertifiedBlock` carries each
+  committed block with its Jolteon two-chain proof (body,
+  certifying child header, QC on the child); every commit emits
+  one, and `node::block_sync::SyncStore` journals them so peers
+  can serve what they finalized — including across restarts. The
+  pump fetches by hash or height range (`MSG_BLOCK_REQ` /
+  `MSG_BLOCK_RESP`) when an authenticated proposal, an unknown
+  QC, or a periodic retry reveals a gap, and
+  `OxideBft::apply_certified_block` re-verifies every record
+  locally — anchor, pair, body, proposer, both QCs — then commits
+  the contiguous prefix through the newest consecutive-view seal,
+  the same commit-by-descent rule live consensus uses. A response
+  can also carry the notarized-but-uncommitted tip so the node can
+  vote on the next round. Gaps below a peer's retention floor (or
+  a foreign-epoch record) log that certified state sync is the
+  designed recovery. Proven end to end on the production binary:
+  `validator_fleet_converges_and_recovers` stops member 3, lets
+  the quorum advance, restarts it, and asserts it reaches the
+  fleet tip and resumes finalizing.
+  - **In plain words:** a validator that was offline — rebooted,
+      partitioned, or just late — used to be stuck forever at the
+      last block it saw. Now it asks its peers for the missed
+      blocks, checks each one's cryptographic proof itself rather
+      than trusting them, and rejoins the live chain on its own.
 
 - **`crypto/dev-identities` feature — derivable test keys leave
   production builds.** `secp::test_identity_key` /

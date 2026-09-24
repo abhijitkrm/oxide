@@ -399,10 +399,21 @@ impl OxideBft {
             if header.prev_block != our_high_qc.block_hash() {
                 return false;
             }
-            let Some((parent_header, _)) = self.blocks.get(&header.prev_block) else {
-                return false;
-            };
-            header.height == parent_header.height.saturating_next()
+            // Parent resolution: in-flight blocks live in `blocks`;
+            // a block synced in via `apply_certified_block` goes
+            // straight to the committed prefix and is only reachable
+            // through `last_committed`. Without the anchor arm a
+            // proposal extending a freshly synced tip is unvotable —
+            // the synced node would catch up but never rejoin.
+            if let Some((parent_header, _)) = self.blocks.get(&header.prev_block) {
+                return header.height == parent_header.height.saturating_next();
+            }
+            match self.last_committed {
+                Some((anchor_hash, anchor_height)) if anchor_hash == header.prev_block => {
+                    header.height == anchor_height.saturating_next()
+                }
+                _ => false,
+            }
         } else {
             match self.last_committed {
                 Some((anchor_hash, anchor_height)) => {

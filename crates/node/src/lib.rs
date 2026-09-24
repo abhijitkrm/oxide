@@ -55,6 +55,7 @@ use ports::{AppInterface, ConsensusEngine};
 use primitives::Address;
 use primitives::fixed::{Price, Qty};
 
+pub mod block_sync;
 pub mod cli;
 pub mod devnet;
 pub mod peer_auth;

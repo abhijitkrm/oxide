@@ -50,7 +50,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -309,27 +309,47 @@ impl PeerStream for TlsReadHalf {
             };
             // Feed rustls under the µs lock, then loop back to drain
             // whatever plaintext the records produced.
+            //
+            // `read_tls` may consume FEWER than `n` bytes: the
+            // deframer's internal buffer only has so much free space
+            // when an incomplete-record tail is still buffered, and a
+            // full `scratch` read after a burst (peer's batched write)
+            // overflows it. A partial consume is backpressure, not
+            // desync — `process_new_packets` drains complete records
+            // out of the deframer, then we offer the remainder again.
+            // Treating partial consume as fatal used to kill the
+            // reader thread on exactly the pattern a reconnecting peer
+            // produces (its backlog arrives as one large ciphertext
+            // blob) — the connection stayed TCP-open while every
+            // inbound frame silently black-holed.
             let mut conn = primitives::sync::lock_state(&self.conn);
-            let used = conn.read_tls(&mut &self.scratch[..n])?;
-            if used != n {
-                // rustls's deframer consumes all offered bytes; a
-                // partial consume would silently desync the stream,
-                // so fail loudly rather than drop ciphertext.
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "rustls declined ciphertext bytes",
-                ));
+            let mut off = 0usize;
+            let mut peer_closed = false;
+            while off < n {
+                let used = conn.read_tls(&mut &self.scratch[off..n])?;
+                off += used;
+                let io_state = conn
+                    .process_new_packets()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                peer_closed |= io_state.peer_has_closed();
+                if used == 0 && off < n {
+                    // The deframer took nothing and processing freed
+                    // no space — the buffered prefix must be one
+                    // incomplete record too large for the buffer.
+                    // Spinning would never progress; this is the only
+                    // honest desync signal left.
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "rustls deframer made no progress on offered ciphertext",
+                    ));
+                }
             }
-            let io_state = conn
-                .process_new_packets()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             // Inbound records can queue TLS-internal responses —
             // `KeyUpdate` replies, the `close_notify` echo.
             // `StreamOwned` flushed these inside `complete_io`; the
             // split halves only flush under `wire`+`conn`, so a
             // read-mostly peer must drain them here or the peer's
             // bookkeeping stalls.
-            let peer_closed = io_state.peer_has_closed();
             if peer_closed {
                 conn.send_close_notify();
             }
@@ -914,6 +934,52 @@ struct OutboundSlot {
     tx: mpsc::SyncSender<Vec<u8>>,
     /// Payload bytes currently queued for this peer.
     queued: Arc<AtomicUsize>,
+    /// Identity of the connection this slot belongs to. Two
+    /// connections to the same peer can be alive at once (an
+    /// inbound accept plus an outbound dial, or a reconnect that
+    /// raced the old socket's teardown); the id lets a dying
+    /// connection remove ONLY its own slot — an unconditional
+    /// `streams.remove(peer)` would evict the newer live
+    /// connection's writer and silently black-hole every send
+    /// afterward (`send` → `UnknownPeer` while a healthy socket
+    /// is still open).
+    conn_id: u64,
+}
+
+/// Monotonic source of `OutboundSlot::conn_id` values — global, so
+/// an id is unique across every connection this process ever
+/// installs. No ordering semantics are consumed; uniqueness is the
+/// only requirement.
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Remove a peer's outbound/shutdown map entries only when they
+/// still belong to `conn_id`. Every connection teardown path goes
+/// through here: the dying connection's reader exit must not evict
+/// the slot a *newer* connection to the same peer already
+/// installed — that was the reconnect black-hole: the old socket's
+/// cleanup deleted the fresh writer, and `send()` reported
+/// `UnknownPeer`/`ChannelClosed` for the rest of the process.
+fn remove_slot_if_current(
+    streams: &Mutex<HashMap<PeerId, OutboundSlot>>,
+    shutdown_streams: &Mutex<HashMap<PeerId, (u64, TcpStream)>>,
+    pid: &PeerId,
+    conn_id: u64,
+) {
+    // Dropping the slot drops `tx`; the writer thread exits on
+    // `Disconnected` — the dead connection's writer is reaped here,
+    // not left to linger until some later install overwrites it.
+    // The guard is held across check+remove: a same-peer install
+    // landing between the two would otherwise be evicted by the
+    // stale teardown this exists to prevent.
+    let mut streams_guard = primitives::sync::lock_state(streams);
+    if streams_guard.get(pid).is_some_and(|slot| slot.conn_id == conn_id) {
+        streams_guard.remove(pid);
+    }
+    drop(streams_guard);
+    let mut shutdown_guard = primitives::sync::lock_state(shutdown_streams);
+    if shutdown_guard.get(pid).is_some_and(|(id, _)| *id == conn_id) {
+        shutdown_guard.remove(pid);
+    }
 }
 
 /// Atomically reserve `len` bytes against `budget` on a shared
@@ -1046,8 +1112,10 @@ pub struct TcpTransport {
     ///
     /// Also used for duplicate-connection handling: when a new
     /// connection from an existing peer arrives, the old stream is
-    /// shut down, forcing the old reader thread to exit.
-    shutdown_streams: Arc<Mutex<HashMap<PeerId, TcpStream>>>,
+    /// shut down, forcing the old reader thread to exit. Each entry
+    /// carries the installing connection's id so a stale teardown
+    /// removes only its own socket (see `remove_slot_if_current`).
+    shutdown_streams: Arc<Mutex<HashMap<PeerId, (u64, TcpStream)>>>,
 }
 
 impl TcpTransport {
@@ -1240,7 +1308,7 @@ impl TcpTransport {
 
         let streams: Arc<Mutex<HashMap<PeerId, OutboundSlot>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let shutdown_streams: Arc<Mutex<HashMap<PeerId, TcpStream>>> =
+        let shutdown_streams: Arc<Mutex<HashMap<PeerId, (u64, TcpStream)>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound_rx) = mpsc::sync_channel::<InboundMessage>(INBOUND_CHANNEL_BOUND);
         let inbound_queued = Arc::new(AtomicUsize::new(0));
@@ -1499,7 +1567,8 @@ impl TcpTransport {
                                 let write_stream = Box::new(write_half) as Box<dyn PeerStream>;
                                 // Install and own the connection until
                                 // it dies — the admission admit/release
-                                // pair and reader loop live inside.
+                                // pair, conditional slot teardown and
+                                // reader loop live inside.
                                 install_connected_peer(
                                     &ctx,
                                     pid.clone(),
@@ -1507,11 +1576,7 @@ impl TcpTransport {
                                     write_stream,
                                     shutdown_stream,
                                 );
-                                // Connection over — remove the stale
-                                // writer channel and shutdown stream,
-                                // then retry.
-                                primitives::sync::lock_state(&ctx.streams).remove(&pid);
-                                primitives::sync::lock_state(&ctx.shutdown_streams).remove(&pid);
+                                // Connection over — retry after backoff.
                                 thread::sleep(Duration::from_millis(500));
                                 continue;
                             }
@@ -1553,8 +1618,8 @@ impl TcpTransport {
                         let write_stream = Box::new(write_raw) as Box<dyn PeerStream>;
                         let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
                         // Install and own the connection until it dies —
-                        // the admission admit/release pair and reader
-                        // loop live inside.
+                        // the admission admit/release pair, conditional
+                        // slot teardown and reader loop live inside.
                         install_connected_peer(
                             &ctx,
                             pid.clone(),
@@ -1562,10 +1627,7 @@ impl TcpTransport {
                             write_stream,
                             shutdown_stream,
                         );
-                        // Connection over — remove the stale writer
-                        // channel and shutdown stream, then retry.
-                        primitives::sync::lock_state(&ctx.streams).remove(&pid);
-                        primitives::sync::lock_state(&ctx.shutdown_streams).remove(&pid);
+                        // Connection over — retry after backoff.
                         thread::sleep(Duration::from_millis(500));
                     }
                 });
@@ -1616,7 +1678,7 @@ impl TcpTransport {
         // of waiting up to `read_timeout` seconds), and writer threads
         // to get an immediate error on their next `write` call.
         let streams = primitives::sync::lock_state(&self.shutdown_streams);
-        for stream in streams.values() {
+        for (_, stream) in streams.values() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
         drop(streams); // release the lock before clearing the senders
@@ -1781,8 +1843,9 @@ struct ConnectCtx {
     max_inbound_queue_bytes: usize,
     /// Live outbound slots keyed by peer id.
     streams: Arc<Mutex<HashMap<PeerId, OutboundSlot>>>,
-    /// Raw sockets kept for forced-close on shutdown.
-    shutdown_streams: Arc<Mutex<HashMap<PeerId, TcpStream>>>,
+    /// Raw sockets kept for forced-close on shutdown, tagged with
+    /// the installing connection's id (see `remove_slot_if_current`).
+    shutdown_streams: Arc<Mutex<HashMap<PeerId, (u64, TcpStream)>>>,
     /// Shared inbound queue every reader loop feeds.
     tx: mpsc::SyncSender<InboundMessage>,
     /// Aggregate queued inbound payload bytes.
@@ -1826,11 +1889,12 @@ fn install_connected_peer(
         return;
     }
     // Duplicate handling: see accept path.
+    let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
     if let Some(shutdown_stream) = shutdown_stream {
         let _ = primitives::sync::lock_state(&ctx.shutdown_streams)
-            .insert(pid.clone(), shutdown_stream);
+            .insert(pid.clone(), (conn_id, shutdown_stream));
     }
-    let slot = spawn_writer(write_stream, &ctx.shutdown, &pid);
+    let slot = spawn_writer(write_stream, &ctx.shutdown, &pid, conn_id);
     primitives::sync::lock_state(&ctx.streams).insert(pid.clone(), slot);
     reader_loop(
         reader_stream,
@@ -1841,9 +1905,16 @@ fn install_connected_peer(
         ctx.max_inbound_queue_bytes,
         ctx.shutdown.clone(),
     );
-    // Reader exited — the connection is dead; pair the admit. This
-    // is the only release site for outbound connections, so the
-    // counter can't drift regardless of how the connection ended.
+    // Reader exited — the connection is dead. Remove the map
+    // entries ONLY if they still belong to this connection: a
+    // newer same-peer connection may have installed its slot while
+    // this one was open, and an unconditional remove would evict
+    // the live writer (`send` would report `UnknownPeer` with a
+    // healthy socket still open — the reconnect black-hole).
+    remove_slot_if_current(&ctx.streams, &ctx.shutdown_streams, &pid, conn_id);
+    // Pair the admit. This is the only release site for outbound
+    // connections, so the counter can't drift regardless of how the
+    // connection ended.
     if let Some(ref ac) = ctx.admission {
         ac.release_connection();
     }
@@ -2160,7 +2231,9 @@ fn reader_loop(
                 // read half's blocking poll runs on the socket with
                 // no conn lock held, so writers are never starved.
             }
-            Err(_) => return, // connection closed or error
+            Err(_) => {
+                return; // connection closed or error
+            }
         }
     }
 }
@@ -2252,6 +2325,7 @@ fn spawn_writer(
     write_stream: Box<dyn PeerStream>,
     shutdown: &Arc<AtomicBool>,
     pid: &PeerId,
+    conn_id: u64,
 ) -> OutboundSlot {
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(OUTBOUND_CHANNEL_BOUND);
     // The byte counter is shared between `send()` (reserves) and
@@ -2266,7 +2340,7 @@ fn spawn_writer(
     let _ = primitives::supervision::spawn_supervised(&actor, false, move || {
         writer_loop(write_stream, rx, writer_queued, shutdown);
     });
-    OutboundSlot { tx, queued }
+    OutboundSlot { tx, queued, conn_id }
 }
 
 /// The result of accepting a connection: the peer's ID, a write
@@ -2289,8 +2363,9 @@ struct PendingAccept {
 struct AcceptShared {
     /// Live outbound slots keyed by peer id.
     streams: Arc<Mutex<HashMap<PeerId, OutboundSlot>>>,
-    /// Raw sockets kept for forced-close on shutdown.
-    shutdown_streams: Arc<Mutex<HashMap<PeerId, TcpStream>>>,
+    /// Raw sockets kept for forced-close on shutdown, tagged with
+    /// the installing connection's id (see `remove_slot_if_current`).
+    shutdown_streams: Arc<Mutex<HashMap<PeerId, (u64, TcpStream)>>>,
     /// Shared inbound queue every reader loop feeds.
     inbound_tx: mpsc::SyncSender<InboundMessage>,
     /// Aggregate queued inbound payload bytes.
@@ -2387,11 +2462,12 @@ fn complete_accept(pending: PendingAccept, shared: &AcceptShared) {
     // shutting it down would kill the peer's new connection. The
     // old reader thread exits when its read timeout expires or the
     // peer closes the connection.
+    let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
     if let Some(shutdown_stream) = shutdown_stream {
         let _ = primitives::sync::lock_state(&shared.shutdown_streams)
-            .insert(peer_id.clone(), shutdown_stream);
+            .insert(peer_id.clone(), (conn_id, shutdown_stream));
     }
-    let slot = spawn_writer(write_stream, &shared.shutdown, &peer_id);
+    let slot = spawn_writer(write_stream, &shared.shutdown, &peer_id, conn_id);
     primitives::sync::lock_state(&shared.streams).insert(peer_id.clone(), slot);
 
     // Spawn a reader thread for this connection. Supervised,
@@ -2403,7 +2479,10 @@ fn complete_accept(pending: PendingAccept, shared: &AcceptShared) {
     // life: `admit_connection` ran above, and `release_connection`
     // runs when the loop exits (EOF, error, or shutdown). Without
     // the release here, reconnect churn would leak slots until the
-    // cap rejected every new inbound peer.
+    // cap rejected every new inbound peer. The reader's exit also
+    // removes its own map slots — a dead inbound connection must
+    // not leave `send()` pointed at a closed channel (`ChannelClosed`
+    // forever) nor evict a newer same-peer connection's slot.
     let actor = format!("p2p-reader-{}", peer_tag(&peer_id));
     let tx = shared.inbound_tx.clone();
     let queued = shared.inbound_queued.clone();
@@ -2411,9 +2490,12 @@ fn complete_accept(pending: PendingAccept, shared: &AcceptShared) {
     let reader_admission = shared.admission.clone();
     let max_message_bytes = shared.max_message_bytes;
     let max_inbound_queue_bytes = shared.max_inbound_queue_bytes;
-    // Cloned for the spawn-failure cleanup below — `peer_id` itself
-    // moves into the reader closure.
+    // Cloned for the closure's exit cleanup AND the spawn-failure
+    // cleanup below — `peer_id` itself moves into the reader call.
     let cleanup_key = peer_id.clone();
+    let fail_key = peer_id.clone();
+    let cleanup_streams = shared.streams.clone();
+    let cleanup_shutdown = shared.shutdown_streams.clone();
     let spawned = primitives::supervision::spawn_supervised(&actor, false, move || {
         reader_loop(
             reader_stream,
@@ -2424,6 +2506,7 @@ fn complete_accept(pending: PendingAccept, shared: &AcceptShared) {
             max_inbound_queue_bytes,
             reader_shutdown,
         );
+        remove_slot_if_current(&cleanup_streams, &cleanup_shutdown, &cleanup_key, conn_id);
         if let Some(ref ac) = reader_admission {
             ac.release_connection();
         }
@@ -2432,8 +2515,7 @@ fn complete_accept(pending: PendingAccept, shared: &AcceptShared) {
         // Thread spawn failed — the reader will never run, so the
         // admission slot and map entries would leak. Undo the
         // install; the peer's dialer retries.
-        primitives::sync::lock_state(&shared.streams).remove(&cleanup_key);
-        primitives::sync::lock_state(&shared.shutdown_streams).remove(&cleanup_key);
+        remove_slot_if_current(&shared.streams, &shared.shutdown_streams, &fail_key, conn_id);
         if let Some(ref ac) = shared.admission {
             ac.release_connection();
         }
@@ -3774,7 +3856,7 @@ mod tests {
         let written = Arc::new(Mutex::new(Vec::new()));
         let stream = BlockingWriter { release: release.clone(), written: written.clone() };
         let shutdown = Arc::new(AtomicBool::new(false));
-        let slot = spawn_writer(Box::new(stream), &shutdown, &vec![7u8]);
+        let slot = spawn_writer(Box::new(stream), &shutdown, &vec![7u8], 1);
 
         let budget = 150;
         // Queue a 100-byte frame: reserve, then enqueue.
@@ -4055,6 +4137,47 @@ mod tests {
         let msg = poll_recv(&mut ta, Duration::from_secs(5)).expect("A receives reconnect");
         assert_eq!(msg.from, id_b);
         assert_eq!(msg.bytes, b"reconnect");
+    }
+
+    /// Regression test for the reconnect black-hole: a dead
+    /// connection's teardown must remove ONLY its own map slots.
+    /// Before `conn_id` tagging, the old reader's unconditional
+    /// `streams.remove(peer)` evicted a *newer* live connection's
+    /// writer — every `send` then reported `UnknownPeer` while a
+    /// healthy socket stayed open.
+    #[test]
+    fn remove_slot_if_current_never_evicts_a_replacement() {
+        use std::collections::HashMap;
+        let streams: Mutex<HashMap<PeerId, OutboundSlot>> = Mutex::new(HashMap::new());
+        let shutdown_streams: Mutex<HashMap<PeerId, (u64, TcpStream)>> = Mutex::new(HashMap::new());
+        let pid: PeerId = vec![7u8];
+
+        // Slot for connection 2 (the live replacement): a bare
+        // channel suffices — the teardown logic only inspects
+        // `conn_id`, never the sender.
+        let (tx, _rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        primitives::sync::lock_state(&streams).insert(
+            pid.clone(),
+            OutboundSlot { tx, queued: Arc::new(AtomicUsize::new(0)), conn_id: 2 },
+        );
+
+        // Connection 1's reader exits late — after conn 2 already
+        // installed. Its conditional teardown sees the slot belongs
+        // to conn 2 and must leave it alone.
+        remove_slot_if_current(&streams, &shutdown_streams, &pid, 1);
+        assert!(
+            primitives::sync::lock_state(&streams).contains_key(&pid),
+            "a stale teardown must not evict the live connection's slot"
+        );
+
+        // And when conn 2's own reader exits, its id matches — the
+        // slot IS removed, so `send` fails closed instead of writing
+        // into a dead channel (`ChannelClosed` forever).
+        remove_slot_if_current(&streams, &shutdown_streams, &pid, 2);
+        assert!(
+            primitives::sync::lock_state(&streams).get(&pid).is_none(),
+            "the owning connection's teardown must remove its slot"
+        );
     }
 
     /// A proof from one session verifies against exactly one
