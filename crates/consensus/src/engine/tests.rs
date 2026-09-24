@@ -499,6 +499,128 @@ fn exec_saturation_defers_commits_without_stalling() {
     );
 }
 
+/// Leader reputation: a validator absent from every committed QC in
+/// the reputation window loses its schedule turns — `effective_leader`
+/// walks the cycle past it — so a crashed member stops costing a view
+/// timeout per rotation. The window holds only committed-QC signer
+/// bitmaps: deterministic for every replica that finalized the same
+/// prefix.
+#[test]
+fn absent_validator_loses_leader_turns() {
+    let mut leader = make_multi_engine(0);
+    let mut f1 = make_multi_engine(1);
+    let mut f2 = make_multi_engine(2);
+    // Validator 3 is in the set but never signs — a crashed member.
+    // Every QC's bitmap is 0b0111.
+
+    // Reputation window = 2 * cycle_len = 8 committed heights (n = 4,
+    // equal stake → one rotation is 4 views). Each round commits the
+    // block two views back, so 10 rounds fill the window. A tx per
+    // round keeps `propose` producing (the idle gate stays silent
+    // when there is no work).
+    for i in 0..10u8 {
+        drive_round(&mut leader, &mut [&mut f1, &mut f2], Some(TxBytes::new(vec![i])));
+    }
+    assert_eq!(leader.recent_signers.len(), 8, "the window must cap at two schedule rotations");
+
+    let excluded = leader.excluded_leaders();
+    assert!(excluded[3], "a validator that signed nothing must be excluded");
+    assert!(!excluded[..3].iter().any(|e| *e), "participating validators must stay eligible");
+
+    // Raw schedule: view % 4 — validator 3 owns views 3, 7, 11….
+    // Excluded, its slots fall to the next eligible member (0).
+    for v in [3u64, 7, 11, 15] {
+        assert_eq!(
+            leader.effective_leader(View::new(v)),
+            0,
+            "v{v}: an excluded validator's slot must pass to the next eligible member"
+        );
+    }
+    // Untouched views keep their raw leader.
+    for v in [0u64, 1, 2, 4, 5, 6] {
+        assert_eq!(
+            leader.effective_leader(View::new(v)),
+            u16::try_from(v % 4).unwrap(),
+            "v{v}: a healthy member's slot is unchanged"
+        );
+    }
+
+    // And the replacement actually leads: at the next skipped view
+    // (11 ≡ raw slot 3) the effective leader's engine is the
+    // proposer, its stamped hash is accepted by a follower's
+    // authentication, and the proposal votes.
+    leader.current_view = View::new(11);
+    f1.current_view = View::new(11);
+    assert!(leader.is_leader(), "the replacement member must know it leads");
+    let (header, proposal) = leader.propose().expect("replacement leader proposes");
+    assert_eq!(header.proposer, proposer_hash(0));
+    assert!(
+        f1.vote(&header, &proposal).is_some(),
+        "followers must accept the replacement leader's proposal"
+    );
+}
+
+/// The exclusion bound must hold even under inputs a real chain
+/// can't produce: a window where only a below-quorum subset signed
+/// must not exclude so many members that no quorum remains.
+#[test]
+fn reputation_exclusion_never_strands_quorum() {
+    let mut engine = make_multi_engine(0);
+    // Window full, signed only by validators 0 and 1 — fabricated:
+    // a real QC needs quorum (3 of 4), so this can't arise from
+    // commits, but the guard must hold regardless.
+    let window = 2 * engine.validator_set.leader_cycle_len();
+    for _ in 0..window {
+        engine.recent_signers.push_back(vec![0b0011]);
+    }
+    let excluded = engine.excluded_leaders();
+    // Excluding index 2 leaves eligible stake 3 — exactly quorum —
+    // so it goes. Excluding index 3 next would drop to 2 < 3:
+    // the bound stops there.
+    assert!(excluded[2]);
+    assert!(!excluded[3], "exclusion must stop before the eligible set drops below quorum");
+}
+
+/// Reputation must survive restart: the window is committed state
+/// carried in the WAL, so a recovered engine computes the same
+/// exclusions its peers do — not a divergent schedule while the
+/// window "refills".
+#[test]
+fn reputation_window_survives_restart() {
+    use crate::wal::Wal;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let wal_path = dir.path().join("consensus.wal");
+
+    {
+        let app = Arc::new(MockApp::new());
+        let wal = Wal::open(&wal_path).expect("open WAL");
+        let mut engine =
+            OxideBft::new(app, four_validator_set()).without_signature_verification().with_wal(wal);
+        // One full rotation of committed bitmaps missing validator 3.
+        for _ in 0..4 {
+            engine.recent_signers.push_back(vec![0b0111]);
+        }
+        engine.append_wal().expect("WAL append must succeed");
+        assert!(engine.excluded_leaders()[3]);
+    }
+
+    {
+        let app = Arc::new(MockApp::new());
+        let wal = Wal::open(&wal_path).expect("open WAL");
+        let mut engine =
+            OxideBft::new(app, four_validator_set()).without_signature_verification().with_wal(wal);
+        engine.recover_from_wal().expect("recover from WAL");
+        assert_eq!(
+            engine.recent_signers.len(),
+            4,
+            "the committed-participation window must be restored"
+        );
+        assert!(engine.excluded_leaders()[3], "post-restart exclusions must match pre-crash");
+    }
+}
+
 /// Regression test (safety): a validator that voted for block A
 /// at height h must refuse a *different* block B at the same
 /// height, even in a later view. Without the per-height lock,

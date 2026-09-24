@@ -106,6 +106,23 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     Reads and writes now share only nanosecond-scale crypto locks;
     peer writes are as fast as the socket allows.
 
+- **A crashed validator stops collecting leader turns**
+  (`consensus`): the leader schedule now runs through a reputation
+  window — a validator absent from the last `2 × schedule-rotation`
+  committed QC signer sets is skipped at proposal time instead of
+  each of its slots burning a full view timeout (previously ~25% of
+  views cost ≥ 2 s with one crash in n = 4). Two guards bound the
+  rule: no exclusions until the window covers a full rotation, and
+  exclusion never reduces the eligible set's stake below quorum.
+  Exclusion only costs leader turns — a rejoining validator re-enters
+  the window by voting, so recovery needs no protocol. The window is
+  WAL-persisted and cleared at epoch rotation, keeping the input
+  identical on every replica including after restart.
+  - **In plain words:** a dead validator used to waste everyone's
+    time on every rotation — its turn came up, timed out, repeat.
+    Now the others quietly take its turns until it shows up again,
+    and it earns them back by voting.
+
 - **View changes now recover over real TCP** (`oxide-devnet`): a
   wire-framing bug in the timeout decoder read both certificate
   flags before the certificate bytes, so every peer timeout

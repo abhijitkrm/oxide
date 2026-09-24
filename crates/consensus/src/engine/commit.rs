@@ -242,6 +242,16 @@ impl OxideBft {
         // `append_wal_full(true)` at the boundary serializes live
         // state.
         self.last_committed = Some((block_hash, header.height));
+        // Leader-reputation window: this block's certifying-QC
+        // bitmap is one committed-height sample of who participated.
+        // Push before the deferred WAL append so the snapshot carries
+        // it — the window is committed history, identical on every
+        // replica that finalized the same prefix, and the restart
+        // path must see the same exclusions it had pre-crash.
+        self.recent_signers.push_back(signer_bitmap.to_vec());
+        while self.recent_signers.len() > self.leader_rep_window() {
+            self.recent_signers.pop_front();
+        }
         // A failed append latches `wal_failed` (C10): the commit is
         // already real in memory and cannot be undone, but signing
         // must stop — durable state may now trail emitted signatures.

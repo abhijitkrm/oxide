@@ -263,7 +263,13 @@ impl OxideBft {
         //      proposal).
         // In conformance mode, both checks are skipped.
         if self.verify_signatures {
-            let expected_leader = self.validator_set.leader(header.view);
+            // Reputation-aware expectation: the schedule skips
+            // validators that signed nothing in the committed
+            // window, so the honest leader here is the *effective*
+            // one — a proposal from the raw (possibly excluded)
+            // schedule position is as forged as any other wrong
+            // proposer.
+            let expected_leader = self.effective_leader(header.view);
             let expected_proposer = proposer_hash(expected_leader);
             if header.proposer != expected_proposer {
                 return None;

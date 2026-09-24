@@ -20910,3 +20910,59 @@ Measured on `snapshot_vs_exec` (the lane-installed production
 shape): no statistically significant delta vs the old channel
 (717 µs → 733 µs on the 10k-account row, p = 0.48) — the win is
 liveness, not latency.
+
+### Leader reputation — crashed validators lose their slots
+
+`docs/audit002.md` M1: a crashed validator's leader slots each cost a
+full view timeout on every schedule cycle, because the pacemaker's
+backoff resets on the next progress. With one crash in n = 4 a
+quarter of all views burned ≥ 2 s (default) or ≥ 5 s (mainnet).
+
+The fix is a deterministic reputation window, Aptos/Diem-style:
+
+- `commit_block` feeds each committed block's QC signer bitmap into
+  `recent_signers`, capped at `2 × leader_cycle_len` — long enough
+  that every scheduled leader had a turn inside the window, short
+  enough that a crash is detected within two rotations.
+- `effective_leader` maps each raw schedule slot through the
+  exclusion set: a validator with zero signatures in a full window
+  stops receiving leader turns, and the slot passes to the next
+  eligible member. `is_leader`, the `proposer` stamp,
+  `authenticate_proposal`, and `proposal_admissible` all consult the
+  effective leader — one source of truth, no divergent schedule.
+- Two liveness guards bound the rule. The window must cover a full
+  schedule rotation before anyone is excluded ("no signatures yet"
+  is not evidence at genesis or right after rotation), and
+  exclusions halt before the eligible set's stake drops below
+  quorum — a mass crash already halts the chain; excluding the
+  survivors' peers would only bury the schedule deeper.
+- Exclusion is self-healing: it only costs leader *turns*, not
+  votes. A rejoining validator signs others' proposals, its bitmap
+  bit re-enters the window, and the exclusion lifts — no
+  re-admission protocol needed.
+- Determinism across replicas — including after restart — is the
+  load-bearing property: the window rides the WAL as trailer #6
+  (a varint count + length-prefixed bitmaps; older entries decode
+  `[]`), and `complete_rotation` clears it so a new committee starts
+  with a clean slate rather than inheriting the old committee's
+  attendance record.
+
+Regression tests: `absent_validator_loses_leader_turns` (a validator
+missing from the window is skipped, the substitute's proposals
+authenticate), `reputation_exclusion_never_strands_quorum` (the
+guard refuses exclusions that would drop eligible stake below
+quorum), `reputation_window_survives_restart` (WAL trailer #6
+round-trips; legacy entries decode empty), plus the two
+legacy-layout decode tests extended for the new trailer.
+
+Measured on the engine bench: `propose_single` −3% and
+`vote_on_proposal` within noise — the exclusion scan is O(validators
+× window) once per proposal, nothing next to the ~ms BLS verify it
+sits beside. The WAL-bound benches reported +12–20% vs their
+baselines, but those paths never commit in the bench so the window
+stays empty — the change adds one `0x00` byte to those entries; the
+deltas are fsync variance.
+
+RTT-adaptive pacemaker timeouts (the second half of the M1
+recommendation) remain open — the reputation fix removes the
+per-cycle timeout burn, adaptive sizing is a separate optimization.

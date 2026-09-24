@@ -70,6 +70,11 @@ impl OxideBft {
         };
         self.rotation_activation_height = None;
         self.validator_set = new_set;
+        // The reputation window indexes into the *old* committee —
+        // its bitmaps name positions that no longer exist. Clear it:
+        // the new set earns its own participation history (the
+        // minimum-window guard keeps reputation inert until it has).
+        self.recent_signers.clear();
         // Re-seat our own index under the new committee — removals
         // shift positions and the genesis index may now name a
         // different validator. Matching by BLS key is the honest

@@ -51,6 +51,12 @@ impl OxideBft {
             // the vote locks are — the only writer is the verified
             // mismatch path, and our own WAL is the trust interior.
             self.divergence = entry.divergence;
+            // The reputation window is committed history — the
+            // WAL'd bitmaps pair with the recovered set (rotation
+            // writes a fresh windowed state under the new set), so
+            // restoring it keeps post-restart exclusions identical
+            // to what every live replica computes.
+            self.recent_signers = entry.recent_signers.into_iter().collect();
             // The recorded `current_view` lags real progress by up
             // to one view: `deliver_qc` appends before its own
             // catch-up and `advance_view` does not append at all, so
@@ -199,6 +205,7 @@ impl OxideBft {
             validator_set: include_set.then(|| self.validator_set.clone()),
             pending: self.pending_tail(),
             divergence: self.divergence,
+            recent_signers: self.recent_signers.iter().cloned().collect(),
         }
     }
 

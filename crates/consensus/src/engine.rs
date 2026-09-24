@@ -445,6 +445,24 @@ pub struct OxideBft {
     rotation_activation_height: Option<u64>,
     /// This engine's index in the validator set.
     validator_index: ValidatorIndex,
+    /// Leader-reputation window (audit M1): the certifying QC's
+    /// signer bitmap for each of the last `leader_rep_window()`
+    /// committed heights, oldest → newest. A validator absent from
+    /// every bitmap in a full window has signed nothing the chain
+    /// committed — it is crashed or hopelessly partitioned — and
+    /// [`Self::effective_leader`] walks the schedule past it so its
+    /// turns stop costing a full view timeout each cycle.
+    ///
+    /// Determinism: the inputs are committed QC bitmaps — identical
+    /// on every replica that committed the same prefix — and the
+    /// window rides the WAL, so a restart restores the same
+    /// exclusions rather than computing divergent ones. Replicas at
+    /// different commit depths can disagree transiently (their
+    /// windows differ by the lag) — a wasted vote, never a safety
+    /// issue — and converge on the next commit. Cleared on epoch
+    /// rotation: bitmaps index into the *signing* set, and the new
+    /// committee is a different index space.
+    recent_signers: std::collections::VecDeque<Vec<u8>>,
     /// This engine's BLS secret key (stage 5). Used to sign votes and
     /// timeout messages. `None` in conformance mode (no real signing).
     secret_key: Option<crypto::BlsSecretKey>,
@@ -740,6 +758,7 @@ impl OxideBft {
             next_validator_set: None,
             rotation_activation_height: None,
             validator_index,
+            recent_signers: std::collections::VecDeque::new(),
             secret_key: None,
             pacemaker,
             high_qc: None,
@@ -1026,7 +1045,7 @@ impl OxideBft {
         {
             return false;
         }
-        header.proposer == proposer_hash(self.validator_set.leader(header.view))
+        header.proposer == proposer_hash(self.effective_leader(header.view))
     }
 
     /// The highest QC the engine has seen, if any.
@@ -1123,9 +1142,99 @@ impl OxideBft {
     }
 
     /// Whether this engine is the leader for the current view.
+    /// Reputation-aware: a crashed validator's slot is taken by the
+    /// next eligible member of the schedule, so this answers the
+    /// same question `authenticate_proposal` asks of incoming
+    /// proposals on every replica.
     #[must_use]
     pub fn is_leader(&self) -> bool {
-        self.validator_set.leader(self.current_view) == self.validator_index
+        self.effective_leader(self.current_view) == self.validator_index
+    }
+
+    /// Depth of the leader-reputation window, in committed heights.
+    ///
+    /// Two full schedule rotations: every member gets a leader turn
+    /// (and every voter a signing opportunity) inside the window, so
+    /// a validator absent from *all* of it has provably signed
+    /// nothing — one missed QC can never exclude a healthy member.
+    /// Unit: committed heights. Tradeoff: deeper tolerates longer
+    /// transient partitions before exclusion; shallower evicts a
+    /// crashed leader faster.
+    fn leader_rep_window(&self) -> usize {
+        2 * self.validator_set.leader_cycle_len().max(1)
+    }
+
+    /// The set of validator indices excluded from leadership by
+    /// reputation — absent from every committed QC in the window.
+    ///
+    /// Deterministic by construction for replicas that committed the
+    /// same prefix: the window holds only committed-QC bitmaps, and
+    /// ties in the quorum bound below break by ascending index.
+    ///
+    /// Two guards keep the rule liveness-safe: the window must cover
+    /// at least one full schedule rotation before anything is
+    /// excluded — early in a chain (or right after a rotation cleared
+    /// the window) "no signatures yet" is not evidence of a crash —
+    /// and exclusions stop before the eligible set's stake would drop
+    /// below quorum (a mass crash already halts the chain on its own;
+    /// excluding the survivors' peers would only bury the schedule
+    /// deeper).
+    fn excluded_leaders(&self) -> Vec<bool> {
+        let n = self.validator_set.n();
+        let mut excluded = vec![false; n];
+        if self.recent_signers.len() < self.validator_set.leader_cycle_len() {
+            return excluded;
+        }
+        let mut participation = vec![0u64; n];
+        for bitmap in &self.recent_signers {
+            for (v, count) in participation.iter_mut().enumerate() {
+                if bitmap.get(v / 8).is_some_and(|b| b & (1 << (v % 8)) != 0) {
+                    *count += 1;
+                }
+            }
+        }
+        let quorum = self.validator_set.quorum_stake();
+        let mut eligible_stake = self.validator_set.total_stake();
+        for v in 0..n {
+            if participation[v] != 0 {
+                continue;
+            }
+            let stake = self.validator_set.stake(u16::try_from(v).unwrap_or(0)).unwrap_or(0);
+            if eligible_stake.saturating_sub(stake) < quorum {
+                // Excluding this member strands quorum — keep it
+                // (a crashed whale must retain its slots rather
+                // than bury the schedule) but keep scanning:
+                // a lower-stake absent member may still be
+                // excluded safely. Ascending index order keeps
+                // the greedy choice identical on every replica.
+                continue;
+            }
+            excluded[v] = true;
+            eligible_stake = eligible_stake.saturating_sub(stake);
+        }
+        excluded
+    }
+
+    /// The leader for `view` after reputation exclusions — the
+    /// identity every proposer-stamping and proposal-verifying path
+    /// must agree on. Wraps the raw schedule: the raw leader for the
+    /// view, or the next non-excluded member walking the cycle
+    /// forward. Deterministic given the same committed prefix (see
+    /// [`Self::recent_signers`]); the walk always terminates because
+    /// `excluded_leaders` never excludes below quorum.
+    fn effective_leader(&self, view: View) -> ValidatorIndex {
+        let excluded = self.excluded_leaders();
+        if excluded.iter().all(|e| !e) {
+            return self.validator_set.leader(view);
+        }
+        let mut v = view.value();
+        loop {
+            let idx = self.validator_set.leader(View::new(v));
+            if !excluded.get(usize::from(idx)).copied().unwrap_or(false) {
+                return idx;
+            }
+            v = v.saturating_add(1);
+        }
     }
 
     /// Our index in the *current* validator set — re-seated by epoch
@@ -1456,7 +1565,11 @@ impl OxideBft {
             timeout_cert: self.last_tc.as_ref().map(|v| v.tc().clone()).filter(|tc| {
                 tc.epoch == self.epoch && tc.view.saturating_next() == self.current_view
             }),
-            proposer: proposer_hash(self.validator_set.leader(self.current_view)),
+            // Reputation-aware identity: `propose_inner`'s gate
+            // checks `is_leader` (same `effective_leader` source),
+            // so the stamp must match — stamping the raw schedule
+            // here would sign a proposal every replica rejects.
+            proposer: proposer_hash(self.effective_leader(self.current_view)),
             // The proposer's clock reading, committed under the
             // proposal signature. Voters enforce only the objective
             // rule (non-decreasing vs. the parent) — never their own

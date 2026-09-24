@@ -203,6 +203,18 @@ pub struct WalEntry {
     /// local root + certified root); absent on old files — decoded
     /// `None`.
     pub divergence: Option<types::ExecDivergence>,
+    /// The leader-reputation window: the certifying QC's signer
+    /// bitmap for each of the most recent committed heights, oldest
+    /// → newest. Reputation exclusions are a pure function of this
+    /// committed history — restoring it keeps the post-restart
+    /// leader schedule identical to the pre-crash one instead of
+    /// silently reverting to "nobody excluded" while peers still
+    /// skip the dead member.
+    ///
+    /// Encoded as optional trailer #6 (varint count + per-entry
+    /// varint length + bitmap bytes); absent on old files —
+    /// decoded `[]`.
+    pub recent_signers: Vec<Vec<u8>>,
 }
 
 impl Encode for WalEntry {
@@ -298,6 +310,15 @@ impl Encode for WalEntry {
                 d.certified_root.encode(buf);
             }
             None => buf.push(0),
+        }
+        // Optional trailer #6: the leader-reputation window (varint
+        // count + per-entry varint length + bitmap bytes). The count
+        // is always present once the writer is this version — older
+        // decoders stop before it, newer ones read `0` as empty.
+        codec::write::varint(buf, self.recent_signers.len() as u64);
+        for bitmap in &self.recent_signers {
+            codec::write::varint(buf, bitmap.len() as u64);
+            buf.extend_from_slice(bitmap);
         }
     }
 }
@@ -395,6 +416,8 @@ impl<'a> Decode<'a> for WalEntry {
         } else {
             None
         };
+        // Optional trailer #6: the reputation window.
+        let recent_signers = decode_signer_window(reader)?;
         Ok(Self {
             last_voted_view,
             voted_at_height,
@@ -407,6 +430,7 @@ impl<'a> Decode<'a> for WalEntry {
             timeout_signed_view,
             pending,
             divergence,
+            recent_signers,
         })
     }
 }
@@ -443,6 +467,34 @@ fn decode_pending_tail(
         pending.push((header, body));
     }
     Ok(pending)
+}
+
+/// Decode optional trailer #6: the leader-reputation window.
+///
+/// Each entry is a varint length + bitmap bytes, so a claimed count
+/// beyond the remaining bytes is malformed — the bound runs before
+/// the per-entry loop trusts the wire. Returns `[]` when the buffer
+/// ends before the trailer (entries written by older binaries).
+fn decode_signer_window(reader: &mut Reader<'_>) -> Result<Vec<Vec<u8>>, DecodeError> {
+    if reader.remaining() == 0 {
+        return Ok(Vec::new());
+    }
+    let count =
+        u32::try_from(reader.read_varint()?).map_err(|_| DecodeError::LengthPrefixTooLarge {
+            claimed: u64::MAX,
+            remaining: reader.remaining() as u64,
+        })?;
+    if u64::from(count) > reader.remaining() as u64 {
+        return Err(DecodeError::LengthPrefixTooLarge {
+            claimed: u64::from(count),
+            remaining: reader.remaining() as u64,
+        });
+    }
+    let mut bitmaps = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        bitmaps.push(reader.read_bytes()?.to_vec());
+    }
+    Ok(bitmaps)
 }
 
 /// Errors that can occur during WAL operations.
@@ -973,6 +1025,7 @@ mod tests {
             timeout_signed_view: None,
             pending: Vec::new(),
             divergence: None,
+            recent_signers: Vec::new(),
         }
     }
 
@@ -992,6 +1045,7 @@ mod tests {
             timeout_signed_view: Some(View::new(5)),
             pending: Vec::new(),
             divergence: None,
+            recent_signers: vec![vec![0b0111], vec![0b0111]],
         }
     }
 
@@ -1356,19 +1410,23 @@ mod tests {
     /// node through block sync, never a decode failure.
     #[test]
     fn wal_entry_decodes_legacy_layout_without_tail() {
-        let entry = voted_entry();
+        let mut entry = voted_entry();
+        entry.recent_signers.clear();
         let mut buf = Vec::new();
         entry.encode(&mut buf);
-        // Trailer #5 (divergence flag, `0x00` when unset) sits after
-        // the tail, then `pending` encodes as a trailing varint
-        // count; an empty tail is a single `0x00`. Stripping both
-        // yields exactly the pre-tail byte layout.
+        // Trailer #6 (signer window count) sits last, then trailer #5
+        // (divergence flag, `0x00` when unset), then `pending` encodes
+        // as a trailing varint count; each empty trailer is a single
+        // `0x00`. Stripping all three yields exactly the pre-tail
+        // byte layout.
+        assert_eq!(buf.pop(), Some(0), "empty signer window encodes as one zero byte");
         assert_eq!(buf.pop(), Some(0), "unset divergence encodes as one zero byte");
         assert_eq!(buf.pop(), Some(0), "empty tail encodes as one zero byte");
         let mut reader = Reader::new(&buf);
         let decoded = WalEntry::decode(&mut reader).unwrap();
         assert!(decoded.pending.is_empty());
         assert!(decoded.divergence.is_none());
+        assert!(decoded.recent_signers.is_empty());
         assert_eq!(decoded.timeout_signed_view, entry.timeout_signed_view);
         assert_eq!(decoded.last_committed, entry.last_committed);
     }
@@ -1378,13 +1436,15 @@ mod tests {
     /// the per-entry loop trusts them.
     #[test]
     fn wal_entry_pending_count_is_bounded() {
-        let entry = voted_entry();
+        let mut entry = voted_entry();
+        entry.recent_signers.clear();
         let mut buf = Vec::new();
         entry.encode(&mut buf);
-        // Strip trailer #5's flag byte and the real tail count, then
-        // write the forged count followed by a well-formed `None`
-        // divergence flag — the failure must come from the pending
-        // bound, not a short buffer.
+        // Strip trailer #6's count, trailer #5's flag byte, and the
+        // real tail count, then write the forged count followed by a
+        // well-formed `None` divergence flag — the failure must come
+        // from the pending bound, not a short buffer.
+        buf.pop();
         buf.pop();
         buf.pop();
         codec::write::varint(&mut buf, 0xFFFF);
@@ -1413,16 +1473,20 @@ mod tests {
 
     /// Entries written before the divergence trailer existed must
     /// still decode — a buffer that ends at the tail count decodes
-    /// with `divergence: None` (the rolling-upgrade contract).
+    /// with `divergence: None` and an empty signer window (the
+    /// rolling-upgrade contract).
     #[test]
     fn wal_entry_decodes_legacy_layout_without_divergence() {
-        let entry = voted_entry();
+        let mut entry = voted_entry();
+        entry.recent_signers.clear();
         let mut buf = Vec::new();
         entry.encode(&mut buf);
+        assert_eq!(buf.pop(), Some(0), "empty signer window encodes as one zero byte");
         assert_eq!(buf.pop(), Some(0), "unset divergence encodes as one zero byte");
         let mut reader = Reader::new(&buf);
         let decoded = WalEntry::decode(&mut reader).unwrap();
         assert!(decoded.divergence.is_none());
+        assert!(decoded.recent_signers.is_empty());
         assert_eq!(decoded.pending, entry.pending);
     }
 
