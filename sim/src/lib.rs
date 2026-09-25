@@ -19,27 +19,30 @@
 //! full devnet stack — engine + executor + modules — and are too
 //! heavyweight for this crate's pure-swarm scope).
 //!
-//! ## Phase 4 roadmap
+//! ## How it is wired
 //!
-//! The full swarm harness (plan.md §14, Phase 4) will add:
+//! - `chaos.rs` — the engine-level Byzantine driver: real `OxideBft`
+//!   rounds (`propose`/`vote`/`collect_vote`/`deliver_qc`) with
+//!   equivocation, withholding, spam, and censorship injected as
+//!   *validly signed* deviations, plus partition/heal timing and a
+//!   seeded per-round message schedule. `tests/chaos.rs` carries the
+//!   Phase 4 gate: 10,000 randomized scenarios, zero safety
+//!   violations, with injection-proof counters so the gate cannot
+//!   pass vacuously.
+//! - `byzantine.rs` — the strategy vocabulary the driver applies.
+//! - `network.rs` — delay/loss/partition models (`DeterministicRng`
+//!   powers the schedule axis); a `swarm.rs` config-only runner was
+//!   removed once `chaos.rs` made its scenarios executable — the
+//!   runner applied partitions but never the strategies or delay
+//!   models it advertised, which was false coverage.
 //!
-//! - `swarm.rs` — deterministic multi-node swarm with a virtual clock,
-//!   configurable network topology, and per-node message scheduling.
-//! - `byzantine.rs` — byzantine strategy framework: equivocation,
-//!   vote withholding, tx spamming, censorship, leader-failure storms.
-//! - `network.rs` — network delay/loss/reordering models (uniform,
-//!   gaussian, partition-aware).
-//! - `nightly.rs` — long-run harness for 10k+ view nightly campaigns.
-//!
-//! These are Phase 4 deliverables; this crate exists now to make the
-//! `sim/` directory referenced in `plan.md`, `README.md`, and
-//! `AGENTS.md` real, and to provide a library home for the echo sim
-//! pattern that other crates can depend on.
+//! Remaining Phase 4 surface: `nightly.rs` (long-run harness) and
+//! transport-level delay/loss injection in `MeshTransport` — today
+//! the schedule permutation in `chaos.rs` stands in for latency.
 
 pub mod byzantine;
 pub mod chaos;
 pub mod network;
-pub mod swarm;
 
 // Re-export the echo simulation entry point. The implementation lives
 // in `crates/runtime/tests/echo.rs` as an integration test; this

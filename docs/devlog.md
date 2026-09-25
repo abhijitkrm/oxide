@@ -22073,3 +22073,40 @@ and `balance +=` in the fast paths panic/wrap at the type bounds
 (unreachable under bounded supply); the EIP-7623 floor in
 `try_empty_code_call` runs unconditionally (consistent — every
 constructor is Prague).
+
+## Audit 003 addendum — e2e and formal-verification pass
+
+Audited the verification stack itself for coverage integrity (does a
+green run mean what it claims?) and false-confidence hazards.
+
+**What's real:** the chaos driver (`sim/chaos.rs`) injects byzantine
+behavior at the engine boundary with *validly signed* equivocating
+votes — signature verification can't be the defense, so the QC
+consistency rule is what's exercised — and every gate carries
+injection-proof counters (`conflicting_votes > 0`, `injected_runs >
+1000` on the 10k gate) so it cannot pass vacuously. Safety is
+per-height whole-block equality plus execution-root agreement plus
+contiguous prefixes; liveness is converged honest tips. The TLA+
+model is a faithful abstraction of the real commit rules (six
+invariants, three fidelity tiers, pinned tla2tools, PR + nightly TLC
+runs) and already caught three real counterexamples. The
+multi-process e2e (`validator_fleet`, `fullnode_follower`) drives
+real binaries through keygen → genesis → mTLS → SIGTERM → snapshot →
+certified-sync catch-up; `#[ignore]`d but picked up by nightly's
+workspace `--ignored` run. `evm_parallel_differential` fuzzes
+serial≡batch≡parallel roots over SELFDESTRUCT/REVERT/CREATE mixes —
+the exact equivalence the rebase lane must preserve.
+
+**Found and fixed:** `sim/swarm.rs`'s `ScenarioRunner` ran named
+"byzantine"/"delay" scenarios that injected nothing — `run()`
+applied only `Partition`; delay, loss, and every strategy were
+unread config, and `run_network_delay_7_safety` claimed coverage
+over a perfect network. `chaos.rs` (built later, documented as
+closing exactly this gap) made the file dead weight with a lying
+API — deleted it; `network.rs`/`byzantine.rs` remain as the
+vocabulary the real driver uses.
+
+**Open (Low):** `run_echo_sim` is a documented stub; `DelayModel`/
+`LossModel::Random` are modelled but unapplied (schedule
+permutations stand in — transport-level delay injection is real
+Phase-4 work); Docker compose has no CI job (manual only).

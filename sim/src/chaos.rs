@@ -2,11 +2,8 @@
 //!
 //! # What this is
 //!
-//! [`crate::swarm`] models Byzantine behavior at the *configuration*
-//! layer — strategies are tracked but the underlying
-//! [`devnet::multinode::MultiNodeDevnet`] runs honest rounds. This
-//! module closes that gap: it drives each consensus round through the
-//! real `OxideBft` API (`propose`, `vote`, `collect_vote`,
+//! This is the executable layer: it drives each consensus round
+//! through the real `OxideBft` API (`propose`, `vote`, `collect_vote`,
 //! `try_form_qc`, `deliver_qc`) while applying the per-node
 //! [`ByzantineStrategy`] as real deviations in the message flow:
 //!

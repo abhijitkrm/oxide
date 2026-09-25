@@ -1,7 +1,6 @@
 //! Chaos-simulation tests: real engine-level Byzantine injection.
 //!
-//! Unlike `swarm.rs` (which records strategies as configuration),
-//! these tests run `sim::chaos::run`, which emits real signed
+//! These tests run `sim::chaos::run`, which emits real signed
 //! equivocating votes, malformed frames, and censorship decisions
 //! through the actual `OxideBft` engine + `MeshTransport` path. Every
 //! assertion below verifies that the *engines'* defenses — not the
