@@ -1058,6 +1058,95 @@ fn empty_code_call_multi_tx_matches_revm() {
     assert_eq!(root1, root2, "revm and empty-code-call multi-tx state roots must match");
 }
 
+/// Regression guard for the fast-path mutation-order invariant:
+/// every fallible account load must run BEFORE the first state
+/// write. Both fast paths end with `load_account` calls on the
+/// recipient/coinbase — on a fallible backend, an error there used
+/// to defer to revm with the sender's nonce/balance already charged,
+/// leaving half-applied writes for the fallback to double-apply.
+/// The pre-warm (`load_account` before the mutation block) turns the
+/// post-write loads into cache hits that cannot fail.
+///
+/// Every in-tree backend is `Infallible`, so this exercises the
+/// generic signature's contract rather than a reachable production
+/// path — the property is what a future fallible backend depends on.
+#[test]
+fn fast_path_defers_without_mutating_on_backend_error() {
+    /// A `DatabaseRef` that fails `basic_ref` for one address.
+    struct FailDb {
+        fail: revm::primitives::Address,
+    }
+    impl revm::DatabaseRef for FailDb {
+        type Error = revm::database::ErasedError;
+        fn basic_ref(
+            &self,
+            address: revm::primitives::Address,
+        ) -> Result<Option<revm::database::state::AccountInfo>, Self::Error> {
+            if address == self.fail {
+                return Err(revm::database::ErasedError::new(std::io::Error::other(
+                    "backend read failed",
+                )));
+            }
+            Ok(None)
+        }
+        fn code_by_hash_ref(
+            &self,
+            _: revm::primitives::B256,
+        ) -> Result<revm::bytecode::Bytecode, Self::Error> {
+            Err(revm::database::ErasedError::new(std::io::Error::other("unreachable")))
+        }
+        fn storage_ref(&self, _: revm::primitives::Address, _: U256) -> Result<U256, Self::Error> {
+            Err(revm::database::ErasedError::new(std::io::Error::other("unreachable")))
+        }
+        fn block_hash_ref(&self, _: u64) -> Result<revm::primitives::B256, Self::Error> {
+            Err(revm::database::ErasedError::new(std::io::Error::other("unreachable")))
+        }
+    }
+
+    let (pk, addr) = test_keypair();
+    let sender = revm::primitives::Address::from_slice(&addr.0);
+    let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+    let coinbase = revm::primitives::Address::from_slice(&[0xCB; 20]);
+    let start_balance = U256::from(1_000_000_000_000u64);
+
+    let tx = tx::TxLegacy {
+        fields: tx::TxFields {
+            nonce: 0,
+            gas_limit: 21_000,
+            to: tx::TxKind::Call(recipient),
+            value: U256::from(1u64),
+            data: revm::primitives::Bytes::new(),
+            chain_id: 1,
+        },
+        // Tip > 0 so the coinbase load is on the taken path.
+        gas_price: U256::from(2_000_000_000u64),
+    };
+    let signed = tx::SignedTx::sign_legacy(tx, &pk).expect("sign");
+
+    let mut db: revm::database::CacheDB<FailDb> =
+        revm::database::CacheDB::new(FailDb { fail: coinbase });
+    db.insert_account_info(
+        sender,
+        revm::database::state::AccountInfo { balance: start_balance, ..Default::default() },
+    );
+
+    let result = EvmModule::try_native_transfer(
+        &signed,
+        sender,
+        &mut db,
+        coinbase,
+        1_000_000_000,
+        SpecId::PRAGUE,
+    );
+    assert!(result.is_none(), "a backend error must defer to revm, not half-apply");
+    let sender_after = db.cache.accounts.get(&sender).expect("sender stays cached");
+    assert_eq!(sender_after.info.nonce, 0, "deferred fast path must not bump the nonce");
+    assert_eq!(
+        sender_after.info.balance, start_balance,
+        "deferred fast path must not charge the sender"
+    );
+}
+
 /// Parallel execution with conflicting recipients (two senders
 /// transfer to the same recipient). The conflict must be detected
 /// and the second group re-executed sequentially. The final

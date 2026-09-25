@@ -195,6 +195,15 @@ pub(crate) enum VerifyOutcome {
         /// Whether the signature verified under the voter's key.
         verified: bool,
     },
+    /// The job's closure panicked. The worker synthesizes this so the
+    /// done-message still reaches the pump: without it, a panicked
+    /// `VerifyTask` would kill the worker thread *and* leak the job's
+    /// queue/in-flight/bytes accounting forever — enough panics would
+    /// pin the pool at [`VERIFY_QUEUE_CAP`] and starve all
+    /// verification. The pump applies nothing for this variant: the
+    /// message simply re-arrives via gossip/sync like any dropped
+    /// submission.
+    Panicked,
 }
 
 /// The bounded worker pool. Owns the send half of the job queue,
@@ -244,7 +253,16 @@ impl VerifyPool {
             // failure — consistent with the pump's own startup.
             std::thread::spawn(move || {
                 while let Ok((peer, payload_bytes, task)) = rx.recv() {
-                    if done.send(VerifyDone { peer, payload_bytes, outcome: task() }).is_err() {
+                    // Contain a panicking job: an uncaught panic would
+                    // kill this worker AND strand the job's accounting
+                    // (the VerifyDone that decrements it would never
+                    // send). `AssertUnwindSafe` is sound because the
+                    // closure owns only by-value decoded data and
+                    // resolved crypto material — no shared state can be
+                    // left inconsistent by the unwind.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task))
+                        .unwrap_or(VerifyOutcome::Panicked);
+                    if done.send(VerifyDone { peer, payload_bytes, outcome }).is_err() {
                         // The pump is gone — no one can apply the
                         // verdict, so the worker's job is finished.
                         return;
@@ -554,6 +572,33 @@ mod tests {
         }
         assert_eq!(pool.queued_jobs(), 0);
         assert_eq!(pool.in_flight_of(b"peer-a"), 0);
+    }
+
+    /// A panicking job must not kill the worker or strand its
+    /// accounting: the pool reports `Panicked`, decrements every
+    /// counter the job held, and keeps serving later submissions.
+    /// Without the `catch_unwind` a panic leaked the slot forever —
+    /// enough panicked jobs would pin `queued_jobs` at the cap and
+    /// starve all verification.
+    #[test]
+    fn panicking_job_decrements_accounting_and_pool_survives() {
+        let mut pool = VerifyPool::with_workers(1);
+        let panicking: VerifyTask = Box::new(|| panic!("boom"));
+        assert!(pool.submit(b"peer-a", 64, panicking));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let done = loop {
+            if let Some(done) = pool.try_recv() {
+                break done;
+            }
+            assert!(std::time::Instant::now() < deadline, "panicked job never reported");
+            std::thread::yield_now();
+        };
+        assert!(matches!(done.outcome, VerifyOutcome::Panicked));
+        assert_eq!(done.payload_bytes, 64);
+        assert_eq!(pool.queued_jobs(), 0, "panicked job leaked its queue slot");
+        assert_eq!(pool.in_flight_of(b"peer-a"), 0, "panicked job leaked its peer slot");
+        // The worker survived: a follow-up job still completes.
+        assert!(pool.submit(b"peer-b", 8, marker_job(true)), "pool rejects after panic");
     }
 
     /// The fairness bound: one peer holds at most

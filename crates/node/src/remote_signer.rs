@@ -650,7 +650,13 @@ impl SignerDaemon {
         ctx: SignContext,
         msg_hash: [u8; 32],
     ) -> Result<(u8, Vec<u8>), String> {
-        let mut state = self.state.lock().expect("fence mutex");
+        // Poison recovery is safe *and* stricter here: a panic mid-
+        // `record` can only leave the in-memory fence AHEAD of the
+        // persisted one (records are insert-only), so the recovered
+        // guard enforces a superset of what disk guarantees — the
+        // fail-closed direction. Cascading the panic would wedge the
+        // validator's signing for no safety gain.
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Err(reason) = state.check(domain, ctx, &msg_hash) {
             return Ok((STATUS_REFUSED, reason.into_bytes()));
         }

@@ -22019,3 +22019,57 @@ oldest-first position ordering (`commits_resolve_positions_oldest_first`).
 `uncommitted_proposal_keeps_txs` (executor) now asserts the real
 contract: in-flight while open, re-proposable after the position
 commits. 254 consensus + 125 executor + 34 mempool tests green.
+
+## Audit 003 — post-remediation deep review
+
+Full-repo pass over the newest subsystems plus systemic sweeps.
+Docs: `docs/audit003.md`.
+
+**Cleared on inspection** (recorded so the next pass doesn't
+re-derive them): the fast paths' flat 21 000 on a fresh-recipient
+transfer is correct (the `G_newaccount` surcharge is a CALL-opcode
+charge, not tx-intrinsic — checked against revm 42); the
+touched-empty-account question (revm's `commit_account` writes
+touched-empty accounts identically, and Prague's EIP-7523 makes
+them persist); MVCC coinbase handling (`MvDb` bypasses the version
+store for coinbase so `coinbase_delta` is always the pure tip, and
+`must_reexec |= coinbase_nontrivial` forces non-additive coinbase
+writes through canonical re-execution); the mempool in-flight deque
+(position-ordered commits keep it aligned; eviction/restart release
+early — the safe direction); WAL `atomic_replace` ordering and
+torn-tail repair; no wall-clock in deterministic paths; `unsafe`
+confined to the WAL `fallocate` + matcher bench.
+
+**Found and fixed:**
+
+- *Verify-pool panic leak* (Medium): a panic inside a `VerifyTask`
+  killed the worker thread AND never sent the `VerifyDone` that
+  decrements `in_flight`/`queued_jobs`/`queued_bytes` — each panic
+  permanently consumed a slot, and 128 of them would pin the pool
+  full forever (verification silently dead). Workers now
+  `catch_unwind` the closure (sound: it owns only by-value data)
+  and report `VerifyOutcome::Panicked`, which the pump logs and
+  drops after normal accounting.
+- *Remote-signer fence mutex* (Low-Med): `sign_fenced` had the
+  last bare-poison `.expect()` on a `Mutex` in production — a
+  panic mid-record would have wedged signing forever. Now
+  poison-recovers; insert-only records make the recovered guard
+  strictly *more* conservative than disk, which is the fail-closed
+  direction.
+- *Fast-path mutation order* (Low, latent): both native fast paths
+  ran fallible `load_account`s *after* the sender mutation — a
+  fallible backend would defer to revm over half-applied state.
+  Unreachable today (all backends `Infallible`), but the defer
+  contract is generic. Fixed by pre-warming recipient+coinbase via
+  `load_account` before the first write, making the post-write
+  loads Occupied-entry hits that cannot consult the backend.
+  `fast_path_defers_without_mutating_on_backend_error` drives a
+  failing `DatabaseRef` through it.
+
+**Open (Low):** dead-code decoders in `p2p::discovery`/`p2p::sync`
+pre-allocate from wire counts (`with_capacity(u32)` /
+`resize_with`) — unreachable, no production callers; `nonce += 1`
+and `balance +=` in the fast paths panic/wrap at the type bounds
+(unreachable under bounded supply); the EIP-7623 floor in
+`try_empty_code_call` runs unconditionally (consistent — every
+constructor is Prague).

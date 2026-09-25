@@ -1559,6 +1559,15 @@ fn run_consensus_loop(
                     // cert-existence gate and voter bounds.
                     engine.apply_attest_verdict(voter, attestation, signature, verified);
                 }
+                VerifyOutcome::Panicked => {
+                    // The worker caught a panic inside a verify job.
+                    // Nothing is applied — the message re-arrives via
+                    // gossip/sync like any dropped submission — but
+                    // the accounting already decremented, so the pool
+                    // survives the panic. Loud log: a panicking job is
+                    // a bug worth an operator's attention.
+                    eprintln!("{log_tag}: verify job panicked — job dropped, pool intact");
+                }
             }
         }
 

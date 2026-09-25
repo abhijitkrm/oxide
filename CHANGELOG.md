@@ -162,6 +162,42 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Verify pool survives a panicking job** (`node`): a panic
+  inside a signature-verification closure used to kill the worker
+  thread AND strand the job's queue accounting — enough panics
+  would have pinned the pool at its capacity bound and silently
+  stopped all consensus verification. Workers now catch the
+  unwind, report a `Panicked` outcome so every counter still
+  decrements, and keep serving; the pump logs and drops the
+  result. (`panicking_job_decrements_accounting_and_pool_survives`
+  proves the slot returns.)
+  - **In plain words:** one malformed message could previously
+    punch a permanent hole in the verification capacity a
+    validator has — now a bad job is just dropped and the pool
+    stays whole.
+
+- **EVM fast paths cannot half-apply on a backend error**
+  (`evm`): both native fast paths defer to the full EVM on any
+  error, but the recipient and coinbase account loads sat *after*
+  the sender mutation — a fallible backend would have deferred
+  with the sender's nonce already bumped, letting the fallback
+  double-apply. All fallible loads now happen before the first
+  write (the cache insert makes the later loads un-failable).
+  Unreachable on today's infallible backends; pinned for any
+  future one.
+  - **In plain words:** a defensive ordering fix — if a database
+    read ever fails mid-transaction, the transaction now cleanly
+    hands off instead of leaving a half-written sender account.
+
+- **Remote-signer fence mutex survives a panic**
+  (`node::remote_signer`): the signing daemon's fence lock used a
+  bare `expect`, so a panic while holding it would poison the
+  mutex and permanently disable signing. It now recovers the
+  guard — safe because the fence map is insert-only, so the
+  recovered state can only be *stricter* than what disk recorded.
+  - **In plain words:** a crash inside the key-signing helper can
+    no longer silently wedge the validator's ability to sign.
+
 - **Pipelined proposals no longer commit the same txs twice**
   (`mempool`, `executor`): mempool selection is a peek — entries
   leave the pool only at finalization — so every pipelined

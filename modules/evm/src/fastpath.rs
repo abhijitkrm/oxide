@@ -341,6 +341,20 @@ impl EvmModule {
         let tip = effective_gas_price.saturating_sub(u128::from(base_fee));
         let coinbase_tip = u128::from(TX_GAS_TRANSFER).checked_mul(tip)?;
 
+        // Pre-warm the recipient and coinbase cache entries BEFORE the
+        // first mutation: `load_account` inserts a `DbAccount` on a
+        // backend read, so the post-write loads below are Occupied-
+        // entry hits that cannot consult — or fail on — the backend.
+        // `DB::Error` is `Infallible` at every instantiation today,
+        // but the defer-to-revm contract must not depend on that: a
+        // fallible backend must fail here, while the cache is still
+        // clean. (Recipient `basic_ref` at step 4 does not warm the
+        // cache — `DatabaseRef` reads don't insert — so it needs its
+        // own `load_account`.)
+        if db.load_account(recipient).is_err() || db.load_account(coinbase).is_err() {
+            return None;
+        }
+
         // ── Read + validate sender ─────────────────────────────
         //
         // We load the sender account, check nonce and balance, then
@@ -462,6 +476,7 @@ impl EvmModule {
     /// includes the recipient access cost for top-level transactions.
     ///
     /// Budget: ~200 ns per tx (vs ~60–80 µs through revm).
+    #[allow(clippy::too_many_lines)] // linear check-then-apply; splitting it would scatter one protocol rule
     pub(crate) fn try_empty_code_call<DB: DatabaseRef>(
         signed: &tx::SignedTx,
         caller: revm::primitives::Address,
@@ -567,6 +582,15 @@ impl EvmModule {
         // half-applied for the fallback to re-execute.
         let tip = effective_gas_price.saturating_sub(u128::from(base_fee));
         let coinbase_tip = u128::from(gas_used).checked_mul(tip)?;
+
+        // Pre-warm the coinbase cache entry BEFORE the first mutation
+        // — see `try_native_transfer` for why: the post-write
+        // `load_account` must be an Occupied-entry hit even on a
+        // fallible backend. (The recipient was `load_account`'d at
+        // step 4 — its post-write load is already a cache hit.)
+        if db.load_account(coinbase).is_err() {
+            return None;
+        }
 
         // ── All checks passed — execute natively ───────────────
         //
