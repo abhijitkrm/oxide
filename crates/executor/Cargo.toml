@@ -41,6 +41,10 @@ staking = { workspace = true }
 # drop. Features unify with the lib's own `storage` dep, so the lib
 # itself is unaffected outside tests.
 storage = { workspace = true, features = ["redb"] }
+# redb itself: the durability tests' simulated "restart" must
+# distinguish `DatabaseAlreadyOpen` (the previous incarnation's file
+# lock still releasing — transient, retry) from a real open failure.
+redb = { workspace = true }
 # tempfile: durability tests need real directories — the crash-
 # recovery contract only exists over real filesystem state (the
 # journal segments, snapshot.bin, and the EVM's redb store must

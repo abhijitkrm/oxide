@@ -539,7 +539,12 @@ impl AppInterface for Executor {
         // state, or a lane hand-off — so a crash can only ever lose
         // work the journal still holds. The engine calls this before
         // it WALs its own commit record, keeping the journal a strict
-        // superset of consensus-committed state.
+        // superset of consensus-committed state. `journal_append` is
+        // buffer-only; the fsync is deferred to the barriers named
+        // on that method (execution pre-flush, the engine's
+        // `commit_durability_barrier`, checkpoints/shutdown) — one
+        // sync now covers a whole drain batch instead of one per
+        // block.
         self.journal_append(block);
         // Remove the committed txs from the mempool at finality.
         // `select` is a peek — pooled entries outlive proposals — so
@@ -648,6 +653,11 @@ impl AppInterface for Executor {
                 let (lock, _cv) = &*self.exec_sync;
                 primitives::sync::lock_state(lock).in_flight = Some(block.height.value());
             }
+            // Journal ⊇ durable state: `execute_block`'s module
+            // flushes (the EVM backend's per-block `apply_batch` +
+            // `sync`) must never outrun the block's journal record.
+            // With no worker to defer to, the sync runs here.
+            self.journal_sync_pending();
             let root = self.execute_block(block);
             primitives::sync::lock_state(&self.state_roots).insert_retained(
                 block.height.value(),
@@ -786,5 +796,15 @@ impl AppInterface for Executor {
             adds: val.adds,
             removes: val.removes,
         }
+    }
+
+    fn commit_durability_barrier(&self) {
+        // The engine is about to fsync commit-bearing WAL state
+        // (a signature-gated append or a compaction checkpoint).
+        // Flush pending journal records first so no committed height
+        // can end up durable in consensus evidence while missing
+        // from the journal — the hole a restart could never
+        // re-finalize.
+        self.journal_sync_pending();
     }
 }

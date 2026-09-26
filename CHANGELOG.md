@@ -12,6 +12,41 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Commit-path fsync amortization** (`storage`, `executor`,
+  `ports`, `consensus`): the executor journal used to pay one
+  `fdatasync` per finalized block on the consensus thread — ~21.5 %
+  of the pump in profile. `journal_append` is now buffer-only; the
+  durability point moved to three ordered barriers — the execution
+  lane syncs once per drained batch before any block's module flush
+  (journal stays ahead of durable state), a new
+  `AppInterface::commit_durability_barrier` runs before the
+  consensus WAL's signature-gated appends and compaction
+  checkpoints (journal stays ahead of durable commit evidence), and
+  snapshot/checkpoint paths sync before advancing the replay base.
+  `JournalWriter::sync_if_dirty` keeps clean barriers syscall-free.
+  Same 6 000 offered tx/s fleet: sustained **4 446 → 4 558 tx/s
+  (+2.5 %)**, commit-path `journal::sync` samples ~1 438 → ~41
+  (0.2 %); the freed ~18 points of pump share are headroom the next
+  bottleneck (per-vote WAL fsync, transport tail) can now consume.
+  - **In plain words:** the node used to wait for the disk once per
+    block while finalizing; now it batches that wait across a whole
+    group of blocks — one disk flush covers them all, and nothing
+    is ever written in a place recovery can't find it.
+
+- **Graceful shutdown that actually looks graceful** (`node`,
+  devnet/validator/fullnode): nodes appeared to ignore SIGTERM —
+  the signal set the flag fine, but the post-loop snapshot export
+  over a large state DB ran tens of seconds with no output, and the
+  installed signal handler swallowed every repeat so there was no
+  operator escape. Shared `node::cli::install_shutdown_handler`
+  now sets the flag on the first signal and **force-exits on a
+  second**, and shutdown logs before the export begins. Fresh node
+  exits ~0.5 s after SIGTERM.
+  - **In plain words:** `kill <pid>` used to look like it did
+    nothing for up to a minute on a loaded node. It still finishes
+    its state save safely — but it tells you it's doing that, and a
+    second signal makes it stop immediately.
+
 - **Single-recovery transaction admission** (`executor`, `evm`,
   `node`): mempool admission recovered each EVM sender's secp256k1
   signature twice — once inside `Module::validate` for the stateful

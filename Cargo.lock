@@ -1792,6 +1792,7 @@ dependencies = [
  "metrics",
  "ports",
  "primitives",
+ "redb",
  "staking",
  "storage",
  "tempfile",

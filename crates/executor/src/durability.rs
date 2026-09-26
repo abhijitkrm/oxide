@@ -344,10 +344,26 @@ impl Executor {
     /// without it, an EVM backend that already flushed past the base
     /// would be double-applied onto.
     ///
-    /// `append` is memory-only; `sync` flushes + fdatasyncs the
-    /// segment. One sync per block is the durability contract's
-    /// minimum — batching fsyncs across blocks is a separate
-    /// (performance) work item.
+    /// `append` is memory-only — this call leaves the record in the
+    /// journal's group buffer and returns. The *sync* is deferred to
+    /// [`journal_sync_pending`](Self::journal_sync_pending), which the
+    /// three durability barriers invoke:
+    ///
+    /// - the execution lane / inline drain, before any block executes
+    ///   (journal stays ahead of the EVM backend's per-block durable
+    ///   flush — durable state never outruns the journal);
+    /// - the engine's signature-gated WAL sync via
+    ///   [`AppInterface::commit_durability_barrier`] — consensus's
+    ///   commit record can never be durable while its journal record
+    ///   was still buffered, or a restart could believe a height
+    ///   committed that the journal never received;
+    /// - checkpoints and shutdown export (`seal_and_rotate` flushes
+    ///   and fsyncs the buffer; `export_snapshot` drains first).
+    ///
+    /// One sync per drain batch (or per signature emission while
+    /// records are pending) replaces the old per-block fsync — the
+    /// commit path no longer pays a disk round-trip per finalized
+    /// block.
     ///
     /// # Panics
     ///
@@ -364,8 +380,11 @@ impl Executor {
             // of the state blocks replay onto. Captured lazily here
             // (not at `with_durability`) because module registration
             // and genesis land *between* construction and the first
-            // finalize — the snapshot must contain them.
-            let snapshot = self.export_snapshot();
+            // finalize — the snapshot must contain them. The inner
+            // export skips the lane drain and journal sync: this is
+            // the FIRST commit, so nothing is queued yet, and the
+            // journal lock we hold must not be re-entered.
+            let snapshot = self.export_snapshot_inner();
             let mut payload = Vec::with_capacity(1 + 64);
             payload.push(TAG_CHECKPOINT);
             // `next_block` names the first height that still must
@@ -387,17 +406,37 @@ impl Executor {
         let mut payload = Vec::with_capacity(64);
         payload.push(TAG_BLOCK);
         block.encode(&mut payload);
-        state
-            .writer
-            .append_at_height(block.height.value(), &payload)
-            .and_then(|_| state.writer.sync())
-            .unwrap_or_else(|e| {
-                panic!(
-                    "executor: failed to journal committed block {}: {e} — \
+        state.writer.append_at_height(block.height.value(), &payload).unwrap_or_else(|e| {
+            panic!(
+                "executor: failed to journal committed block {}: {e} — \
                      halting rather than serving undurable finality",
-                    block.height.value()
+                block.height.value()
+            )
+        });
+    }
+
+    /// The deferred durability point for [`journal_append`](Self::journal_append):
+    /// flush + fdatasync everything buffered so far, or a no-op when
+    /// the journal is already clean. Every barrier that must order
+    /// "journal durable" before something else — module execution
+    /// (whose EVM backend flush is durable) or the consensus WAL's
+    /// commit evidence — runs this; the dirty-check keeps the
+    /// common already-synced case syscall-free.
+    ///
+    /// # Panics
+    ///
+    /// Panics on any journal error, same fail-closed convention as
+    /// [`journal_append`](Self::journal_append).
+    pub(crate) fn journal_sync_pending(&self) {
+        let Some(durability) = &self.durability else { return };
+        primitives::sync::lock_state(&durability.journal).writer.sync_if_dirty().unwrap_or_else(
+            |e| {
+                panic!(
+                    "executor: failed to sync committed-block journal: {e} — \
+                        halting rather than serving undurable finality"
                 )
-            });
+            },
+        );
     }
 
     /// Write a checkpoint at `height` when the interval divides it —

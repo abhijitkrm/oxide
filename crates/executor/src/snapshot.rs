@@ -116,6 +116,21 @@ impl Executor {
         // Waiting for `executed == enqueued` captures a quiesced
         // height boundary.
         self.wait_exec_idle();
+        // Journal ⊇ snapshot: any committed block whose journal
+        // record is still buffered must be durable before the
+        // snapshot becomes the new replay base — otherwise a clean
+        // shutdown could leave a committed height in neither the
+        // snapshot nor the journal, while consensus's WAL already
+        // believes it committed.
+        self.journal_sync_pending();
+        self.export_snapshot_inner()
+    }
+
+    /// The snapshot assembly half of [`export_snapshot`](Self::export_snapshot)
+    /// — no lane drain, no journal sync. `journal_append`'s baseline
+    /// capture calls this: the journal mutex is already held there,
+    /// and the first commit means the lane is trivially idle.
+    pub(crate) fn export_snapshot_inner(&self) -> ExecutorSnapshot {
         let height = self.current_height();
         let state_root = self.state_root_at(height);
         let module_roots: Vec<(String, Hash)> =

@@ -190,6 +190,18 @@ pub trait AppInterface: Send + Sync {
     fn take_epoch_changes(&self) -> types::EpochChanges {
         types::EpochChanges::default()
     }
+
+    /// Durability barrier for committed-block records.
+    ///
+    /// The engine invokes this immediately before any operation that
+    /// fsyncs commit-bearing WAL state — signature-gated appends and
+    /// compaction checkpoints — so an app whose commit journal
+    /// batches fsyncs can flush its pending records *first*:
+    /// WAL-durable commit evidence must never outrun the journal
+    /// record a restart would need to re-drive the block's
+    /// finalization. Implementations without a deferred-durability
+    /// journal (mocks, synchronous executors) keep the no-op default.
+    fn commit_durability_barrier(&self) {}
 }
 
 /// Implemented by consensus engines (oxideBFT is the default;

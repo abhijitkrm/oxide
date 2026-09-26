@@ -73,8 +73,25 @@ fn durable_executor(
             DurabilityConfig::new(dir.join("state")).with_checkpoint_interval(checkpoint_interval),
         )
         .expect("journal dir is writable");
+    // `DatabaseAlreadyOpen` means the previous incarnation's `redb`
+    // file lock hasn't been released yet: `Arc::drop` reads
+    // `strong_count == 0` the moment the last ref decrements, while
+    // `EvmModule`'s destructor (and the `Database` close underneath
+    // it) is still unwinding on whichever thread released it. A
+    // simulated restart has to wait that out — the honest signal is
+    // the flock itself, so retry until the OS releases it rather
+    // than guessing at a sleep. Any other open error is fatal.
+    let path = dir.join("state/evm.redb");
     let backend = Box::new(
-        storage::RedbBackend::open(dir.join("state/evm.redb")).expect("redb backend opens"),
+        (0..500)
+            .find_map(|_| match storage::RedbBackend::open(&path) {
+                Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    None
+                }
+                result => Some(result.expect("redb backend opens")),
+            })
+            .expect("redb file lock released within 5s of the previous drop"),
     );
     let evm = Arc::new(evm::EvmModule::with_storage(CHAIN_ID, BASE_FEE, backend));
     executor.register_module(evm.clone());
@@ -400,4 +417,108 @@ fn atomic_write_replaces_without_residue() {
         .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
         .collect();
     assert!(leftovers.is_empty(), "no .tmp files may survive");
+}
+
+/// `commit_durability_barrier` is the engine's pre-WAL-sync hook:
+/// whatever the commit path buffered into the journal must be durable
+/// before it returns. With the async lane spawned, `journal_append`
+/// is buffer-only — a crash between the append and the lane's own
+/// drain-sync must still not lose a committed record once the barrier
+/// has run, or the WAL's durable commit evidence would suppress the
+/// re-finalization that record exists to drive.
+#[test]
+fn commit_durability_barrier_flushes_pending_journal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (executor, evm, staking) = durable_executor(dir.path(), u64::MAX);
+    let executor = Arc::new(executor);
+    let sender = fund(&evm);
+    executor.spawn_exec_lane();
+    // The records are buffered on this thread; whether the worker
+    // already drained-and-synced them is deliberately left to timing —
+    // the barrier must cover both cases and be synchronous about it.
+    run_blocks(&executor, 0, 3, 1, 0);
+    executor.commit_durability_barrier();
+    // "Crash": drop the executor outright. The lane worker may still
+    // be holding a transient strong ref mid-execution — `Executor`'s
+    // drop (which releases the EVM module) runs on whichever thread
+    // releases the last ref, so wait for that ref to go. The `redb`
+    // file lock can lag the drop by a moment (the destructor runs
+    // *after* the count reads 0); `durable_executor` retries the open
+    // to cover that tail.
+    let evm_probe = Arc::downgrade(&evm);
+    drop(executor);
+    drop(evm);
+    drop(staking);
+    for _ in 0..500 {
+        if evm_probe.strong_count() == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(evm_probe.strong_count(), 0, "lane worker must release the executor");
+
+    let (executor, evm, ..) = restart(dir.path(), u64::MAX);
+    let report = executor
+        .recover_durable_state()
+        .expect("recovery must succeed")
+        .expect("durability is configured");
+    assert_eq!(report.blocks_replayed, 3, "every committed block must replay");
+    assert_eq!(report.recovered_height, 2);
+    assert_eq!(executor.executed_nonce_of(&sender), 3);
+    assert!(Balances::balance(evm.as_ref(), &staking::BONDED_POOL) > 0);
+}
+
+/// In lane mode the per-commit fsync moves off the caller: the lane
+/// syncs once per drain batch. The observable contract that must hold
+/// either way is recovery after a crash *without* the barrier — the
+/// lane drains asynchronously, so whichever records were synced before
+/// the drop form a contiguous prefix; replay must never gap on it.
+#[test]
+fn lane_mode_crash_recovers_synced_prefix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (executor, evm, staking) = durable_executor(dir.path(), u64::MAX);
+    let executor = Arc::new(executor);
+    let sender = fund(&evm);
+    executor.spawn_exec_lane();
+    for h in 0..3 {
+        executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(h),
+            txs: vec![delegate_tx(h, 1, 100 + h)],
+            signers: Vec::new(),
+        });
+    }
+    // Let the lane catch up, then drop — everything synced is a
+    // recoverable prefix. `attest_state` waits on the executed
+    // watermark, which the worker only advances past a block after
+    // its journal sync.
+    let attest = executor.attest_state(Height::new(2));
+    assert!(attest.is_some(), "lane must execute height 2");
+    // The lane worker is idle now — its `Weak` cannot keep the
+    // executor alive, but a mid-iteration transient upgrade can lag
+    // a few microseconds; probe the EVM handle (whose drop closes
+    // the redb file) so the "restart" is deterministic. The lock
+    // release can trail the drop itself by a hair — the restart
+    // helper retries `AlreadyOpen` to cover it.
+    let evm_probe = Arc::downgrade(&evm);
+    drop(executor);
+    drop(evm);
+    drop(staking);
+    for _ in 0..500 {
+        if evm_probe.strong_count() == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(evm_probe.strong_count(), 0, "lane worker must release the executor");
+
+    let (executor, evm, ..) = restart(dir.path(), u64::MAX);
+    let report = executor
+        .recover_durable_state()
+        .expect("recovery must succeed")
+        .expect("durability is configured");
+    assert_eq!(report.blocks_replayed, 3);
+    assert_eq!(report.recovered_height, 2);
+    assert_eq!(executor.executed_nonce_of(&sender), 3);
+    assert!(Balances::balance(evm.as_ref(), &staking::BONDED_POOL) > 0);
 }

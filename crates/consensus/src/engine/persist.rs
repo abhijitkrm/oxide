@@ -292,6 +292,17 @@ impl OxideBft {
         if self.wal.is_none() {
             return Ok(());
         }
+        // Journal ⊇ WAL-committed: a synced append makes every
+        // deferred frame durable — commit markers included — so the
+        // app's commit journal must fsync its pending records first.
+        // Otherwise a crash could leave consensus holding a durable
+        // commit record for a height the journal never received:
+        // the journal is what re-drives that block's finalization on
+        // restart, and there is no reconciliation for the hole. The
+        // barrier is a no-op when the journal is already clean.
+        if sync {
+            self.app.commit_durability_barrier();
+        }
         // Build the entry first to avoid borrowing self while
         // the WAL is mutably borrowed. `wal_entry` is the single
         // field list — the pending tail travels with every append.
@@ -319,6 +330,10 @@ impl OxideBft {
         // a set-less entry would lose the committed committee a
         // post-rotation restart depends on. A checkpoint failure is a
         // WAL write failure: same latch, same fail-closed outcome.
+        // The fsync inside `checkpoint` carries the same journal-⊇-WAL
+        // ordering requirement as a synced append, and a deferred
+        // append can trigger it — barrier unconditionally.
+        self.app.commit_durability_barrier();
         let checkpoint = self.wal_entry(true);
         let wal = self.wal.as_mut().expect("checked above");
         match wal.checkpoint(&checkpoint) {

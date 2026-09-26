@@ -196,6 +196,16 @@ pub struct JournalWriter {
     /// segment holds no height-tagged records — such segments get
     /// no `heights.idx` entry and are skipped by height pruning.
     current_segment_max: Option<u64>,
+    /// `true` while bytes reached the file (via `flush` or the
+    /// segment header write at create) but no `fsync` has covered
+    /// them. Buffered appends do not set this — their bytes are
+    /// still in `buf` and ride the next `sync`'s flush, so the
+    /// dirty test is `unfsynced || !buf.is_empty()`.
+    unfsynced: bool,
+    /// Count of `fsync` calls this writer has issued — test/bench
+    /// instrumentation for the fsync-batching contract (same role
+    /// as `Wal::syncs` on the consensus WAL).
+    syncs: u64,
     config: JournalConfig,
     /// Armed one-shot fault point — see [`FaultPoint`]. Test builds
     /// only: the field does not exist in production, so the injector
@@ -226,6 +236,10 @@ impl JournalWriter {
             segment_bytes: 0,
             next_offset: 0,
             current_segment_max: None,
+            // `new_segment_file` writes SEGMENT_MAGIC straight to the
+            // file, so a fresh writer starts with unsynced bytes.
+            unfsynced: true,
+            syncs: 0,
             config,
             #[cfg(test)]
             fault: None,
@@ -328,6 +342,7 @@ impl JournalWriter {
         self.file.write_all(&self.buf).map_err(JournalError::Io)?;
         self.segment_bytes += self.buf.len();
         self.buf.clear();
+        self.unfsynced = true;
         Ok(())
     }
 
@@ -341,7 +356,33 @@ impl JournalWriter {
         #[cfg(test)]
         self.check_fault(FaultPoint::SyncFsync)?;
         self.file.sync_data().map_err(JournalError::Io)?;
+        self.unfsynced = false;
+        self.syncs = self.syncs.saturating_add(1);
         Ok(())
+    }
+
+    /// [`sync`](Self::sync) only when it would carry new bytes:
+    /// records still buffered or already flushed but not yet
+    /// fsynced. A clean journal returns without touching the file —
+    /// the amortization hook: callers that must order "journal
+    /// durable" ahead of another object's durability point (the
+    /// consensus WAL's signature-gated appends) can run this on
+    /// every barrier without paying an fsync per call.
+    ///
+    /// # Errors
+    /// [`JournalError::Io`] on write or sync failure.
+    pub fn sync_if_dirty(&mut self) -> Result<(), JournalError> {
+        if self.buf.is_empty() && !self.unfsynced {
+            return Ok(());
+        }
+        self.sync()
+    }
+
+    /// Total `fdatasync` calls this writer has issued. Test/bench
+    /// instrumentation only — callers must not branch on it.
+    #[doc(hidden)]
+    pub fn sync_count(&self) -> u64 {
+        self.syncs
     }
 
     /// Finish the active segment and start the next one.
@@ -356,6 +397,7 @@ impl JournalWriter {
         #[cfg(test)]
         self.check_fault(FaultPoint::RotateSealSync)?;
         self.file.sync_data().map_err(JournalError::Io)?;
+        self.syncs = self.syncs.saturating_add(1);
         // Seal the height index FIRST: the entry
         // `[sealed_seq → max_height]` must exist before the new
         // segment file does, or a concurrent height-prune could
@@ -375,6 +417,9 @@ impl JournalWriter {
         self.buf = buf;
         self.segment_bytes = 0;
         self.next_offset = 0;
+        // The new file's SEGMENT_MAGIC header write is unsynced —
+        // keep the flag honest for `sync_if_dirty`.
+        self.unfsynced = true;
         Ok(())
     }
 
@@ -1052,6 +1097,40 @@ mod tests {
         let replayed = replay(&dir).unwrap();
         assert_eq!(replayed.records.len(), 1);
         assert_eq!(replayed.records[0].payload, b"kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `sync_if_dirty` is the fsync-amortization hook: it must pay an
+    /// fsync exactly when uncommitted bytes exist (buffered records or
+    /// flushed-but-unsynced writes) and stay syscall-free otherwise.
+    /// The `syncs` counter makes the amortization directly observable.
+    #[test]
+    fn test_sync_if_dirty_skips_redundant_fsyncs() {
+        let dir = temp_dir("sd");
+        let mut j = JournalWriter::create(&dir, JournalConfig::default()).unwrap();
+        // Fresh segment: SEGMENT_MAGIC was written at create — dirty.
+        j.sync_if_dirty().unwrap();
+        assert_eq!(j.sync_count(), 1, "create-time header write must sync once");
+        // Clean journal: no buffered or flushed-unsynced bytes → no fsync.
+        j.sync_if_dirty().unwrap();
+        j.sync_if_dirty().unwrap();
+        assert_eq!(j.sync_count(), 1, "clean journal must not fsync");
+        // A buffered record counts as dirty: one sync covers it.
+        j.append(b"a").unwrap();
+        j.append(b"b").unwrap();
+        j.sync_if_dirty().unwrap();
+        assert_eq!(j.sync_count(), 2, "one sync covers the whole buffer");
+        // Flushed-but-unsynced bytes also count as dirty (flush is
+        // reachable via prune/rotate internals): a written-but-not-
+        // durable record must still drive an fsync.
+        j.append(b"c").unwrap();
+        j.flush().unwrap();
+        j.sync_if_dirty().unwrap();
+        assert_eq!(j.sync_count(), 3, "flushed-unsynced bytes must fsync");
+        j.sync_if_dirty().unwrap();
+        assert_eq!(j.sync_count(), 3, "post-sync is clean again");
+        let replayed = replay(&dir).unwrap();
+        assert_eq!(replayed.records.len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -22184,3 +22184,96 @@ inline despite the idle verify pool), then the ~46 % tail:
 gossip fanout, transport syscalls, WAL appends. Next levers: WAL
 fsync amortization across commits and routing proposal BLS through
 the verify pool.
+
+## Session: commit-path fsync amortization + graceful-shutdown fix
+
+Attack on the post-dedup bottleneck stack (commit fsync ~21.5 %,
+admission ~18.6 %, proposal BLS ~13.5 %, ~46 % tail) plus the
+devnet SIGTERM bug filed last session.
+
+**SIGTERM root cause (verified, not guessed):** nodes were not
+ignoring the signal — the shutdown path exports a full state
+snapshot after the consensus loop exits, and on a loaded node
+(~500 MB+ state) that takes tens of seconds with zero output. A
+fresh node exits ~0.5 s after SIGTERM. Fixed the real gaps:
+`node::cli::install_shutdown_handler` is now the shared handler
+for all four binaries (devnet/validator/fullnode + validator's
+async site); the first signal sets the flag, a **second signal
+force-exits** (the installed tokio disposition used to swallow
+repeats, so there was no operator escape), and the shutdown path
+logs before the snapshot export so the wait is visibly working.
+
+**Proposal BLS — investigated, already offloaded.** Inbound
+proposals already route through the verify pool
+(`proposal_verify_context` → `proposal_job` → `admit_preverified`
+in `validator_net.rs`). The profile's `vote → admit_proposal_inner`
+frames were the leader's once-per-view self-vote (~25 samples —
+noise, not the 13.5 %). No change needed; the pool was doing its
+job.
+
+**Commit-path fsync amortization — the real lever.** The old
+contract was one `fdatasync` per finalized block inside
+`journal_append`, on the commit thread. The new contract:
+
+- `journal_append` is **buffer-only** (encode + memcpy, no
+  syscall). `JournalWriter` gained `unfsynced`/`syncs` tracking and
+  `sync_if_dirty` — the barrier primitive.
+- `journal_sync_pending` runs at three ordered barriers so the
+  "journal ⊇ durable state" and "journal ⊇ WAL-committed"
+  invariants survive the deferral:
+  1. the exec lane / inline backlog drain / synchronous
+     `finalize_block`, **before any `execute_block`** — the EVM
+     backend's per-block `apply_batch`+`sync` must never outrun the
+     journal record (double-apply on replay otherwise);
+  2. the engine's signature-gated WAL sync and WAL compaction
+     checkpoint, via new `AppInterface::commit_durability_barrier`
+     (default no-op; `Executor` overrides) — a synced WAL append
+     makes every deferred frame durable, commit markers included,
+     and a durable commit record for a height the journal never
+     received is a hole restart cannot re-finalize;
+  3. `export_snapshot` / `durable_checkpoint` / `seal_and_rotate`
+     (checkpoint prunes segments — the buffer must be durable
+     before the replay base advances).
+- Amortization lands two ways: one fsync per exec-lane drain
+  **batch** instead of per block, and `sync_if_dirty` makes every
+  other barrier syscall-free when the journal is already clean.
+
+**Refactor bugs found by the suite, fixed:** (a) a deadlock —
+`journal_append`'s baseline branch holds the journal mutex and
+called `export_snapshot`, which after my change re-entered it via
+`journal_sync_pending`; split into `export_snapshot_inner` (no
+journal touch, `pub(crate)`) + the public wrapper that drains and
+syncs. (b) `DatabaseAlreadyOpen` in the new barrier test —
+`Arc::drop` reports `strong_count == 0` the instant the last ref
+decrements, while `EvmModule`'s destructor (and the `redb` file
+close + flock release under it) is still unwinding on the lane
+thread. `weak_count` doesn't help either (this std reports 0 once
+strong hits 0). The honest probe is the resource itself:
+`durable_executor` retries `RedbBackend::open` on
+`DatabaseAlreadyOpen` for up to 5 s — the flock release is the
+ground truth for "the previous incarnation is gone".
+
+**Measured (same fleet, same 6 000 offered, 45 s window):**
+- sustained executed: **4 446 → 4 558 tx/s (+2.5 %)** — the pump
+  was already partly sleep-bound at this rate, so the win is
+  headroom not raw throughput
+- pump attribution: `journal::sync` on the commit path 1 438 →
+  **~41 samples (0.2 %)**; `commit_durability_barrier` ≈ 0 samples
+  (clean-barrier fast path); remaining fsync cost is the per-vote
+  WAL append (~3.3 %) — the anti-equivocation barrier, which must
+  stay per-signature by design
+- `nanosleep` ~67 % of pump — consensus now waits on work rather
+  than being busy
+
+**New bottleneck stack:** the WAL signature-path `fcntl` (~700
+samples) is the largest remaining syscall on the pump — amortizing
+it needs group-vote/fsync semantics and is a bigger design change.
+`recover_sender` (execution-side recovery on the lane thread) is
+the biggest CPU item overall but off the critical path. The ~46 %
+tail (gossip fanout, transport syscalls) is next.
+
+Tests: 10/10 durability suite green including the new
+`commit_durability_barrier_flushes_pending_journal` regression
+(crash after barrier with the lane spawned), journal-level
+`test_sync_if_dirty_skips_redundant_fsyncs`, all touched crates
+green (executor 112+10, storage 68+, consensus 254, node 78).
