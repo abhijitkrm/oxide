@@ -22110,3 +22110,77 @@ vocabulary the real driver uses.
 `LossModel::Random` are modelled but unapplied (schedule
 permutations stand in — transport-level delay injection is real
 Phase-4 work); Docker compose has no CI job (manual only).
+
+## Pipeline-knee profile → single-recovery admission + injector resync anchor
+
+Profiled the ~5k tx/s production-path knee on a 4-node plaintext
+devnet fleet (mTLS left enabled in prod configs; the pump-side cost
+shape is identical — handshakes are per-connection, not per-tx).
+`oxide-devnet --tx-inject-rate 1500` per node = 6 000 offered tx/s;
+executed rate measured by the injector's fixed-sink balance delta
+(`eth_getBalance` window), stack attribution via a 10 s `sample(1)`
+of node 0's pump thread.
+
+**Profile verdict:** the consensus pump spent ~57 % of its samples
+inside `ingest_tx`, and the split was damning — `EvmModule::validate`
+ran `secp256k1::recover_sender` to get the sender for its stateful
+gates, then `Executor::ingest_tx` called `preverify_batch`, which
+recovered the *same* sender *again* just to fill the preverify
+cache. Every admitted tx paid ~30 µs of recovery twice, on the
+pump thread, for gossip and injector traffic alike. The verify pool
+sat ~99.5 % idle. Proposal BLS verification ran inline for another
+~13 %, commit/journal sync ~11 %.
+
+**Fix 1 — one recovery per admission** (`executor`, `evm`):
+`Module::validate_authenticated(ctx, msg, recovered)` joined the
+trait; for `authenticates_sender()` modules `ingest_tx` now runs
+`preverify_batch` *first*, extracts the recovered sender, and hands
+it to `validate_authenticated`, which skips the recovery and runs
+only the stateful gates (nonce floor, gas bounds, EIP-1559 ordering,
+balance cover — extracted into `EvmModule::validate_stateful`,
+shared verbatim by `validate`). One recovery now serves admission
+*and* the preverify cache. `preverify_batch` also got a
+single-element path — the per-tx call was paying rayon's split/join
+overhead for one item.
+
+**Fix 2 — the injector's resync anchor** (`node`, `executor`): the
+dedup alone exposed that the devnet load driver wedged permanently.
+`TxInject` advanced its nonce fire-and-forget, so the first
+intake-full or pool-drain drop became an unhealable gap in the
+pool's contiguous `select` chain — an earlier run executed ~10 k
+txs then froze while blocks kept finalizing. The fix rewinds the
+stream when its nonce outruns the sender's *executed* watermark by
+`INJECT_MAX_LEAD` (512) and holds the nonce on rejection instead of
+skipping it. But the first cut still froze every sender at exactly
+LEAD+1: `Executor::executed_nonce_of` returns 0 **forever** for
+self-authenticating senders — `plan_block_runs` deliberately never
+bumps the executor map for them (envelope claims must not drive
+it), so the rewind target was `0` and every reset parked the stream
+in a `nonce 0 < current` reject loop. New `Module::sender_nonce`
+(default `None`; `EvmModule` returns its account-store nonce — the
+same counter `validate` checks and `eth_getTransactionCount`
+serves) plus `Executor::module_sender_nonce` gives the anchor the
+truthful source: `TxInject.anchor_module` selects it, the
+`inject_anchor_nonce` helper falls back to the executor map for
+native traffic.
+
+**Measured (same fleet, same 6 000 tx/s offer):**
+- sustained executed: **4 016 → 4 446 tx/s (+10.7 %)**, no
+  permanent stalls across 60 s windows; injector rejections now
+  self-heal (dozens of resyncs, zero wedges)
+- pump attribution moved from `ingest_tx` ~57 % to **~18.6 %**
+  (one recovery per tx); the top line is now the commit path —
+  `on_inbound_qc`→`finalize_block`→`journal::sync`/`fcntl` ~21.5 %,
+  vote/BLS ~13.5 %
+- an early burst window ran ~8.2k tx/s — the sustained figure is
+  the honest one; resend churn adds admission work beyond the
+  executed rate, so the dedup's full gain is understated here
+
+**Open bottleneck stack, in order:** commit/QC path fsync + QC
+bookkeeping (~21.5 %, `journal::sync` ≈ 500 samples is pure WAL
+fsync per commit), remaining admission crypto (~18.6 % — the single
+recovery plus envelope/hash work), proposal BLS (~13.5 % — still
+inline despite the idle verify pool), then the ~46 % tail:
+gossip fanout, transport syscalls, WAL appends. Next levers: WAL
+fsync amortization across commits and routing proposal BLS through
+the verify pool.

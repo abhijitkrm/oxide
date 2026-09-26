@@ -724,6 +724,40 @@ pub trait Module: Send + Sync {
         Ok(())
     }
 
+    /// Validate a message whose sender has already been
+    /// cryptographically authenticated at admission — the sender
+    /// recovered by [`preverify_batch`](Self::preverify_batch) for
+    /// self-authenticating modules, or the envelope-verified
+    /// `ctx.sender` for signature-on-envelope modules.
+    ///
+    /// This exists so admission pays signature recovery **once**:
+    /// a module that recovers a signer inside `validate` (the EVM —
+    /// its payload carries the secp256k1 signature) would otherwise
+    /// recover it again when the executor calls `preverify_batch`
+    /// for the cache — ~30 µs/tx duplicated on the caller's thread.
+    /// The override contract: run every `validate` gate except the
+    /// signature/recovery step, substituting `sender` for the
+    /// internally-recovered value. `sender` is trustworthy — it was
+    /// produced by this node's own `preverify_batch` of these exact
+    /// `msg` bytes, never by the peer.
+    ///
+    /// The default forwards to [`validate`](Self::validate) and
+    /// ignores `sender`, preserving behavior for modules that do no
+    /// in-`validate` recovery.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`validate`](Self::validate).
+    fn validate_authenticated(
+        &self,
+        ctx: &TxContext,
+        msg: &[u8],
+        sender: &[u8; 20],
+    ) -> Result<(), ExecError> {
+        let _ = sender;
+        self.validate(ctx, msg)
+    }
+
     /// Handle a message. Returns events on success, or an error.
     ///
     /// The `ctx` carries the sender, nonce, and fee parsed from the
@@ -985,6 +1019,18 @@ pub trait Module: Send + Sync {
     /// modules are rejected as malformed.
     fn authenticates_sender(&self) -> bool {
         false
+    }
+
+    /// The sender's next-executable nonce as the module itself
+    /// tracks it — `None` (the default) when the module keeps no
+    /// sender-nonce state. Envelope-authenticated modules rely on
+    /// the executor's `executed_nonce` map and return `None`;
+    /// self-authenticating ones (the EVM) own the account nonce
+    /// inside their state — the executor's map deliberately never
+    /// advances for them (see `plan_block_runs`), so this is the
+    /// only authoritative resync anchor a submitter can use.
+    fn sender_nonce(&self, _sender: &primitives::Address) -> Option<u64> {
+        None
     }
 
     /// Estimate the gas cost of a message for block gas limit
@@ -1896,6 +1942,19 @@ impl Executor {
     #[must_use]
     pub fn executed_nonce_of(&self, sender: &primitives::Address) -> u64 {
         primitives::sync::lock_state(&self.executed_nonce).map.get(sender).copied().unwrap_or(0)
+    }
+
+    /// The next nonce `module_id` expects from `sender` as the
+    /// module itself tracks it — `None` when the module keeps no
+    /// sender-nonce state. Self-authenticating modules (the EVM)
+    /// own this counter: `executed_nonce_of` is the anchor for
+    /// envelope-authenticated traffic only and reads 0 forever for
+    /// senders whose txs authenticate inside the payload — which is
+    /// correct there (the map must not be driveable by envelope
+    /// claims) but useless as a submitter's resync anchor.
+    #[must_use]
+    pub fn module_sender_nonce(&self, module_id: u8, sender: &primitives::Address) -> Option<u64> {
+        self.modules[usize::from(module_id)].as_ref().and_then(|m| m.sender_nonce(sender))
     }
 
     /// The latest state root (at the current chain height).

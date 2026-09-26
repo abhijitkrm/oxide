@@ -164,18 +164,26 @@ impl EvmModule {
         &self,
         msgs: &'a [T],
     ) -> Vec<Result<PreverifiedTx<'a>, ExecError>> {
-        msgs.par_iter()
-            .map(|raw| {
-                let signed =
-                    tx::SignedTx::decode_raw(raw.as_ref()).map_err(|_| ExecError::Malformed)?;
-                if signed.chain_id() != self.chain_id {
-                    return Err(ExecError::Malformed);
-                }
-                let sender = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
-                let caller = alloy_primitives_address(sender.0);
-                Ok(PreverifiedTx { raw: raw.as_ref(), sender: caller })
-            })
-            .collect()
+        // A lone tx has no parallelism to buy — the rayon bridge's
+        // split/join overhead (~µs) is pure cost on the caller's
+        // thread, and the mempool admission path calls this with a
+        // single-element slice per tx.
+        if msgs.len() == 1 {
+            return msgs.iter().map(|raw| self.preverify_one(raw.as_ref())).collect();
+        }
+        msgs.par_iter().map(|raw| self.preverify_one(raw.as_ref())).collect()
+    }
+
+    /// Decode + chain-ID + secp256k1 recovery for one raw tx — the
+    /// per-item body of [`preverify_batch`](Self::preverify_batch).
+    fn preverify_one<'a>(&self, raw: &'a [u8]) -> Result<PreverifiedTx<'a>, ExecError> {
+        let signed = tx::SignedTx::decode_raw(raw).map_err(|_| ExecError::Malformed)?;
+        if signed.chain_id() != self.chain_id {
+            return Err(ExecError::Malformed);
+        }
+        let sender = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
+        let caller = alloy_primitives_address(sender.0);
+        Ok(PreverifiedTx { raw, sender: caller })
     }
 
     /// Execute a batch of transactions with **pre-verified senders**.

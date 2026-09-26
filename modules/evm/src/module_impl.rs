@@ -223,91 +223,26 @@ impl Module for EvmModule {
 
         // 3. Signature recovery.
         let sender = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
-        let sender_addr = Address(sender.0);
 
-        // 4. Nonce: tx nonce must be ≥ current account nonce.
-        //    This rejects stale (already-used) nonces. Future nonces
-        //    are allowed for mempool queueing.
-        let current_nonce = self.nonce(&sender_addr);
-        if signed.nonce() < current_nonce {
-            return Err(ExecError::ModuleRejected(format!(
-                "nonce {nonce} < current {current_nonce}",
-                nonce = signed.nonce()
-            )));
-        }
+        self.validate_stateful(&signed, Address(sender.0))
+    }
 
-        // 5. Gas limit: must be positive.
-        let gas_limit = signed.gas_limit();
-        if gas_limit == 0 {
-            return Err(ExecError::ModuleRejected("gas_limit is zero".to_string()));
+    /// Admission gate with the sender already authenticated by the
+    /// caller's `preverify_batch` — runs the same decode and stateful
+    /// gates as `validate` but skips the duplicate secp256k1
+    /// recovery (~30 µs/tx saved on the caller's thread, which is the
+    /// consensus pump for gossip traffic).
+    fn validate_authenticated(
+        &self,
+        _ctx: &TxContext,
+        msg: &[u8],
+        sender: &[u8; 20],
+    ) -> Result<(), ExecError> {
+        let signed = tx::SignedTx::decode_raw(msg).map_err(|_| ExecError::Malformed)?;
+        if signed.chain_id() != self.chain_id {
+            return Err(ExecError::Malformed);
         }
-
-        // HIGH fix: gas_limit must fit within the block gas limit.
-        // A tx with gas_limit > block_gas_limit can never be included
-        // and should be rejected at admission to save mempool space.
-        if gas_limit > self.block_gas_limit() {
-            return Err(ExecError::ModuleRejected(format!(
-                "gas_limit {gas_limit} > block_gas_limit {}",
-                self.block_gas_limit()
-            )));
-        }
-
-        // 6. Intrinsic gas: gas_limit must cover the intrinsic cost.
-        //    The intrinsic cost is 21_000 (base) + calldata cost
-        //    (16/byte for non-zero, 4/byte for zero) + access list
-        //    cost. We use a conservative lower bound of 21_000 here;
-        //    the full calldata-aware check arrives with the gas
-        //    economics phase (A5).
-        if gas_limit < INTRINSIC_GAS_BASE {
-            return Err(ExecError::ModuleRejected(format!(
-                "gas_limit {gas_limit} < intrinsic {INTRINSIC_GAS_BASE}"
-            )));
-        }
-
-        // HIGH fix: EIP-1559 fee gates.
-        //   a. max_fee >= base_fee: a tx with max_fee < base_fee
-        //      can never be included (revm rejects it during
-        //      execution). Reject at admission to save resources.
-        //   b. priority_fee <= max_fee: EIP-1559 requires
-        //      max_priority_fee_per_gas <= max_fee_per_gas. A tx
-        //      with priority_fee > max_fee is invalid.
-        let max_fee = u128::try_from(signed.max_fee_per_gas())
-            .map_err(|_| ExecError::ModuleRejected("max_fee overflow u128".to_string()))?;
-        let priority_fee = u128::try_from(signed.max_priority_fee_per_gas())
-            .map_err(|_| ExecError::ModuleRejected("priority_fee overflow u128".to_string()))?;
-        if max_fee < u128::from(self.current_base_fee()) {
-            return Err(ExecError::ModuleRejected(format!(
-                "max_fee {max_fee} < base_fee {}",
-                self.current_base_fee()
-            )));
-        }
-        if priority_fee > max_fee {
-            return Err(ExecError::ModuleRejected(format!(
-                "priority_fee {priority_fee} > max_fee {max_fee}"
-            )));
-        }
-
-        // 7. Balance: sender must cover gas_cost + value.
-        //    gas_cost = gas_limit * max_fee_per_gas (the worst-case
-        //    fee the sender could pay). For legacy txs, gas_price is
-        //    the max fee. For EIP-1559, max_fee_per_gas is the cap.
-        let balance = self.balance(&sender_addr);
-        let value = u128::try_from(signed.value())
-            .map_err(|_| ExecError::ModuleRejected("value overflow u128".to_string()))?;
-        // gas_cost = gas_limit * max_fee, checked for overflow.
-        let gas_cost = u128::from(gas_limit)
-            .checked_mul(max_fee)
-            .ok_or_else(|| ExecError::ModuleRejected("gas cost overflow".to_string()))?;
-        let total_needed = gas_cost
-            .checked_add(value)
-            .ok_or_else(|| ExecError::ModuleRejected("gas_cost + value overflow".to_string()))?;
-        if balance < total_needed {
-            return Err(ExecError::ModuleRejected(format!(
-                "insufficient balance: have {balance}, need {total_needed}"
-            )));
-        }
-
-        Ok(())
+        self.validate_stateful(&signed, Address(*sender))
     }
 
     /// The EVM is self-funded: revm charges `gas_used × effective
@@ -359,6 +294,16 @@ impl Module for EvmModule {
     /// redundant recovery on top of the RLP's own verification.
     fn authenticates_sender(&self) -> bool {
         true
+    }
+
+    /// The account nonce is the module's own sender-nonce counter:
+    /// self-authenticating senders bypass the executor's
+    /// `executed_nonce` map entirely (the envelope's declared pair
+    /// is unauthenticated for this module), so the account store's
+    /// nonce is the only authoritative resync anchor a submitter —
+    /// injector, wallet, `eth_getTransactionCount` — can use.
+    fn sender_nonce(&self, sender: &primitives::Address) -> Option<u64> {
+        Some(self.nonce(sender))
     }
 
     /// Gas estimate = the tx's declared `gas_limit`, decoded from
@@ -1085,6 +1030,103 @@ impl Module for EvmModule {
         framework::lock_state(&self.retained_branches).clear();
         *framework::lock_state(&self.cached_state_root) = None;
         framework::lock_state(&self.touched).clear();
+        Ok(())
+    }
+}
+
+impl EvmModule {
+    /// The stateful admission gates shared by `validate` (which
+    /// recovers the signer itself) and `validate_authenticated`
+    /// (which takes the caller's recovered sender): nonce floor,
+    /// gas-limit bounds, EIP-1559 fee ordering, and the balance
+    /// cover check. Pure reads only — admission never mutates state.
+    fn validate_stateful(
+        &self,
+        signed: &tx::SignedTx,
+        sender_addr: Address,
+    ) -> Result<(), ExecError> {
+        // 4. Nonce: tx nonce must be ≥ current account nonce.
+        //    This rejects stale (already-used) nonces. Future nonces
+        //    are allowed for mempool queueing.
+        let current_nonce = self.nonce(&sender_addr);
+        if signed.nonce() < current_nonce {
+            return Err(ExecError::ModuleRejected(format!(
+                "nonce {nonce} < current {current_nonce}",
+                nonce = signed.nonce()
+            )));
+        }
+
+        // 5. Gas limit: must be positive.
+        let gas_limit = signed.gas_limit();
+        if gas_limit == 0 {
+            return Err(ExecError::ModuleRejected("gas_limit is zero".to_string()));
+        }
+
+        // HIGH fix: gas_limit must fit within the block gas limit.
+        // A tx with gas_limit > block_gas_limit can never be included
+        // and should be rejected at admission to save mempool space.
+        if gas_limit > self.block_gas_limit() {
+            return Err(ExecError::ModuleRejected(format!(
+                "gas_limit {gas_limit} > block_gas_limit {}",
+                self.block_gas_limit()
+            )));
+        }
+
+        // 6. Intrinsic gas: gas_limit must cover the intrinsic cost.
+        //    The intrinsic cost is 21_000 (base) + calldata cost
+        //    (16/byte for non-zero, 4/byte for zero) + access list
+        //    cost. We use a conservative lower bound of 21_000 here;
+        //    the full calldata-aware check arrives with the gas
+        //    economics phase (A5).
+        if gas_limit < INTRINSIC_GAS_BASE {
+            return Err(ExecError::ModuleRejected(format!(
+                "gas_limit {gas_limit} < intrinsic {INTRINSIC_GAS_BASE}"
+            )));
+        }
+
+        // HIGH fix: EIP-1559 fee gates.
+        //   a. max_fee >= base_fee: a tx with max_fee < base_fee
+        //      can never be included (revm rejects it during
+        //      execution). Reject at admission to save resources.
+        //   b. priority_fee <= max_fee: EIP-1559 requires
+        //      max_priority_fee_per_gas <= max_fee_per_gas. A tx
+        //      with priority_fee > max_fee is invalid.
+        let max_fee = u128::try_from(signed.max_fee_per_gas())
+            .map_err(|_| ExecError::ModuleRejected("max_fee overflow u128".to_string()))?;
+        let priority_fee = u128::try_from(signed.max_priority_fee_per_gas())
+            .map_err(|_| ExecError::ModuleRejected("priority_fee overflow u128".to_string()))?;
+        if max_fee < u128::from(self.current_base_fee()) {
+            return Err(ExecError::ModuleRejected(format!(
+                "max_fee {max_fee} < base_fee {}",
+                self.current_base_fee()
+            )));
+        }
+        if priority_fee > max_fee {
+            return Err(ExecError::ModuleRejected(format!(
+                "priority_fee {priority_fee} > max_fee {max_fee}"
+            )));
+        }
+
+        // 7. Balance: sender must cover gas_cost + value.
+        //    gas_cost = gas_limit * max_fee_per_gas (the worst-case
+        //    fee the sender could pay). For legacy txs, gas_price is
+        //    the max fee. For EIP-1559, max_fee_per_gas is the cap.
+        let balance = self.balance(&sender_addr);
+        let value = u128::try_from(signed.value())
+            .map_err(|_| ExecError::ModuleRejected("value overflow u128".to_string()))?;
+        // gas_cost = gas_limit * max_fee, checked for overflow.
+        let gas_cost = u128::from(gas_limit)
+            .checked_mul(max_fee)
+            .ok_or_else(|| ExecError::ModuleRejected("gas cost overflow".to_string()))?;
+        let total_needed = gas_cost
+            .checked_add(value)
+            .ok_or_else(|| ExecError::ModuleRejected("gas_cost + value overflow".to_string()))?;
+        if balance < total_needed {
+            return Err(ExecError::ModuleRejected(format!(
+                "insufficient balance: have {balance}, need {total_needed}"
+            )));
+        }
+
         Ok(())
     }
 }

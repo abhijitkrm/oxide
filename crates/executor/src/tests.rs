@@ -3403,3 +3403,63 @@ fn shared_chain_params_drive_live_fee_floor() {
     );
     assert_eq!(*primitives::sync::lock_state(&collector.charged), 100);
 }
+
+/// A self-authenticating test module with module-owned sender-nonce
+/// state — mirrors the EVM, whose account store tracks nonces
+/// internally while the executor's `executed_nonce` map deliberately
+/// never advances for it.
+struct NonceAnchorModule {
+    nonce: u64,
+}
+
+impl Module for NonceAnchorModule {
+    fn name(&self) -> &'static str {
+        "nonce-anchor"
+    }
+    fn id(&self) -> u8 {
+        3
+    }
+    fn authenticates_sender(&self) -> bool {
+        true
+    }
+    fn sender_nonce(&self, _sender: &primitives::Address) -> Option<u64> {
+        Some(self.nonce)
+    }
+    fn begin_block(&self, _height: Height) {}
+    fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+        Ok(vec![])
+    }
+    fn end_block(&self, _height: Height) -> Vec<Event> {
+        Vec::new()
+    }
+    fn state_root(&self) -> Hash {
+        Hash::ZERO
+    }
+}
+
+/// `module_sender_nonce` must answer from the module's own sender-
+/// nonce state for self-authenticating modules — the only truthful
+/// resync anchor for them — while `executed_nonce_of` keeps its
+/// envelope-auth-only semantics and reads 0 for the same sender.
+/// Native modules and empty slots report no module-owned anchor.
+#[test]
+fn module_sender_nonce_reports_self_auth_anchor() {
+    let mut executor = test_executor(100);
+    let sender = Address([0x77; 20]);
+    executor.register_module(Arc::new(NonceAnchorModule { nonce: 7 }));
+    assert_eq!(
+        executor.module_sender_nonce(3, &sender),
+        Some(7),
+        "self-authenticating modules answer from their own sender-nonce state"
+    );
+    assert_eq!(
+        executor.executed_nonce_of(&sender),
+        0,
+        "the executor map deliberately never advances for self-authenticating senders"
+    );
+    assert_eq!(
+        executor.module_sender_nonce(2, &sender),
+        None,
+        "an empty module slot has no sender-nonce state"
+    );
+}

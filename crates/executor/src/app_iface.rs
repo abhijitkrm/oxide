@@ -66,16 +66,42 @@ impl AppInterface for Executor {
                 Err(reason) => return MempoolAck::Rejected { reason: reason.to_string() },
             };
         let payload = module_payload(bytes);
-        if let Err(e) = module.validate(&ctx, payload) {
+        // Authenticate the module payload ONCE: for self-
+        // authenticating modules (the EVM — the payload carries its
+        // own secp256k1 signature) `preverify_batch` is the signature
+        // check, and the recovered sender feeds
+        // `validate_authenticated` so the stateful gates run without
+        // a second recovery. The previous order — `validate`
+        // recovering internally, then `preverify_batch` recovering
+        // again for the cache — paid ~30 µs of secp256k1 twice per
+        // admitted tx on the caller's thread, which for gossip and
+        // injector traffic is the consensus pump.
+        //
+        // `msgs` must outlive `preverify_result` — the returned
+        // `PreverifiedTx` borrows the payload slice.
+        let msgs = [payload];
+        let preverify_result = module.preverify_batch(&msgs);
+        let recovered_sender = preverify_result[0]
+            .as_ref()
+            .ok()
+            .and_then(|pv| (pv.sender != [0u8; 20]).then_some(pv.sender));
+        if module.authenticates_sender() {
+            // A failed preverify means the payload's own signature
+            // did not recover — the same verdict `validate` returns
+            // on these bytes, so reject before the stateful gates.
+            let Some(sender) = recovered_sender else {
+                return MempoolAck::Rejected { reason: "validate: malformed".to_string() };
+            };
+            if let Err(e) = module.validate_authenticated(&ctx, payload, &sender) {
+                return MempoolAck::Rejected { reason: format!("validate: {e:?}") };
+            }
+        } else if let Err(e) = module.validate(&ctx, payload) {
             return MempoolAck::Rejected { reason: format!("validate: {e:?}") };
         }
 
-        // Pre-recover the sender at ingestion time and cache it.
-        // This amortizes secp256k1 recovery (~30 µs/tx) across the
-        // tx's lifetime in the mempool. At block execution time, the
-        // cached sender is used to skip recovery entirely — the
-        // execution hot path sees only RLP decode + chain ID check.
-        //
+        // Cache the authenticated sender so block execution skips
+        // recovery entirely — the execution hot path then sees only
+        // RLP decode + chain ID check.
         // A cache entry asserts "a trustworthy sender exists for this
         // exact tx hash" — `check_envelope_auth` treats a hit as
         // already-verified, and `execute_block` routes all-cached
@@ -92,10 +118,6 @@ impl AppInterface for Executor {
         //   `all_cached` false, so the group takes the plain
         //   `handle_batch` path (correct per-tx contexts).
         //
-        // `msgs` must outlive `preverify_result` — the returned
-        // `PreverifiedTx` borrows the payload slice.
-        let msgs = [payload];
-        let preverify_result = module.preverify_batch(&msgs);
         // Compute the cacheable entry now but insert it only if the
         // bounded intake accepts the tx below — a cache populated
         // ahead of admission grew on *rejected* submissions (an
@@ -103,19 +125,8 @@ impl AppInterface for Executor {
         // never held), the one intake-side map that wasn't bounded
         // by any capacity check. The hash is taken now because `tx`
         // moves into the channel below.
-        let cacheable = preverify_result[0]
-            .as_ref()
-            .ok()
-            .and_then(|preverified| {
-                if preverified.sender != [0u8; 20] {
-                    Some(preverified.sender)
-                } else if envelope_verified {
-                    Some(ctx.sender.0)
-                } else {
-                    None
-                }
-            })
-            .map(|sender| {
+        let cacheable =
+            recovered_sender.or_else(|| envelope_verified.then_some(ctx.sender.0)).map(|sender| {
                 (crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, bytes), sender)
             });
 
@@ -219,36 +230,46 @@ impl AppInterface for Executor {
                     }
                 };
             let payload = module_payload(bytes);
-            if let Err(e) = module.validate(&ctx, payload) {
+            // Same single-authentication order as `ingest_tx`:
+            // `preverify_batch` recovers the module-level signer once
+            // and `validate_authenticated` consumes it for the
+            // stateful gates — no second secp256k1 recovery per tx.
+            // `msgs` must outlive `preverify_result` — the returned
+            // `PreverifiedTx` borrows the payload slice.
+            let msgs = [payload];
+            let preverify_result = module.preverify_batch(&msgs);
+            let recovered_sender = preverify_result[0]
+                .as_ref()
+                .ok()
+                .and_then(|pv| (pv.sender != [0u8; 20]).then_some(pv.sender));
+            if module.authenticates_sender() {
+                // A failed preverify means the payload's own
+                // signature did not recover — the same verdict
+                // `validate` would return on these bytes.
+                let Some(sender) = recovered_sender else {
+                    results
+                        .push(MempoolAck::Rejected { reason: "validate: malformed".to_string() });
+                    continue;
+                };
+                if let Err(e) = module.validate_authenticated(&ctx, payload, &sender) {
+                    results.push(MempoolAck::Rejected { reason: format!("validate: {e:?}") });
+                    continue;
+                }
+            } else if let Err(e) = module.validate(&ctx, payload) {
                 results.push(MempoolAck::Rejected { reason: format!("validate: {e:?}") });
                 continue;
             }
-            // Pre-recover the sender at ingestion time. Only cache a
-            // sender that was actually authenticated — the module's
-            // own recovery (non-zero) or the envelope-verified
-            // `ctx.sender`. A zero placeholder on an
-            // admitted-unsigned tx is skipped so `all_cached` stays
-            // false and the group keeps the plain `handle_batch`
-            // path. `msgs` must outlive `preverify_result` — the
-            // returned `PreverifiedTx` borrows the payload slice.
-            // The entry is *computed* here but cached only after the
-            // pool accepts the tx below — caching ahead of bounded
-            // admission let rejected submissions grow the map past
-            // every capacity check.
-            let msgs = [payload];
-            let preverify_result = module.preverify_batch(&msgs);
-            let cacheable = preverify_result[0]
-                .as_ref()
-                .ok()
-                .and_then(|preverified| {
-                    if preverified.sender != [0u8; 20] {
-                        Some(preverified.sender)
-                    } else if envelope_verified {
-                        Some(ctx.sender.0)
-                    } else {
-                        None
-                    }
-                })
+            // Only cache a sender that was actually authenticated —
+            // the module's own recovery (non-zero) or the
+            // envelope-verified `ctx.sender`. A zero placeholder on
+            // an admitted-unsigned tx is skipped so `all_cached`
+            // stays false and the group keeps the plain
+            // `handle_batch` path. The entry is *computed* here but
+            // cached only after the pool accepts the tx below —
+            // caching ahead of bounded admission let rejected
+            // submissions grow the map past every capacity check.
+            let cacheable = recovered_sender
+                .or_else(|| envelope_verified.then_some(ctx.sender.0))
                 .map(|sender| {
                     (
                         crypto::hash::Hasher::hash_one(

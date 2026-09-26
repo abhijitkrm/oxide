@@ -131,6 +131,23 @@ const CERT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// schedule fast-forwards after this many emissions in one pass.
 const INJECT_CATCHUP_CAP: u32 = 64;
 
+/// Maximum nonce lead the `TxInject` stream may hold over the
+/// sender's executed watermark before it rewinds and resends. The
+/// pool's `select` walks the contiguous nonce chain from
+/// `executed_nonce + 1`, so a dropped tx (intake-full reject, or a
+/// post-ack pool eviction at the proposal drain) is a permanent gap
+/// unless the injector resends it — fire-and-forget injection froze
+/// execution after the first drop under sustained load.
+///
+/// Sizing: `512` bounds the resend window to ~0.34 s of the
+/// 1 500-tx/s stream — the rewind covers the in-flight range in
+/// under a second, so a transient drop heals instead of stalling
+/// the sender — keeps the whole in-flight window under the
+/// per-sender `select` cap (`DEFAULT_MAX_PER_SENDER` = 1 000), and
+/// stays above the few-hundred-nonce depth of healthy pipelined
+/// flow so steady-state emission never triggers it.
+const INJECT_MAX_LEAD: u64 = 512;
+
 /// mTLS material for the peer transport — resolved file paths.
 ///
 /// Peer certificates are required per expected peer: a peer without
@@ -173,6 +190,14 @@ pub struct TxInject {
     /// resumes past consumed nonces instead of replaying them into
     /// `NonceTooLow` rejections.
     pub sender: primitives::Address,
+    /// Module whose sender-nonce counter anchors the stream —
+    /// `Some(id)` for self-authenticating modules (the EVM), whose
+    /// senders bypass the executor's `executed_nonce` map by design
+    /// (envelope claims must not drive that map), leaving
+    /// `module_sender_nonce` as the only authoritative anchor.
+    /// `None` anchors on the executor map for envelope-
+    /// authenticated traffic.
+    pub anchor_module: Option<u8>,
     /// Wall-clock interval between injected transactions (the
     /// reciprocal of the offered rate).
     pub interval: std::time::Duration,
@@ -213,6 +238,7 @@ impl TxInject {
         let sink = alloy_primitives::Address::from([0x77; 20]);
         Self {
             sender,
+            anchor_module: Some(evm::MODULE_ID),
             interval: Duration::from_secs_f64(1.0 / rate),
             build: Box::new(move |nonce: u64| {
                 let tx = evm::tx::TxLegacy {
@@ -234,6 +260,22 @@ impl TxInject {
                 evm::wrap_evm_tx_envelope(&sender, nonce, 10_000_000_000, &signed.encode_to_bytes())
             }),
         }
+    }
+}
+
+/// The injector's resync anchor — the next nonce the sender must
+/// offer for its account to make progress. A stream targeting a
+/// self-authenticating module reads that module's own sender-nonce
+/// counter (`Module::sender_nonce`); envelope-authenticated
+/// streams read the executor's `executed_nonce` map. The fallback
+/// keeps a `Some` module without nonce state anchored on the
+/// executor map rather than resetting the stream to 0.
+fn inject_anchor_nonce(app: &executor::Executor, inject: &TxInject) -> u64 {
+    match inject.anchor_module {
+        Some(id) => app
+            .module_sender_nonce(id, &inject.sender)
+            .unwrap_or_else(|| app.executed_nonce_of(&inject.sender)),
+        None => app.executed_nonce_of(&inject.sender),
     }
 }
 
@@ -905,7 +947,7 @@ fn run_consensus_loop(
     // resumes past consumed nonces instead of replaying them into
     // rejections. `inject_next` is a fixed schedule: missed ticks
     // are owed and fire as a bounded catch-up burst next pass.
-    let mut inject_nonce = tx_inject.as_ref().map(|i| app.executed_nonce_of(&i.sender));
+    let mut inject_nonce = tx_inject.as_ref().map(|i| inject_anchor_nonce(app, i));
     let mut inject_next = std::time::Instant::now();
 
     loop {
@@ -1588,24 +1630,47 @@ fn run_consensus_loop(
         // waste). Ticks missed during a stall are owed, capped per
         // pass at `INJECT_CATCHUP_CAP`; deeper backlog fast-forwards
         // the schedule rather than amortizing into a flood.
+        //
+        // The nonce stream stays anchored to the executed watermark:
+        // advancing past a dropped tx leaves a gap the pool's
+        // contiguous-nonce `select` can never cross — a single
+        // intake-full or pool-evict drop used to freeze that
+        // sender's execution permanently while the injector raced
+        // ahead. Rewinding past `INJECT_MAX_LEAD` resends the window
+        // (still-pending duplicates dedup harmlessly at pool submit)
+        // and rejection holds the nonce for the next tick instead of
+        // skipping it.
         if let (Some(inject), Some(nonce)) = (&mut tx_inject, &mut inject_nonce) {
             let now = std::time::Instant::now();
             let mut emitted = 0u32;
             while inject_next <= now && emitted < INJECT_CATCHUP_CAP {
+                let executed = inject_anchor_nonce(app, inject);
+                if *nonce < executed || *nonce > executed + INJECT_MAX_LEAD {
+                    *nonce = executed;
+                }
                 let tx_bytes = (inject.build)(*nonce);
-                *nonce += 1;
                 inject_next += inject.interval;
                 emitted += 1;
-                let ack = engine.submit_tx(types::TxBytes::new(tx_bytes.clone()));
-                if matches!(ack, types::MempoolAck::Accepted) {
-                    fanout_tx(
-                        engine,
-                        transport,
-                        our_addr,
-                        &mut seen_txs,
-                        &mut seen_txs_fifo,
-                        &tx_bytes,
-                    );
+                match engine.submit_tx(types::TxBytes::new(tx_bytes.clone())) {
+                    types::MempoolAck::Accepted => {
+                        *nonce += 1;
+                        fanout_tx(
+                            engine,
+                            transport,
+                            our_addr,
+                            &mut seen_txs,
+                            &mut seen_txs_fifo,
+                            &tx_bytes,
+                        );
+                    }
+                    types::MempoolAck::Rejected { .. } => {
+                        // Backpressure (intake full) or a stale nonce:
+                        // hold this nonce for the next owed tick and
+                        // shed the accumulated backlog rather than
+                        // queueing an unbounded retry burst.
+                        inject_next = now + inject.interval;
+                        break;
+                    }
                 }
             }
             if inject_next <= now {

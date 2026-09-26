@@ -12,6 +12,35 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Single-recovery transaction admission** (`executor`, `evm`,
+  `node`): mempool admission recovered each EVM sender's secp256k1
+  signature twice — once inside `Module::validate` for the stateful
+  gates, then again in `preverify_batch` purely to fill the
+  preverify cache — ~30 µs twice per tx on the thread that also
+  runs consensus. Profiling a 4-node fleet at 6 000 offered tx/s
+  showed `ingest_tx` holding ~57 % of the consensus pump.
+  `Module::validate_authenticated` now lets the self-authenticating
+  module's one recovery serve both the stateful gates and the
+  cache, and `preverify_batch` skips rayon dispatch for the
+  single-tx call. Sustained executed throughput on the same fleet:
+  **4 016 → 4 446 tx/s (+10.7 %)**, admission's pump share cut to
+  ~19 %. The devnet injector (`--tx-inject-rate`) also gained a
+  resync anchor — it rewinds to the sender's module-anchored nonce
+  (`Module::sender_nonce` / `Executor::module_sender_nonce`) when
+  its stream outruns execution by `INJECT_MAX_LEAD` and holds a
+  nonce on rejection instead of skipping it, so a transient
+  intake/pool drop heals instead of permanently gapping the
+  sender's contiguous `select` chain — the wedge that used to
+  freeze injected load after the first drop.
+  - **In plain words:** every transaction used to get its signature
+    checked twice before it even reached the mempool. Now it's
+    checked once and the result is reused — so the consensus thread
+    spends its time on consensus instead of duplicated crypto, and
+    roughly one in ten more transactions per second lands. The load
+    generator used to jam permanently the first time a transaction
+    got dropped under pressure; now it backs up and retries the
+    missing nonce like a real wallet would.
+
 - **Folded-fsync consensus WAL** (`consensus::wal`): on Linux the
   WAL opens `O_DSYNC`, so a signature-path append's `write(2)` is
   itself durable — no second fsync syscall per vote — and
