@@ -588,12 +588,21 @@ pub fn run(spec: ValidatorNetSpec) {
 
     // Graceful shutdown: if a data dir is configured, export the
     // current state to `<dir>/snapshot.bin` so a restart can resume
-    // with the full chain state (not just the WAL).
+    // with the full chain state (not just the WAL). Logged *before*
+    // it runs: a loaded node's export takes seconds, and silence
+    // during it reads as a hung shutdown to an operator watching
+    // stderr — the elapsed print reports what the wait cost.
     if let Some(ref dir) = data_dir {
+        let export_start = std::time::Instant::now();
+        println!(
+            "{log_tag}: exporting state snapshot to {} — this can take a while on a loaded state",
+            dir.join("snapshot.bin").display(),
+        );
         let height = crate::devnet::export_snapshot(&app, dir).unwrap_or_else(|e| panic!("{e}"));
         println!(
-            "{log_tag}: exported snapshot to {} (height {height})",
+            "{log_tag}: exported snapshot to {} (height {height}) in {:?}",
             dir.join("snapshot.bin").display(),
+            export_start.elapsed(),
         );
     }
     println!("{log_tag}: shutdown complete");

@@ -197,11 +197,29 @@ fn run_single_node() {
                     _ = sigterm.recv() => tracing::info!("received SIGTERM"),
                     _ = sigint.recv() => tracing::info!("received SIGINT (Ctrl+C)"),
                 }
+                // A second signal during the graceful teardown below
+                // force-exits: the installed tokio disposition swallows
+                // repeats, so without this an operator signalling twice
+                // while state export runs sees a process that looks
+                // hung. Detached so this select arm completes now.
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = sigterm.recv() => {},
+                        _ = sigint.recv() => {},
+                    }
+                    tracing::warn!("second shutdown signal — exiting immediately");
+                    std::process::exit(1);
+                });
             }
             #[cfg(not(unix))]
             {
                 tokio::signal::ctrl_c().await.expect("install Ctrl+C handler");
                 tracing::info!("received shutdown signal");
+                tokio::spawn(async {
+                    tokio::signal::ctrl_c().await.expect("ctrl_c handler");
+                    tracing::warn!("second shutdown signal — exiting immediately");
+                    std::process::exit(1);
+                });
             }
         };
 
@@ -289,30 +307,7 @@ fn run_validator_node() {
 
     // Graceful shutdown: SIGINT/SIGTERM sets the flag the pump polls.
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-    let _ = primitives::supervision::spawn_supervised("signal-handler", false, move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("signal runtime");
-        rt.block_on(async {
-            #[cfg(unix)]
-            {
-                let mut sigterm =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("sigterm handler");
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {},
-                    _ = sigterm.recv() => {},
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                tokio::signal::ctrl_c().await.expect("ctrl_c handler");
-            }
-            shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
-        });
-    });
+    node::cli::install_shutdown_handler(shutdown.clone());
 
     let rpc_listen = node::cli::parse_cli_flag("--rpc-listen").or_else(|| {
         if cfg.rpc.listen_addr.is_empty() { None } else { Some(cfg.rpc.listen_addr.clone()) }
@@ -1261,30 +1256,7 @@ fn run_signer_daemon(args: &[String]) {
         node::cli::hex_encode(daemon.public_key().as_bytes())
     );
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-    let _ = primitives::supervision::spawn_supervised("signer-signal", false, move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("signal runtime");
-        rt.block_on(async {
-            #[cfg(unix)]
-            {
-                let mut sigterm =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("sigterm handler");
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {},
-                    _ = sigterm.recv() => {},
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                tokio::signal::ctrl_c().await.expect("ctrl_c handler");
-            }
-            shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
-        });
-    });
+    node::cli::install_shutdown_handler(shutdown.clone());
     daemon.serve(listener, &shutdown);
     println!("oxide-validator signer: shutdown");
 }

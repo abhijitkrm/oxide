@@ -401,6 +401,70 @@ pub fn load_config(mode: crate::NodeMode, bin: &str) -> LoadedConfig {
     }
 }
 
+/// Install the standard shutdown-signal handler on `flag`: the
+/// first SIGINT/SIGTERM sets it so the consumer can unwind
+/// gracefully — WAL close, snapshot export — and a *second* signal
+/// exits immediately.
+///
+/// The second-signal rule is what keeps the handler honest: with it
+/// missing, the installed tokio disposition swallows every repeat —
+/// a loaded node's graceful path (a state export over a multi-GB
+/// redb) can take tens of seconds, during which the operator's
+/// repeated SIGTERM does nothing and the process looks hung.
+/// Snapshot writes are atomic, so exiting mid-export leaves the old
+/// or the new file, never a torn one.
+///
+/// The handler is best-effort: if the supervised thread fails to
+/// spawn, the node keeps running and loses only graceful-shutdown
+/// signaling — visible via the registry — which beats refusing to
+/// boot on a signal-emaciated platform.
+///
+/// # Panics
+///
+/// Panics on the handler thread if the tokio runtime or the signal
+/// streams themselves fail to initialize — a broken OS signal
+/// disposition is not something a node can compensate for, so the
+/// supervised-thread registry records it loudly rather than letting
+/// the operator believe graceful shutdown is armed.
+pub fn install_shutdown_handler(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let _ = primitives::supervision::spawn_supervised("signal-handler", false, move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("signal runtime");
+        rt.block_on(async move {
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("sigterm handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = sigterm.recv() => {},
+                }
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                // The handler owns the process's signal disposition
+                // now — nothing reaches the default action — so a
+                // repeat has to be intercepted and acted on here.
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = sigterm.recv() => {},
+                }
+                eprintln!("second shutdown signal — exiting immediately");
+                std::process::exit(1);
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.expect("ctrl_c handler");
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                tokio::signal::ctrl_c().await.expect("ctrl_c handler");
+                eprintln!("second shutdown signal — exiting immediately");
+                std::process::exit(1);
+            }
+        });
+    });
+}
+
 /// Parse a `--flag value` pair from CLI args.
 ///
 /// Returns the value if the flag is found, `None` otherwise.

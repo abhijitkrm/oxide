@@ -167,30 +167,7 @@ fn run_follower(cfg: &config::Config, config: &NodeConfig, peers: Vec<(Vec<u8>, 
     // Graceful shutdown: same supervised signal thread as the
     // validator — SIGINT/SIGTERM flips the flag the pump polls.
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-    let _ = primitives::supervision::spawn_supervised("signal-handler", false, move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("signal runtime");
-        rt.block_on(async {
-            #[cfg(unix)]
-            {
-                let mut sigterm =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("sigterm handler");
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {},
-                    _ = sigterm.recv() => {},
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                tokio::signal::ctrl_c().await.expect("ctrl_c handler");
-            }
-            shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
-        });
-    });
+    node::cli::install_shutdown_handler(shutdown.clone());
 
     // Optional certified-snapshot bootstrap: fetch, verify against
     // the same checkpoint, and write to `<data_dir>/snapshot.bin` —

@@ -18,7 +18,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 fn main() {
     // Supervision before anything can spawn: a panic on a critical
@@ -350,37 +349,10 @@ fn run_node(node_index_str: &str) {
     );
 
     // Graceful shutdown: SIGINT/SIGTERM sets the shutdown flag, which
-    // `run_consensus_loop` checks each iteration. On Unix, SIGTERM
-    // is handled via `signal(SignalKind::terminate())`; on other
-    // platforms, only SIGINT (Ctrl+C) is caught.
+    // `run_consensus_loop` checks each iteration — and a second
+    // signal force-exits so a slow snapshot export never looks hung.
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-    // Non-critical: if the signal thread dies, the node keeps running
-    // and only loses graceful-shutdown signaling — visible via the
-    // registry, not fatal.
-    let _ = primitives::supervision::spawn_supervised("signal-handler", false, move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("signal runtime");
-        rt.block_on(async {
-            #[cfg(unix)]
-            {
-                let mut sigterm =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("sigterm handler");
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {},
-                    _ = sigterm.recv() => {},
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                tokio::signal::ctrl_c().await.expect("ctrl_c handler");
-            }
-            shutdown_clone.store(true, Ordering::Relaxed);
-        });
-    });
+    node::cli::install_shutdown_handler(shutdown.clone());
 
     // Smoke-test transaction, devnet genesis only: a staking
     // delegate signed by devnet identity 0 to itself. Under a real
