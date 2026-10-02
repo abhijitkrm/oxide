@@ -1346,6 +1346,7 @@ dependencies = [
  "primitives",
  "secp256k1",
  "sha3",
+ "zeroize",
 ]
 
 [[package]]
@@ -2538,6 +2539,7 @@ dependencies = [
  "tokio-tungstenite 0.27.0",
  "trading",
  "types",
+ "zeroize",
 ]
 
 [[package]]
@@ -2654,6 +2656,7 @@ dependencies = [
  "tracing",
  "trading",
  "types",
+ "zeroize",
 ]
 
 [[package]]
@@ -2904,6 +2907,7 @@ dependencies = [
  "tokio",
  "trading",
  "types",
+ "zeroize",
 ]
 
 [[package]]
@@ -2972,6 +2976,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "types",
+ "zeroize",
 ]
 
 [[package]]

@@ -495,7 +495,7 @@ fn load_bls_key(index: usize) -> crypto::BlsSecretKey {
         // `OXIDE_KEY_PASSPHRASE` in the environment).
         let bytes = node::cli::load_secret_key_file(&path, node::cli::SecretKind::Bls)
             .unwrap_or_else(|e| panic!("invalid BLS key file: {e}"));
-        crypto::BlsSecretKey::from_bytes(&bytes)
+        crypto::BlsSecretKey::from_bytes(&bytes[..])
             .unwrap_or_else(|e| panic!("invalid BLS secret key in {path}: {e:?}"))
     } else {
         // Deterministic devnet fallback — NOT suitable for production.

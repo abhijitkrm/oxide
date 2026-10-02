@@ -890,8 +890,9 @@ pub struct ServerConfig {
     /// the key-derived address, which is what the exchange's
     /// `settlement_operator` gate must be configured with. `None`
     /// produces unsigned envelopes — accepted only under the
-    /// executor's `UnsignedTxPolicy::Allow` (devnet).
-    pub settlement_key: Option<[u8; 32]>,
+    /// executor's `UnsignedTxPolicy::Allow` (devnet). `Zeroizing`:
+    /// the key is a long-lived secret — wiped when the config drops.
+    pub settlement_key: Option<zeroize::Zeroizing<[u8; 32]>>,
     /// Durable checkpoint file for the settlement lane's
     /// `{next_nonce, pending}` state — survives restarts so an
     /// in-flight batch is resolved rather than forgotten. `None`
@@ -928,8 +929,8 @@ fn build_settler(
 ) -> Arc<BatchSettler> {
     let mut settler =
         BatchSettler::new(sealer, submitter, confirmer, config.batch_interval_ms, sender, 0);
-    if let Some(key) = config.settlement_key {
-        settler = settler.with_signing(key, config.chain_id);
+    if let Some(key) = &config.settlement_key {
+        settler = settler.with_signing(**key, config.chain_id);
     }
     if let Some(path) = &config.settlement_outbox {
         settler = settler.with_outbox(path.clone());

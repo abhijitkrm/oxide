@@ -36,6 +36,7 @@
 
 use aws_lc_rs::aead::{AES_256_GCM, Aad, Nonce, RandomizedNonceKey};
 use aws_lc_rs::pbkdf2;
+use zeroize::Zeroizing;
 
 /// File magic — `is_keystore` sniffs this so key-file loaders can
 /// accept either raw secrets or keystores without a separate flag.
@@ -189,9 +190,14 @@ pub fn seal(kind: KeyKind, secret: &[u8; 32], passphrase: &str) -> Result<Vec<u8
     out.extend_from_slice(&KDF_ITERATIONS.to_be_bytes());
     out.extend_from_slice(&salt);
 
-    let mut body = Vec::with_capacity(SEALED_SECRET_LEN);
+    // `key` holds the PBKDF2-derived AEAD key and `body` holds the
+    // plaintext secret until `seal_in_place_append_tag` turns it into
+    // ciphertext||tag — both zeroize on drop so the passphrase-derived
+    // key and the raw secret don't linger in freed heap memory.
+    let key = derive_key(&salt, passphrase);
+    let mut body = Zeroizing::new(Vec::with_capacity(SEALED_SECRET_LEN));
     body.extend_from_slice(secret);
-    let nonce = seal_with(&derive_key(&salt, passphrase), &out, &mut body)?;
+    let nonce = seal_with(&key, &out, &mut body)?;
 
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&body);
@@ -199,6 +205,10 @@ pub fn seal(kind: KeyKind, secret: &[u8; 32], passphrase: &str) -> Result<Vec<u8
 }
 
 /// Decrypt a keystore blob, returning the kind and the secret.
+///
+/// The secret comes back in a [`Zeroizing`] wrapper so the plaintext
+/// is wiped when the caller's binding drops — the file was encrypted
+/// precisely because the secret should not survive in cleartext.
 ///
 /// # Errors
 ///
@@ -211,7 +221,10 @@ pub fn seal(kind: KeyKind, secret: &[u8; 32], passphrase: &str) -> Result<Vec<u8
 ///
 /// Never in practice: the fixed-offset field slices are guarded by
 /// the upfront length check, so the `expect`s are unreachable.
-pub fn open(bytes: &[u8], passphrase: &str) -> Result<(KeyKind, [u8; 32]), KeystoreError> {
+pub fn open(
+    bytes: &[u8],
+    passphrase: &str,
+) -> Result<(KeyKind, Zeroizing<[u8; 32]>), KeystoreError> {
     if !is_keystore(bytes) {
         return Err(KeystoreError::NotKeystore);
     }
@@ -228,7 +241,10 @@ pub fn open(bytes: &[u8], passphrase: &str) -> Result<(KeyKind, [u8; 32]), Keyst
     let nonce_off = HEADER_LEN;
     let nonce = Nonce::try_assume_unique_for_key(&bytes[nonce_off..nonce_off + NONCE_LEN])
         .map_err(|_| KeystoreError::Malformed)?;
-    let mut body = bytes[nonce_off + NONCE_LEN..].to_vec();
+    // `body` decrypts in place: ciphertext+tag in, plaintext+tag out.
+    // `Zeroizing` wipes both the ciphertext copy and the recovered
+    // plaintext tail on drop.
+    let mut body = Zeroizing::new(bytes[nonce_off + NONCE_LEN..].to_vec());
     if body.len() != SEALED_SECRET_LEN {
         return Err(KeystoreError::Truncated);
     }
@@ -239,13 +255,13 @@ pub fn open(bytes: &[u8], passphrase: &str) -> Result<(KeyKind, [u8; 32]), Keyst
     // The header (magic..salt) is the AAD: the tag proves kind, iters
     // and salt are the values the sealer committed to.
     let header = &bytes[..nonce_off];
-    let mut key = [0u8; 32];
-    pbkdf2::derive(pbkdf2::PBKDF2_HMAC_SHA256, iters, salt, passphrase.as_bytes(), &mut key);
-    let cipher = RandomizedNonceKey::new(&AES_256_GCM, &key).map_err(|_| KeystoreError::Crypto)?;
+    let mut key = Zeroizing::new([0u8; 32]);
+    pbkdf2::derive(pbkdf2::PBKDF2_HMAC_SHA256, iters, salt, passphrase.as_bytes(), &mut *key);
+    let cipher = RandomizedNonceKey::new(&AES_256_GCM, &*key).map_err(|_| KeystoreError::Crypto)?;
     cipher
         .open_in_place(nonce, Aad::from(header), &mut body)
         .map_err(|_| KeystoreError::DecryptFailed)?;
-    let secret: [u8; 32] = body[..32].try_into().expect("32-byte secret payload");
+    let secret = Zeroizing::new(body[..32].try_into().expect("32-byte secret payload"));
     Ok((kind, secret))
 }
 
@@ -256,35 +272,39 @@ pub fn open(bytes: &[u8], passphrase: &str) -> Result<(KeyKind, [u8; 32]), Keyst
 /// [`KeystoreError::NoPassphrase`] when the variable is unset or
 /// empty — callers surface the message verbatim so the operator sees
 /// exactly what is missing.
-pub fn passphrase_from_env() -> Result<String, KeystoreError> {
+pub fn passphrase_from_env() -> Result<Zeroizing<String>, KeystoreError> {
     match std::env::var(PASSPHRASE_ENV) {
-        Ok(p) if !p.is_empty() => Ok(p),
+        Ok(p) if !p.is_empty() => Ok(Zeroizing::new(p)),
         _ => Err(KeystoreError::NoPassphrase),
     }
 }
 
 /// Derive the 32-byte AEAD key from salt+passphrase at the standard
-/// iteration count.
-fn derive_key(salt: &[u8; SALT_LEN], passphrase: &str) -> [u8; 32] {
-    let mut key = [0u8; 32];
+/// iteration count. `Zeroizing` — the derived key is as sensitive as
+/// the passphrase itself (it decrypts the keystore body).
+fn derive_key(salt: &[u8; SALT_LEN], passphrase: &str) -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0u8; 32]);
     pbkdf2::derive(
         pbkdf2::PBKDF2_HMAC_SHA256,
         std::num::NonZeroU32::new(KDF_ITERATIONS).expect("nonzero iters"),
         salt,
         passphrase.as_bytes(),
-        &mut key,
+        &mut *key,
     );
     key
 }
 
 /// AES-256-GCM seal over `secret` with a random nonce; `header` is
-/// bound as AAD. Returns the nonce the sealer chose.
+/// bound as AAD. Returns the nonce the sealer chose. The `Zeroizing`
+/// params keep the borrowed labels honest: the derived key and the
+/// plaintext buffer are both wiped at their owners' scopes.
 fn seal_with(
-    key: &[u8; 32],
+    key: &Zeroizing<[u8; 32]>,
     header: &[u8],
     body: &mut Vec<u8>,
 ) -> Result<[u8; NONCE_LEN], KeystoreError> {
-    let cipher = RandomizedNonceKey::new(&AES_256_GCM, key).map_err(|_| KeystoreError::Crypto)?;
+    let cipher =
+        RandomizedNonceKey::new(&AES_256_GCM, &**key).map_err(|_| KeystoreError::Crypto)?;
     let nonce = cipher
         .seal_in_place_append_tag(Aad::from(header), body)
         .map_err(|_| KeystoreError::Crypto)?;
@@ -311,7 +331,7 @@ mod tests {
         assert!(is_keystore(&blob));
         let (kind, key) = open(&blob, PASS).expect("open");
         assert_eq!(kind, KeyKind::Bls);
-        assert_eq!(key, secret());
+        assert_eq!(*key, secret());
     }
 
     /// Two seals of the same secret differ — salt and nonce are
@@ -327,7 +347,10 @@ mod tests {
     #[test]
     fn wrong_passphrase_fails() {
         let blob = seal(KeyKind::Bls, &secret(), PASS).expect("seal");
-        assert_eq!(open(&blob, "wrong horse battery staple"), Err(KeystoreError::DecryptFailed));
+        assert!(matches!(
+            open(&blob, "wrong horse battery staple"),
+            Err(KeystoreError::DecryptFailed)
+        ));
     }
 
     /// Truncated, version-shifted, and kind-corrupted files all fail
@@ -335,19 +358,19 @@ mod tests {
     #[test]
     fn malformed_files_fail() {
         let blob = seal(KeyKind::Bls, &secret(), PASS).expect("seal");
-        assert_eq!(open(&blob[..20], PASS), Err(KeystoreError::Truncated));
+        assert!(matches!(open(&blob[..20], PASS), Err(KeystoreError::Truncated)));
         let mut bad = blob.clone();
         bad[5] = 99;
-        assert_eq!(open(&bad, PASS), Err(KeystoreError::UnsupportedVersion(99)));
+        assert!(matches!(open(&bad, PASS), Err(KeystoreError::UnsupportedVersion(99))));
         let mut bad = blob.clone();
         bad[6] = 77;
-        assert_eq!(open(&bad, PASS), Err(KeystoreError::UnknownKind(77)));
+        assert!(matches!(open(&bad, PASS), Err(KeystoreError::UnknownKind(77))));
         // Flipping a salt byte must fail the tag, not decrypt garbage.
         let mut bad = blob.clone();
         bad[11] ^= 1;
-        assert_eq!(open(&bad, PASS), Err(KeystoreError::DecryptFailed));
+        assert!(matches!(open(&bad, PASS), Err(KeystoreError::DecryptFailed)));
         // And a raw key is not a keystore.
-        assert_eq!(open(&secret(), PASS), Err(KeystoreError::NotKeystore));
+        assert!(matches!(open(&secret(), PASS), Err(KeystoreError::NotKeystore)));
     }
 
     /// Short passphrases are refused before any crypto.

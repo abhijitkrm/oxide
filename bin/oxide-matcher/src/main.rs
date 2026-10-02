@@ -92,7 +92,7 @@ struct CliConfig {
     accounts_cap: usize,
     chain_id: u64,
     nonce_state: Option<std::path::PathBuf>,
-    settlement_key: Option<[u8; 32]>,
+    settlement_key: Option<zeroize::Zeroizing<[u8; 32]>>,
     settlement_outbox: Option<std::path::PathBuf>,
 }
 
@@ -125,7 +125,7 @@ fn parse_cli() -> CliConfig {
         // gate. `main` refuses to start without it (and refuses
         // test-identity scalars).
         settlement_key: parse_flag_opt::<String>("--settlement-key")
-            .map(|hex| parse_key_hex(&hex))
+            .map(|hex| parse_key_hex(&zeroize::Zeroizing::new(hex)))
             .or_else(|| {
                 parse_flag_opt::<String>("--settlement-key-file").map(|path| {
                     node::cli::load_secret_key_file(&path, node::cli::SecretKind::Secp256k1)
@@ -143,7 +143,9 @@ fn parse_cli() -> CliConfig {
 /// cannot start. The key is mandatory — settlement batches are always
 /// signed, so an absent or publicly derivable key would wire a public
 /// identity as the exchange's settlement gate.
-fn settlement_key_check(key: Option<[u8; 32]>) -> Result<[u8; 32], String> {
+fn settlement_key_check(
+    key: Option<zeroize::Zeroizing<[u8; 32]>>,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
     match key {
         None => {
             Err("missing --settlement-key/--settlement-key-file: batch envelopes are signed and \
@@ -163,7 +165,9 @@ fn settlement_key_check(key: Option<[u8; 32]>) -> Result<[u8; 32], String> {
 /// The settlement key or a precise startup failure — an operator
 /// misconfiguration, reported on stderr with exit code 1 (matching the
 /// binary's other fatal-startup convention).
-fn settlement_key_or_exit(key: Option<[u8; 32]>) -> [u8; 32] {
+fn settlement_key_or_exit(
+    key: Option<zeroize::Zeroizing<[u8; 32]>>,
+) -> zeroize::Zeroizing<[u8; 32]> {
     match settlement_key_check(key) {
         Ok(k) => k,
         Err(reason) => {
@@ -179,14 +183,14 @@ fn settlement_key_or_exit(key: Option<[u8; 32]>) -> [u8; 32] {
 ///
 /// Panics on malformed input — a bad operator key is a startup
 /// misconfiguration, not a runtime condition.
-fn parse_key_hex(hex: &str) -> [u8; 32] {
+fn parse_key_hex(hex: &str) -> zeroize::Zeroizing<[u8; 32]> {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
     assert_eq!(hex.len(), 64, "--settlement-key must be 32 bytes (64 hex chars)");
     let mut key = [0u8; 32];
     for (i, b) in key.iter_mut().enumerate() {
         *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("--settlement-key must be hex");
     }
-    key
+    zeroize::Zeroizing::new(key)
 }
 
 /// Build a `ServerConfig` from the CLI port settings.
@@ -199,7 +203,7 @@ fn build_server_config(cli: &CliConfig) -> ServerConfig {
         batch_interval_ms: cli.batch_interval,
         chain_id: cli.chain_id,
         nonce_state_path: cli.nonce_state.clone(),
-        settlement_key: cli.settlement_key,
+        settlement_key: cli.settlement_key.clone(),
         settlement_outbox: cli.settlement_outbox.clone(),
     }
 }
@@ -282,8 +286,8 @@ fn main() {
     // address — envelopes are signed, so the node keeps the default
     // `Reject` unsigned policy. The key is mandatory and must not be
     // a public test-identity scalar.
-    let key = settlement_key_or_exit(cli.settlement_key);
-    let sender = crypto::secp::signable_pubkey_address(&key)
+    let key = settlement_key_or_exit(cli.settlement_key.clone());
+    let sender = crypto::secp::signable_pubkey_address(&key[..])
         .expect("settlement key must be a valid secp256k1 secret");
     println!("  settlement operator: {sender:?}");
 
@@ -419,7 +423,8 @@ mod tests {
         // The whole public identity space — scalars 1..=256 — is refused.
         for idx in 0u8..=255 {
             let key = crypto::secp::test_identity_key(idx);
-            let err = settlement_key_check(Some(key)).expect_err("test-identity key must fail");
+            let err = settlement_key_check(Some(zeroize::Zeroizing::new(key)))
+                .expect_err("test-identity key must fail");
             assert!(err.contains("test-identity"), "idx {idx}: {err}");
         }
     }
@@ -430,6 +435,7 @@ mod tests {
         let mut key = [0u8; 32];
         key[31] = 0x01;
         key[30] = 0x01; // scalar 257
-        settlement_key_check(Some(key)).expect("non-identity scalar must pass");
+        settlement_key_check(Some(zeroize::Zeroizing::new(key)))
+            .expect("non-identity scalar must pass");
     }
 }

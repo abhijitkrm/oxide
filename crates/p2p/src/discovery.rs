@@ -110,7 +110,12 @@ impl DiscoveryMessage {
                 }
                 let count = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
                 let mut pos = 4;
-                let mut peers = Vec::with_capacity(count);
+                // Pre-size by the wire count, but never more than the
+                // input can actually hold — a peer entry costs ≥4
+                // bytes (two u16 length prefixes), so `rest.len()/4`
+                // bounds `count` even when the claimed count is huge.
+                // The loop still bounds-checks every field.
+                let mut peers = Vec::with_capacity(count.min(rest.len() / 4));
                 for _ in 0..count {
                     if pos + 2 > rest.len() {
                         return Err(DiscoveryError::TooShort);
@@ -318,6 +323,17 @@ mod tests {
     fn decode_truncated_peer_list_fails() {
         // Type byte + count (4 bytes) but no peer data.
         let bytes = vec![0x02, 0x00, 0x00, 0x00, 0x01];
+        assert_eq!(DiscoveryMessage::decode(&bytes), Err(DiscoveryError::TooShort));
+    }
+
+    /// A claimed `u32::MAX` peer count with an empty body must fail
+    /// `TooShort` at the first length check — and must not have
+    /// pre-allocated a `count`-sized Vec on the way (the regression
+    /// this pins is the unbounded `Vec::with_capacity(count)`).
+    #[test]
+    fn decode_huge_peer_count_fails() {
+        let mut bytes = vec![0x02];
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
         assert_eq!(DiscoveryMessage::decode(&bytes), Err(DiscoveryError::TooShort));
     }
 

@@ -38,6 +38,9 @@ evm = { workspace = true }
 # alloy-primitives: U256 for parsing genesis `evm.alloc` storage slots.
 alloy-primitives = { workspace = true }
 rpc = { workspace = true }
+# zeroize: key-loading buffers (hex strings, decoded byte vecs) are
+# wiped after the real key object is built.
+zeroize = { workspace = true }
 codec = { workspace = true }
 tokio = { workspace = true }
 metrics = { workspace = true }

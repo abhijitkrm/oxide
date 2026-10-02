@@ -271,8 +271,10 @@ pub(crate) fn aggregate_fills(
 /// exchange gates batch settlement on the declared sender matching
 /// the configured settlement operator.
 pub(crate) struct SigningConfig {
-    /// The operator's 32-byte secret key.
-    pub(crate) privkey: [u8; 32],
+    /// The operator's 32-byte secret key — `Zeroizing` so a dropped
+    /// or reconfigured settler doesn't leave the secret in freed
+    /// heap memory.
+    pub(crate) privkey: zeroize::Zeroizing<[u8; 32]>,
     /// EIP-712 chain ID bound into the signature.
     pub(crate) chain_id: u64,
 }
@@ -376,7 +378,7 @@ impl BatchSettler {
     pub fn with_signing(mut self, privkey: [u8; 32], chain_id: u64) -> Self {
         self.sender = crypto::secp::signable_pubkey_address(&privkey)
             .expect("settlement key must be a valid secp256k1 secret");
-        self.signing = Some(SigningConfig { privkey, chain_id });
+        self.signing = Some(SigningConfig { privkey: zeroize::Zeroizing::new(privkey), chain_id });
         self
     }
 
@@ -604,7 +606,7 @@ impl BatchSettler {
         envelope.extend_from_slice(&fee.to_le_bytes());
         if let Some(signing) = &self.signing {
             let sig = crypto::eip712::sign_tx(
-                &signing.privkey,
+                &signing.privkey[..],
                 signing.chain_id,
                 &self.sender,
                 nonce,

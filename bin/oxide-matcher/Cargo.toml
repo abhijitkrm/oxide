@@ -27,6 +27,9 @@ executor = { workspace = true }
 ports = { workspace = true }
 # crypto: secp256k1 key→address derivation for --settlement-key.
 crypto = { workspace = true }
+# zeroize: the settlement secret travels through CLI parsing in
+# `Zeroizing` wrappers — never a bare `[u8; 32]` left in freed memory.
+zeroize = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

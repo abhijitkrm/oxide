@@ -144,7 +144,7 @@ fn run_follower(cfg: &config::Config, config: &NodeConfig, peers: Vec<(Vec<u8>, 
     });
     let key_bytes = node::cli::load_secret_key_file(&key_path, node::cli::SecretKind::Bls)
         .unwrap_or_else(|e| panic!("invalid observer key file {key_path}: {e}"));
-    let observer_key = crypto::BlsSecretKey::from_bytes(&key_bytes)
+    let observer_key = crypto::BlsSecretKey::from_bytes(&key_bytes[..])
         .unwrap_or_else(|e| panic!("invalid BLS secret key in {key_path}: {e:?}"));
     let signer: std::sync::Arc<dyn crypto::ConsensusSigner> =
         std::sync::Arc::new(observer_key.clone());

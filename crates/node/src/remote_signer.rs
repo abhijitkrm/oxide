@@ -131,6 +131,7 @@ use std::time::Duration;
 
 use crypto::hash::Domain;
 use crypto::{BlsSecretKey, ConsensusSigner, SignContext, Signature, SignerError};
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 /// Protocol tag: a signing request (`SignRequest`).
 const TAG_SIGN_REQUEST: u8 = 1;
@@ -202,7 +203,10 @@ fn ct_eq32(a: &[u8; 32], b: &[u8; 32]) -> bool {
 /// The per-session MAC keys derived from the link key + both
 /// nonces. `c2s` authenticates client→daemon frames, `s2c` the
 /// reverse; separating the directions means a reflected frame
-/// never verifies in the wrong direction.
+/// never verifies in the wrong direction. `ZeroizeOnDrop`: the
+/// keys are as sensitive as the link key — a live session MAC key
+/// forges frames for its direction.
+#[derive(ZeroizeOnDrop)]
 struct Session {
     c2s: [u8; 32],
     s2c: [u8; 32],
@@ -420,7 +424,9 @@ impl FenceState {
 /// their signatures non-equivocating.
 pub struct SignerDaemon {
     key: BlsSecretKey,
-    link_key: [u8; 32],
+    // The shared link secret authenticates every client handshake —
+    // zeroized on drop like the signing key itself.
+    link_key: Zeroizing<[u8; 32]>,
     state: Mutex<FenceState>,
 }
 
@@ -441,7 +447,11 @@ impl SignerDaemon {
         state_path: PathBuf,
         link_key: [u8; 32],
     ) -> Result<Self, SignerError> {
-        Ok(Self { key, link_key, state: Mutex::new(FenceState::load(&state_path)?) })
+        Ok(Self {
+            key,
+            link_key: Zeroizing::new(link_key),
+            state: Mutex::new(FenceState::load(&state_path)?),
+        })
     }
 
     /// The daemon's public key — what `PubKeyRequest` answers.
@@ -737,7 +747,10 @@ struct Conn {
 /// dead session's MACs.
 pub struct RemoteSigner {
     addr: String,
-    link_key: [u8; 32],
+    // The client credential — a copy of the daemon's link secret.
+    // Zeroized with the struct so a retired signer doesn't leave it
+    // in freed memory.
+    link_key: Zeroizing<[u8; 32]>,
     conn: Mutex<Option<Conn>>,
     public_key: crypto::PublicKey,
     io_timeout: Duration,
@@ -778,7 +791,7 @@ impl RemoteSigner {
                 Ok(conn) => {
                     let mut rs = Self {
                         addr: addr.to_string(),
-                        link_key,
+                        link_key: Zeroizing::new(link_key),
                         conn: Mutex::new(Some(conn)),
                         public_key: crypto::PublicKey([0u8; 48]),
                         io_timeout,

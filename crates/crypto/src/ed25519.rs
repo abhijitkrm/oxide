@@ -68,7 +68,7 @@ pub fn generate_keypair_for_test() -> (Ed25519SecretKey, Ed25519PublicKey) {
     // verified.
     static SEED_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let counter = SEED_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut seed = [0u8; 32];
+    let mut seed = zeroize::Zeroizing::new([0u8; 32]);
     let nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_nanos(),
         Err(_) => 1,

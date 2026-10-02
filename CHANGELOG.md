@@ -162,6 +162,32 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Secret material is zeroized end-to-end** (`crypto`, `node`,
+  `matcher`, binaries): decrypted keystore payloads, the
+  `OXIDE_KEY_PASSPHRASE` value, PBKDF2-derived AEAD keys, remote-signer
+  link keys, per-session MAC keys, settlement signing keys, and every
+  raw/hex intermediate a key file travels through now wipe on drop
+  (`zeroize`/`Zeroizing`). secp256k1 intermediates get an explicit
+  `non_secure_erase`; `ed25519-dalek`'s `zeroize` feature is on.
+  - **In plain words:** validator keys, keystores, and the
+    signer-daemon credential no longer leave plaintext copies sitting
+    in freed memory after use.
+
+- **Wire-count allocations bounded in dormant decoders** (`p2p`):
+  `discovery` peer-list decode and `SnapshotClient::set_metadata`
+  sized buffers directly from wire-controlled counts. Unreachable
+  today, but a future caller would have inherited the OOM shape —
+  now capped by remaining input / `MAX_CHUNKS`, with regression
+  tests.
+  - **In plain words:** malformed "a billion peers/chunks" messages
+    can no longer make a node allocate a giant buffer it then
+    immediately rejects.
+
+- **`secp256k1` recovery-ID docs corrected** (`crypto`): the docs
+  claimed `recid > 3` was accepted-reject boundary; the code
+  correctly rejects `recid > 1` (standard `{0, 1}` set). Docs now
+  match.
+
 - **Verify pool survives a panicking job** (`node`): a panic
   inside a signature-verification closure used to kill the worker
   thread AND strand the job's queue accounting — enough panics

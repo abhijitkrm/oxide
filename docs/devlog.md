@@ -22110,3 +22110,64 @@ vocabulary the real driver uses.
 `LossModel::Random` are modelled but unapplied (schedule
 permutations stand in — transport-level delay injection is real
 Phase-4 work); Docker compose has no CI job (manual only).
+
+## Status-doc sweep — the checklists catch up to the code
+
+Two status documents had drifted behind the work they describe.
+
+- `AGENTS.md` "Current status" still read "Phase 2 complete" —
+  updated to Phases 0–3 complete (all §13 gates met per the
+  recorded benches) with Phase 4 in progress: fuzz campaign,
+  10k-scenario chaos sim, and the TLA+ model landed; external
+  review and the geo-distributed testnet remain.
+- `docs/production-readiness.md` gate sections for 5 and 6 still
+  read "Not started" while the top-level eval already counted
+  them. Gate 5 now records its evidence (the 2026-09-17 soak
+  campaign, committed corpus, nightly CI, the vacuous
+  `journal-replay` harness it caught). Gate 6 is marked `[~]`
+  rather than `[x]` — the vectors, upstream-pinned trie roots,
+  and differential fuzz exist, but the official ethereum/tests
+  runner the gate literally specifies is still deferred; the
+  top-level eval now says so.
+
+## Secret-material zeroization + wire-count caps (Audit 003 remediation)
+
+Post-review remediation pass, priority order.
+
+**Zeroize everywhere a secret lives.** `keystore::open` returns the
+decrypted secret in `Zeroizing<[u8; 32]>` and `passphrase_from_env`
+returns a `Zeroizing<String>`; the PBKDF2-derived AEAD key and the
+in-place decrypt buffer inside `open`/`seal` are `Zeroizing` too.
+`BlsSecretKey::to_bytes` returns `Zeroizing` (the blst `SecretKey`
+itself was already `#[zeroize(drop)]`). `secp` signing paths wipe
+their `key_arr` copies and call `non_secure_erase` on the `SecretKey`
+(the crate offers no drop-time wipe). `ed25519-dalek` gained its
+`zeroize` feature so `SigningKey` is `ZeroizeOnDrop`. Node-side:
+`load_secret_key_file`/`parse_secret_key_bytes` return `Zeroizing`
+and wipe the raw file buffer and the hex-decoded intermediate;
+remote-signer `Session` derives `ZeroizeOnDrop` and both
+`SignerDaemon`/`RemoteSigner` store the link key as
+`Zeroizing<[u8; 32]>`; matcher's `SigningConfig`/`ServerConfig`
+settlement keys are `Zeroizing`. Binaries wipe argv-hex strings and
+decoded Vecs immediately after the real key object is built.
+Non-goal honestly noted: zeroization covers owned Rust buffers —
+compiler-generated copies, OS core dumps, and swap are outside its
+guarantee (OS hardening is a deployment concern).
+
+**Bounded the dead-code decoders.** `p2p::discovery` `PeerList`
+decode pre-sizes by `count.min(rest.len()/4)` — each entry costs ≥4
+bytes of wire — and `p2p::sync`'s `SnapshotClient::set_metadata`
+caps its chunk table at `MAX_CHUNKS` (the encoder rejects larger
+snapshots, so a larger claim is provably hostile). Both were
+unreachable-by-caller dead code, but they carried the pre-fix OOM
+shape; now a future caller inherits the bound. Pinned with
+`decode_huge_peer_count_fails` and
+`snapshot_client_caps_hostile_chunk_count`.
+
+**Doc fix:** `secp.rs` `recover_sender`/`RecoverableSignature::from_bytes`
+docs claimed `recid > 3` was rejected; the implementation rejects
+`recid > 1` (EIP-2 standard `{0,1}` set) — docs corrected.
+
+Deps: `zeroize 1.9.0` added as a direct dep (already transitive via
+blst; MIT/Apache-2.0, published 2025-06 — past the 7-day rule);
+`cargo deny` clean.

@@ -42,6 +42,10 @@ ed25519-dalek = { workspace = true }
 # Optional so pure-Rust consumers (sim, fuzz, in-process harnesses)
 # never pull the C toolchain through crypto.
 aws-lc-rs = { version = "=1.18.1", optional = true }
+# zeroize: memory hygiene for secrets — keystore plaintext/derived
+# keys, decoded key buffers, secp256k1 intermediates. blst already
+# zeroizes its SecretKey on drop; this covers the buffers around it.
+zeroize = { workspace = true }
 
 [features]
 # Deterministic test identities (`secp::test_identity_key`,

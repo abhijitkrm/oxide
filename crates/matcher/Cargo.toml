@@ -35,6 +35,10 @@ futures-util = { workspace = true }
 # Replaces std::sync::mpsc + Mutex with a truly lock-free channel.
 # MIT/Apache-2.0 licensed (GPL-3.0-compatible).
 crossbeam-channel = { workspace = true }
+# zeroize: the settlement signing key lives in `SigningConfig` and
+# `ServerConfig` for the process lifetime — wiped on drop so the
+# secp256k1 secret doesn't linger in freed heap memory.
+zeroize = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.7.0"
