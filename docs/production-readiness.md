@@ -257,7 +257,18 @@ results.
 
 ### Status
 
-- `[ ]` Not started.
+- `[x]` Complete (2026-09-17 campaign, `5cf1b56`; expanded
+      2026-09-22, `171471c`). Every target soaked ≥10 min with
+      zero crashes (~100M+ execs on the fast targets); the
+      minimized corpus is committed under `fuzz/corpus/`;
+      `fuzz/README.md` records per-target input contracts and the
+      coverage snapshot; the nightly CI job fuzzes all targets at
+      10 min each. The campaign caught a real harness bug —
+      `journal-replay` wrote `0.log`, which `segment_files()`
+      ignores, so its coverage was vacuous — fixed and re-seeded.
+      Two targets added since the campaign: `exchange_settlement`
+      and `evm_parallel_differential` (serial≡batch≡parallel
+      state roots), bringing the suite to 11.
 
 ---
 
@@ -280,7 +291,19 @@ results.
 
 ### Status
 
-- `[ ]` Not started.
+- `[~]` Substantially covered. The literal criterion — running
+      the official ethereum/tests `BlockchainTests` against the
+      module — is the one deferred piece; the header of
+      `modules/evm/tests/conformance.rs` documents that deferral.
+      What exists instead: 44 hand-crafted conformance vectors
+      including reth-style revert/gas/CREATE/EIP-6780 cases
+      (`739d5c6`), MPT state roots pinned to upstream alloy-trie
+      reference vectors (`8c7c29e`), tx-type coverage across
+      legacy/2930/1559/7702 (4844 blobs are a deliberate
+      omission), and the `evm_parallel_differential` fuzz target
+      asserting serial≡batch≡parallel roots. No known open
+      divergences. To read `[x]`: wire the official test
+      fixtures.
 
 ---
 
@@ -390,7 +413,10 @@ gates are complete and the operational runbooks are validated.
 
 **Gates completed:** 1 (networking), 2 (metrics), 3 (security
 review + fixes), 4 (sustained-throughput bench), 5 (fuzz soak),
-6 (EVM conformance), 7 (multi-host testnet).
+7 (multi-host testnet). Gate 6 (EVM conformance) is substantially
+covered — vectors, upstream-pinned trie roots, and the
+serial≡batch≡parallel fuzz gate — with the official
+ethereum/tests runner the one deferred piece.
 
 **Operational runbooks validated (2026-09-15):**
 
