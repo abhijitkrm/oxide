@@ -875,7 +875,16 @@ where
     ) -> Result<Option<InterpreterResult>, String> {
         let addr_bytes = inputs.bytecode_address.0.0;
         let oxide_addr = Address(addr_bytes);
-        if is_precompile(&oxide_addr) {
+        // Gate on the REGISTERED set, not the address pattern: every
+        // `0x00..0OOXX` address decodes, but only the pairs in
+        // `NATIVE_PRECOMPILES` are real. Without the membership check
+        // an ordinary contract whose address happens to match the
+        // pattern (e.g. `0x..c0de`, `0x..1000`) would be hijacked into
+        // the dispatcher and revert instead of running its code —
+        // the conformance suite caught exactly this.
+        if decode_precompile_address(&oxide_addr)
+            .is_some_and(|pair| NATIVE_PRECOMPILES.contains(&pair))
+        {
             let input_bytes: Vec<u8> = inputs.input.as_bytes(context).to_vec();
             let call = NativeCallCtx {
                 caller: Address(inputs.caller.0.0),

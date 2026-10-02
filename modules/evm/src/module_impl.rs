@@ -12,8 +12,7 @@ use super::{
     Address, Arc, BLOCK_TIME_SECS, Balances, CHAIN_BLOCK_GAS_LIMIT, CacheDB, EmptyDB, Event,
     EvmModule, ExecError, HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS, Hash, Height,
     INTRINSIC_GAS_BASE, MODULE_ID, Module, PreverifiedTx, RejectCategory, SpecId, TxContext,
-    alloy_primitives_address, encode_trie_leaf, fee, history, persist, receipts, sparse_walk, trie,
-    tx, versioned,
+    alloy_primitives_address, encode_trie_leaf, fee, persist, sparse_walk, trie, tx, versioned,
 };
 
 impl Module for EvmModule {
@@ -389,55 +388,7 @@ impl Module for EvmModule {
     }
 
     fn handle(&self, _ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
-        // Perf: single RLP decode. Decode once to get both the tx
-        // type (for the receipt) and the signed tx (for execution).
-        // The old code decoded twice — once in handle() for the tx
-        // type, once in execute() for execution. The decode is
-        // ~1 µs, so this saves ~1 µs per tx on the cold path.
-        let signed = tx::SignedTx::decode_raw(msg).map_err(|_| ExecError::Malformed)?;
-        let tx_type = signed.tx_type();
-        // The canonical Ethereum tx hash is keccak256 of the raw
-        // RLP — the same value `eth_sendRawTransaction` returns.
-        let tx_hash = alloy_primitives::keccak256(msg);
-        let (result, caller, call_trace) = self.execute_signed(&signed)?;
-
-        // Phase C: build a receipt from the execution result.
-        // The receipt captures status, gas used, logs, bloom, and
-        // (for CREATE) the created address. This is the data that
-        // `eth_getTransactionReceipt` returns and that goes into the
-        // block's receipts trie.
-        let receipt = receipts::Receipt::from_execution_result(&result, tx_type);
-
-        // Record into the executed-block history for RPC queries
-        // (`eth_getTransactionByHash`, `eth_getTransactionReceipt`,
-        // `eth_getLogs`). `record` assigns the tx_index from the
-        // pending-block position; `msg` (the raw signed RLP) is kept
-        // until `seal_block` computes `transactionsRoot`.
-        framework::lock_state(&self.history).record(
-            history::stored_tx(&signed, caller, tx_hash, 0),
-            receipt.clone(),
-            msg,
-            call_trace,
-        );
-
-        let status_str = if receipt.status { "success" } else { "revert" };
-        let contract_info =
-            receipt.contract_address.map(|a| format!(" contract={a}")).unwrap_or_default();
-        let log_count = receipt.logs.len();
-
-        Ok(vec![Event {
-            module: "evm",
-            kind: "evm_call",
-            data: format!(
-                "gas_used={} status={} base_fee={} logs={}{}",
-                receipt.gas_used,
-                status_str,
-                self.current_base_fee(),
-                log_count,
-                contract_info
-            )
-            .into_bytes(),
-        }])
+        self.handle_inner(msg).map(|(events, _)| events)
     }
 
     /// Batch execution: delegate to the inherent `handle_batch` which
@@ -721,6 +672,12 @@ impl Module for EvmModule {
                     .accounts
                     .get(addr)
                     .filter(|a| a.account_state != revm::database::AccountState::NotExisting)
+                    // EIP-158: a touched account that ends up empty
+                    // (nonce 0, balance 0, no code) is deleted from
+                    // the state trie — e.g. the coinbase when the
+                    // tip is zero. Keeping it would put an extra
+                    // leaf in the root every upstream client drops.
+                    .filter(|a| !a.info.is_empty())
                 {
                     let storage_root = if account.storage.is_empty() {
                         trie::EMPTY_ROOT
@@ -755,7 +712,11 @@ impl Module for EvmModule {
             // skipped — they are not part of the committed trie (see
             // the incremental path above).
             for (addr, account) in &db.cache.accounts {
-                if account.account_state == revm::database::AccountState::NotExisting {
+                if account.account_state == revm::database::AccountState::NotExisting
+                    // EIP-158 empty-account deletion — see the
+                    // incremental path above.
+                    || account.info.is_empty()
+                {
                     continue;
                 }
                 let storage_root = if account.storage.is_empty() {
@@ -990,8 +951,11 @@ impl Module for EvmModule {
         let accounts = Self::parse_snapshot_entries(snapshot)?;
         // Rebuild the state trie from the staged accounts — the
         // same keying (keccak256(addr)) and leaf RLP as the live
-        // `state_root` full-build path.
-        let iter = accounts.iter().map(|(addr, acct)| {
+        // `state_root` full-build path, including its EIP-158
+        // exclusion of empty accounts: a foreign or older-binary
+        // snapshot may carry one, and the recompute must agree with
+        // `state_root` on whether it exists.
+        let iter = accounts.iter().filter(|(_, acct)| !acct.is_empty()).map(|(addr, acct)| {
             let storage_root = if acct.storage.is_empty() {
                 trie::EMPTY_ROOT
             } else {

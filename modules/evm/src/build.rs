@@ -214,6 +214,13 @@ impl EvmModule {
                 block.timestamp = revm::primitives::U256::from(block_timestamp);
                 block.gas_limit = self.block_gas_limit();
                 block.basefee = self.current_base_fee();
+                // RANDAO/difficulty: `None` prevrandao keeps revm's
+                // post-Merge default (the `DIFFICULTY` opcode then
+                // returns `block.difficulty`, matching pre-Merge
+                // semantics). The conformance runner sets both per
+                // fixture (`currentRandom`/`currentDifficulty`).
+                block.prevrandao = *framework::lock_state(&self.block_prevrandao);
+                block.difficulty = *framework::lock_state(&self.block_difficulty);
             });
         let instruction = revm::handler::instructions::EthInstructions::<
             revm::interpreter::interpreter::EthInterpreter,

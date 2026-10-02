@@ -352,6 +352,20 @@ impl History {
         self.pending.traces.push(trace);
     }
 
+    /// Receipts recorded so far in the still-open block, in
+    /// execution order. The conformance runner reads the just-executed
+    /// transaction's logs from here before `seal_block` runs; RPC
+    /// paths only see sealed blocks.
+    pub fn pending_receipts(&self) -> &[Receipt] {
+        &self.pending.receipts
+    }
+
+    /// Call traces recorded so far in the still-open block (parallel
+    /// to `pending_receipts`). Conformance debugging only.
+    pub fn pending_traces(&self) -> &[Option<crate::trace::CallFrame>] {
+        &self.pending.traces
+    }
+
     /// Seal the pending accumulator as block `number` and insert it
     /// into the retained window. Called from `end_block`.
     ///

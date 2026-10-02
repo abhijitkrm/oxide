@@ -22203,3 +22203,88 @@ since the variant stayed a tuple. Two handlers crossed the
 100-line clippy gate from the longer constructor — extraction
 (`check_market_accepts_order`, `check_order_slot`) keeps them
 under.
+
+## Official ethereum/tests GeneralStateTests runner (gate 6)
+
+`modules/evm/tests/official_state_tests.rs` drives the official
+`ethereum/tests` filled `GeneralStateTests` corpus through the
+production EVM path — `sign_* → encode → decode → validate →
+handle → state_root` — not an adapter shim. Fixtures are the
+release tarball subset committed under `tests/fixtures/state/`
+(1,548 files, provenance in `MANIFEST.txt`).
+
+**Re-signing, not bypassing.** Upstream `txbytes` carry unprotected
+`v ∈ {27,28}` legacy signatures, which decode to `chain_id 0` and
+are rejected by the production EIP-155 admission check — correctly.
+Rather than weaken validation, the runner reconstructs each
+transaction from the fixture's declared fields and re-signs with
+the fixture `secretKey` at `config.chainid`, so production signing,
+encoding, recovery, and admission all execute. (Added
+`SignedTx::sign_eip2930` to complete the `sign_*` family.)
+
+**Three real bugs the corpus caught:**
+
+1. *EIP-158 empty-account deletion missing from `state_root`.*
+   Coinbase accounts touched with a zero tip stayed in the trie as
+   empty leaves — every upstream client drops them. ~8,800
+   root mismatches traced to this via the new per-account
+   `post.state` differ; fixed in both the incremental and full
+   trie paths (`a.info.is_empty()` filter).
+2. *Precompile dispatch hijacked pattern-matching addresses.*
+   `PrecompileProvider::run` gated on `is_precompile(addr)` — the
+   `0x00..0OOXX` syntactic pattern — so an ordinary contract at
+   e.g. `0xc0de` or `0x1000` was routed into the native dispatcher
+   and reverted instead of executing its code. Consensus-level
+   bug: any deploy landing on the pattern was uncallable. Now
+   gated on membership in `NATIVE_PRECOMPILES`.
+3. *Block env incomplete.* `prevrandao` and `difficulty` were
+   never wired into `BlockEnv` — `DIFFICULTY`/`PREVRANDAO`
+   returned zero. `set_prevrandao`/`set_difficulty` module setters
+   now exist; production leaves them unset by design (no beacon
+   randomness yet — noted on the field docs).
+
+**Result:** 13,754 pass / 0 unexpected fail / 20 pinned
+divergences / 184 unsupported (26 EIP-4844 blob txs, 158 pre-state
+balances above the module's u128 ledger — both reported, never
+dropped).
+
+**The 20 divergences are all EIP-7610** — "revert creation when the
+destination has non-empty storage," a *retroactive* amendment to
+EIP-684, which is why `[Cancun-Prague]` fills expect it. revm 42
+implements only EIP-684 (its journal collision check never inspects
+storage); reth explicitly opts out of 7610; revm's own statetest
+runner hard-skips the same fixture family. On Oxide the
+precondition — nonce 0 ∧ empty code ∧ non-empty storage — is
+unreachable via transactions post-EIP-161: storage writes only
+happen inside an initialized (nonce ≥ 1) account, so only genesis
+injection can produce it, which is exactly what these fixtures do.
+Enforcement would need the inspector execution path (per-instruction
+hook tax on the hot path), ~130 lines of opcode-prologue
+replication, or a revm fork — disproportionate for a genesis-only
+edge case. Decision: pin each divergent expectation by test name in
+`KNOWN_DIVERGENCES`; the gate still fails on any divergence outside
+the pinned set, so a new regression cannot hide. Revisit if Oxide
+ever imports foreign state or schedules Osaka.
+
+Supporting test-surface additions: `History::pending_receipts` /
+`pending_traces` (read the just-executed tx before `seal_block`),
+`EvmModule::all_accounts_for_test` (per-account post-state diff),
+`handle_returning_result_for_test` (halt reason, not just the
+receipt bit) sharing `handle_inner` with the production `handle`.
+
+**Postscript — the same EIP-158 gap lived in the persistence
+layer.** `checkpoint_bounds_replay` caught it: the height-8
+checkpoint serialized the zero-tip coinbase's touched-empty
+account into `snapshot.bin`, `inspect_state` rebuilt the trie
+*including* it, and the claimed module root — computed by the
+newly EIP-158-filtered `state_root` — didn't reproduce. Snapshot
+rejected, journal replay fell back to height 0, `JournalGap`.
+Three consistent points now share the predicate
+(`persist::DeserializedAccount::is_empty` mirrors revm's
+`AccountInfo::is_empty`): `serialize_committed_account` returns
+`None` for empties (the flush emits `Delete`, so drained accounts
+no longer resurrect on reload — a second real durability bug the
+same predicate fixes), `inspect_state` filters them in the verify
+recompute, and `load_from_storage` skips installing them so a
+ghost can't linger root-inert in the backend. Regression pin:
+`snapshot_omits_eip158_empty_accounts`.

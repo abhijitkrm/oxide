@@ -1757,6 +1757,8 @@ dependencies = [
  "proptest",
  "rayon",
  "revm",
+ "serde",
+ "serde_json",
  "staking",
  "storage",
  "types",

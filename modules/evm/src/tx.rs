@@ -580,6 +580,21 @@ impl SignedTx {
         Ok(Self::Eip1559(tx, sig_to_txsig(&sig)))
     }
 
+    /// Sign an EIP-2930 access-list transaction with the given private
+    /// key and return the signed transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`secp::SecpError`] if the private key is invalid or
+    /// signing fails.
+    pub fn sign_eip2930(tx: TxEip2930, privkey: &[u8]) -> Result<Self, secp::SecpError> {
+        let dummy_sig = TxSignature { r: U256::ZERO, s: U256::ZERO, recid: RecoveryId::new(0) };
+        let temp = Self::Eip2930(tx.clone(), dummy_sig);
+        let signing_hash = temp.signing_hash();
+        let sig = secp::sign(privkey, &signing_hash)?;
+        Ok(Self::Eip2930(tx, sig_to_txsig(&sig)))
+    }
+
     /// Sign an EIP-7702 transaction with the given private key and
     /// return the signed transaction.
     ///

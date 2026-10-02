@@ -53,6 +53,10 @@ crypto = { workspace = true, features = ["dev-identities"] }
 # proptest: differential execution properties — every EVM entry
 # path must agree on state roots over generated contract workloads.
 proptest = "1.11.0"
+# serde_json + serde: the official ethereum/tests fixtures are JSON
+# (dev-only — production decode paths stay dependency-free).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [[bench]]
 name = "fee"

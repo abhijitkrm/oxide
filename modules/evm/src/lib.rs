@@ -55,6 +55,7 @@
 //! - Parallel OCC scheduler for cross-tx parallelism.
 //! - JSON-RPC + WebSocket server.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use executor::{Event, ExecError, Module, RejectCategory, TxContext};
@@ -405,6 +406,12 @@ const HISTORY_SERVE_WINDOW: u64 = 8_191;
 const HISTORY_STORAGE_ADDRESS: revm::primitives::Address =
     revm::primitives::address!("0000f90827f1c53a10cb7a02335b175320002935");
 
+/// One account as [`EvmModule::all_accounts_for_test`] reports it:
+/// `(balance, nonce, code, non-zero storage slots)`. Test/diagnostics
+/// only.
+pub type AccountSnapshot =
+    (u128, u64, Vec<u8>, Vec<(revm::primitives::U256, revm::primitives::U256)>);
+
 /// The EVM module: wraps `revm` and exposes it as an Oxide `Module`.
 ///
 /// State is stored in a `CacheDB<EmptyDB>` (in-memory) during
@@ -485,6 +492,22 @@ pub struct EvmModule {
     /// Set in `begin_block`, read in `execute`.
     /// Behind a `Mutex` because `Module::handle` takes `&self`.
     block_timestamp: Mutex<u64>,
+    /// The post-Merge RANDAO mix — revm's `block.prevrandao`, the
+    /// value `PREVRANDAO`/`DIFFICULTY` returns on Merge+ specs.
+    /// Defaults to `Some(0x0)`: revm *rejects* `None` post-Merge
+    /// (`PrevrandaoNotSet`), while pre-Merge specs ignore the field
+    /// entirely — `DIFFICULTY` then reads `block.difficulty`.
+    /// Production keeps the zero mix until a consensus prevrandao
+    /// commitment exists (plan.md defers beacon-style randomness);
+    /// the conformance runner sets it per fixture
+    /// (`currentRandom`). Behind a `Mutex` because `Module::handle`
+    /// takes `&self`.
+    block_prevrandao: Mutex<Option<alloy_primitives::B256>>,
+    /// The pre-Merge `PoW` difficulty — revm's `block.difficulty`,
+    /// returned by `DIFFICULTY` when no `prevrandao` is wired.
+    /// `0` post-Merge; conformance fixtures set `currentDifficulty`.
+    /// Behind a `Mutex` because `Module::handle` takes `&self`.
+    block_difficulty: Mutex<revm::primitives::U256>,
     /// The block gas limit for the current block — revm's
     /// `block.gas_limit`, the `validate` admission bound, and the
     /// denominator of the EIP-1559 fee target. `begin_block_ctx`
@@ -652,6 +675,8 @@ impl EvmModule {
             coinbase: Mutex::new(revm::primitives::Address::ZERO),
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
+            block_prevrandao: Mutex::new(Some(alloy_primitives::B256::ZERO)),
+            block_difficulty: Mutex::new(revm::primitives::U256::ZERO),
             block_gas_limit: std::sync::atomic::AtomicU64::new(CHAIN_BLOCK_GAS_LIMIT),
             sim_timeout: DEFAULT_SIM_TIMEOUT,
             fee_recipient: None,
@@ -687,6 +712,8 @@ impl EvmModule {
             coinbase: Mutex::new(revm::primitives::Address::ZERO),
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
+            block_prevrandao: Mutex::new(Some(alloy_primitives::B256::ZERO)),
+            block_difficulty: Mutex::new(revm::primitives::U256::ZERO),
             block_gas_limit: std::sync::atomic::AtomicU64::new(CHAIN_BLOCK_GAS_LIMIT),
             sim_timeout: DEFAULT_SIM_TIMEOUT,
             fee_recipient: None,
@@ -749,6 +776,8 @@ impl EvmModule {
             coinbase: Mutex::new(revm::primitives::Address::ZERO),
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
+            block_prevrandao: Mutex::new(Some(alloy_primitives::B256::ZERO)),
+            block_difficulty: Mutex::new(revm::primitives::U256::ZERO),
             block_gas_limit: std::sync::atomic::AtomicU64::new(CHAIN_BLOCK_GAS_LIMIT),
             sim_timeout: DEFAULT_SIM_TIMEOUT,
             fee_recipient: None,
@@ -895,6 +924,33 @@ impl EvmModule {
     pub fn coinbase(&self) -> revm::primitives::Address {
         *framework::lock_state(&self.coinbase)
     }
+
+    /// Set the post-Merge RANDAO mix (`block.prevrandao`) for the
+    /// current block. `None` restores the default zero mix.
+    ///
+    /// Used by the official-fixture conformance runner, which must
+    /// reproduce each fixture's `env.currentRandom`. Production
+    /// blocks do not set this — Oxide has no beacon randomness yet,
+    /// so `PREVRANDAO` returns zero there by design.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    pub fn set_prevrandao(&self, prevrandao: Option<alloy_primitives::B256>) {
+        *framework::lock_state(&self.block_prevrandao) = prevrandao;
+    }
+
+    /// Set the block difficulty (`block.difficulty`) — the value the
+    /// `DIFFICULTY` opcode returns on pre-Merge specs when no
+    /// `prevrandao` is wired. Fixture `env.currentDifficulty` lands
+    /// here.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    pub fn set_difficulty(&self, difficulty: revm::primitives::U256) {
+        *framework::lock_state(&self.block_difficulty) = difficulty;
+    }
 }
 
 impl EvmModule {
@@ -1006,6 +1062,120 @@ impl EvmModule {
         // genesis faucet funding, so the hole is not test-only.
         drop(db_guard);
         framework::lock_state(&self.touched).insert(evm_addr);
+    }
+
+    /// Snapshot every account in the in-memory state, for conformance
+    /// testing. Returns `(address → (balance, nonce, code, storage))`.
+    ///
+    /// `NotExisting` tombstones are excluded — they are not part of
+    /// committed state (see `state_root`). Storage slots at zero are
+    /// likewise excluded (zero means absent).
+    ///
+    /// Test/diagnostics only — callers must not treat the clone as a
+    /// live view.
+    pub fn all_accounts_for_test(&self) -> BTreeMap<Address, AccountSnapshot> {
+        let db = framework::lock_state(&self.db);
+        let mut out = BTreeMap::new();
+        for (addr, account) in &db.cache.accounts {
+            if account.account_state == revm::database::AccountState::NotExisting {
+                continue;
+            }
+            let code =
+                account.info.code.as_ref().map(|b| b.original_bytes().to_vec()).unwrap_or_default();
+            let storage = account
+                .storage
+                .iter()
+                .filter(|(_, v)| !v.is_zero())
+                .map(|(k, v)| (*k, *v))
+                .collect();
+            out.insert(
+                Address(addr.0.0),
+                (
+                    u128::try_from(account.info.balance).unwrap_or(u128::MAX),
+                    account.info.nonce,
+                    code,
+                    storage,
+                ),
+            );
+        }
+        out
+    }
+
+    /// Execute `msg` like `handle` and additionally return the raw
+    /// revm `ExecutionResult`. Test/diagnostics only — conformance
+    /// runners need the halt reason, not just the success bit the
+    /// receipt exposes.
+    ///
+    /// # Errors
+    ///
+    /// Same as `handle`.
+    pub fn handle_returning_result_for_test(
+        &self,
+        _ctx: &TxContext,
+        msg: &[u8],
+    ) -> Result<(Vec<Event>, revm::context::result::ExecutionResult), ExecError> {
+        self.handle_inner(msg)
+    }
+
+    /// Shared `handle` implementation: decode → execute → receipt +
+    /// history record → event. Returns the `ExecutionResult` so test
+    /// callers can inspect the halt reason.
+    fn handle_inner(
+        &self,
+        msg: &[u8],
+    ) -> Result<(Vec<Event>, revm::context::result::ExecutionResult), ExecError> {
+        // Perf: single RLP decode. Decode once to get both the tx
+        // type (for the receipt) and the signed tx (for execution).
+        // The old code decoded twice — once in handle() for the tx
+        // type, once in execute() for execution. The decode is
+        // ~1 µs, so this saves ~1 µs per tx on the cold path.
+        let signed = tx::SignedTx::decode_raw(msg).map_err(|_| ExecError::Malformed)?;
+        let tx_type = signed.tx_type();
+        // The canonical Ethereum tx hash is keccak256 of the raw
+        // RLP — the same value `eth_sendRawTransaction` returns.
+        let tx_hash = alloy_primitives::keccak256(msg);
+        let (result, caller, call_trace) = self.execute_signed(&signed)?;
+
+        // Phase C: build a receipt from the execution result.
+        // The receipt captures status, gas used, logs, bloom, and
+        // (for CREATE) the created address. This is the data that
+        // `eth_getTransactionReceipt` returns and that goes into the
+        // block's receipts trie.
+        let receipt = receipts::Receipt::from_execution_result(&result, tx_type);
+
+        // Record into the executed-block history for RPC queries
+        // (`eth_getTransactionByHash`, `eth_getTransactionReceipt`,
+        // `eth_getLogs`). `record` assigns the tx_index from the
+        // pending-block position; `msg` (the raw signed RLP) is kept
+        // until `seal_block` computes `transactionsRoot`.
+        framework::lock_state(&self.history).record(
+            history::stored_tx(&signed, caller, tx_hash, 0),
+            receipt.clone(),
+            msg,
+            call_trace,
+        );
+
+        let status_str = if receipt.status { "success" } else { "revert" };
+        let contract_info =
+            receipt.contract_address.map(|a| format!(" contract={a}")).unwrap_or_default();
+        let log_count = receipt.logs.len();
+
+        Ok((
+            vec![Event {
+                module: "evm",
+                kind: "evm_call",
+                data: format!(
+                    "gas_used={} status={} base_fee={} logs={}{}",
+                    receipt.gas_used,
+                    status_str,
+                    self.current_base_fee(),
+                    log_count,
+                    contract_info
+                )
+                .into_bytes(),
+            }],
+            result,
+        ))
     }
 
     /// Insert an account with full state — the genesis `alloc` path.

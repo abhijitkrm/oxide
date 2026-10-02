@@ -162,6 +162,53 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Precompile dispatch no longer hijacks pattern-matching
+  addresses** (`evm::precompiles`): the gate was the syntactic
+  `0x00..0OOXX` address shape, so any ordinary contract deployed at
+  an address like `0xc0de` or `0x1000` was routed into the native
+  precompile dispatcher and reverted instead of executing its
+  bytecode. Dispatch now requires membership in the registered
+  `NATIVE_PRECOMPILES` set. Consensus-relevant: previously such
+  contracts were permanently uncallable. Caught by the official
+  `ethereum/tests` corpus.
+  - **In plain words:** a contract could be deployed fine but then
+    be unreachable forever if its address happened to look like a
+    precompile — the official conformance suite surfaced it, and
+    now only real precompiles intercept calls.
+
+- **State root drops touched-but-empty accounts (EIP-158)**
+  (`evm::module_impl`): an account touched during execution that
+  ends up empty (nonce 0, balance 0, no code — e.g. the coinbase
+  when the gas tip is zero) used to stay in the trie as an extra
+  leaf. Every upstream client deletes it, so our post-state root
+  diverged on virtually every block-like execution. Both the
+  incremental and full-state root paths now exclude empty
+  accounts.
+  - **In plain words:** our state hash used to disagree with
+    Ethereum's on almost every transaction that tipped the block
+    proposer zero — now it matches.
+
+- **`DIFFICULTY`/`PREVRANDAO` block fields wired** (`evm`): the
+  revm `BlockEnv` never carried `prevrandao`/`difficulty`, so both
+  opcodes always read zero. The module gains `set_prevrandao` /
+  `set_difficulty`; production leaves them unset by design (no
+  beacon randomness commitment yet), and the conformance runner
+  sets them per fixture.
+
+- **Empty accounts are deleted from durable state too** (`evm`'s
+  persistence): the EIP-158 rule above now reaches every place an
+  account can be written — the block flush emits a `Delete` for an
+  emptied account, snapshots omit it, snapshot verification
+  recomputes without it, and restart load skips it. Previously a
+  drained account (or a zero-tip coinbase) persisted and
+  resurrected on reload, and a checkpoint containing one failed
+  the importer's root recompute — recovery lost the snapshot and
+  replayed from genesis. Pinned by `snapshot_omits_eip158_empty_
+  accounts` and the executor's `checkpoint_bounds_replay`.
+  - **In plain words:** an account emptied to zero used to come
+    back to life after a restart and could even break crash
+    recovery — now "deleted" means deleted everywhere.
+
 - **Secret material is zeroized end-to-end** (`crypto`, `node`,
   `matcher`, binaries): decrypted keystore payloads, the
   `OXIDE_KEY_PASSPHRASE` value, PBKDF2-derived AEAD keys, remote-signer
@@ -357,6 +404,26 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     vote to skip the dead turn and keep going, as designed.
 
 ### Added
+
+- **Official `ethereum/tests` `GeneralStateTests` runner**
+  (`modules/evm/tests/official_state_tests.rs`, production-readiness
+  gate 6): 1,548 committed fixture files (~14k expectations) run
+  through the production path — sign → encode → decode → validate →
+  execute → state root + logs hash. Fixture transactions are
+  re-signed at `config.chainid` (upstream ships unprotected
+  signatures Oxide correctly rejects). Result: **13,754 pass, 0
+  unexpected divergence, 184 explicitly unsupported** (EIP-4844
+  blobs, >u128 pre-state balances), **20 pinned known-divergences**
+  — all EIP-7610 (create-over-nonempty-storage), matching
+  revm/reth's upstream position; the precondition is unreachable
+  via transactions post-EIP-161. Per-account `post.state` diffs and
+  call traces make any new divergence immediately diagnosable, and
+  the gate fails on anything outside the pinned set.
+  - **In plain words:** the EVM now continuously proves its state
+    transitions against Ethereum's own conformance corpus, with the
+    two remaining gaps (a retroactive create-collision rule even
+    reth skips, and blob transactions) explicitly documented rather
+    than hidden.
 
 - **Bounded signature-verification pool for the consensus pump**
   (`node::verify_pool` + engine `*_preverified` entries). Every
