@@ -10,8 +10,9 @@
 use super::{
     Arc, CacheDB, CoinbaseObs, DecodedTx, Event, EvmModule, ExecError, ExecuteCommitEvm, InfoKey,
     InspectEvm, IntoParallelIterator, IntoParallelRefIterator, MvDb, MvState, ParallelIterator,
-    PreverifiedTx, SharedCacheDB, SpecTx, TracedResult, TxContext, alloy_primitives_address,
-    destructive_accounts, history, info_key, receipts, trace, tx, versioned,
+    PreverifiedTx, RejectCategory, SharedCacheDB, SpecTx, TracedResult, TxContext,
+    alloy_primitives_address, destructive_accounts, history, info_key, receipts, trace, tx,
+    versioned,
 };
 use revm::database_interface::DatabaseRef;
 use revm::state::EvmState;
@@ -410,9 +411,10 @@ impl EvmModule {
                     Ok(rs) => rs,
                     Err(e) => {
                         evm.precompiles.clear_native_journal();
-                        results.push(Err(ExecError::ModuleRejected(format!(
-                            "evm transact failed: {e:?}"
-                        ))));
+                        results.push(Err(ExecError::rejected(
+                            RejectCategory::Other,
+                            format!("evm transact failed: {e:?}"),
+                        )));
                         continue;
                     }
                 };
@@ -892,9 +894,10 @@ impl EvmModule {
                     Err(e) => Some(SpecTx {
                         idx: i,
                         sender: caller,
-                        result: Err(ExecError::ModuleRejected(format!(
-                            "evm transact failed: {e:?}"
-                        ))),
+                        result: Err(ExecError::rejected(
+                            RejectCategory::Other,
+                            format!("evm transact failed: {e:?}"),
+                        )),
                         // Whatever the journal read before rejecting
                         // is the observation record — a real subset,
                         // not just the sender.
@@ -1212,9 +1215,10 @@ impl EvmModule {
                             final_results[i] = Some(Ok((r, call_trace)));
                         }
                         Err(e) => {
-                            final_results[i] = Some(Err(ExecError::ModuleRejected(format!(
-                                "evm transact failed: {e:?}"
-                            ))));
+                            final_results[i] = Some(Err(ExecError::rejected(
+                                RejectCategory::Other,
+                                format!("evm transact failed: {e:?}"),
+                            )));
                         }
                     }
                 }
@@ -1315,8 +1319,9 @@ impl EvmModule {
                     results.push(self.exec_result_to_events(res, meta));
                 }
                 None => {
-                    results.push(Err(ExecError::ModuleRejected(
-                        "parallel execution: missing result".to_string(),
+                    results.push(Err(ExecError::rejected(
+                        RejectCategory::NotFound,
+                        "parallel execution: missing result",
                     )));
                 }
             }

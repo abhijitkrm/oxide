@@ -90,6 +90,93 @@ impl<K: Ord, V> InsertRetained<K, V> for BTreeMap<K, V> {
     }
 }
 
+/// The machine-readable class of a module rejection.
+///
+/// `ModuleRejected` used to carry only a free-form string, which made
+/// every semantic distinction — insufficient funds vs missing market
+/// vs wrong owner — unmatchable without string parsing. The category
+/// is the stable half admission, verdict, and RPC paths may branch on;
+/// the human `detail` remains for logs and error messages.
+///
+/// Distinction that matters to callers: `InsufficientFunds`,
+/// `Unauthorized`, `NotFound`, `InvalidInput`, and `Precondition` are
+/// *user-actionable* transaction rejections (the operation failed; the
+/// tx still consumed its nonce and fee like an EVM revert).
+/// `Internal` marks a module-side invariant or wiring break — those
+/// warrant operator attention, not user retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectCategory {
+    /// A balance, escrow, margin, or fee check failed — the account
+    /// could not cover the required amount.
+    InsufficientFunds,
+    /// The sender lacks authority for the operation: not the object
+    /// owner, not the operator, not a committee member, bad signer.
+    Unauthorized,
+    /// A referenced object does not exist: market, order, validator,
+    /// proposal, delegation, account.
+    NotFound,
+    /// The message itself is invalid for this module regardless of
+    /// state: zero amount, out-of-range value, malformed argument.
+    InvalidInput,
+    /// The object exists but state forbids the operation right now:
+    /// already exists, wrong phase, halted or paused, registry full.
+    /// Typically retryable only after state changes.
+    Precondition,
+    /// The module's own state path failed mid-handler — a wiring or
+    /// invariant break (refund failed, engine returned an internal
+    /// error), not user error. Investigate, don't retry.
+    Internal,
+    /// The rejection doesn't fit a narrower category.
+    Other,
+}
+
+impl std::fmt::Display for RejectCategory {
+    /// The stable lowercase token used when the category prefixes a
+    /// rejection reason at wire seams (e.g. `insufficient_funds: …`).
+    /// Treat as an API surface — match tokens are never renamed
+    /// without a versioned change.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let token = match self {
+            RejectCategory::InsufficientFunds => "insufficient_funds",
+            RejectCategory::Unauthorized => "unauthorized",
+            RejectCategory::NotFound => "not_found",
+            RejectCategory::InvalidInput => "invalid_input",
+            RejectCategory::Precondition => "precondition",
+            RejectCategory::Internal => "internal",
+            RejectCategory::Other => "rejected",
+        };
+        f.write_str(token)
+    }
+}
+
+/// A module's rejection of a well-formed message: a typed
+/// [`RejectCategory`] for machines plus a human-readable `detail`
+/// for logs, verdicts, and RPC reason strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleRejection {
+    /// Stable classification — safe to branch on.
+    pub category: RejectCategory,
+    /// Human-readable context (which market, which balance). Not a
+    /// stable API: match on `category`, never on this string.
+    pub detail: String,
+}
+
+impl ModuleRejection {
+    /// A rejection in `category` with a human-readable `detail`.
+    pub fn new(category: RejectCategory, detail: impl Into<String>) -> Self {
+        Self { category, detail: detail.into() }
+    }
+}
+
+impl std::fmt::Display for ModuleRejection {
+    /// Renders `"category: detail"`. At the mempool/RPC seams the
+    /// category token is a stable prefix clients may match on; the
+    /// detail stays free-form.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.category, self.detail)
+    }
+}
+
 /// A module execution error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecError {
@@ -97,11 +184,44 @@ pub enum ExecError {
     Malformed,
     /// The module is not registered.
     UnknownModule(u8),
-    /// The module rejected the message.
-    ModuleRejected(String),
+    /// The module rejected the message. Carries a typed
+    /// [`RejectCategory`] so admission and RPC paths classify
+    /// without string-matching.
+    ModuleRejected(ModuleRejection),
     /// Insufficient gas.
     OutOfGas,
 }
+
+impl ExecError {
+    /// Shorthand constructor for a [`RejectCategory`]-typed module
+    /// rejection — keeps handler call sites one line.
+    pub fn rejected(category: RejectCategory, detail: impl Into<String>) -> Self {
+        Self::ModuleRejected(ModuleRejection::new(category, detail))
+    }
+
+    /// The rejection category, if this is a module rejection.
+    /// Executor-internal variants (`Malformed`, `UnknownModule`,
+    /// `OutOfGas`) are pre-module failures with no module category.
+    pub fn rejection_category(&self) -> Option<RejectCategory> {
+        match self {
+            ExecError::ModuleRejected(r) => Some(r.category),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ExecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecError::Malformed => f.write_str("malformed transaction"),
+            ExecError::UnknownModule(id) => write!(f, "unknown module {id}"),
+            ExecError::ModuleRejected(r) => write!(f, "{r}"),
+            ExecError::OutOfGas => f.write_str("out of gas"),
+        }
+    }
+}
+
+impl std::error::Error for ExecError {}
 
 /// A point-in-time snapshot of the executor's state (plan.md §8).
 ///
@@ -916,10 +1036,13 @@ pub trait Module: Send + Sync {
     /// downgrade) or the transform itself fails.
     fn migrate(&self, from: u32) -> Result<u32, ExecError> {
         if from > self.state_version() {
-            return Err(ExecError::ModuleRejected(format!(
-                "state version {from} is newer than module's declared {}",
-                self.state_version()
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                format!(
+                    "state version {from} is newer than module's declared {}",
+                    self.state_version()
+                ),
+            ));
         }
         Ok(self.state_version())
     }

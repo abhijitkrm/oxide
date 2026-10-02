@@ -10,8 +10,8 @@
 use super::{
     Address, BTreeMap, CANCEL_REGISTERED_BODY_LEN, CUSTODY_BODY_LEN, Event, ExchangeModule,
     ExecError, FILL_ENTRY_LEN, Inner, MAX_BATCH_FILLS, MAX_REGISTERED_ORDERS, MarketConfig,
-    OrderKey, OrderType, PRICE_SCALE, Price, Qty, REGISTER_BODY_LEN, RegisteredOrder, Reserved,
-    Side, TradingError, TxContext, qty_add, qty_sub,
+    OrderKey, OrderType, PRICE_SCALE, Price, Qty, REGISTER_BODY_LEN, RegisteredOrder,
+    RejectCategory, Reserved, Side, TradingError, TxContext, qty_add, qty_sub,
 };
 use crate::codec::{
     cancel_event, decode_side, encode_side, fill_event, outcome_event, pair_event, removal_event,
@@ -35,16 +35,22 @@ impl ExchangeModule {
 
         let Inner { markets, base_balances, base_holds, .. } = inner;
         let Some(engine) = markets[usize::from(market)].as_mut() else {
-            return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                format!("market {market} does not exist"),
+            ));
         };
 
         // Authorization: only the order's owner may cancel.
         if let Some(owner) = engine.order_owner(order_id) {
             if owner != ctx.sender {
-                return Err(ExecError::ModuleRejected("cancel: not the order owner".to_string()));
+                return Err(ExecError::rejected(
+                    RejectCategory::Unauthorized,
+                    "cancel: not the order owner",
+                ));
             }
         } else {
-            return Err(ExecError::ModuleRejected("cancel: order not found".to_string()));
+            return Err(ExecError::rejected(RejectCategory::NotFound, "cancel: order not found"));
         }
 
         match engine.cancel(order_id) {
@@ -66,13 +72,17 @@ impl ExchangeModule {
                                     / PRICE_SCALE,
                             )
                             .map_err(|_| {
-                                ExecError::ModuleRejected(
-                                    "cancel refund exceeds u64 quote range".to_string(),
+                                ExecError::rejected(
+                                    RejectCategory::Internal,
+                                    "cancel refund exceeds u64 quote range",
                                 )
                             })?;
                             if refund > 0 {
                                 ledger.credit(&canceled.owner, refund).map_err(|_| {
-                                    ExecError::ModuleRejected("cancel refund failed".to_string())
+                                    ExecError::rejected(
+                                        RejectCategory::Internal,
+                                        "cancel refund failed",
+                                    )
                                 })?;
                             }
                         }
@@ -94,9 +104,9 @@ impl ExchangeModule {
                 Ok(vec![cancel_event(market, canceled)])
             }
             Err(TradingError::OrderNotFound) => {
-                Err(ExecError::ModuleRejected("cancel: order not found".to_string()))
+                Err(ExecError::rejected(RejectCategory::NotFound, "cancel: order not found"))
             }
-            Err(e) => Err(ExecError::ModuleRejected(format!("cancel: {e}"))),
+            Err(e) => Err(ExecError::rejected(RejectCategory::Internal, format!("cancel: {e}"))),
         }
     }
 
@@ -123,7 +133,10 @@ impl ExchangeModule {
         // custody maps disjointly.
         let Inner { markets, fills, base_balances, base_holds, fee_vault, .. } = inner;
         let Some(engine) = markets[usize::from(market)].as_mut() else {
-            return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                format!("market {market} does not exist"),
+            ));
         };
 
         // Reservations (C6 + DvP): if the ledger is wired, BOTH sides
@@ -167,14 +180,18 @@ impl ExchangeModule {
                         _ => u128::from(order.price.0) * u128::from(order.qty.0),
                     };
                     let quote_needed = u64::try_from(notional / PRICE_SCALE).map_err(|_| {
-                        ExecError::ModuleRejected(
-                            "buy notional exceeds u64 quote range".to_string(),
+                        ExecError::rejected(
+                            RejectCategory::InvalidInput,
+                            "buy notional exceeds u64 quote range",
                         )
                     })?;
                     // Debit up front — fails here, BEFORE the book is
                     // touched, on insufficient funds.
                     ledger.debit(&ctx.sender, quote_needed).map_err(|_| {
-                        ExecError::ModuleRejected("insufficient balance for buy order".to_string())
+                        ExecError::rejected(
+                            RejectCategory::InsufficientFunds,
+                            "insufficient balance for buy order",
+                        )
                     })?;
                     reservation = quote_needed;
                 }
@@ -187,8 +204,9 @@ impl ExchangeModule {
                     let key = (ctx.sender, market);
                     let free = base_balances.get(&key).copied().unwrap_or_default();
                     if free < order.qty {
-                        return Err(ExecError::ModuleRejected(
-                            "insufficient base custody for sell order".to_string(),
+                        return Err(ExecError::rejected(
+                            RejectCategory::InsufficientFunds,
+                            "insufficient base custody for sell order",
                         ));
                     }
                     // `free >= qty` was just proven — cannot underflow.
@@ -223,7 +241,7 @@ impl ExchangeModule {
                     && let Some(ledger) = &self.ledger
                 {
                     ledger.credit(&ctx.sender, reservation).map_err(|_| {
-                        ExecError::ModuleRejected("engine-reject refund failed".to_string())
+                        ExecError::rejected(RejectCategory::Internal, "engine-reject refund failed")
                     })?;
                 }
                 if taker_base.0 > 0 {
@@ -234,7 +252,7 @@ impl ExchangeModule {
                         qty_add(free, taker_base).ok_or(ExecError::Malformed)?,
                     );
                 }
-                return Err(ExecError::ModuleRejected(format!("engine: {e}")));
+                return Err(ExecError::rejected(RejectCategory::Internal, format!("engine: {e}")));
             }
         };
 
@@ -318,11 +336,17 @@ impl ExchangeModule {
                         u128::from(r.price) * u128::from(r.removed_qty) / PRICE_SCALE,
                     )
                     .map_err(|_| {
-                        ExecError::ModuleRejected("STP release exceeds u64 quote range".to_string())
+                        ExecError::rejected(
+                            RejectCategory::Internal,
+                            "STP release exceeds u64 quote range",
+                        )
                     })?;
                     if refund > 0 {
                         ledger.credit(&r.owner, refund).map_err(|_| {
-                            ExecError::ModuleRejected("STP release refund failed".to_string())
+                            ExecError::rejected(
+                                RejectCategory::Internal,
+                                "STP release refund failed",
+                            )
                         })?;
                     }
                 }
@@ -363,6 +387,29 @@ impl ExchangeModule {
     /// leg), a duplicate `(owner, client_id)` key, the module-wide
     /// registered-order cap, missing ledger wiring, and (buys) an
     /// escrow the sender cannot cover.
+    /// Admission checks on the order registry: the `(owner,
+    /// client_id)` pair must be fresh and the bounded table must
+    /// have a slot free. Both are `Precondition` — state-dependent,
+    /// retryable once the registry changes.
+    fn check_order_slot(
+        registered: &framework::CommittedMap<OrderKey, RegisteredOrder>,
+        key: &OrderKey,
+    ) -> Result<(), ExecError> {
+        if registered.contains_key(key) {
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                "register: duplicate client order id",
+            ));
+        }
+        if registered.len() >= MAX_REGISTERED_ORDERS {
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                "register: order registry full",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn handle_register(
         &self,
         ctx: &TxContext,
@@ -384,7 +431,12 @@ impl ExchangeModule {
             .get(usize::from(market))
             .and_then(Option::as_ref)
             .map(|e| *e.config())
-            .ok_or_else(|| ExecError::ModuleRejected(format!("market {market} does not exist")))?;
+            .ok_or_else(|| {
+                ExecError::rejected(
+                    RejectCategory::NotFound,
+                    format!("market {market} does not exist"),
+                )
+            })?;
         // The order itself must be placeable: same tick/lot/band
         // rules a fill leg enforces, applied at authorization time so
         // an off-book order can never be registered.
@@ -394,20 +446,14 @@ impl ExchangeModule {
             || price > cfg.max_price.0
             || !price.is_multiple_of(cfg.tick_size.0)
         {
-            return Err(ExecError::ModuleRejected(
-                "register: price/qty outside market config".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                "register: price/qty outside market config",
             ));
         }
 
         let key = OrderKey { owner: ctx.sender, client_id };
-        if registered.contains_key(&key) {
-            return Err(ExecError::ModuleRejected(
-                "register: duplicate client order id".to_string(),
-            ));
-        }
-        if registered.len() >= MAX_REGISTERED_ORDERS {
-            return Err(ExecError::ModuleRejected("register: order registry full".to_string()));
-        }
+        Self::check_order_slot(registered, &key)?;
 
         // Escrow — both sides, denominated in the side's obligation
         // asset (`reserved` is quote for buys, base for sells):
@@ -424,17 +470,19 @@ impl ExchangeModule {
         let reserved = match side {
             Side::Buy => {
                 let ledger = self.ledger.as_ref().ok_or_else(|| {
-                    ExecError::ModuleRejected("register requires ledger wiring".to_string())
+                    ExecError::rejected(RejectCategory::Internal, "register requires ledger wiring")
                 })?;
                 let amount = u64::try_from(u128::from(price) * u128::from(qty) / PRICE_SCALE)
                     .map_err(|_| {
-                        ExecError::ModuleRejected(
-                            "register: escrow exceeds u64 quote range".to_string(),
+                        ExecError::rejected(
+                            RejectCategory::Precondition,
+                            "register: escrow exceeds u64 quote range",
                         )
                     })?;
                 ledger.debit(&ctx.sender, amount).map_err(|_| {
-                    ExecError::ModuleRejected(
-                        "register: insufficient balance for buy escrow".to_string(),
+                    ExecError::rejected(
+                        RejectCategory::InsufficientFunds,
+                        "register: insufficient balance for buy escrow",
                     )
                 })?;
                 Reserved::Quote(amount)
@@ -444,13 +492,17 @@ impl ExchangeModule {
                 // check above bounds `market` to the 256-slot engine
                 // space.
                 let m = u8::try_from(market).map_err(|_| {
-                    ExecError::ModuleRejected("register: market out of range".to_string())
+                    ExecError::rejected(
+                        RejectCategory::InvalidInput,
+                        "register: market out of range",
+                    )
                 })?;
                 let key = (ctx.sender, m);
                 let free = base_balances.get(&key).copied().unwrap_or_default();
                 if free < Qty(qty) {
-                    return Err(ExecError::ModuleRejected(
-                        "register: insufficient base custody for sell".to_string(),
+                    return Err(ExecError::rejected(
+                        RejectCategory::InsufficientFunds,
+                        "register: insufficient base custody for sell",
                     ));
                 }
                 let bal = base_balances.get(&key).copied().ok_or(ExecError::Malformed)?;
@@ -499,7 +551,7 @@ impl ExchangeModule {
             u64::from_le_bytes(body[0..8].try_into().map_err(|_| ExecError::Malformed)?);
         let key = OrderKey { owner: ctx.sender, client_id };
         let Some(order) = inner.registered.get(&key) else {
-            return Err(ExecError::ModuleRejected("cancel: order not found".to_string()));
+            return Err(ExecError::rejected(RejectCategory::NotFound, "cancel: order not found"));
         };
         // The denomination carries the routing: quote escrow returns
         // to the ledger, base escrow returns to free base custody.
@@ -509,10 +561,16 @@ impl ExchangeModule {
             Reserved::Quote(_) => {
                 if refund > 0 {
                     let ledger = self.ledger.as_ref().ok_or_else(|| {
-                        ExecError::ModuleRejected("cancel requires ledger wiring".to_string())
+                        ExecError::rejected(
+                            RejectCategory::Internal,
+                            "cancel requires ledger wiring",
+                        )
                     })?;
                     ledger.credit(&ctx.sender, refund).map_err(|_| {
-                        ExecError::ModuleRejected("cancel: escrow refund failed".to_string())
+                        ExecError::rejected(
+                            RejectCategory::Internal,
+                            "cancel: escrow refund failed",
+                        )
                     })?;
                 }
             }
@@ -523,7 +581,10 @@ impl ExchangeModule {
             Reserved::Base(residue) => {
                 if residue.0 > 0 {
                     let market = u8::try_from(order.market).map_err(|_| {
-                        ExecError::ModuleRejected("cancel: market out of range".to_string())
+                        ExecError::rejected(
+                            RejectCategory::InvalidInput,
+                            "cancel: market out of range",
+                        )
                     })?;
                     let free =
                         inner.base_balances.get(&(ctx.sender, market)).copied().unwrap_or_default();
@@ -571,17 +632,20 @@ impl ExchangeModule {
         let market = body[0];
         let amount = u64::from_le_bytes(body[1..9].try_into().map_err(|_| ExecError::Malformed)?);
         if amount == 0 {
-            return Err(ExecError::ModuleRejected("deposit: zero amount".to_string()));
+            return Err(ExecError::rejected(RejectCategory::InvalidInput, "deposit: zero amount"));
         }
         if inner.markets[usize::from(market)].is_none() {
-            return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                format!("market {market} does not exist"),
+            ));
         }
         let ledger = self.ledger.as_ref().ok_or_else(|| {
-            ExecError::ModuleRejected("deposit requires ledger wiring".to_string())
+            ExecError::rejected(RejectCategory::Internal, "deposit requires ledger wiring")
         })?;
-        ledger
-            .debit(&ctx.sender, amount)
-            .map_err(|_| ExecError::ModuleRejected("deposit: insufficient balance".to_string()))?;
+        ledger.debit(&ctx.sender, amount).map_err(|_| {
+            ExecError::rejected(RejectCategory::InsufficientFunds, "deposit: insufficient balance")
+        })?;
         let entry = inner.base_balances.get(&(ctx.sender, market)).copied().unwrap_or_default();
         // The 1:1 denomination bridge: `amount` native base units
         // become `amount` scale-6 base micro-units of custody — the
@@ -593,10 +657,13 @@ impl ExchangeModule {
             // Unreachable while total native supply < u64::MAX
             // (custody is native-backed). Refund the debit so the
             // failed deposit is a no-op, not a loss.
-            ledger
-                .credit(&ctx.sender, amount)
-                .map_err(|_| ExecError::ModuleRejected("deposit: refund failed".to_string()))?;
-            return Err(ExecError::ModuleRejected("deposit: base custody overflow".to_string()));
+            ledger.credit(&ctx.sender, amount).map_err(|_| {
+                ExecError::rejected(RejectCategory::Internal, "deposit: refund failed")
+            })?;
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                "deposit: base custody overflow",
+            ));
         }
         Ok(vec![Event {
             module: "exchange",
@@ -636,20 +703,23 @@ impl ExchangeModule {
         let market = body[0];
         let amount = u64::from_le_bytes(body[1..9].try_into().map_err(|_| ExecError::Malformed)?);
         if amount == 0 {
-            return Err(ExecError::ModuleRejected("withdraw: zero amount".to_string()));
+            return Err(ExecError::rejected(RejectCategory::InvalidInput, "withdraw: zero amount"));
         }
         let ledger = self.ledger.as_ref().ok_or_else(|| {
-            ExecError::ModuleRejected("withdraw requires ledger wiring".to_string())
+            ExecError::rejected(RejectCategory::Internal, "withdraw requires ledger wiring")
         })?;
         let free = inner.base_balances.get(&(ctx.sender, market)).copied().unwrap_or_default();
         // Same 1:1 bridge as the deposit: `amount` native units
         // equals `amount` base micro-units of custody.
         if free < Qty(amount) {
-            return Err(ExecError::ModuleRejected("withdraw: insufficient free base".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                "withdraw: insufficient free base",
+            ));
         }
-        ledger
-            .credit(&ctx.sender, amount)
-            .map_err(|_| ExecError::ModuleRejected("withdraw: credit failed".to_string()))?;
+        ledger.credit(&ctx.sender, amount).map_err(|_| {
+            ExecError::rejected(RejectCategory::Internal, "withdraw: credit failed")
+        })?;
         // `free >= amount` was just proven — the decrement cannot
         // underflow.
         let bal =
@@ -735,7 +805,10 @@ impl ExchangeModule {
         // Authorization: only the settlement operator may submit
         // fills — and only against orders the owners signed for.
         if self.settlement_operator != Some(ctx.sender) {
-            return Err(ExecError::ModuleRejected("unauthorized settlement operator".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "unauthorized settlement operator",
+            ));
         }
         let fill_count = usize::try_from(u32::from_le_bytes(
             body.get(0..4)
@@ -754,7 +827,7 @@ impl ExchangeModule {
         }
 
         let ledger = self.ledger.as_ref().ok_or_else(|| {
-            ExecError::ModuleRejected("batch settle requires ledger wiring".to_string())
+            ExecError::rejected(RejectCategory::Internal, "batch settle requires ledger wiring")
         })?;
 
         let Inner { markets, registered, base_balances, fee_vault, .. } = &mut *inner;

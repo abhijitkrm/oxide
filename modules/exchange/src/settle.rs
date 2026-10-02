@@ -10,8 +10,8 @@
 
 use super::{
     Address, Arc, BPS_DENOM, BTreeMap, Event, ExecError, FEE_BPS, FillEvent, MarketConfig,
-    OrderKey, OrderOutcome, PRICE_SCALE, Price, Qty, RegisteredOrder, Reserved, Side, qty_add,
-    qty_sub,
+    OrderKey, OrderOutcome, PRICE_SCALE, Price, Qty, RegisteredOrder, RejectCategory, Reserved,
+    Side, qty_add, qty_sub,
 };
 use crate::codec::{w32, w64};
 
@@ -76,9 +76,10 @@ impl BookSettlement<'_> {
         for f in fills {
             let notional = u128::from(f.price.0) * u128::from(f.qty.0);
             let quote_amount = u64::try_from(notional / PRICE_SCALE).map_err(|_| {
-                ExecError::ModuleRejected(format!(
-                    "fill notional exceeds u64 quote range (market {market})"
-                ))
+                ExecError::rejected(
+                    RejectCategory::Precondition,
+                    format!("fill notional exceeds u64 quote range (market {market})"),
+                )
             })?;
             // Buyer and seller from the taker's side: the maker
             // sells when the taker buys and vice versa.
@@ -136,11 +137,19 @@ impl BookSettlement<'_> {
             let fee = u64::try_from(
                 u128::from(quote_amount) * u128::from(FEE_BPS) / u128::from(BPS_DENOM),
             )
-            .map_err(|_| ExecError::ModuleRejected(format!("fee overflow (market {market})")))?;
+            .map_err(|_| {
+                ExecError::rejected(
+                    RejectCategory::Internal,
+                    format!("fee overflow (market {market})"),
+                )
+            })?;
             // `fee <= quote_amount` (`FEE_BPS < BPS_DENOM`) —
             // saturating is the same value and fails closed.
             self.ledger.credit(&seller, quote_amount.saturating_sub(fee)).map_err(|_| {
-                ExecError::ModuleRejected(format!("settlement credit failed (market {market})"))
+                ExecError::rejected(
+                    RejectCategory::Internal,
+                    format!("settlement credit failed (market {market})"),
+                )
             })?;
             let vault = self.fee_vault.get(&market).copied().unwrap_or(0);
             match vault.checked_add(fee) {
@@ -179,7 +188,7 @@ impl BookSettlement<'_> {
             let refund = taker.reservation.saturating_sub(taker_paid.saturating_add(held));
             if refund > 0 {
                 self.ledger.credit(&taker.owner, refund).map_err(|_| {
-                    ExecError::ModuleRejected("reservation refund failed".to_string())
+                    ExecError::rejected(RejectCategory::Internal, "reservation refund failed")
                 })?;
             }
         }

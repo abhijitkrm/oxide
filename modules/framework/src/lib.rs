@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use executor::{ExecError, Module};
+use executor::{ExecError, Module, RejectCategory};
 use primitives::{Address, Hash};
 
 /// Canonical module dispatch IDs. These are stable wire constants —
@@ -268,15 +268,17 @@ impl Endorsements {
         committee: &dyn Committee,
     ) -> Result<EndorsementOutcome, ExecError> {
         if committee.power(endorser) == 0 {
-            return Err(ExecError::ModuleRejected(
-                "governance: sender has no committee voting power".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "governance: sender has no committee voting power",
             ));
         }
         let mut inner = lock_state(&self.inner);
         if !inner.contains_key(action) && inner.len() >= MAX_PENDING_ACTIONS {
-            return Err(ExecError::ModuleRejected(format!(
-                "governance: {MAX_PENDING_ACTIONS} pending actions already tracked"
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                format!("governance: {MAX_PENDING_ACTIONS} pending actions already tracked"),
+            ));
         }
         let endorsers = inner.entry(action.to_vec()).or_default();
         endorsers.insert(*endorser);
@@ -443,11 +445,14 @@ impl Balances for MemoryBalances {
 
     fn debit(&self, addr: &Address, amount: u64) -> Result<(), ExecError> {
         let mut m = lock_state(&self.inner);
-        let bal = m
-            .get_mut(addr)
-            .ok_or_else(|| ExecError::ModuleRejected(format!("debit: {addr:?} has no account")))?;
+        let bal = m.get_mut(addr).ok_or_else(|| {
+            ExecError::rejected(RejectCategory::NotFound, format!("debit: {addr:?} has no account"))
+        })?;
         *bal = bal.checked_sub(amount).ok_or_else(|| {
-            ExecError::ModuleRejected(format!("debit: {addr:?} balance {bal} < {amount}"))
+            ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                format!("debit: {addr:?} balance {bal} < {amount}"),
+            )
         })?;
         Ok(())
     }
@@ -456,7 +461,10 @@ impl Balances for MemoryBalances {
         let mut m = lock_state(&self.inner);
         let bal = m.entry(*addr).or_insert(0);
         *bal = bal.checked_add(amount).ok_or_else(|| {
-            ExecError::ModuleRejected(format!("credit: {addr:?} balance overflows u64"))
+            ExecError::rejected(
+                RejectCategory::Precondition,
+                format!("credit: {addr:?} balance overflows u64"),
+            )
         })?;
         Ok(())
     }
@@ -469,22 +477,32 @@ impl Balances for MemoryBalances {
             return if bal >= amount {
                 Ok(())
             } else {
-                Err(ExecError::ModuleRejected(format!(
-                    "transfer: {from:?} balance {bal} < {amount}"
-                )))
+                Err(ExecError::rejected(
+                    RejectCategory::InsufficientFunds,
+                    format!("transfer: {from:?} balance {bal} < {amount}"),
+                ))
             };
         }
         // Validate both sides before writing either — a transfer is
         // all-or-nothing: a credit overflow must not strand the debit.
         let from_bal = m.get(from).copied().ok_or_else(|| {
-            ExecError::ModuleRejected(format!("transfer: {from:?} has no account"))
+            ExecError::rejected(
+                RejectCategory::NotFound,
+                format!("transfer: {from:?} has no account"),
+            )
         })?;
         let new_from = from_bal.checked_sub(amount).ok_or_else(|| {
-            ExecError::ModuleRejected(format!("transfer: {from:?} balance {from_bal} < {amount}"))
+            ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                format!("transfer: {from:?} balance {from_bal} < {amount}"),
+            )
         })?;
         let to_bal = m.get(to).copied().unwrap_or(0);
         let new_to = to_bal.checked_add(amount).ok_or_else(|| {
-            ExecError::ModuleRejected(format!("transfer: {to:?} balance overflows u64"))
+            ExecError::rejected(
+                RejectCategory::Precondition,
+                format!("transfer: {to:?} balance overflows u64"),
+            )
         })?;
         m.insert(*from, new_from);
         m.insert(*to, new_to);

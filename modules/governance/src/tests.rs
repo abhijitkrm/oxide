@@ -88,7 +88,7 @@ fn vote_no_increments_no_votes() {
 fn vote_on_unknown_proposal_rejected() {
     let gov = wired_gov();
     let err = gov.handle(&ctx(1), &msg::vote(99, Vote::Yes)).unwrap_err();
-    assert_eq!(err, ExecError::ModuleRejected("unknown proposal".to_string()));
+    assert_eq!(err, ExecError::rejected(RejectCategory::NotFound, "unknown proposal"));
 }
 
 #[test]
@@ -439,7 +439,7 @@ struct TestSink {
 impl ParameterSink for TestSink {
     fn apply_param(&self, key: &[u8], value: &[u8]) -> Result<(), ExecError> {
         if self.fail {
-            return Err(ExecError::ModuleRejected("sink rejected value".to_string()));
+            return Err(ExecError::rejected(RejectCategory::Other, "sink rejected value"));
         }
         framework::lock_state(&self.applied).push((key.to_vec(), value.to_vec()));
         Ok(())

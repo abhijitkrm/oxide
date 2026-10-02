@@ -10,8 +10,8 @@
 
 use super::{
     Address, Arc, CacheDB, CallError, CallOutcome, CallRequest, EvmModule, ExecError, InspectEvm,
-    SharedCacheDB, TxEnv, TxKind, alloy_primitives_address, overrides, precompiles, trace, tx,
-    versioned,
+    RejectCategory, SharedCacheDB, TxEnv, TxKind, alloy_primitives_address, overrides, precompiles,
+    trace, tx, versioned,
 };
 
 impl EvmModule {
@@ -416,9 +416,12 @@ impl EvmModule {
                 // EvmState. The call trace rides out alongside the
                 // result for `debug_traceCall` —
                 // `call_read`/`estimate_call_gas` ignore it.
-                let result = evm
-                    .inspect_tx(tx_env)
-                    .map_err(|e| CallError::Rejected(ExecError::ModuleRejected(format!("{e:?}"))));
+                let result = evm.inspect_tx(tx_env).map_err(|e| {
+                    CallError::Rejected(ExecError::rejected(
+                        RejectCategory::Other,
+                        format!("{e:?}"),
+                    ))
+                });
                 // Inspector is ((NativeJournalInspector,
                 // CallRecorder), DeadlineInspector): trace at `.0.1`,
                 // timeout flag at `.1`.
@@ -437,9 +440,10 @@ impl EvmModule {
                     history.block(h).map(|b| (b.timestamp, b.coinbase, b.number))
                 };
                 let Some((ts, cb, num)) = env else {
-                    return Err(CallError::Rejected(ExecError::ModuleRejected(format!(
-                        "state for block {h} unavailable"
-                    ))));
+                    return Err(CallError::Rejected(ExecError::rejected(
+                        RejectCategory::NotFound,
+                        format!("state for block {h} unavailable"),
+                    )));
                 };
                 // Same short-lock discipline: clone the committed
                 // `Arc` under the db lock and release it
@@ -460,9 +464,12 @@ impl EvmModule {
                 let view = versioned::StateView::new(&snap, &versioned, &self.history, h);
                 let mut cache = CacheDB::new(overrides::OverrideView::new(view, ovr));
                 let mut evm = self.build_sim_evm(&mut cache, cb, num, ts, deadline);
-                let result = evm
-                    .inspect_tx(tx_env)
-                    .map_err(|e| CallError::Rejected(ExecError::ModuleRejected(format!("{e:?}"))));
+                let result = evm.inspect_tx(tx_env).map_err(|e| {
+                    CallError::Rejected(ExecError::rejected(
+                        RejectCategory::Other,
+                        format!("{e:?}"),
+                    ))
+                });
                 let timed_out = evm.inspector.1.timed_out();
                 let call_trace = evm.inspector.0.1.take_root();
                 evm.precompiles.clear_native_journal();

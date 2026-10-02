@@ -64,7 +64,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use executor::{Event, ExecError, Module, TxContext};
+use executor::{Event, ExecError, Module, RejectCategory, TxContext};
 use framework::{Balances, module_id};
 use primitives::{Address, Hash, Height};
 
@@ -1226,7 +1226,10 @@ impl Module for StakingModule {
             msg_type::UNDELEGATE => self.handle_undelegate(ctx, validator, amount, msg),
             msg_type::SLASH => self.handle_slash(ctx, validator, amount, msg),
             msg_type::CLAIM_REWARD => self.handle_claim_reward(ctx, validator, amount, msg),
-            _ => Err(ExecError::ModuleRejected(format!("unknown staking message type {msg_type}"))),
+            _ => Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                format!("unknown staking message type {msg_type}"),
+            )),
         }
     }
 
@@ -1551,8 +1554,9 @@ impl StakingModule {
     /// debit path without a ledger.
     fn require_ledger(&self) -> Result<std::sync::Arc<dyn Balances + Send + Sync>, ExecError> {
         framework::lock_state(&self.ledger).clone().ok_or_else(|| {
-            ExecError::ModuleRejected(
-                "staking: balance ledger not wired (cannot settle delegation)".to_string(),
+            ExecError::rejected(
+                RejectCategory::Internal,
+                "staking: balance ledger not wired (cannot settle delegation)",
             )
         })
     }
@@ -1579,8 +1583,9 @@ impl framework::ParameterSink for StakingModule {
             b"staking.unbonding_period" => &self.unbonding_period,
             b"staking.block_reward" => &self.block_reward,
             _ => {
-                return Err(ExecError::ModuleRejected(
-                    "staking: unknown governed parameter".to_string(),
+                return Err(ExecError::rejected(
+                    RejectCategory::NotFound,
+                    "staking: unknown governed parameter",
                 ));
             }
         };
@@ -1589,8 +1594,9 @@ impl framework::ParameterSink for StakingModule {
         };
         let v = u64::from_le_bytes(v);
         if key == b"staking.unbonding_period" && v == 0 {
-            return Err(ExecError::ModuleRejected(
-                "staking.unbonding_period: must be > 0 (evidence window)".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                "staking.unbonding_period: must be > 0 (evidence window)",
             ));
         }
         target.store(v, std::sync::atomic::Ordering::Relaxed);

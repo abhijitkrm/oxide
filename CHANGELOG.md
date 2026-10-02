@@ -658,6 +658,19 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Changed
 
+- **Typed transaction-rejection categories.** Module rejections
+  (`ExecError::ModuleRejected`) now carry a stable
+  `RejectCategory` — `insufficient_funds`, `unauthorized`,
+  `not_found`, `invalid_input`, `precondition`, `internal`, or
+  `rejected` — alongside the human detail string. Rejection reasons
+  rendered at the mempool/RPC boundary are prefixed with the
+  category token (`"insufficient_funds: balance 3 < 9"`), so
+  clients can branch on the category instead of matching free-form
+  text. `internal` marks a module-side failure (wiring, invariant,
+  engine error) — investigate rather than retry.
+  - **In plain words:** a rejected transaction now says *why* in a
+    way software can rely on, not just a human reading logs.
+
 - **No production path signs with a public test identity.**
   `oxide-validator genesis` without `--validator-pubkeys` or an
   explicit `--devnet` refuses instead of embedding the publicly

@@ -7,10 +7,10 @@
 //! ordering auditable end-to-end.
 
 use super::{
-    Address, Event, ExchangeModule, ExecError, Hash, Height, Module, TAG_BATCH_SETTLE, TAG_CANCEL,
-    TAG_CANCEL_REGISTERED, TAG_DEPOSIT_BASE, TAG_LIST_MARKET, TAG_PLACE, TAG_REGISTER_ORDER,
-    TAG_WITHDRAW_BASE, TxContext, base_balances_leaf, base_holds_leaf, decode, fee_vault_leaf,
-    module_id, registered_leaf, store_leaf,
+    Address, Event, ExchangeModule, ExecError, Hash, Height, Module, RejectCategory,
+    TAG_BATCH_SETTLE, TAG_CANCEL, TAG_CANCEL_REGISTERED, TAG_DEPOSIT_BASE, TAG_LIST_MARKET,
+    TAG_PLACE, TAG_REGISTER_ORDER, TAG_WITHDRAW_BASE, TxContext, base_balances_leaf,
+    base_holds_leaf, decode, fee_vault_leaf, module_id, registered_leaf, store_leaf,
 };
 
 impl Module for ExchangeModule {
@@ -46,8 +46,9 @@ impl Module for ExchangeModule {
                 // slot. This also bounds the allocation `list_market`
                 // performs at quorum: `validate` caps `max_resting`
                 // at `MAX_RESTING_LIMIT`.
-                cfg.validate()
-                    .map_err(|e| ExecError::ModuleRejected(format!("list_market: {e}")))?;
+                cfg.validate().map_err(|e| {
+                    ExecError::rejected(RejectCategory::Internal, format!("list_market: {e}"))
+                })?;
                 drop(inner);
                 // Committee-quorum gate: a listing eagerly allocates
                 // the market's order-pool and id-map arenas, so an
@@ -56,8 +57,9 @@ impl Module for ExchangeModule {
                 // message; the market lists only once endorsing power
                 // strictly exceeds two-thirds of the committee.
                 let Some(committee) = self.committee.clone() else {
-                    return Err(ExecError::ModuleRejected(
-                        "list_market: no committee wired".to_string(),
+                    return Err(ExecError::rejected(
+                        RejectCategory::Unauthorized,
+                        "list_market: no committee wired",
                     ));
                 };
                 match self.endorsements.record(msg, &ctx.sender, committee.as_ref())? {
@@ -226,8 +228,9 @@ impl Module for ExchangeModule {
 impl framework::ParameterSink for ExchangeModule {
     fn apply_param(&self, key: &[u8], value: &[u8]) -> Result<(), ExecError> {
         if key != b"exchange.fee_vault.withdraw" {
-            return Err(ExecError::ModuleRejected(
-                "exchange: unknown governed parameter".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                "exchange: unknown governed parameter",
             ));
         }
         if value.len() != 29 {
@@ -243,16 +246,20 @@ impl framework::ParameterSink for ExchangeModule {
         let dest = Address(dest_bytes);
         let amount = u64::from_le_bytes(amount_bytes);
         if amount == 0 {
-            return Err(ExecError::ModuleRejected("fee_vault.withdraw: zero amount".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                "fee_vault.withdraw: zero amount",
+            ));
         }
         let ledger = self.ledger.as_ref().ok_or_else(|| {
-            ExecError::ModuleRejected("fee_vault.withdraw: no ledger wired".to_string())
+            ExecError::rejected(RejectCategory::Internal, "fee_vault.withdraw: no ledger wired")
         })?;
         let mut inner = framework::lock_state(&self.inner);
         let vault = inner.fee_vault.get(&market).copied().unwrap_or(0);
         if vault < amount {
-            return Err(ExecError::ModuleRejected(
-                "fee_vault.withdraw: insufficient vault balance".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                "fee_vault.withdraw: insufficient vault balance",
             ));
         }
         // Credit before decrementing custody — same ordering as
@@ -260,7 +267,7 @@ impl framework::ParameterSink for ExchangeModule {
         // untouched (the proposal then records ApplyFailed rather
         // than silently losing the funds).
         ledger.credit(&dest, amount).map_err(|_| {
-            ExecError::ModuleRejected("fee_vault.withdraw: credit failed".to_string())
+            ExecError::rejected(RejectCategory::Internal, "fee_vault.withdraw: credit failed")
         })?;
         // `vault >= amount` was just proven — saturating is the same
         // value and cannot panic under release `overflow-checks`.

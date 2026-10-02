@@ -22171,3 +22171,35 @@ docs claimed `recid > 3` was rejected; the implementation rejects
 Deps: `zeroize 1.9.0` added as a direct dep (already transitive via
 blst; MIT/Apache-2.0, published 2025-06 — past the 7-day rule);
 `cargo deny` clean.
+
+## Typed module rejections (audit follow-up)
+
+`ExecError::ModuleRejected(String)` encoded every module-level
+failure — insufficient balance, missing market, wrong owner,
+unwired ledger — as free-form text. Anything downstream that wanted
+the *kind* of failure (RPC classification, mempool retry policy,
+operator alerting) had to string-match. The variant now carries a
+`ModuleRejection { category: RejectCategory, detail: String }`:
+`RejectCategory` is the stable, matchable half (`InsufficientFunds`,
+`Unauthorized`, `NotFound`, `InvalidInput`, `Precondition`,
+`Internal`, `Other`), `detail` stays human-facing. `Display` renders
+`"category_token: detail"`, so the mempool `Rejected { reason }`
+wire string gains a stable lowercase prefix clients can match on
+without a wire-format change — and `ExecError` gained `Display` +
+`Error` impls so seams format `{e}` instead of `{e:?}`.
+
+~205 call sites across all modules re-classified by semantics:
+user-actionable rejections (`InsufficientFunds`/`Unauthorized`/
+`NotFound`/`InvalidInput`/`Precondition`) vs module-side invariant
+breaks (`Internal` — refund failures, missing ledger wiring, engine
+errors). The distinction is deliberate: `Internal` means
+investigate, not retry. Opaque revm error passthroughs stay `Other`
+— honest rather than guessed. `rejection_category()` exposes the
+typed half; `ExecError::rejected(cat, detail)` keeps handler call
+sites one line. Regression test pins the category + rendered
+shape (`module_rejection_carries_category`); ~90 existing
+`matches!(.., ModuleRejected(_))` pattern tests needed no changes
+since the variant stayed a tuple. Two handlers crossed the
+100-line clippy gate from the longer constructor — extraction
+(`check_market_accepts_order`, `check_order_slot`) keeps them
+under.

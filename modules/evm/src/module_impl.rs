@@ -11,7 +11,7 @@
 use super::{
     Address, Arc, BLOCK_TIME_SECS, Balances, CHAIN_BLOCK_GAS_LIMIT, CacheDB, EmptyDB, Event,
     EvmModule, ExecError, HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS, Hash, Height,
-    INTRINSIC_GAS_BASE, MODULE_ID, Module, PreverifiedTx, SpecId, TxContext,
+    INTRINSIC_GAS_BASE, MODULE_ID, Module, PreverifiedTx, RejectCategory, SpecId, TxContext,
     alloy_primitives_address, encode_trie_leaf, fee, history, persist, receipts, sparse_walk, trie,
     tx, versioned,
 };
@@ -230,26 +230,26 @@ impl Module for EvmModule {
         //    are allowed for mempool queueing.
         let current_nonce = self.nonce(&sender_addr);
         if signed.nonce() < current_nonce {
-            return Err(ExecError::ModuleRejected(format!(
-                "nonce {nonce} < current {current_nonce}",
-                nonce = signed.nonce()
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                format!("nonce {nonce} < current {current_nonce}", nonce = signed.nonce()),
+            ));
         }
 
         // 5. Gas limit: must be positive.
         let gas_limit = signed.gas_limit();
         if gas_limit == 0 {
-            return Err(ExecError::ModuleRejected("gas_limit is zero".to_string()));
+            return Err(ExecError::rejected(RejectCategory::InvalidInput, "gas_limit is zero"));
         }
 
         // HIGH fix: gas_limit must fit within the block gas limit.
         // A tx with gas_limit > block_gas_limit can never be included
         // and should be rejected at admission to save mempool space.
         if gas_limit > self.block_gas_limit() {
-            return Err(ExecError::ModuleRejected(format!(
-                "gas_limit {gas_limit} > block_gas_limit {}",
-                self.block_gas_limit()
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("gas_limit {gas_limit} > block_gas_limit {}", self.block_gas_limit()),
+            ));
         }
 
         // 6. Intrinsic gas: gas_limit must cover the intrinsic cost.
@@ -259,9 +259,10 @@ impl Module for EvmModule {
         //    the full calldata-aware check arrives with the gas
         //    economics phase (A5).
         if gas_limit < INTRINSIC_GAS_BASE {
-            return Err(ExecError::ModuleRejected(format!(
-                "gas_limit {gas_limit} < intrinsic {INTRINSIC_GAS_BASE}"
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("gas_limit {gas_limit} < intrinsic {INTRINSIC_GAS_BASE}"),
+            ));
         }
 
         // HIGH fix: EIP-1559 fee gates.
@@ -271,20 +272,23 @@ impl Module for EvmModule {
         //   b. priority_fee <= max_fee: EIP-1559 requires
         //      max_priority_fee_per_gas <= max_fee_per_gas. A tx
         //      with priority_fee > max_fee is invalid.
-        let max_fee = u128::try_from(signed.max_fee_per_gas())
-            .map_err(|_| ExecError::ModuleRejected("max_fee overflow u128".to_string()))?;
-        let priority_fee = u128::try_from(signed.max_priority_fee_per_gas())
-            .map_err(|_| ExecError::ModuleRejected("priority_fee overflow u128".to_string()))?;
+        let max_fee = u128::try_from(signed.max_fee_per_gas()).map_err(|_| {
+            ExecError::rejected(RejectCategory::InvalidInput, "max_fee overflow u128")
+        })?;
+        let priority_fee = u128::try_from(signed.max_priority_fee_per_gas()).map_err(|_| {
+            ExecError::rejected(RejectCategory::InvalidInput, "priority_fee overflow u128")
+        })?;
         if max_fee < u128::from(self.current_base_fee()) {
-            return Err(ExecError::ModuleRejected(format!(
-                "max_fee {max_fee} < base_fee {}",
-                self.current_base_fee()
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("max_fee {max_fee} < base_fee {}", self.current_base_fee()),
+            ));
         }
         if priority_fee > max_fee {
-            return Err(ExecError::ModuleRejected(format!(
-                "priority_fee {priority_fee} > max_fee {max_fee}"
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("priority_fee {priority_fee} > max_fee {max_fee}"),
+            ));
         }
 
         // 7. Balance: sender must cover gas_cost + value.
@@ -292,19 +296,21 @@ impl Module for EvmModule {
         //    fee the sender could pay). For legacy txs, gas_price is
         //    the max fee. For EIP-1559, max_fee_per_gas is the cap.
         let balance = self.balance(&sender_addr);
-        let value = u128::try_from(signed.value())
-            .map_err(|_| ExecError::ModuleRejected("value overflow u128".to_string()))?;
+        let value = u128::try_from(signed.value()).map_err(|_| {
+            ExecError::rejected(RejectCategory::InvalidInput, "value overflow u128")
+        })?;
         // gas_cost = gas_limit * max_fee, checked for overflow.
-        let gas_cost = u128::from(gas_limit)
-            .checked_mul(max_fee)
-            .ok_or_else(|| ExecError::ModuleRejected("gas cost overflow".to_string()))?;
-        let total_needed = gas_cost
-            .checked_add(value)
-            .ok_or_else(|| ExecError::ModuleRejected("gas_cost + value overflow".to_string()))?;
+        let gas_cost = u128::from(gas_limit).checked_mul(max_fee).ok_or_else(|| {
+            ExecError::rejected(RejectCategory::InvalidInput, "gas cost overflow")
+        })?;
+        let total_needed = gas_cost.checked_add(value).ok_or_else(|| {
+            ExecError::rejected(RejectCategory::InvalidInput, "gas_cost + value overflow")
+        })?;
         if balance < total_needed {
-            return Err(ExecError::ModuleRejected(format!(
-                "insufficient balance: have {balance}, need {total_needed}"
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                format!("insufficient balance: have {balance}, need {total_needed}"),
+            ));
         }
 
         Ok(())

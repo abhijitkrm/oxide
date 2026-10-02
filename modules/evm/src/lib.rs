@@ -57,7 +57,7 @@
 
 use std::sync::Mutex;
 
-use executor::{Event, ExecError, Module, TxContext};
+use executor::{Event, ExecError, Module, RejectCategory, TxContext};
 use framework::{Balances, module_id};
 use primitives::{Address, Hash, Height};
 // Ceiling 1: the chain-configured block gas limit is the single

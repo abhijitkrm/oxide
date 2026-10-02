@@ -82,7 +82,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use executor::{Event, ExecError, Module, TxContext};
+use executor::{Event, ExecError, Module, RejectCategory, TxContext};
 use framework::module_id;
 use primitives::fixed::{Price, Qty, qty_add, qty_sub};
 use primitives::{Address, Hash, Height};
@@ -611,10 +611,9 @@ impl ExchangeModule {
     pub fn list_market(&self, cfg: MarketConfig) -> Result<u8, ExecError> {
         let mut inner = framework::lock_state(&self.inner);
         // Find the first empty slot.
-        let id =
-            inner.markets.iter().position(Option::is_none).ok_or_else(|| {
-                ExecError::ModuleRejected("all 256 market slots taken".to_string())
-            })?;
+        let id = inner.markets.iter().position(Option::is_none).ok_or_else(|| {
+            ExecError::rejected(RejectCategory::Precondition, "all 256 market slots taken")
+        })?;
         // u8 market id space: position is 0..=255, fits u8.
         #[allow(clippy::cast_possible_truncation)]
         let id_u8 = id as u8;
@@ -622,13 +621,15 @@ impl ExchangeModule {
         // invalid configs, but the decoded bytes are checked again so
         // a corrupted store cannot pair an unchecked config with an
         // engine — the proof type makes the check structural.
-        let vcfg = cfg
-            .validated()
-            .map_err(|e| ExecError::ModuleRejected(format!("market config: {e}")))?;
-        let book = DenseBook::new(vcfg)
-            .map_err(|e| ExecError::ModuleRejected(format!("book init: {e}")))?;
-        let mut engine = MatchingEngine::new(vcfg, book)
-            .map_err(|e| ExecError::ModuleRejected(format!("engine init: {e}")))?;
+        let vcfg = cfg.validated().map_err(|e| {
+            ExecError::rejected(RejectCategory::Internal, format!("market config: {e}"))
+        })?;
+        let book = DenseBook::new(vcfg).map_err(|e| {
+            ExecError::rejected(RejectCategory::Internal, format!("book init: {e}"))
+        })?;
+        let mut engine = MatchingEngine::new(vcfg, book).map_err(|e| {
+            ExecError::rejected(RejectCategory::Internal, format!("engine init: {e}"))
+        })?;
         // Committed engines always carry the incremental book fold —
         // `state_root` reads `resting_fold()` instead of re-walking
         // the book. Enabled before any orders rest, so the fold is

@@ -618,7 +618,7 @@ impl Executor {
                     block_events.extend(events.iter().cloned());
                     TxOutcome::Executed { events, error: None }
                 }
-                Err(e) => TxOutcome::Executed { events: Vec::new(), error: Some(format!("{e:?}")) },
+                Err(e) => TxOutcome::Executed { events: Vec::new(), error: Some(format!("{e}")) },
             };
             outcomes.record(t.tx_hash, outcome);
         }

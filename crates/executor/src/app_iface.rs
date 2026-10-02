@@ -67,7 +67,7 @@ impl AppInterface for Executor {
             };
         let payload = module_payload(bytes);
         if let Err(e) = module.validate(&ctx, payload) {
-            return MempoolAck::Rejected { reason: format!("validate: {e:?}") };
+            return MempoolAck::Rejected { reason: format!("validate: {e}") };
         }
 
         // Pre-recover the sender at ingestion time and cache it.
@@ -220,7 +220,7 @@ impl AppInterface for Executor {
                 };
             let payload = module_payload(bytes);
             if let Err(e) = module.validate(&ctx, payload) {
-                results.push(MempoolAck::Rejected { reason: format!("validate: {e:?}") });
+                results.push(MempoolAck::Rejected { reason: format!("validate: {e}") });
                 continue;
             }
             // Pre-recover the sender at ingestion time. Only cache a

@@ -93,7 +93,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
 
-use executor::{Event, ExecError, Module, TxContext};
+use executor::{Event, ExecError, Module, RejectCategory, TxContext};
 use framework::{KVStore, module_id, subtree_root};
 use primitives::{Address, Hash, Height};
 
@@ -490,8 +490,9 @@ impl Module for OracleModule {
                     return Err(ExecError::Malformed);
                 }
                 if !self.is_feeder(&ctx.sender) {
-                    return Err(ExecError::ModuleRejected(
-                        "submit: sender is not an authorized price feed".to_string(),
+                    return Err(ExecError::rejected(
+                        RejectCategory::Unauthorized,
+                        "submit: sender is not an authorized price feed",
                     ));
                 }
                 Ok(())
@@ -503,8 +504,9 @@ impl Module for OracleModule {
                 let mut feed = [0u8; 20];
                 feed.copy_from_slice(&msg[1..21]);
                 if !self.committee.as_ref().is_some_and(|c| c.is_active_validator(&ctx.sender)) {
-                    return Err(ExecError::ModuleRejected(
-                        "feed registry: sender is not an active validator".to_string(),
+                    return Err(ExecError::rejected(
+                        RejectCategory::Unauthorized,
+                        "feed registry: sender is not an active validator",
                     ));
                 }
                 let _ = feed;
@@ -532,13 +534,15 @@ impl Module for OracleModule {
                 if price == 0 {
                     // A zero mark is not a price — it zeroes margin
                     // math and would mass-liquidate every position.
-                    return Err(ExecError::ModuleRejected(
-                        "submit: price must be nonzero".to_string(),
+                    return Err(ExecError::rejected(
+                        RejectCategory::InvalidInput,
+                        "submit: price must be nonzero",
                     ));
                 }
                 if !self.is_feeder(&ctx.sender) {
-                    return Err(ExecError::ModuleRejected(
-                        "submit: sender is not an authorized price feed".to_string(),
+                    return Err(ExecError::rejected(
+                        RejectCategory::Unauthorized,
+                        "submit: sender is not an authorized price feed",
                     ));
                 }
                 let mut submissions = framework::lock_state(&self.submissions);
@@ -561,8 +565,9 @@ impl Module for OracleModule {
                 // the committee. Without a wired committee the path
                 // is closed entirely.
                 let Some(committee) = self.committee.clone() else {
-                    return Err(ExecError::ModuleRejected(
-                        "feed registry: no committee wired".to_string(),
+                    return Err(ExecError::rejected(
+                        RejectCategory::Unauthorized,
+                        "feed registry: no committee wired",
                     ));
                 };
                 match self.endorsements.record(msg, &ctx.sender, committee.as_ref())? {
@@ -729,7 +734,7 @@ mod tests {
     impl framework::MarkSink for TestSink {
         fn set_mark_price(&self, market: u8, mark: u64) -> Result<(), ExecError> {
             if self.reject {
-                return Err(ExecError::ModuleRejected("sink rejected".to_string()));
+                return Err(ExecError::rejected(RejectCategory::Other, "sink rejected"));
             }
             framework::lock_state(&self.pushed).insert(market, mark);
             Ok(())

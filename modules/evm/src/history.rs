@@ -793,8 +793,8 @@ pub fn effective_gas_price(stx: &StoredTx, base_fee: u64) -> u128 {
 
 use super::{
     AccountProof, Arc, CacheDB, CallError, CallOutcome, CallRequest, DatabaseRef, EmptyDB,
-    EvmModule, ExecError, Mutex, StateError, StorageProof, alloy_primitives_address, history,
-    overrides, trie, versioned,
+    EvmModule, ExecError, Mutex, RejectCategory, StateError, StorageProof,
+    alloy_primitives_address, history, overrides, trie, versioned,
 };
 
 // ── Height-indexed state queries ────────────────────────────
@@ -843,10 +843,10 @@ impl EvmModule {
     /// [`StateError`] → [`CallError`] for the simulation entry
     /// points (which surface height errors through `Rejected`).
     pub(crate) fn state_as_call_err(e: StateError) -> CallError {
-        CallError::Rejected(ExecError::ModuleRejected(format!(
-            "state for block {} unavailable: {e:?}",
-            e.requested()
-        )))
+        CallError::Rejected(ExecError::rejected(
+            RejectCategory::Internal,
+            format!("state for block {} unavailable: {e:?}", e.requested()),
+        ))
     }
 
     /// A [`versioned::StateView`] at `h` over the live db and undo
@@ -1004,10 +1004,10 @@ impl EvmModule {
         h: u64,
     ) -> Result<AccountProof, CallError> {
         let h = self.check_state_height(h).map_err(|e| {
-            CallError::Rejected(ExecError::ModuleRejected(format!(
-                "state for block {} unavailable: {e:?}",
-                e.requested()
-            )))
+            CallError::Rejected(ExecError::rejected(
+                RejectCategory::Internal,
+                format!("state for block {} unavailable: {e:?}", e.requested()),
+            ))
         })?;
         // Pin a committed-state snapshot under a short db lock,
         // then release it — the undo index is locked next (it only

@@ -554,8 +554,9 @@ impl framework::ParameterSink for ChainParamSink {
             b"chain.block_max_bytes" => &self.0.max_bytes,
             b"chain.min_fee" => &self.0.min_fee,
             _ => {
-                return Err(executor::ExecError::ModuleRejected(
-                    "chain: unknown governed parameter".to_string(),
+                return Err(executor::ExecError::rejected(
+                    executor::RejectCategory::NotFound,
+                    "chain: unknown governed parameter",
                 ));
             }
         };
@@ -564,10 +565,10 @@ impl framework::ParameterSink for ChainParamSink {
         };
         let v = u64::from_le_bytes(v);
         if key != b"chain.min_fee" && v == 0 {
-            return Err(executor::ExecError::ModuleRejected(format!(
-                "{}: block budget must be > 0",
-                String::from_utf8_lossy(key)
-            )));
+            return Err(executor::ExecError::rejected(
+                executor::RejectCategory::InvalidInput,
+                format!("{}: block budget must be > 0", String::from_utf8_lossy(key)),
+            ));
         }
         target.store(v, std::sync::atomic::Ordering::Relaxed);
         Ok(())

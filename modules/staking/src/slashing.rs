@@ -9,8 +9,8 @@
 //! to end in one file.
 
 use super::{
-    Address, BONDED_POOL, EVIDENCE_PAYLOAD_LEN, Event, ExecError, MIN_JAIL_BLOCKS, StakingModule,
-    TxContext, msg, msg_type,
+    Address, BONDED_POOL, EVIDENCE_PAYLOAD_LEN, Event, ExecError, MIN_JAIL_BLOCKS, RejectCategory,
+    StakingModule, TxContext, msg, msg_type,
 };
 
 impl StakingModule {
@@ -34,7 +34,10 @@ impl StakingModule {
         // collect endorsements — slashing an unknown address is
         // never meaningful.
         if !framework::lock_state(&self.validators).contains_key(&validator) {
-            return Err(ExecError::ModuleRejected("slash: validator not found".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                "slash: validator not found",
+            ));
         }
         match self.endorsements.record(msg, &ctx.sender, self)? {
             framework::EndorsementOutcome::Pending { .. } => {
@@ -74,7 +77,7 @@ impl StakingModule {
         let mut delegations = framework::lock_state(&self.delegations);
         let stake = validators
             .get_mut(&validator)
-            .ok_or(ExecError::ModuleRejected("slash: validator not found".to_string()))?;
+            .ok_or(ExecError::rejected(RejectCategory::NotFound, "slash: validator not found"))?;
         let slash_amount = amount.min(*stake);
         let stake_before = *stake;
 
@@ -207,11 +210,14 @@ impl StakingModule {
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
         if msg.len() != 21 + EVIDENCE_PAYLOAD_LEN {
-            return Err(ExecError::ModuleRejected(format!(
-                "evidence: expected {}-byte message, got {} bytes",
-                21 + EVIDENCE_PAYLOAD_LEN,
-                msg.len()
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!(
+                    "evidence: expected {}-byte message, got {} bytes",
+                    21 + EVIDENCE_PAYLOAD_LEN,
+                    msg.len()
+                ),
+            ));
         }
         let view = u64::from_le_bytes(msg[21..29].try_into().map_err(|_| ExecError::Malformed)?);
         let phase = msg[29];
@@ -222,8 +228,9 @@ impl StakingModule {
         // same (view, phase, epoch). Identical hashes are just one
         // vote presented twice — no fault.
         if hash_a == hash_b {
-            return Err(ExecError::ModuleRejected(
-                "evidence: identical block hashes — no equivocation".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                "evidence: identical block hashes — no equivocation",
             ));
         }
         let sig_a =
@@ -253,8 +260,9 @@ impl StakingModule {
             }
         }
         if candidates.is_empty() {
-            return Err(ExecError::ModuleRejected(
-                "evidence: no consensus key on record for validator".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                "evidence: no consensus key on record for validator",
             ));
         }
 
@@ -275,7 +283,10 @@ impl StakingModule {
         {
             let seen = framework::lock_state(&self.seen_evidence);
             if seen.contains(&offense_id) {
-                return Err(ExecError::ModuleRejected("evidence: already applied".to_string()));
+                return Err(ExecError::rejected(
+                    RejectCategory::Precondition,
+                    "evidence: already applied",
+                ));
             }
         }
 
@@ -307,8 +318,9 @@ impl StakingModule {
             })
         };
         if !verifies(&sig_a, &vote_msg_a) || !verifies(&sig_b, &vote_msg_b) {
-            return Err(ExecError::ModuleRejected(
-                "evidence: signature verification failed".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "evidence: signature verification failed",
             ));
         }
 
@@ -345,26 +357,31 @@ impl StakingModule {
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
         if ctx.sender != validator {
-            return Err(ExecError::ModuleRejected(
-                "unjail: only the validator can unjail itself".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "unjail: only the validator can unjail itself",
             ));
         }
-        let jailed_at = framework::lock_state(&self.jailed)
-            .get(&validator)
-            .copied()
-            .ok_or(ExecError::ModuleRejected("unjail: validator is not jailed".to_string()))?;
+        let jailed_at = framework::lock_state(&self.jailed).get(&validator).copied().ok_or(
+            ExecError::rejected(RejectCategory::Precondition, "unjail: validator is not jailed"),
+        )?;
         let height = *framework::lock_state(&self.current_height);
         if height.saturating_sub(jailed_at) < MIN_JAIL_BLOCKS {
-            return Err(ExecError::ModuleRejected(format!(
-                "unjail: {MIN_JAIL_BLOCKS}-block jail period not elapsed"
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                format!("unjail: {MIN_JAIL_BLOCKS}-block jail period not elapsed"),
+            ));
         }
         if self.stake(&validator) == 0 {
-            return Err(ExecError::ModuleRejected("unjail: validator has no stake".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                "unjail: validator has no stake",
+            ));
         }
         if !framework::lock_state(&self.bls_keys).contains_key(&validator) {
-            return Err(ExecError::ModuleRejected(
-                "unjail: no consensus key on record".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                "unjail: no consensus key on record",
             ));
         }
 
@@ -395,9 +412,12 @@ impl StakingModule {
     ) -> Result<Vec<Event>, ExecError> {
         let current = *framework::lock_state(&self.current_height);
         if halt_height != 0 && halt_height <= current {
-            return Err(ExecError::ModuleRejected(format!(
-                "schedule_halt: height {halt_height} is not in the future (current {current})"
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!(
+                    "schedule_halt: height {halt_height} is not in the future (current {current})"
+                ),
+            ));
         }
         // Action identity = the type tag + the target height. A
         // stale-height action can still reach quorum after the tip

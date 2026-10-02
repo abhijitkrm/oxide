@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use primitives::Address;
 
-use executor::ExecError;
+use executor::{ExecError, RejectCategory};
 use framework::{Balances, WEI_PER_UNIT};
 use revm::context::Cfg;
 use revm::context_interface::journaled_state::JournalTr;
@@ -120,7 +120,7 @@ impl<'a, J: JournalTr> JournalBalances<'a, J> {
     /// in-memory `CacheDB<EmptyDB>` backend (its error type is
     /// `Infallible`) but must still be handled for a generic `J`.
     fn db_err(context: &str) -> ExecError {
-        ExecError::ModuleRejected(format!("ledger: {context} — db error"))
+        ExecError::rejected(RejectCategory::Internal, format!("ledger: {context} — db error"))
     }
 }
 
@@ -148,9 +148,10 @@ impl<J: JournalTr> Balances for JournalBalances<'_, J> {
         if load.data.decr_balance(wei) {
             Ok(())
         } else {
-            Err(ExecError::ModuleRejected(format!(
-                "ledger: {addr:?} insufficient balance for {amount} units"
-            )))
+            Err(ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                format!("ledger: {addr:?} insufficient balance for {amount} units"),
+            ))
         }
     }
 
@@ -166,7 +167,10 @@ impl<J: JournalTr> Balances for JournalBalances<'_, J> {
         if load.data.incr_balance(wei) {
             Ok(())
         } else {
-            Err(ExecError::ModuleRejected(format!("ledger: {addr:?} balance overflows U256")))
+            Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                format!("ledger: {addr:?} balance overflows U256"),
+            ))
         }
     }
 
@@ -180,9 +184,10 @@ impl<J: JournalTr> Balances for JournalBalances<'_, J> {
             return if self.balance(from) >= amount {
                 Ok(())
             } else {
-                Err(ExecError::ModuleRejected(format!(
-                    "ledger: {from:?} insufficient balance for {amount} units"
-                )))
+                Err(ExecError::rejected(
+                    RejectCategory::InsufficientFunds,
+                    format!("ledger: {from:?} insufficient balance for {amount} units"),
+                ))
             };
         }
         let mut journal = self.journal.borrow_mut();
@@ -194,7 +199,9 @@ impl<J: JournalTr> Balances for JournalBalances<'_, J> {
             Ok(None) => Ok(()),
             // `OutOfFunds`/`OverflowPayment`/`CreateCollision` — all
             // reject the transfer with no balance moved.
-            Ok(Some(err)) => Err(ExecError::ModuleRejected(format!("ledger: {err:?}"))),
+            Ok(Some(err)) => {
+                Err(ExecError::rejected(RejectCategory::Internal, format!("ledger: {err:?}")))
+            }
             Err(_) => Err(Self::db_err("transfer")),
         }
     }

@@ -417,7 +417,10 @@ impl Module for LedgerFeeModule {
         let mut balances = primitives::sync::lock_state(&self.balances);
         let balance = balances.entry(ctx.sender).or_insert(0);
         if *balance < ctx.fee {
-            return Err(ExecError::ModuleRejected("insufficient fee balance".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                "insufficient fee balance",
+            ));
         }
         *balance -= ctx.fee;
         *primitives::sync::lock_state(&self.charged_total) += ctx.fee;
@@ -1759,7 +1762,7 @@ impl Module for VersionedModule {
     fn migrate(&self, from: u32) -> Result<u32, ExecError> {
         primitives::sync::lock_state(&self.migrate_calls).push(from);
         if self.migrate_fails {
-            return Err(ExecError::ModuleRejected("boom".to_string()));
+            return Err(ExecError::rejected(RejectCategory::Other, "boom"));
         }
         Ok(self.version)
     }
@@ -2960,7 +2963,7 @@ fn tx_outcome_records_module_rejection() {
         }
         fn begin_block(&self, _height: Height) {}
         fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
-            Err(ExecError::ModuleRejected("nope".to_string()))
+            Err(ExecError::rejected(RejectCategory::Other, "nope"))
         }
         fn end_block(&self, _height: Height) -> Vec<Event> {
             Vec::new()
@@ -3060,7 +3063,10 @@ impl Module for LedgerFeeCollector {
         let mut ledger = primitives::sync::lock_state(&self.ledger);
         let balance = ledger.entry(ctx.sender).or_insert(0);
         if *balance < ctx.fee {
-            return Err(ExecError::ModuleRejected("insufficient fee balance".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                "insufficient fee balance",
+            ));
         }
         *balance -= ctx.fee;
         Ok(())
@@ -3402,4 +3408,26 @@ fn shared_chain_params_drive_live_fee_floor() {
         "only the adequately-paid tx executes under the shared floor"
     );
     assert_eq!(*primitives::sync::lock_state(&collector.charged), 100);
+}
+
+/// Regression: module rejections carry a typed [`RejectCategory`]
+/// alongside the human detail, so admission/RPC paths classify
+/// without string-matching — and the rendered reason keeps a stable
+/// `category: detail` shape at the wire seams.
+#[test]
+fn module_rejection_carries_category() {
+    let e = ExecError::rejected(RejectCategory::NotFound, "order 7 not found");
+    assert_eq!(e.rejection_category(), Some(RejectCategory::NotFound));
+    assert_eq!(e.to_string(), "not_found: order 7 not found");
+
+    // Non-module executor errors have no rejection category.
+    assert_eq!(ExecError::Malformed.rejection_category(), None);
+    assert_eq!(ExecError::OutOfGas.rejection_category(), None);
+
+    // User-actionable vs internal categories stay distinguishable —
+    // the distinction RPC admission needs (retryable vs investigate).
+    let funds = ExecError::rejected(RejectCategory::InsufficientFunds, "balance 3 < 9");
+    let wiring = ExecError::rejected(RejectCategory::Internal, "refund failed");
+    assert_ne!(funds.rejection_category(), wiring.rejection_category());
+    assert!(wiring.to_string().starts_with("internal: "));
 }
