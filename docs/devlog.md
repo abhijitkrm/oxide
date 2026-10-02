@@ -22277,3 +22277,97 @@ Tests: 10/10 durability suite green including the new
 (crash after barrier with the lane spawned), journal-level
 `test_sync_if_dirty_skips_redundant_fsyncs`, all touched crates
 green (executor 112+10, storage 68+, consensus 254, node 78).
+
+## Session: capacity + latency audit — where the pipeline actually binds
+
+Full re-measurement of the 4-node devnet fleet (M2, 21k-gas EVM
+transfers) with thread-level `sample` profiles, commit-gap timing,
+mempool introspection, and an RPC end-to-end latency probe. No
+production code changed — findings and the prioritized plan below.
+
+**Throughput.** Sustained executed: **~4.4k tx/s** at 6k fleet-
+offered (matches the last session's 4 558); cadence 145–176 ms/block
+carrying ~420–780 txs. At 15k offered executed *drops* to 3.7k —
+overload makes it worse, not faster.
+
+**Thread attribution (the important part).**
+- Pump: 50–65 % busy; **56 % of its busy time is secp256k1
+  recovery for transaction admission**. The pump admits its own
+  injector's stream AND every peer's gossiped `MSG_TX`
+  (`submit_tx → ingest_tx` inline), so with full-mesh gossip every
+  node admits every tx: fleet admission work scales ×n with
+  validator count. At 15k offered that is ~0.45–0.9 CPU-s/s of
+  recovery on the consensus thread — the pump starves the block
+  pipeline, which is why more offered load yields less executed
+  throughput.
+- Exec lane: 6–33 % busy (execute + state root + redb sync +
+  journal batch sync). Massive headroom — execution is *not* the
+  constraint at these rates.
+- p2p reader/writer, RPC, verify-pool, rayon: idle.
+
+**Latency (RPC submit → receipt, measured).** Unloaded: **~230 ms**
+(10-tx burst, 2 blocks). Loaded (4.5k offered): **p50 = 537 ms**,
+all 10 txs in a single block — the delay is queueing ahead of
+inclusion, not multiple blocks. Commit-gap distribution at idle is
+bimodal: fast mode **35–70 ms/commit** (14–28 blk/s) punctuated by
+gaps when no work is pending (`IDLE_HEARTBEAT` = 1 s gates
+empty-block proposals; each tx drives ~2 commits via the 2-chain
+rule). The 143 ms average is work-arrival shaped, not a fixed
+clock — but the fast mode itself (~70 ms/view) is still far from
+HFT-grade.
+
+**Storage / syscall layer.** Journal per-commit fsync amortization
+holds (commit-path `journal::sync` ~0.2 % of pump). Remaining IO
+on the pump: WAL `BufWriter` flush per append (one `write` per
+consensus append) and journal height-index writes during
+`prune_below_height` (block-sync retention). Exec lane pays redb
+`apply_batch`+`sync` and the batch journal sync per drain — fine
+at 7 blocks/s, would bind at HFT cadence (50+ blocks/s).
+
+**EVM state root is not a wall:** the sparse retained-trie walk is
+O(touched · log n) after the first build; the O(N) full-rebuild
+bench is the displaced baseline only.
+
+**Harness findings (devnet injector).**
+- `INJECT_MAX_LEAD` = 512 makes the injector a *rate-follower*
+  after its first cap hit: rewind → resend duplicates →
+  `Rejected{Duplicate}` → hold nonce → effective emission ≈
+  execution rate + churn. "Offered" rates above the drain rate are
+  never actually offered. Raising the cap to 2 000 for a probe
+  changed measured executed throughput by ~0 (4.4k either way) —
+  reverted; the honest fix is open-loop semantics: treat
+  `Duplicate` as accounted (advance the nonce) and size the cap to
+  the pool capacity (10k entries), not 512.
+- `txpool_status` confirms the pool is nearly empty (88 txs)
+  under nominal "offered" load — consistent with the follower
+  behavior above.
+
+**RPC.** Default per-IP rate limit is 100 cost-units/s,
+cost-weighted by batch size (`DEFAULT_RATE_LIMIT_PER_SEC`); a
+50-receipt batch poll at 20 Hz trips 429s. Fine as hardening;
+documented for latency-sensitive clients (poll `eth_getBalance`/
+`eth_blockNumber` instead of per-hash receipt batches).
+
+**Operational finding.** A node restarted with a wiped data dir
+did not rejoin the running fleet within ~1 min — it sat
+rebroadcasting timeout signatures at a stale view while the rest
+of the fleet advanced; state-repair did not kick in. Needs a
+dedicated investigation (replace-a-validator path).
+
+**Prioritized next steps.**
+1. Move admission off the pump: dedicated admission workers over
+   the intake ring; batch-admit remote `MSG_TX` via
+   `ingest_tx_batch` (exists); cheap pre-filters (dedup, pool-full,
+   lead) *before* recovery. Target: pump busy < 30 % at 10k
+   offered.
+2. Instrument the view timeline (propose → votes → QC → commit
+   timestamps per stage) — the 70 ms/view fast mode must be
+   decomposed before it can be cut.
+3. Storage cadence for HFT block times: group redb syncs across
+   blocks (the journal ⊇ durable-state invariant already permits
+   it), batch WAL appends with writev.
+4. Gossip policy at scale: stop paying ×n admission for every tx
+   (relay subset / next-leader forwarding).
+5. Open-loop injector semantics (Duplicate = accounted) so
+   capacity measurements are honest.
+6. Wiped-node rejoin path.
