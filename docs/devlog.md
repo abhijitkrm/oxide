@@ -22288,3 +22288,26 @@ same predicate fixes), `inspect_state` filters them in the verify
 recompute, and `load_from_storage` skips installing them so a
 ghost can't linger root-inert in the backend. Regression pin:
 `snapshot_omits_eip158_empty_accounts`.
+
+## HFT / low-latency audit (`hft-audit.md`)
+
+A full source-level audit of the hot paths against the
+`performance-first` rules — matching engine, matcher service,
+consensus pump, executor/EVM, p2p, WAL, primitives/codec, and the
+bench/gate apparatus — with every quantitative claim verified
+against the committed benches. Findings carry file:line, quantified
+impact, and remediation; 19 findings (6 High, 6 Medium, 4 Low, 3
+Info) plus a verified-strengths section.
+
+Headline items: the validator pump sleeps 1 ms at the end of every
+pass unconditionally (the comment claims otherwise — the single
+highest-value latency fix); no CPU pinning/NUMA exists despite the
+skill requiring it; the matcher "SPSC" ring is crossbeam MPMC and
+every push takes a global mutex + notify; the sequencer has an
+unbounded spin on a client-drainable ring; the market-data publisher
+would serialize JSON on the sequencer thread (currently unwired —
+fix before wiring); and the EVM parallel path re-runs secp256k1
+recovery (~30 µs/tx) that the preverify cache exists to avoid.
+Enforced throughput floors sit 5–24× below claims/measurements, so
+the audit recommends ratcheting gates. Fix order and required
+benches are listed in the audit's remediation plan.
