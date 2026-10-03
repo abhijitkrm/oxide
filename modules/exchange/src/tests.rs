@@ -1833,7 +1833,7 @@ fn pre_custody_sell_orders_cannot_settle() {
         framework::subtree_root_map(&store_map),
         "store section must hash to the committed root"
     );
-    let (markets, endorsements, mut registered, _, _, _) =
+    let (markets, endorsements, mut registered, _, _, _, _) =
         ExchangeModule::decode_committed(&mut r, &store_map, 256).expect("decodes");
     registered.insert(
         crate::OrderKey { owner: addr(9), client_id: 9 },
@@ -2194,4 +2194,305 @@ fn batch_accumulators_saturate_instead_of_wrapping() {
     );
     // Σ rebate = (release - pays) × 2 = 2 — both rebates drain.
     assert_eq!(ledger.balance(&buyer), 2, "both legs' rebates credited");
+}
+
+// ── Trading-key linkage (system-audit S2) ────────────────────────
+//
+// The off-chain matcher's Ed25519 owner can never sign a secp256k1
+// tx envelope, so its on-chain custody and escrow would be
+// permanently locked without the link registry. These tests cover
+// the whole lifecycle: consent-verified link, link-gated custody
+// and ledger egress, linked order registration and settlement,
+// revocation, and replay resistance.
+
+/// A fresh Ed25519 trading identity and its derived owner address.
+fn trading_key() -> (crypto::ed25519::Ed25519SecretKey, crypto::ed25519::Ed25519PublicKey, Address)
+{
+    let (secret, public) = crypto::ed25519::generate_keypair_for_test();
+    (secret, public, crypto::ed25519::owner_address(&public))
+}
+
+/// Sign `payload` with the Ed25519 secret, returning the 64-byte sig.
+fn ed_sign(secret: &crypto::ed25519::Ed25519SecretKey, payload: &[u8]) -> [u8; 64] {
+    crypto::ed25519::sign_message(secret, payload).to_bytes()
+}
+
+/// Link the trading owner of `public` to secp ledger account
+/// `secp_byte` at `epoch` — expects acceptance.
+fn link(
+    ex: &ExchangeModule,
+    secp_byte: u8,
+    secret: &crypto::ed25519::Ed25519SecretKey,
+    public: &crypto::ed25519::Ed25519PublicKey,
+    epoch: u64,
+) {
+    let consent = msg::link_consent_message(&addr(secp_byte), &public.to_bytes(), epoch);
+    let sig = ed_sign(secret, &consent);
+    ex.handle(&ctx(secp_byte), &msg::link_trading_key(&public.to_bytes(), &sig))
+        .expect("link must be accepted");
+}
+
+/// A ledgered module with one listed market, for the linkage tests.
+fn linked_exchange() -> (Arc<framework::MemoryBalances>, ExchangeModule) {
+    let ledger = Arc::new(framework::MemoryBalances::new());
+    let ex = ExchangeModule::with_ledger(ledger.clone());
+    ex.list_market(test_cfg()).unwrap();
+    (ledger, ex)
+}
+
+#[test]
+fn link_then_withdraw_moves_custody_to_linked_ledger() {
+    let (ledger, ex) = linked_exchange();
+    let (secret, public, owner) = trading_key();
+
+    // The linked operator funds the trading owner's custody via
+    // the permissionless deposit-for path.
+    ledger.mint(&addr(1), 1_000_000);
+    ex.handle(&ctx(1), &msg::deposit_base_for(owner, 0, 50_000)).unwrap();
+    assert_eq!(ex.base_balance(owner, 0), 50_000);
+
+    // Before the link exists, the withdrawal is unauthorized.
+    let err = ex.handle(&ctx(1), &msg::withdraw_linked(owner, 0, 1)).unwrap_err();
+    assert!(format!("{err:?}").contains("Unauthorized"), "unlinked withdraw must reject: {err:?}");
+
+    link(&ex, 1, &secret, &public, 1);
+
+    // After linking, the secp account withdraws the trading
+    // owner's custody into its own ledger — the venue egress path.
+    let before = ledger.balance(&addr(1));
+    ex.handle(&ctx(1), &msg::withdraw_linked(owner, 0, 20_000)).unwrap();
+    assert_eq!(ledger.balance(&addr(1)), before + 20_000);
+    assert_eq!(ex.base_balance(owner, 0), 30_000);
+}
+
+#[test]
+fn link_rejects_consent_naming_a_different_secp() {
+    let (_ledger, ex) = linked_exchange();
+    let (secret, public, _owner) = trading_key();
+
+    // The consent names addr(2) but the envelope sender is addr(1):
+    // the signature won't cover the actual sender, so the module
+    // builds a different preimage than the signer signed.
+    let consent = msg::link_consent_message(&addr(2), &public.to_bytes(), 1);
+    let sig = ed_sign(&secret, &consent);
+    let err = ex.handle(&ctx(1), &msg::link_trading_key(&public.to_bytes(), &sig)).unwrap_err();
+    assert!(format!("{err:?}").contains("Unauthorized"), "misdirected consent must reject");
+}
+
+#[test]
+fn link_rejects_signature_from_an_unrelated_key() {
+    let (_ledger, ex) = linked_exchange();
+    let (_s1, public, _owner) = trading_key();
+    let (forger, _p2, _o2) = trading_key();
+
+    // A validly formed consent, but signed by a key that is not the
+    // declared trading key — the classic "bind a victim's key to my
+    // ledger" griefing attempt.
+    let consent = msg::link_consent_message(&addr(1), &public.to_bytes(), 1);
+    let forged_sig = ed_sign(&forger, &consent);
+    let err =
+        ex.handle(&ctx(1), &msg::link_trading_key(&public.to_bytes(), &forged_sig)).unwrap_err();
+    assert!(format!("{err:?}").contains("Unauthorized"), "forged consent must reject");
+}
+
+#[test]
+fn captured_consent_cannot_replay_after_epoch_advances() {
+    let (_ledger, ex) = linked_exchange();
+    let (secret, public, _owner) = trading_key();
+
+    // Link at epoch 1 to addr(1), then relink at epoch 2 to addr(2)
+    // — the trading key rotates its custodian.
+    link(&ex, 1, &secret, &public, 1);
+    link(&ex, 2, &secret, &public, 2);
+
+    // Replay the captured epoch-1 consent: the module expects
+    // epoch 3 in the preimage, so the old signature fails.
+    let stale = msg::link_consent_message(&addr(1), &public.to_bytes(), 1);
+    let stale_sig = ed_sign(&secret, &stale);
+    let err =
+        ex.handle(&ctx(1), &msg::link_trading_key(&public.to_bytes(), &stale_sig)).unwrap_err();
+    assert!(format!("{err:?}").contains("Unauthorized"), "stale-epoch consent must reject");
+}
+
+#[test]
+fn unlink_revokes_and_relink_recovers_egress() {
+    let (ledger, ex) = linked_exchange();
+    let (secret, public, owner) = trading_key();
+    ledger.mint(&addr(1), 1_000_000);
+    ledger.mint(&addr(2), 1_000);
+    ex.handle(&ctx(1), &msg::deposit_base_for(owner, 0, 50_000)).unwrap();
+    link(&ex, 1, &secret, &public, 1);
+
+    // Unlink at epoch 2 — a signed revocation any sender may relay.
+    let revoke = msg::unlink_consent_message(&public.to_bytes(), 2);
+    let revoke_sig = ed_sign(&secret, &revoke);
+    ex.handle(&ctx(9), &msg::unlink_trading_key(&public.to_bytes(), &revoke_sig)).unwrap();
+
+    // The old linked account can no longer withdraw.
+    let err = ex.handle(&ctx(1), &msg::withdraw_linked(owner, 0, 1)).unwrap_err();
+    assert!(format!("{err:?}").contains("Unauthorized"), "revoked link must reject");
+
+    // Unlinking again rejects — there is no live link to sever
+    // (it must not burn the epoch either).
+    let err =
+        ex.handle(&ctx(9), &msg::unlink_trading_key(&public.to_bytes(), &revoke_sig)).unwrap_err();
+    assert!(format!("{err:?}").contains("Precondition"), "double unlink must reject");
+
+    // Relink to addr(2) at epoch 3 — the trading key picks a new
+    // custodian — and egress resumes under the new account.
+    link(&ex, 2, &secret, &public, 3);
+    let before = ledger.balance(&addr(2));
+    ex.handle(&ctx(2), &msg::withdraw_linked(owner, 0, 10_000)).unwrap();
+    assert_eq!(ledger.balance(&addr(2)), before + 10_000);
+}
+
+#[test]
+fn withdraw_linked_rejects_wrong_sender() {
+    let (ledger, ex) = linked_exchange();
+    let (secret, public, owner) = trading_key();
+    ledger.mint(&addr(1), 1_000_000);
+    ex.handle(&ctx(1), &msg::deposit_base_for(owner, 0, 50_000)).unwrap();
+    link(&ex, 1, &secret, &public, 1);
+
+    // addr(9) is not the linked account — it cannot touch custody.
+    let err = ex.handle(&ctx(9), &msg::withdraw_linked(owner, 0, 1)).unwrap_err();
+    assert!(format!("{err:?}").contains("Unauthorized"), "foreign sender must reject");
+}
+
+#[test]
+fn register_linked_escrows_from_the_owner() {
+    let (ledger, ex) = linked_exchange();
+    let (secret, public, owner) = trading_key();
+    // The trading owner's ledger is funded by an ordinary transfer
+    // (any secp account can send native tokens to the derived
+    // address — the ledger is keyed by address, not credential).
+    ledger.mint(&owner, 10_000_000);
+    ledger.mint(&addr(1), 1_000_000);
+    ex.handle(&ctx(1), &msg::deposit_base_for(owner, 0, 5_000)).unwrap();
+    link(&ex, 1, &secret, &public, 1);
+
+    // Buy under the linked owner: escrow debits the OWNER's ledger,
+    // not the relayer's — the operator submits, the owner pays.
+    let buy_escrow = 1_500_000_000u64 * 1_000 / 100_000_000; // price*qty/SCALE = 15_000
+    ex.handle(&ctx(1), &msg::register_linked(owner, 0, Side::Buy, 1_500_000_000, 1_000, 7))
+        .unwrap();
+    assert_eq!(ledger.balance(&owner), 10_000_000 - buy_escrow);
+
+    // Sell under the linked owner: escrow draws the owner's custody.
+    ex.handle(&ctx(1), &msg::register_linked(owner, 0, Side::Sell, 1_500_000_000, 2_000, 8))
+        .unwrap();
+    assert_eq!(ex.base_balance(owner, 0), 5_000 - 2_000);
+}
+
+#[test]
+fn cancel_linked_refunds_the_owner_not_the_relayer() {
+    let (ledger, ex) = linked_exchange();
+    let (secret, public, owner) = trading_key();
+    ledger.mint(&owner, 10_000_000);
+    link(&ex, 1, &secret, &public, 1);
+
+    ex.handle(&ctx(1), &msg::register_linked(owner, 0, Side::Buy, 1_500_000_000, 1_000, 7))
+        .unwrap();
+    let before = ledger.balance(&owner);
+    ex.handle(&ctx(1), &msg::cancel_linked(owner, 7)).unwrap();
+    // The full buy escrow returns to the owner's ledger.
+    assert_eq!(ledger.balance(&owner), before + 15_000);
+
+    // A foreign account cannot cancel the owner's order.
+    ex.handle(&ctx(1), &msg::register_linked(owner, 0, Side::Buy, 1_500_000_000, 1_000, 9))
+        .unwrap();
+    let err = ex.handle(&ctx(9), &msg::cancel_linked(owner, 9)).unwrap_err();
+    assert!(format!("{err:?}").contains("Unauthorized"), "foreign cancel must reject");
+}
+
+#[test]
+fn sweep_linked_moves_owner_ledger_to_the_linked_account() {
+    let (ledger, ex) = linked_exchange();
+    let (secret, public, owner) = trading_key();
+    // Settlement refunds/rebates credit the owner's ledger; sweep is
+    // how the linked account collects them.
+    ledger.mint(&owner, 50_000);
+    link(&ex, 1, &secret, &public, 1);
+
+    let err = ex.handle(&ctx(9), &msg::sweep_linked(owner, 1)).unwrap_err();
+    assert!(format!("{err:?}").contains("Unauthorized"), "foreign sweep must reject");
+
+    let before = ledger.balance(&addr(1));
+    ex.handle(&ctx(1), &msg::sweep_linked(owner, 30_000)).unwrap();
+    assert_eq!(ledger.balance(&addr(1)), before + 30_000);
+    assert_eq!(ledger.balance(&owner), 20_000);
+}
+
+#[test]
+fn linked_orders_settle_end_to_end_and_egress() {
+    let ledger = Arc::new(framework::MemoryBalances::new());
+    let ex = ExchangeModule::with_ledger(ledger.clone()).with_settlement_operator(addr(7));
+    ex.list_market(test_cfg()).unwrap();
+
+    let (b_secret, b_public, buyer) = trading_key();
+    let (s_secret, s_public, seller) = trading_key();
+
+    // Both sides link to their ledger accounts and register orders
+    // through the linked path — the venue's full Ed25519 flow.
+    link(&ex, 1, &b_secret, &b_public, 1);
+    link(&ex, 2, &s_secret, &s_public, 1);
+    ledger.mint(&buyer, 10_000_000);
+    ledger.mint(&addr(1), 1_000_000);
+    ex.handle(&ctx(1), &msg::deposit_base_for(seller, 0, 5_000)).unwrap();
+    ex.handle(&ctx(1), &msg::register_linked(buyer, 0, Side::Buy, 1_500_000_000, 1_000, 1))
+        .unwrap();
+    ex.handle(&ctx(2), &msg::register_linked(seller, 0, Side::Sell, 1_500_000_000, 1_000, 1))
+        .unwrap();
+
+    // The settlement operator submits the matched fill.
+    let fills = vec![BatchFillEntry {
+        market: 0,
+        price: Price(1_500_000_000),
+        qty: Qty(1_000),
+        buy: crate::OrderKey { owner: buyer, client_id: 1 },
+        sell: crate::OrderKey { owner: seller, client_id: 1 },
+    }];
+    ex.handle(&ctx(7), &msg::batch_settle(&fills)).unwrap();
+
+    // Delivery landed under the trading owners: buyer holds base
+    // custody, seller holds quote on its ledger. Neither can sign a
+    // tx — their linked accounts egress both sides.
+    assert_eq!(ex.base_balance(buyer, 0), 1_000);
+    let seller_quote = ledger.balance(&seller);
+    assert!(seller_quote > 0, "seller's quote credit landed under its owner");
+
+    let b1 = ledger.balance(&addr(1));
+    ex.handle(&ctx(1), &msg::withdraw_linked(buyer, 0, 1_000)).unwrap();
+    assert_eq!(ledger.balance(&addr(1)), b1 + 1_000);
+
+    let s2 = ledger.balance(&addr(2));
+    ex.handle(&ctx(2), &msg::sweep_linked(seller, seller_quote)).unwrap();
+    assert_eq!(ledger.balance(&addr(2)), s2 + seller_quote);
+    assert_eq!(ledger.balance(&seller), 0);
+}
+
+/// The linkage registry is committed state: a snapshot round-trip
+/// must carry it exactly — a replica that installed an empty or
+/// different registry would authorize different withdrawals than
+/// the exporter, which is precisely the divergence committed state
+/// exists to prevent.
+#[test]
+fn state_snapshot_preserves_linkage() {
+    let (ledger, src) = linked_exchange();
+    let (secret, public, owner) = trading_key();
+    ledger.mint(&addr(1), 1_000_000);
+    src.handle(&ctx(1), &msg::deposit_base_for(owner, 0, 50_000)).unwrap();
+    link(&src, 1, &secret, &public, 1);
+
+    let snapshot = src.export_state().expect("exports state");
+    assert_eq!(src.inspect_state(&snapshot).unwrap(), src.state_root());
+
+    let dst = ExchangeModule::with_ledger(ledger.clone());
+    dst.import_state(&snapshot).unwrap();
+    assert_eq!(dst.state_root(), src.state_root());
+
+    // The installed link authorizes the same account — and only it.
+    dst.handle(&ctx(1), &msg::withdraw_linked(owner, 0, 10_000)).unwrap();
+    let err = dst.handle(&ctx(9), &msg::withdraw_linked(owner, 0, 1)).unwrap_err();
+    assert!(format!("{err:?}").contains("Unauthorized"), "imported link must still gate");
 }

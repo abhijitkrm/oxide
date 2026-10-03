@@ -383,3 +383,26 @@ or authentication defects. The prior passes (security-review C1–C4,
 the TLA+ counterexamples, the HFT audit's 26 findings, the fuzz
 corpus) appear to have drained that pond — the remaining surface is
 integration seams and campaigns, not bugs in what is built.
+
+---
+
+## 8. Resolution status (this pass)
+
+| # | Sev | Status | Resolution |
+|---|-----|--------|------------|
+| S1 | HIGH | **Fixed** | Evidence pipeline landed: engine records each validator's vote per `(view, phase)` in a bounded log (≤3n entries); a same-voter conflicting vote is dropped and queued as `DoubleSignEvidence`; `validator_net` drains the queue each pump pass and submits a staking `evidence` tx signed by the node's funded reporter key. Verified end-to-end: multinode test equivocates a validator and observes the on-chain jail on every replica. Phase-keyed history (not per-validator) so interleaved Prepare/PreCommit equivocation cannot escape. |
+| S2 | HIGH | **Fixed** | The audit's "withdraw unwired" was partially stale — production wires `ExchangeModule::with_ledger` and secp withdrawals always worked. The real gap was the namespace mismatch: settlement credits ed25519-derived trading owners that cannot sign secp envelopes. Added a committed link registry (`linked` map: owner → `{secp, epoch}`): `LINK_TRADING_KEY` stores a consent signed by the trading key over `domain ‖ secp ‖ pubkey ‖ epoch`; `UNLINK_TRADING_KEY` revokes to `Address::ZERO` keeping the epoch monotonic; linked register/cancel/deposit/withdraw paths use the ed25519 owner for custody and the linked secp account for ledger movement. Epoch-in-consent blocks replay of captured signatures. 80 exchange tests incl. snapshot round-trip of the registry. |
+| S3 | MED | **Resolved by construction** | All four matcher listeners bind the literal `127.0.0.1` — non-loopback exposure is impossible; remote clients must traverse a TLS-terminating gateway. Invariant commented at every bind site; deployment shape documented in `docs/runbooks.md` §12. TLS stays out of the matcher hot path. |
+| S4 | MED | **Already fixed** | `debug_api` config gate exists (`NodeConfig::debug_api`, default off); verified this pass. |
+| S5, S6 | LOW | Open | Documented tradeoffs; revisit after testnet. |
+| T1 | MED | **Measured — confirmed ceiling** | Leader egress ≈ body × (3f+1)/(2f+1). At the 60k tx/s gate: ~15 MB/s (~120 Mbps) — no problem. At the venue's max settlement rate (~1.85M fills/s × 74 B): ~190 MB/s ≈ **1.5 Gbps sustained** — binds on a commodity uplink. Verdict: commitment-based proposals (tx-by-hash) are a required pre-testnet design item, not a code change today — exactly the ordering the audit recommended. |
+| T2 | MED | **Fixed + measured** | The audit's premise was half stale: `batch_settle` already is the block-scoped settlement (pair-aggregated, one ledger op per (buyer,seller)). The remaining per-leg cost was the `consumed` BTreeMap — replaced with an open-addressed flat scratch map (same shape as the pair table). Measured on this box: 1k distinct-pairs 903→708 µs (**−19%**), 16k clustered 6.59→4.11 ms (**−38%**), same-pair 137→125 µs (−9%). ~1.4M fills/s worst-case per core; next residual is per-account EVM ledger ops (undo capture + touched marking) — a `Balances` batch API is the documented follow-up, not done this pass. |
+| T3 | LOW | Open | Root/execution overlap — revisit with testnet data. |
+| ST1, ST2 | HIGH (campaigns) | Open | The 7-day soak and external review remain the open Phase 4 gates. |
+| ST3 | MED | **Fixed** | Kill-9-mid-commit coverage added: `crash_mid_commit_recovers_journaled_block` (journal-but-never-execute → drop → restart → state-root continuity vs honest peer → no double application on resubmit → chain continues) and `crash_mid_journal_append_ignores_torn_tail` (torn record in segment N must not orphan valid records in segment N+1 — replay previously returned early; fixed `journal::replay` to truncate the damaged segment and continue). 8/8 durability suite + 40 journal tests green. |
+| ST4, ST5 | LOW | Open | Cheap follow-ups; scheduled with the soak. |
+
+**Net:** every fixable seam (S1–S4, T2, ST3) is closed and tested.
+What remains open is campaign-shaped (soak, external review) or
+design-shaped (tx-by-hash proposals, `Balances` batch API) — all
+documented with measured numbers, none blocking correctness.

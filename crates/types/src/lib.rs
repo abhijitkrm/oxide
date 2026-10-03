@@ -909,6 +909,45 @@ impl<'a> Decode<'a> for Vote {
     }
 }
 
+/// Slashable equivocation evidence: two *conflicting* votes observed
+/// from the same validator at the same `(view, phase, epoch)` but
+/// naming different block hashes.
+///
+/// Emitted by the consensus engine when its per-view vote history
+/// sees a second signed vote that disagrees with the first it
+/// recorded for a voter. Both signatures are carried verbatim —
+/// the pair is self-authenticating: the staking module re-derives
+/// the exact vote signing messages and re-verifies each signature
+/// against the offender's current and retired BLS keys, so a
+/// malformed or forged pair cannot produce a slash. The record is
+/// a Rust-only hand-off (engine → node pump → staking evidence
+/// transaction); it has no wire form of its own.
+///
+/// `first`/`second` are ordered by observation time. The staking
+/// module treats the pair symmetrically — order carries no
+/// protocol meaning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoubleSignEvidence {
+    /// The equivocating validator's staking address — the account
+    /// the slash and jail apply to.
+    pub validator: Address,
+    /// The view both votes were cast in.
+    pub view: View,
+    /// The pipeline phase both votes were cast in.
+    pub phase: VotePhase,
+    /// The epoch both votes belong to — the signing messages the
+    /// module reconstructs bind the epoch.
+    pub epoch: Epoch,
+    /// The block hash of the first observed vote.
+    pub first_block_hash: Hash,
+    /// The BLS signature on the first observed vote.
+    pub first_signature: Signature,
+    /// The block hash of the second, conflicting vote.
+    pub second_block_hash: Hash,
+    /// The BLS signature on the second, conflicting vote.
+    pub second_signature: Signature,
+}
+
 /// A quorum certificate: the aggregate of votes for a single
 /// `(view, phase, block_hash)` whose signers hold a strict
 /// two-thirds supermajority of voting power

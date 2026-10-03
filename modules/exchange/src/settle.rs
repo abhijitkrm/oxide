@@ -475,6 +475,104 @@ pub(crate) fn pair_hash(buyer: &[u8; 20], seller: &[u8; 20]) -> u64 {
     h
 }
 
+/// Hash an `OrderKey` for the `consumed` scratch table — the same
+/// fx-hash rotate-multiply scheme as `pair_hash` over the key's four
+/// words (owner as two `u64`s + one `u32`, then `client_id`).
+/// Internal scratch only: collision-handled by probing, and
+/// deterministic across platforms because batch settlement is
+/// consensus-adjacent.
+fn order_key_hash(key: &OrderKey) -> u64 {
+    const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+    const MUL: u64 = 0x517c_c1b7_2722_0a95;
+    let mut h = SEED;
+    for x in [w64(&key.owner.0, 0), w64(&key.owner.0, 8), w32(&key.owner.0, 16), key.client_id] {
+        h = (h.rotate_left(5) ^ x).wrapping_mul(MUL);
+    }
+    h
+}
+
+/// Open-addressed scratch map accumulating each order's consumed
+/// quantity across a batch — the same flat-index shape as the
+/// `(buyer, seller)` pair table in `handle_batch_settle`. Replaces a
+/// `BTreeMap<OrderKey, Qty>` whose get+insert pair per leg cost
+/// ~30-60ns each at 65k fills (16+ levels of pointer-chasing on a
+/// 28-byte key); the flat probe is one hash plus 1-3 cache-resident
+/// slots at load ≤ 0.5. `consumed` is pure scratch — never iterated
+/// — so the `BTreeMap`'s ordering was paying for semantics nothing
+/// observed.
+///
+/// `table` slots are `u32::MAX` = empty, otherwise an index into
+/// `entries` (insertion-ordered `(key, qty)` pairs). Capacity is
+/// fixed at construction: 4× the leg count keeps the worst case
+/// (2 distinct keys per leg) under load 0.5 with headroom.
+pub(crate) struct ConsumedMap {
+    table: Vec<u32>,
+    entries: Vec<(OrderKey, Qty)>,
+}
+
+impl ConsumedMap {
+    /// A table sized for `legs` fill legs — `4 × legs`, next power
+    /// of two, minimum 64 slots (matching the pair table's floor).
+    pub(crate) fn with_legs(legs: usize) -> Self {
+        let table_cap = legs.saturating_mul(4).next_power_of_two().max(64);
+        Self {
+            table: vec![u32::MAX; table_cap],
+            entries: Vec::with_capacity(legs.saturating_mul(2)),
+        }
+    }
+
+    /// The cumulative quantity consumed so far for `key` — `None`
+    /// when no earlier leg touched the order.
+    pub(crate) fn get(&self, key: &OrderKey) -> Option<Qty> {
+        let mask = self.table.len() - 1;
+        // `u64 → usize` can only lose bits on a <64-bit target, and
+        // the mask already confines the result to the table — the
+        // cast is the same shape the pair table uses.
+        #[allow(clippy::cast_possible_truncation)]
+        let mut slot = (order_key_hash(key) as usize) & mask;
+        loop {
+            let t = self.table[slot];
+            if t == u32::MAX {
+                return None;
+            }
+            if self.entries[t as usize].0 == *key {
+                return Some(self.entries[t as usize].1);
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    /// Set `key`'s cumulative consumed quantity. Only ever called
+    /// with the batch-to-date total (overwrite semantics), so the
+    /// table can never exceed `2 × legs` entries — the construction
+    /// bound keeps probes short without rehashing.
+    pub(crate) fn insert(&mut self, key: OrderKey, qty: Qty) {
+        let mask = self.table.len() - 1;
+        // Same masked-index cast as `get` — truncation-safe under
+        // the table bound.
+        #[allow(clippy::cast_possible_truncation)]
+        let mut slot = (order_key_hash(&key) as usize) & mask;
+        loop {
+            let t = self.table[slot];
+            if t == u32::MAX {
+                // `entries` ≤ 2 × `MAX_BATCH_FILLS` (each leg inserts
+                // at most two keys) — far under u32::MAX, so the
+                // cast cannot truncate on any supported target.
+                #[allow(clippy::cast_possible_truncation)]
+                let i = self.entries.len() as u32;
+                self.entries.push((key, qty));
+                self.table[slot] = i;
+                return;
+            }
+            if self.entries[t as usize].0 == key {
+                self.entries[t as usize].1 = qty;
+                return;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+}
+
 /// Parse an `OrderKey` (`[owner:20][client_id:8]` = 28 bytes) out of
 /// a batch-settle leg at byte offset `off`.
 pub(crate) fn leg_key(body: &[u8], off: usize) -> Result<OrderKey, ExecError> {
@@ -524,7 +622,7 @@ pub(crate) fn settle_leg(
     off: usize,
     configs: &[Option<MarketConfig>],
     registered: &framework::CommittedMap<OrderKey, RegisteredOrder>,
-    consumed: &mut BTreeMap<OrderKey, Qty>,
+    consumed: &mut ConsumedMap,
 ) -> Result<Option<LegPlan>, ExecError> {
     let market = u16::from_le_bytes(
         body.get(off..off + 2)
@@ -587,8 +685,8 @@ pub(crate) fn settle_leg(
     // legs already took from each order must fit its `remaining`.
     // `consumed` is updated only for valid legs, so a rejected leg
     // consumes nothing.
-    let buy_used = consumed.get(&buy).copied().unwrap_or_default();
-    let sell_used = consumed.get(&sell).copied().unwrap_or_default();
+    let buy_used = consumed.get(&buy).unwrap_or_default();
+    let sell_used = consumed.get(&sell).unwrap_or_default();
     let Some(buy_total) = qty_add(buy_used, qty) else { return Ok(None) };
     let Some(sell_total) = qty_add(sell_used, qty) else { return Ok(None) };
     if buy_total > buy_order.remaining || sell_total > sell_order.remaining {

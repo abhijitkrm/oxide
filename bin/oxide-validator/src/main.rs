@@ -341,6 +341,28 @@ fn run_validator_node() {
         })
         .collect();
 
+    // `--evidence-key-file` wires the S1 equivocation pipeline:
+    // the engine detects double-signs in every build, but the
+    // records only become slashes once a funded secp256k1 account
+    // carries them on-chain. Absent the flag the node still detects
+    // (and logs what it declined to submit); a PUBLIC test-identity
+    // key is refused outright — its "signature" authenticates as an
+    // identity anyone can recompute, which would spam the evidence
+    // lane with envelopes anyone could have sent.
+    let evidence_reporter = node::cli::parse_cli_flag("--evidence-key-file").map(|path| {
+        let key = node::cli::load_secret_key_file(&path, node::cli::SecretKind::Secp256k1)
+            .unwrap_or_else(|e| panic!("invalid --evidence-key-file '{path}': {e}"));
+        if crypto::is_test_identity_key(&key) {
+            eprintln!(
+                "oxide-validator: --evidence-key-file is a public test-identity scalar — \
+                 a known key cannot authorize evidence submission"
+            );
+            std::process::exit(1);
+        }
+        node::validator_net::EvidenceReporter::new(key)
+            .unwrap_or_else(|| panic!("--evidence-key-file '{path}' is not a valid secp256k1 key"))
+    });
+
     node::validator_net::run(node::validator_net::ValidatorNetSpec {
         log_tag: "oxide-validator".to_string(),
         seat: usize::from(our_seat),
@@ -363,6 +385,7 @@ fn run_validator_node() {
         // A production validator never originates transactions —
         // injection is a devnet/test-harness surface.
         tx_inject: None,
+        evidence_reporter,
     });
 }
 

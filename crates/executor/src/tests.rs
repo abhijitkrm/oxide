@@ -3435,3 +3435,170 @@ fn module_rejection_carries_category() {
     assert_ne!(funds.rejection_category(), wiring.rejection_category());
     assert!(wiring.to_string().starts_with("internal: "));
 }
+
+// ── Kill-9-mid-commit recovery (system-audit ST3) ─────────────────
+//
+// The crash the durability design exists for: `finalize_block`
+// journals the committed block BEFORE any effect lands (WAL), so a
+// SIGKILL during `execute_block` leaves the journaled record with
+// no applied state — and a crash mid-*append* can leave a torn
+// record as the journal's tail. Recovery must replay what is
+// durable, ignore what never verified, and land the exact roots
+// an uncorrupted peer computed — never double-apply, never skip.
+
+/// A journaled-but-unexecuted block models kill-9 mid-commit:
+/// `journal_append` is the WAL write `finalize_block` does before
+/// `execute_block` runs — dropping the executor right after it is
+/// exactly the post-crash durable state (the in-memory `in_flight`
+/// marker evaporates with the process, which is what recovery
+/// sees).
+#[test]
+fn crash_mid_commit_recovers_journaled_block() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut exec = test_executor(100)
+        .with_durability(DurabilityConfig::new(dir.path()).with_checkpoint_interval(4096))
+        .expect("durability config");
+    let counter = Arc::new(CounterModule::new());
+    exec.register_module(counter.clone());
+    for h in 0..3u64 {
+        exec.finalize_block(&repair_block(h, vec![make_tx_with_nonce(1, &[9], h)]));
+    }
+    exec.wait_exec_idle();
+    let prefix_roots: Vec<_> = (0..3u64).map(|h| exec.state_root_at(h)).collect();
+    let count_at_2 = *primitives::sync::lock_state(&counter.count);
+
+    // The crash: block 3's record is durable but its execution
+    // never ran — the journaled-but-unexecuted state the recovery
+    // contract names "in-flight".
+    let mid_commit = repair_block(3, vec![make_tx_with_nonce(1, &[10], 3)]);
+    exec.journal_append(&mid_commit);
+    drop(exec);
+    drop(counter);
+
+    // The honest peer computes what block 3's root SHOULD be —
+    // the certified state the crashed replica must reproduce.
+    let mut honest = test_executor(100);
+    honest.register_module(Arc::new(CounterModule::new()));
+    for h in 0..4u64 {
+        honest.finalize_block(&repair_block(
+            h,
+            vec![make_tx_with_nonce(1, &[u8::try_from(h + 9).unwrap_or(0)], h)],
+        ));
+    }
+    honest.wait_exec_idle();
+    let honest_tip = honest.state_root_at(3);
+
+    // Restart on the same directory: the journal is the authority.
+    let mut exec2 = test_executor(100)
+        .with_durability(DurabilityConfig::new(dir.path()).with_checkpoint_interval(4096))
+        .expect("durability config");
+    let counter2 = Arc::new(CounterModule::new());
+    exec2.register_module(counter2.clone());
+    let report = exec2.recover_durable_state().expect("recovery").expect("journal exists");
+    assert_eq!(report.recovered_height, 3, "replay reaches the mid-commit block");
+    for (h, root) in prefix_roots.iter().enumerate() {
+        assert_eq!(exec2.state_root_at(h as u64), *root, "prefix root {h} unchanged");
+    }
+    assert_eq!(
+        exec2.state_root_at(3),
+        honest_tip,
+        "replayed block 3 lands the peer's certified root"
+    );
+    assert_eq!(
+        *primitives::sync::lock_state(&counter2.count),
+        count_at_2 + 1,
+        "each block's tx counted exactly once — no double-apply"
+    );
+
+    // Consensus resubmits block 3 after restart (its commit walk
+    // still holds the height): the watermark dedup must make the
+    // re-finalize a no-op, not a second execution.
+    exec2.finalize_block(&mid_commit);
+    exec2.wait_exec_idle();
+    assert_eq!(
+        *primitives::sync::lock_state(&counter2.count),
+        count_at_2 + 1,
+        "idempotent re-commit does not double-apply"
+    );
+    // And the chain continues: block 4 executes normally on top.
+    exec2.finalize_block(&repair_block(4, vec![make_tx_with_nonce(1, &[11], 4)]));
+    exec2.wait_exec_idle();
+    assert_eq!(*primitives::sync::lock_state(&counter2.count), count_at_2 + 2);
+}
+
+/// The other mid-commit crash shape: SIGKILL lands during the
+/// journal *append itself* — the segment's tail is a torn record
+/// that fails CRC. Replay must keep the complete prefix, drop the
+/// torn tail, and continue to later segments (the writer restarts
+/// into a fresh segment, so post-restart history sits past the
+/// tear — skipping it would orphan every block since).
+#[test]
+fn crash_mid_journal_append_ignores_torn_tail() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let journal_dir = || dir.path().join(crate::durability::JOURNAL_DIR_NAME);
+    let mut exec = test_executor(100)
+        .with_durability(DurabilityConfig::new(dir.path()).with_checkpoint_interval(4096))
+        .expect("durability config");
+    let counter = Arc::new(CounterModule::new());
+    exec.register_module(counter.clone());
+    for h in 0..3u64 {
+        exec.finalize_block(&repair_block(h, vec![make_tx_with_nonce(1, &[9], h)]));
+    }
+    exec.wait_exec_idle();
+    let prefix_roots: Vec<_> = (0..3u64).map(|h| exec.state_root_at(h)).collect();
+
+    // Block 3 starts journaling — then the process dies mid-write.
+    // The append already synced blocks 0..2; block 3's record is
+    // torn: chop the tail bytes so the final record fails CRC.
+    exec.journal_append(&repair_block(3, vec![make_tx_with_nonce(1, &[10], 3)]));
+    drop(exec);
+    drop(counter);
+    let seg0 = journal_dir().join("segment-0.log");
+    let full = std::fs::read(&seg0).expect("segment exists");
+    std::fs::write(&seg0, &full[..full.len() - 7]).expect("tear the tail mid-record");
+
+    // Restart: replay must cover blocks 0..2 only (the torn record
+    // is dropped), and the writer must resume into a NEW segment —
+    // the torn tail is never appended onto.
+    let mut exec2 = test_executor(100)
+        .with_durability(DurabilityConfig::new(dir.path()).with_checkpoint_interval(4096))
+        .expect("durability config");
+    let counter2 = Arc::new(CounterModule::new());
+    exec2.register_module(counter2.clone());
+    let report = exec2.recover_durable_state().expect("recovery").expect("journal exists");
+    assert_eq!(report.recovered_height, 2, "torn block 3 is not replayed");
+    for (h, root) in prefix_roots.iter().enumerate() {
+        assert_eq!(exec2.state_root_at(h as u64), *root, "prefix root {h} unchanged");
+    }
+    assert!(journal_dir().join("segment-1.log").exists(), "writer resumed on a fresh segment");
+
+    // The SAME block 3 consensus resubmits after restart executes
+    // fresh — and a second crash must now replay it from the new
+    // segment, proving the torn tail did not orphan later history.
+    let mut honest = test_executor(100);
+    honest.register_module(Arc::new(CounterModule::new()));
+    for h in 0..4u64 {
+        honest.finalize_block(&repair_block(
+            h,
+            vec![make_tx_with_nonce(1, &[u8::try_from(h + 9).unwrap_or(0)], h)],
+        ));
+    }
+    honest.wait_exec_idle();
+    let honest_tip = honest.state_root_at(3);
+
+    exec2.finalize_block(&repair_block(3, vec![make_tx_with_nonce(1, &[10], 3)]));
+    exec2.wait_exec_idle();
+    assert_eq!(exec2.state_root_at(3), honest_tip, "re-executed block 3 matches the peer");
+    drop(exec2);
+    drop(counter2);
+
+    let mut exec3 = test_executor(100)
+        .with_durability(DurabilityConfig::new(dir.path()).with_checkpoint_interval(4096))
+        .expect("durability config");
+    let counter3 = Arc::new(CounterModule::new());
+    exec3.register_module(counter3.clone());
+    let report = exec3.recover_durable_state().expect("second recovery").expect("journal");
+    assert_eq!(report.recovered_height, 3, "post-restart history survives past the torn tail");
+    assert_eq!(exec3.state_root_at(3), honest_tip);
+    assert_eq!(*primitives::sync::lock_state(&counter3.count), 4, "0..3 applied once each");
+}

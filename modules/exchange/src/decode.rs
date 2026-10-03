@@ -41,6 +41,10 @@ pub(crate) struct RootView<'a> {
     /// `fee_vault`'s fold root — market-scale (folded anyway: the
     /// map participates in the same incremental contract).
     pub fee_vault_fold: Hash,
+    /// `linked`'s fold root — the linkage registry is committed
+    /// state: replicas disagreeing on links authorize different
+    /// withdrawals.
+    pub linked_fold: Hash,
 }
 
 /// The markets section for `write_committed` (the snapshot blob):
@@ -114,6 +118,7 @@ pub(crate) fn write_root_preimage(v: &RootView<'_>, w: &mut framework::Canonical
     w.put_root(&v.base_balances_fold);
     w.put_root(&v.base_holds_fold);
     w.put_root(&v.fee_vault_fold);
+    w.put_root(&v.linked_fold);
 }
 
 impl ExchangeModule {
@@ -172,6 +177,17 @@ impl ExchangeModule {
         for (market, amount) in &inner.fee_vault {
             w.put_u8(*market);
             w.put_u64(*amount);
+        }
+        // Trading-key linkage — committed state: the link registry
+        // decides who may withdraw a trading owner's custody and
+        // ledger. Trailing section; pre-upgrade blobs decode with
+        // an empty registry (fail-closed: no linked accounts means
+        // every link-gated op rejects, never authorizes).
+        w.put_count(inner.linked.len());
+        for (owner, entry) in &inner.linked {
+            w.put_addr(owner);
+            w.put_addr(&entry.secp);
+            w.put_u64(entry.epoch);
         }
     }
 
@@ -299,6 +315,20 @@ impl ExchangeModule {
                 }
             }
         }
-        Some((markets, endorsements, registered, base_balances, base_holds, fee_vault))
+        // Final trailing section: the linkage registry. Tolerant
+        // tail — a pre-upgrade blob decodes with an empty registry,
+        // which is fail-closed (every link-gated op rejects).
+        let mut linked = BTreeMap::new();
+        if r.remaining() > 0 {
+            let count = r.get_count()?;
+            for _ in 0..count {
+                let owner = r.get_addr()?;
+                let entry = super::LinkedEntry { secp: r.get_addr()?, epoch: r.get_u64()? };
+                if linked.insert(owner, entry).is_some() {
+                    return None; // Duplicate key — non-canonical.
+                }
+            }
+        }
+        Some((markets, endorsements, registered, base_balances, base_holds, fee_vault, linked))
     }
 }

@@ -17,6 +17,20 @@
 //! a batch settlement transaction to consensus via the `TxSubmitter`
 //! trait. This is the bridge between off-chain matching and on-chain
 //! settlement.
+//!
+//! # Exposure posture (system-audit S3)
+//!
+//! Every listener in this file binds `127.0.0.1` as a hardcoded
+//! literal — **loopback-only by construction**, not by config.
+//! Order-entry traffic is plaintext, so the supported deployment for
+//! remote clients is a TLS-terminating proxy (nginx/haproxy/stunnel)
+//! on the same host forwarding to these ports; there is deliberately
+//! no flag that could widen the bind and expose unsigned-transport
+//! order flow to a network path. Orders are signature-authenticated
+//! end-to-end, so the residual plaintext risk is intent
+//! confidentiality (a passive observer on the host/network sees
+//! order flow) — the proxy keeps that surface off the wire.
+//! `docs/runbooks.md` carries the deployment shape.
 
 use crate::protocol::{
     OrderRequest, OrderResponse, RejectReason, decode_action_request, decode_request,
@@ -331,6 +345,8 @@ async fn run_binary_tcp_server_impl(
     ring_matcher: Option<Arc<crate::RingMatcher>>,
     ring_counter: Arc<std::sync::atomic::AtomicUsize>,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("binary TCP server listening on 127.0.0.1:{port}");
 
@@ -529,6 +545,8 @@ async fn run_jsonrpc_tcp_server_impl(
     ring_counter: Arc<std::sync::atomic::AtomicUsize>,
     port: u16,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("JSON-RPC server listening on 127.0.0.1:{port}");
 
@@ -662,6 +680,8 @@ async fn run_fix_server_impl(
     ring_counter: Arc<std::sync::atomic::AtomicUsize>,
     port: u16,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("FIX server listening on 127.0.0.1:{port}");
 
@@ -827,6 +847,8 @@ async fn run_websocket_server_impl(
     ring_counter: Arc<std::sync::atomic::AtomicUsize>,
     port: u16,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("WebSocket server listening on 127.0.0.1:{port}");
 
@@ -1239,6 +1261,8 @@ pub async fn run_binary_tcp_server_multi(
     matcher: Arc<crate::MultiMarketMatcher>,
     port: u16,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("binary TCP (multi-market) server listening on 127.0.0.1:{port}");
     loop {
@@ -1346,6 +1370,8 @@ pub async fn run_jsonrpc_tcp_server_multi(
     matcher: Arc<crate::MultiMarketMatcher>,
     port: u16,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("JSON-RPC (multi-market) server listening on 127.0.0.1:{port}");
     loop {
@@ -1423,6 +1449,8 @@ pub async fn run_fix_server_multi(
     matcher: Arc<crate::MultiMarketMatcher>,
     port: u16,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("FIX (multi-market) server listening on 127.0.0.1:{port}");
     loop {
@@ -1528,6 +1556,8 @@ pub async fn run_websocket_server_multi(
     matcher: Arc<crate::MultiMarketMatcher>,
     port: u16,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("WebSocket (multi-market) server listening on 127.0.0.1:{port}");
     loop {

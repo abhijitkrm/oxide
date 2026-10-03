@@ -522,10 +522,11 @@ pub fn replay(dir: &Path) -> Result<Replay, JournalError> {
         while !cursor.is_empty() {
             // Framing parse, inline: [len u32][crc u32][payload]. Any
             // short read (torn tail) or out-of-bounds length ends the
-            // replay at this position — never a panic, never a guess.
+            // segment's replay at this position — never a panic, never
+            // a guess.
             if cursor.len() < 8 {
-                out.truncated_at = Some(Location { segment: seq, offset: pos, len: 0 });
-                return Ok(out);
+                out.truncated_at.get_or_insert(Location { segment: seq, offset: pos, len: 0 });
+                break;
             }
             let len_field = u32::from_le_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
             let crc = u32::from_le_bytes([cursor[4], cursor[5], cursor[6], cursor[7]]);
@@ -533,13 +534,21 @@ pub fn replay(dir: &Path) -> Result<Replay, JournalError> {
                 // Corrupted length or torn payload: identical recovery
                 // rule — the complete prefix is trustworthy, the rest is
                 // not (spec §2 rule 1).
-                out.truncated_at = Some(Location { segment: seq, offset: pos, len: len_field });
-                return Ok(out);
+                out.truncated_at.get_or_insert(Location {
+                    segment: seq,
+                    offset: pos,
+                    len: len_field,
+                });
+                break;
             }
             let payload = &cursor[8..8 + len_field as usize];
             if crc32(payload) != crc {
-                out.truncated_at = Some(Location { segment: seq, offset: pos, len: len_field });
-                return Ok(out);
+                out.truncated_at.get_or_insert(Location {
+                    segment: seq,
+                    offset: pos,
+                    len: len_field,
+                });
+                break;
             }
             out.records.push(ReplayRecord {
                 location: Location { segment: seq, offset: pos, len: len_field },
@@ -548,6 +557,15 @@ pub fn replay(dir: &Path) -> Result<Replay, JournalError> {
             pos += 8 + u64::from(len_field);
             cursor = &cursor[8 + len_field as usize..];
         }
+        // A truncated record ends this segment only — later segments
+        // self-verify independently, and a writer that crashed
+        // mid-append restarts into a FRESH segment (`create` picks
+        // `next_segment_seq`), so the records after a torn tail are
+        // the only copy of post-restart history. Skipping them would
+        // orphan every block journaled since the last recovery.
+        // Whether the resulting record stream is still contiguous is
+        // the consumer's call (the executor fails loudly on a height
+        // gap, or a checkpoint bridges it) — not replay's to decide.
     }
     Ok(out)
 }

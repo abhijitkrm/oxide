@@ -237,6 +237,47 @@ impl TxInject {
     }
 }
 
+/// A funded secp256k1 account the pump submits equivocation
+/// evidence under (system-audit S1).
+///
+/// The consensus engine preserves conflicting signed votes as
+/// [`types::DoubleSignEvidence`] records; they become slashable
+/// only once a staking `evidence` transaction lands on-chain.
+/// Evidence is *permissionless* — the module authenticates the
+/// offense by re-verifying both BLS vote signatures, ignoring
+/// `ctx.sender` — so any funded account can carry it. This is the
+/// account the operator lends to that job: a dedicated key is
+/// recommended (it pays fees and its nonce stream is consumed
+/// only by evidence), but any funded secp256k1 account works.
+///
+/// `None` disables submission — records still drain so the
+/// engine's bounded queue cannot grow, and the pump logs how
+/// much evidence went unsubmitted. A validator that wants
+/// automatic slashing wires a key; one that doesn't still detects.
+pub struct EvidenceReporter {
+    /// The secp256k1 secret that signs the evidence envelope —
+    /// `Zeroizing` so the pump's copy wipes on drop. The binaries
+    /// load it via `cli::load_secret_key_file(SecretKind::Secp256k1)`.
+    pub key: zeroize::Zeroizing<[u8; 32]>,
+    /// The staking address `key` resolves to — the tx sender and
+    /// nonce owner.
+    pub sender: primitives::Address,
+}
+
+impl EvidenceReporter {
+    /// Build a reporter from raw key material, deriving `sender`
+    /// from `key` so the two can never disagree.
+    ///
+    /// Returns `None` when `key` is not a valid secp256k1 secret —
+    /// callers loading from files should treat `None` as a startup
+    /// refusal, not a silent disable.
+    #[must_use]
+    pub fn new(key: zeroize::Zeroizing<[u8; 32]>) -> Option<Self> {
+        let sender = crypto::signable_pubkey_address(&key[..])?;
+        Some(Self { key, sender })
+    }
+}
+
 /// Everything [`run`] needs, already resolved.
 ///
 /// The binaries own flag/config parsing and their mode's defaults;
@@ -329,6 +370,10 @@ pub struct ValidatorNetSpec {
     /// Optional sustained-load injector — see [`TxInject`].
     /// `None` on production validators.
     pub tx_inject: Option<TxInject>,
+    /// Account that submits detected equivocation evidence — see
+    /// [`EvidenceReporter`]. `None` still drains the engine queue
+    /// (detection stays on) but logs and drops the records.
+    pub evidence_reporter: Option<EvidenceReporter>,
 }
 
 /// Run a networked validator until `spec.shutdown` is set.
@@ -369,6 +414,7 @@ pub fn run(spec: ValidatorNetSpec) {
         repair_peers,
         observer_peers,
         tx_inject,
+        evidence_reporter,
     } = spec;
 
     // Peer identity is the validator's staking address — the stable
@@ -551,6 +597,8 @@ pub fn run(spec: ValidatorNetSpec) {
         &mut sync_store,
         &repair_peers,
         tx_inject,
+        evidence_reporter,
+        node_config.chain_id,
     );
     // Flush any batched certified-record appends before the data
     // dir is handed to the snapshot exporter.
@@ -846,6 +894,8 @@ fn run_consensus_loop(
     sync_store: &mut crate::block_sync::SyncStore,
     repair_peers: &[String],
     mut tx_inject: Option<TxInject>,
+    evidence_reporter: Option<EvidenceReporter>,
+    chain_id: u64,
 ) {
     // (cap documented at module scope — `GOSSIP_SEEN_CAP`)
     // Track proposals received from the network. Followers vote on
@@ -942,6 +992,16 @@ fn run_consensus_loop(
     // are owed and fire as a bounded catch-up burst next pass.
     let mut inject_nonce = tx_inject.as_ref().map(|i| app.executed_nonce_of(&i.sender));
     let mut inject_next = std::time::Instant::now();
+
+    // Evidence reporter nonce — same seeding contract as
+    // `inject_nonce`: the sender's EXECUTED nonce from committed
+    // executor state, so a restarted pump resumes past consumed
+    // nonces. Advanced only on `Accepted` submissions (a rejected
+    // envelope left its nonce slot free); re-seeded each drain to
+    // the max of the counter and the executed watermark, which
+    // heals a counter that raced ahead of an externally-submitted
+    // tx without ever rewinding in-flight nonces.
+    let mut reporter_nonce = evidence_reporter.as_ref().map(|r| app.executed_nonce_of(&r.sender));
 
     // Reusable peer-id scratch for broadcast sends (F-24): `send`
     // takes `&PeerId` = `&Vec<u8>`, so `addr.0.to_vec()` used to
@@ -1669,6 +1729,77 @@ fn run_consensus_loop(
             }
             if inject_next <= now {
                 inject_next = now + inject.interval;
+            }
+        }
+
+        // Phase 3d: equivocation evidence → staking (system-audit
+        // S1). The engine preserves conflicting signed votes in a
+        // bounded queue; here each record becomes a signed staking
+        // `evidence` envelope, is admitted locally, and gossips to
+        // the committee on acceptance — the same relay path as
+        // injected txs, so the slash lands whichever validator
+        // proposes next. Evidence is fleet-redundant (every honest
+        // node detects the same pair), so a local rejection —
+        // including the module's own "already applied" dedup —
+        // is informational, never retried.
+        let evidence = engine.take_evidence();
+        if !evidence.is_empty() {
+            match (&evidence_reporter, &mut reporter_nonce) {
+                (Some(reporter), Some(nonce)) => {
+                    *nonce = (*nonce).max(app.executed_nonce_of(&reporter.sender));
+                    for ev in evidence {
+                        let payload = staking::msg::evidence(
+                            ev.validator,
+                            ev.view.value(),
+                            ev.phase as u8,
+                            ev.epoch.value(),
+                            ev.first_block_hash.as_bytes(),
+                            ev.first_signature.as_bytes(),
+                            ev.second_block_hash.as_bytes(),
+                            ev.second_signature.as_bytes(),
+                        );
+                        let tx = crate::cli::build_signed_tx_with(
+                            &reporter.key[..],
+                            reporter.sender,
+                            chain_id,
+                            framework::module_id::STAKING,
+                            &payload,
+                            *nonce,
+                        );
+                        let tx_bytes = tx.as_bytes().to_vec();
+                        let ack = engine.submit_tx(tx);
+                        eprintln!(
+                            "{log_tag}: equivocation evidence vs {} view={} phase={} → {:?}",
+                            ev.validator,
+                            ev.view.value(),
+                            ev.phase as u8,
+                            ack
+                        );
+                        if matches!(ack, types::MempoolAck::Accepted) {
+                            *nonce += 1;
+                            fanout_tx(
+                                engine,
+                                transport,
+                                our_addr,
+                                &mut seen_txs,
+                                &mut seen_txs_fifo,
+                                &tx_bytes,
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    // No reporter key — detection still ran (the
+                    // queue was drained), but nothing can carry the
+                    // records on-chain. Log once per drain so an
+                    // operator sees what their node is declining
+                    // to submit.
+                    eprintln!(
+                        "{log_tag}: {} equivocation evidence record(s) dropped — no \
+                         evidence reporter key configured",
+                        evidence.len()
+                    );
+                }
             }
         }
 

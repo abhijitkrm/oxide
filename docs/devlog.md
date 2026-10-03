@@ -22703,3 +22703,139 @@ shipped transport is the hand-rolled TCP+TLS stack), the workspace
 layout synced with reality (matcher, indexer, statesync, metrics,
 devnet, config; no `state/` crate), MSRV corrected to 1.91, and the
 test count updated (2,048).
+
+## Session: system-audit resolution pass
+
+The audit's fixable findings closed; the open ones are campaigns
+(soak, external review) or documented design items (tx-by-hash,
+`Balances` batch API). `docs/system-audit.md` §8 is the status table
+of record.
+
+### S1 — equivocation evidence reaches staking (HIGH, fixed)
+
+Detection already existed; the evidence died in consensus. Now:
+`Engine` keeps a per-`(validator, phase)` seen-vote log bounded at
+3 entries/validator (one per phase — the history key is
+position-specific so an interleaved Prepare/PreCommit equivocation
+can't overwrite its own evidence). A same-voter conflict in
+`collect_vote_split` is dropped and queued as `DoubleSignEvidence`;
+`validator_net` drains the queue every pump pass and submits a
+staking `evidence` tx signed by a funded reporter key
+(`EvidenceReporter` on `ValidatorNetSpec`, wired from the validator
+key in `oxide-validator`, from `identity(i)` in devnet when tx
+injection is off so nonce streams never collide).
+
+The staking side needed no changes — `handle_evidence` already
+verified both BLS signatures and jailed; it just never saw a tx.
+End-to-end proof: `multinode` test equivocates validator 0, runs
+the pump, and asserts the jail flag is set on *every* replica's
+committed staking state.
+
+One subtlety the tests caught: detection keyed on `(voter, view,
+phase)` rather than `voter` alone — the QC buffer clears per bout,
+so per-voter history without the phase key would miss an
+equivocation split across phases.
+
+A second subtlety the pre-existing phantom-vote test caught: the
+first draft recorded every inbound vote into the history before
+admissibility. That broke the phantom-block guard's contract — a
+vote for a never-proposed hash is *dropped* (it's typically a
+forgery, e.g. `Signature::ZERO`), so recording it let a forged
+"first vote" turn the voter's real vote into a false conflict and
+bogus evidence. Recording now happens at the storage point: a vote
+anchors history only after clearing the idempotent-slot,
+signature, phantom, and conflict gates. Detection still reads
+history *before* those gates (an equivocating second vote is
+dropped + evidenced regardless of whether it would itself be
+admitted — the voter did sign it), and the module re-verifies both
+signatures, so a forged-signature vote that slipped in under
+`verify_per_vote = false` can pollute the bucket but can never
+produce a slash.
+
+### S2 — venue egress authorization (HIGH, fixed)
+
+The audit was half stale: `withdraw_base` was already ledger-wired
+and worked for secp senders. The real gap: settlement credits
+custody under the *ed25519-derived* trading owner
+(`BLAKE3(Ed25519Owner ‖ pubkey)[..20]`), and that address can never
+sign a secp envelope — a one-way vault.
+
+Fix: a committed link registry. `LINK_TRADING_KEY` stores
+`owner → {secp, epoch}` gated on an ed25519 signature over
+`LINK_CONSENT_DOMAIN ‖ secp ‖ pubkey ‖ epoch`; `UNLINK_TRADING_KEY`
+writes `Address::ZERO` (tombstone keeps the epoch monotonic, so a
+captured consent can't resurrect a revoked link); the epoch is in
+the signed preimage, so replay is impossible by construction.
+Linked variants of register/cancel/deposit/withdraw reuse the same
+owner-parameterized cores (`register_for`, `deposit_base_for`,
+`withdraw_base_for(custody_owner, dest, …)`), keeping the old
+self-service paths byte-identical. `WITHDRAW_LINKED` credits the
+linked secp address — the only destination the link authorizes.
+Wire tags append (8–13), never renumber; snapshot codec gains a
+tolerantly-decoded trailing `linked` section (old snapshots still
+import — they just have no links yet).
+
+### S3 — matcher listeners are loopback-only by construction (MED)
+
+All four binds are `127.0.0.1` literals — not a default, the only
+value the code admits. Documented at every bind site + a gateway
+deployment shape (TLS-terminating reverse proxy for remote clients)
+in runbooks §12. TLS stays out of the matcher's hot path.
+
+### S4 — already fixed
+
+`debug_api` defaults off in `NodeConfig`; verified while scoping.
+
+### ST3 — kill-9-mid-commit + a real journal bug (MED, fixed)
+
+`crash_mid_commit_recovers_journaled_block` models the exact crash:
+journal the block, never execute, drop the executor, recover, then
+prove (a) every prefix root matches an honest peer's, (b)
+resubmitting the same block doesn't double-apply, (c) block N+1
+executes cleanly on the recovered state.
+
+Writing its companion test surfaced a genuine replay bug:
+`journal::replay` *returned* at the first torn record — correct for
+a single segment, wrong after any restart, because the writer always
+opens a *new* segment. A crash mid-append followed by hours of
+healthy blocks in segment N+1 meant restart replayed nothing past
+the tear: silent history loss on the recovery path. `replay` now
+records `truncated_at`, stops scanning the damaged segment, and
+continues into later ones. `crash_mid_journal_append_ignores_torn_tail`
+locks it in.
+
+### T2 — settlement batching: measured, then optimized (MED)
+
+The audit asked whether the block path batches. It does —
+`batch_settle` pair-aggregates every leg into one ledger transfer
+per (buyer, seller); the "0.5M vs 24.5M" gap in the audit compared
+the book path to raw matching. Profiling the real residual
+(`perf` on `batch_settle_1k_distinct_pairs`): EVM ledger ops ~28%,
+`consumed` BTreeMap ~22% (two get+insert per leg, 16 levels deep at
+65k fills on a 28-byte key), BLAKE3 leaf hashing ~10%.
+
+The `consumed` scratch never iterates — ordering was paid for and
+never observed. Replaced with `ConsumedMap` (open-addressed flat
+table, same shape as the pair map, fx-hash on the key's four words,
+2× headroom so probes stay ≤ ~3). Measured: 1k distinct-pairs
+903→708 µs (−19%), 16k clustered 6.59→4.11 ms (−38%), same-pair
+137→125 µs (−9%) — the win grows with table depth exactly as the
+tree-depth model predicts.
+
+Left as follow-up with the reason: per-account EVM ledger ops
+(block-undo capture + touched marking are per-account semantics,
+amortizable only across *distinct* accounts) → a `Balances` batch
+API; and CommittedMap leaf-hash deferral → touches the incremental
+root invariant. Both need their own measurement justifications.
+
+### T1 — leader egress: measured analytically (MED)
+
+`ErasureBroadcast` uploads (3f+1)/(2f+1) ≈ 1.4× body. Native
+traffic at the 60k tx/s gate ≈ 15 MB/s — nowhere near binding. The
+venue's max settlement rate (~1.85M fills/s × 74 B/leg ≈ 137 MB/s
+payload) makes leader egress ≈ **190 MB/s ≈ 1.5 Gbps sustained** —
+that binds on a commodity uplink at exactly the workload the design
+targets. Conclusion recorded in §8: tx-by-hash/commitment proposals
+are a required *pre-testnet design item* (against
+`docs/oxidebft-spec.md`), not a code change today — the audit's
+recommended ordering.

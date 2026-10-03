@@ -34,6 +34,22 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Batch-settle `consumed` map flattened** (`exchange`): the
+  per-order consumed-quantity scratch was a `BTreeMap` (16+ levels
+  of pointer-chasing at 65k fills, ~22% of the batch profile) whose
+  ordering was never observed. Replaced with an open-addressed flat
+  table (same shape as the pair map). Measured on the criterion
+  bench: 1k distinct-pairs **903 → 708 µs (−19%)**, 16k clustered
+  pairs **6.59 → 4.11 ms (−38%)**, 1k same-pair **137 → 125 µs
+  (−9%)**. In plain words: settlement's worst case is ~25% faster
+  and improves with batch size — the win grows exactly where the
+  tree was deepest.
+- **Leader egress measured** (audit T1): proposals carry full
+  bodies, uploaded at ~1.4× via the erasure layer. At the 60k tx/s
+  gate that's ~15 MB/s (fine); at the venue's max settlement rate
+  (~1.85M fills/s) it's ~1.5 Gbps sustained — the ceiling that
+  binds. Recorded in `docs/system-audit.md` §8: tx-by-hash
+  proposals are a required pre-testnet design item, not code yet.
 - **HFT audit implementation pass** (`hft-audit.md` F-01–F-26):
   the validated findings are now implemented. Headline deltas,
   all head-to-head against the displaced code on identical
@@ -205,6 +221,21 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Journal replay could orphan post-recovery history**
+  (`storage::journal`): `replay` returned at the first torn record
+  — correct for a single segment, wrong after a restart, because
+  the writer always opens a *new* segment. A mid-append crash
+  followed by healthy blocks meant the next restart silently lost
+  everything after the tear. Replay now truncates the damaged
+  segment and continues scanning later ones. Covered by
+  `crash_mid_journal_append_ignores_torn_tail`.
+- **Kill-9-mid-commit recovery coverage** (`executor`): the
+  WAL-first path is now exercised under the real crash timing —
+  block journaled but never executed, executor dropped mid-commit,
+  restarted: recovered roots match an honest peer, resubmitting the
+  same block doesn't double-apply, and the chain continues. In
+  plain words: the crash path that's supposed to save you during a
+  power cut is now proven to.
 - **Empty proposals under pipelined consensus** (`mempool`,
   `executor`): a validator whose pool anchored at the last
   *executed* nonce saw a gap whenever the sender's intermediate
@@ -504,6 +535,39 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     vote to skip the dead turn and keep going, as designed.
 
 ### Added
+
+- **Equivocation evidence reaches staking** (`consensus`,
+  `validator_net`, `types`, `devnet`): the engine now records each
+  validator's vote per `(view, phase)` in a bounded log; a
+  same-voter conflicting vote is dropped and queued as
+  `DoubleSignEvidence`, which `validator_net` drains every pump
+  pass and submits as a staking `evidence` transaction signed by
+  the node's funded reporter key (`EvidenceReporter`). Verified
+  end-to-end: a multinode test equivocates a validator and observes
+  the on-chain jail on every replica. In plain words: double-signing
+  used to be detected but never punished — now the chain slashes it
+  automatically, no operator action needed.
+- **Venue egress: Ed25519↔secp256k1 key linkage** (`exchange`):
+  settlement credits custody under the ed25519-derived trading
+  owner, an address that can never sign a native secp envelope —
+  deposits in, no way out. The new committed link registry fixes
+  it: `LINK_TRADING_KEY` records `owner → {secp, epoch}` gated on
+  the trading key's signature over a domain-separated consent that
+  includes the next epoch (captured consents can't replay, and a
+  tombstoned link can't resurrect); `UNLINK_TRADING_KEY` revokes.
+  Linked register/cancel/deposit/withdraw paths reuse the same
+  custody cores as the self-service ones; `WITHDRAW_LINKED` pays
+  out only to the linked secp account. New wire tags append — old
+  messages and snapshots are unaffected. In plain words: trading
+  accounts funded by the matcher can finally withdraw — signed for
+  by the trading key, paid to a wallet the owner proved they
+  control.
+- **Matcher loopback-only guarantee, documented** (`matcher`,
+  `docs/runbooks.md`): all FIX/WS/p3p listeners bind `127.0.0.1`
+  literally — remote exposure is impossible by construction; remote
+  clients terminate TLS at a reverse proxy/gateway (deployment
+  shape in runbooks §12). In plain words: order entry can't be
+  exposed on a public interface even by misconfiguration.
 
 - **Thread pinning + NUMA surface** (`[performance]` config,
   `primitives::pin`, matcher flags): `consensus_core`,

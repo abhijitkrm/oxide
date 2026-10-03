@@ -76,8 +76,9 @@ use super::{Executor, ExecutorSnapshot, FinalizedBlock, SnapshotImportError};
 /// Directory inside [`DurabilityConfig::dir`] holding the block
 /// journal's segment files. A subdirectory — not a single file —
 /// because the journal is segmented (`segment-<n>.log`) with a
-/// `heights.idx` pruning sidecar.
-const JOURNAL_DIR_NAME: &str = "block-journal";
+/// `heights.idx` pruning sidecar. `pub(crate)` so crash-recovery
+/// tests can address the same directory the writer uses.
+pub(crate) const JOURNAL_DIR_NAME: &str = "block-journal";
 
 /// The checkpoint file inside [`DurabilityConfig::dir`] — the same
 /// `snapshot.bin` the devnet auto-persistence convention already

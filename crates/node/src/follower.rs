@@ -812,6 +812,10 @@ mod tests {
             repair_peers: Vec::new(),
             observer_peers: vec![observer],
             tx_inject,
+            // Test-cluster validators detect equivocation but do
+            // not submit — no funded secp256k1 identity exists in
+            // this harness, and the drain keeps detection warm.
+            evidence_reporter: None,
         };
         std::thread::spawn(move || crate::validator_net::run(spec));
     }

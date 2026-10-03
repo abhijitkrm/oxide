@@ -8,17 +8,19 @@
 //! (`release_maker_holds`), so conservation is auditable here.
 
 use super::{
-    Address, BTreeMap, CANCEL_REGISTERED_BODY_LEN, CUSTODY_BODY_LEN, Event, ExchangeModule,
-    ExecError, FILL_ENTRY_LEN, Inner, MAX_BATCH_FILLS, MAX_REGISTERED_ORDERS, MarketConfig,
-    OrderKey, OrderType, PRICE_SCALE, Price, Qty, REGISTER_BODY_LEN, RegisteredOrder,
-    RejectCategory, Reserved, Side, TradingError, TxContext, qty_add, qty_sub,
+    Address, CANCEL_LINKED_BODY_LEN, CANCEL_REGISTERED_BODY_LEN, CUSTODY_BODY_LEN, Event,
+    ExchangeModule, ExecError, FILL_ENTRY_LEN, Inner, LINK_BODY_LEN, LINKED_CUSTODY_BODY_LEN,
+    LinkedEntry, MAX_BATCH_FILLS, MAX_REGISTERED_ORDERS, MarketConfig, OrderKey, OrderType,
+    PRICE_SCALE, Price, Qty, REGISTER_BODY_LEN, REGISTER_LINKED_BODY_LEN, RegisteredOrder,
+    RejectCategory, Reserved, SWEEP_LINKED_BODY_LEN, Side, TradingError, TxContext, qty_add,
+    qty_sub,
 };
 use crate::codec::{
     cancel_event, decode_side, encode_side, fill_event, outcome_event, pair_event, removal_event,
 };
 use crate::settle::{
-    BookSettlement, LegPlan, TakerCtx, consume_and_release, pair_hash, rejected_leg_event,
-    settle_leg,
+    BookSettlement, ConsumedMap, LegPlan, TakerCtx, consume_and_release, pair_hash,
+    rejected_leg_event, settle_leg,
 };
 
 impl ExchangeModule {
@@ -426,7 +428,7 @@ impl ExchangeModule {
         let client_id =
             u64::from_le_bytes(body[19..27].try_into().map_err(|_| ExecError::Malformed)?);
 
-        let Inner { markets, registered, base_balances, .. } = &mut *inner;
+        let Inner { markets, registered, .. } = &mut *inner;
         let cfg = markets
             .get(usize::from(market))
             .and_then(Option::as_ref)
@@ -454,6 +456,29 @@ impl ExchangeModule {
 
         let key = OrderKey { owner: ctx.sender, client_id };
         Self::check_order_slot(registered, &key)?;
+        self.register_for(ctx.sender, market, side, price, qty, client_id, inner, key)
+    }
+
+    /// Register an off-chain-matched order under `owner` — the
+    /// escrow-allocating core shared by `TAG_REGISTER_ORDER` (owner
+    /// is the envelope sender) and `TAG_REGISTER_LINKED` (owner is
+    /// the sender's linked trading account; the link check runs in
+    /// the caller before any escrow moves). See [`Self::handle_register`]
+    /// for the escrow semantics; this function takes `owner` as the
+    /// identity everything debits, escrows, and registers under.
+    #[allow(clippy::too_many_arguments)]
+    fn register_for(
+        &self,
+        owner: Address,
+        market: u16,
+        side: Side,
+        price: u64,
+        qty: u64,
+        client_id: u64,
+        inner: &mut Inner,
+        key: OrderKey,
+    ) -> Result<Vec<Event>, ExecError> {
+        let Inner { markets: _, registered, base_balances, .. } = &mut *inner;
 
         // Escrow — both sides, denominated in the side's obligation
         // asset (`reserved` is quote for buys, base for sells):
@@ -479,7 +504,7 @@ impl ExchangeModule {
                             "register: escrow exceeds u64 quote range",
                         )
                     })?;
-                ledger.debit(&ctx.sender, amount).map_err(|_| {
+                ledger.debit(&owner, amount).map_err(|_| {
                     ExecError::rejected(
                         RejectCategory::InsufficientFunds,
                         "register: insufficient balance for buy escrow",
@@ -497,7 +522,7 @@ impl ExchangeModule {
                         "register: market out of range",
                     )
                 })?;
-                let key = (ctx.sender, m);
+                let key = (owner, m);
                 let free = base_balances.get(&key).copied().unwrap_or_default();
                 if free < Qty(qty) {
                     return Err(ExecError::rejected(
@@ -520,7 +545,7 @@ impl ExchangeModule {
             kind: "order_registered",
             data: {
                 let mut d = Vec::with_capacity(20 + 8 + 2 + 1 + 8 + 8);
-                d.extend_from_slice(&ctx.sender.0);
+                d.extend_from_slice(&owner.0);
                 d.extend_from_slice(&client_id.to_le_bytes());
                 d.extend_from_slice(&market.to_le_bytes());
                 d.push(encode_side(side));
@@ -549,7 +574,24 @@ impl ExchangeModule {
         }
         let client_id =
             u64::from_le_bytes(body[0..8].try_into().map_err(|_| ExecError::Malformed)?);
-        let key = OrderKey { owner: ctx.sender, client_id };
+        self.cancel_registered_for(ctx.sender, client_id, inner)
+    }
+
+    /// Cancel `owner`'s registered order and refund its escrow —
+    /// the core shared by `TAG_CANCEL_REGISTERED` (owner is the
+    /// envelope sender) and `TAG_CANCEL_LINKED` (owner is the
+    /// sender's linked trading account, link-checked by the
+    /// caller). Refunds route by denomination: quote escrow back to
+    /// the owner's ledger, base escrow back to the owner's free
+    /// custody — identical to a self-cancel, because the owner owns
+    /// the escrow regardless of who submitted.
+    fn cancel_registered_for(
+        &self,
+        owner: Address,
+        client_id: u64,
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        let key = OrderKey { owner, client_id };
         let Some(order) = inner.registered.get(&key) else {
             return Err(ExecError::rejected(RejectCategory::NotFound, "cancel: order not found"));
         };
@@ -566,7 +608,7 @@ impl ExchangeModule {
                             "cancel requires ledger wiring",
                         )
                     })?;
-                    ledger.credit(&ctx.sender, refund).map_err(|_| {
+                    ledger.credit(&owner, refund).map_err(|_| {
                         ExecError::rejected(
                             RejectCategory::Internal,
                             "cancel: escrow refund failed",
@@ -587,9 +629,9 @@ impl ExchangeModule {
                         )
                     })?;
                     let free =
-                        inner.base_balances.get(&(ctx.sender, market)).copied().unwrap_or_default();
+                        inner.base_balances.get(&(owner, market)).copied().unwrap_or_default();
                     inner.base_balances.insert(
-                        (ctx.sender, market),
+                        (owner, market),
                         qty_add(free, residue).ok_or(ExecError::Malformed)?,
                     );
                 }
@@ -601,7 +643,7 @@ impl ExchangeModule {
             kind: "order_canceled",
             data: {
                 let mut d = Vec::with_capacity(20 + 8 + 8);
-                d.extend_from_slice(&ctx.sender.0);
+                d.extend_from_slice(&owner.0);
                 d.extend_from_slice(&client_id.to_le_bytes());
                 d.extend_from_slice(&refund.to_le_bytes());
                 d
@@ -634,6 +676,26 @@ impl ExchangeModule {
         if amount == 0 {
             return Err(ExecError::rejected(RejectCategory::InvalidInput, "deposit: zero amount"));
         }
+        self.deposit_base_for(ctx.sender, ctx.sender, market, amount, inner)
+    }
+
+    /// Deposit `amount` of `payer`'s native tokens into `owner`'s
+    /// free base custody on `market` — the shared core of
+    /// `TAG_DEPOSIT_BASE` (payer == owner) and
+    /// `TAG_DEPOSIT_BASE_FOR` (payer funds a linked trading
+    /// account's custody; harmless to be permissionless since the
+    /// gift only increases what the beneficiary's link can reach).
+    /// See [`Self::handle_deposit_base`] for the backing invariant.
+    fn deposit_base_for(
+        &self,
+        payer: Address,
+        owner: Address,
+        market: u8,
+        amount: u64,
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        // Base for a market that does not exist is dead state —
+        // reject before any funds move, on either deposit path.
         if inner.markets[usize::from(market)].is_none() {
             return Err(ExecError::rejected(
                 RejectCategory::NotFound,
@@ -643,21 +705,21 @@ impl ExchangeModule {
         let ledger = self.ledger.as_ref().ok_or_else(|| {
             ExecError::rejected(RejectCategory::Internal, "deposit requires ledger wiring")
         })?;
-        ledger.debit(&ctx.sender, amount).map_err(|_| {
+        ledger.debit(&payer, amount).map_err(|_| {
             ExecError::rejected(RejectCategory::InsufficientFunds, "deposit: insufficient balance")
         })?;
-        let entry = inner.base_balances.get(&(ctx.sender, market)).copied().unwrap_or_default();
+        let entry = inner.base_balances.get(&(owner, market)).copied().unwrap_or_default();
         // The 1:1 denomination bridge: `amount` native base units
         // become `amount` scale-6 base micro-units of custody — the
         // module's documented backing choice (the base asset trades
         // in the native unit's own granularity).
         if let Some(v) = qty_add(entry, Qty(amount)) {
-            inner.base_balances.insert((ctx.sender, market), v);
+            inner.base_balances.insert((owner, market), v);
         } else {
             // Unreachable while total native supply < u64::MAX
             // (custody is native-backed). Refund the debit so the
             // failed deposit is a no-op, not a loss.
-            ledger.credit(&ctx.sender, amount).map_err(|_| {
+            ledger.credit(&payer, amount).map_err(|_| {
                 ExecError::rejected(RejectCategory::Internal, "deposit: refund failed")
             })?;
             return Err(ExecError::rejected(
@@ -668,9 +730,13 @@ impl ExchangeModule {
         Ok(vec![Event {
             module: "exchange",
             kind: "base_deposited",
+            // `[owner][market][amount]` — identical bytes to the
+            // legacy `[sender][market][amount]` record when
+            // payer == owner (the self-deposit path). The payer is
+            // the tx envelope sender, so it needs no field here.
             data: {
                 let mut d = Vec::with_capacity(20 + 1 + 8);
-                d.extend_from_slice(&ctx.sender.0);
+                d.extend_from_slice(&owner.0);
                 d.push(market);
                 d.extend_from_slice(&amount.to_le_bytes());
                 d
@@ -705,10 +771,28 @@ impl ExchangeModule {
         if amount == 0 {
             return Err(ExecError::rejected(RejectCategory::InvalidInput, "withdraw: zero amount"));
         }
+        self.withdraw_base_for(ctx.sender, ctx.sender, market, amount, inner)
+    }
+
+    /// Withdraw `amount` of `owner`'s free base custody on `market`
+    /// into `dest`'s ledger balance — the shared core of
+    /// `TAG_WITHDRAW_BASE` (owner == dest == sender) and
+    /// `TAG_WITHDRAW_LINKED` (owner is the trading account, dest is
+    /// the sender's ledger; the caller link-checks first). The
+    /// ledger credit runs BEFORE the custody decrement so a credit
+    /// failure can never strand funds.
+    fn withdraw_base_for(
+        &self,
+        owner: Address,
+        dest: Address,
+        market: u8,
+        amount: u64,
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
         let ledger = self.ledger.as_ref().ok_or_else(|| {
             ExecError::rejected(RejectCategory::Internal, "withdraw requires ledger wiring")
         })?;
-        let free = inner.base_balances.get(&(ctx.sender, market)).copied().unwrap_or_default();
+        let free = inner.base_balances.get(&(owner, market)).copied().unwrap_or_default();
         // Same 1:1 bridge as the deposit: `amount` native units
         // equals `amount` base micro-units of custody.
         if free < Qty(amount) {
@@ -717,27 +801,326 @@ impl ExchangeModule {
                 "withdraw: insufficient free base",
             ));
         }
-        ledger.credit(&ctx.sender, amount).map_err(|_| {
+        ledger.credit(&dest, amount).map_err(|_| {
             ExecError::rejected(RejectCategory::Internal, "withdraw: credit failed")
         })?;
         // `free >= amount` was just proven — the decrement cannot
         // underflow.
-        let bal =
-            inner.base_balances.get(&(ctx.sender, market)).copied().ok_or(ExecError::Malformed)?;
+        let bal = inner.base_balances.get(&(owner, market)).copied().ok_or(ExecError::Malformed)?;
         inner
             .base_balances
-            .insert((ctx.sender, market), qty_sub(bal, Qty(amount)).ok_or(ExecError::Malformed)?);
+            .insert((owner, market), qty_sub(bal, Qty(amount)).ok_or(ExecError::Malformed)?);
         Ok(vec![Event {
             module: "exchange",
             kind: "base_withdrawn",
+            // `[owner][market][amount]` — identical bytes to the
+            // legacy record when owner == dest == sender. The
+            // destination ledger account is the tx envelope sender
+            // on both paths, so it needs no field.
             data: {
                 let mut d = Vec::with_capacity(20 + 1 + 8);
-                d.extend_from_slice(&ctx.sender.0);
+                d.extend_from_slice(&owner.0);
                 d.push(market);
                 d.extend_from_slice(&amount.to_le_bytes());
                 d
             },
         }])
+    }
+
+    /// Authorize `sender` to act for `owner` via the linkage
+    /// registry: the stored secp account must equal the envelope
+    /// sender. A revoked link stores `secp == ZERO`, which no real
+    /// envelope can claim — the same check covers "never linked"
+    /// and "unlinked" with no separate tombstone read.
+    fn require_linked(inner: &Inner, owner: Address, sender: Address) -> Result<(), ExecError> {
+        let authorized =
+            inner.linked.get(&owner).is_some_and(|e| e.secp != Address::ZERO && e.secp == sender);
+        if authorized {
+            Ok(())
+        } else {
+            Err(ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "linked: sender is not the owner's linked ledger account",
+            ))
+        }
+    }
+
+    /// Handle a link-trading-key message: bind the secp256k1 sender
+    /// to the Ed25519 trading owner `owner_address(pubkey)`.
+    ///
+    /// Authorization is the trading key's own consent: an Ed25519
+    /// signature over `LINK_CONSENT_DOMAIN ‖ sender ‖ pubkey ‖
+    /// (stored_epoch + 1)`. Requiring consent in the message — not
+    /// just the sender's signature — is what stops a griefing link:
+    /// without it, anyone could bind a victim's trading key to
+    /// their own ledger account and drain the victim's custody via
+    /// `TAG_WITHDRAW_LINKED`. The epoch makes every consent
+    /// single-use: it must name the next epoch, so a captured
+    /// consent can never re-bind after a revoke or relink.
+    ///
+    /// Latest-wins: relinking to a different ledger account is
+    /// simply a new consent at the next epoch — the trading key
+    /// controls its own custodian at all times.
+    pub(crate) fn handle_link(
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        if body.len() != LINK_BODY_LEN {
+            return Err(ExecError::Malformed);
+        }
+        let pubkey_bytes: [u8; 32] = body[0..32].try_into().map_err(|_| ExecError::Malformed)?;
+        let pubkey = crypto::ed25519::Ed25519PublicKey::from_bytes(&pubkey_bytes)
+            .map_err(|_| ExecError::Malformed)?;
+        let owner = crypto::ed25519::owner_address(&pubkey);
+        let epoch = inner.linked.get(&owner).map_or(0, |e| e.epoch) + 1;
+        let consent = crate::msg::link_consent_message(&ctx.sender, &pubkey_bytes, epoch);
+        let sig = crypto::ed25519::Ed25519Signature::from_slice(&body[32..96])
+            .map_err(|_| ExecError::Malformed)?;
+        crypto::ed25519::verify_message(&pubkey, &consent, &sig).map_err(|_| {
+            ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "link: trading-key consent signature invalid",
+            )
+        })?;
+        inner.linked.insert(owner, LinkedEntry { secp: ctx.sender, epoch });
+        Ok(vec![Event {
+            module: "exchange",
+            kind: "trading_key_linked",
+            data: {
+                let mut d = Vec::with_capacity(20 + 20 + 8);
+                d.extend_from_slice(&owner.0);
+                d.extend_from_slice(&ctx.sender.0);
+                d.extend_from_slice(&epoch.to_le_bytes());
+                d
+            },
+        }])
+    }
+
+    /// Handle an unlink-trading-key message: revoke the trading
+    /// owner's link, tombstoning the entry (`secp = ZERO`) while
+    /// keeping `epoch` so no captured signature can replay.
+    /// Permissionless — any sender relays it; the Ed25519 signature
+    /// inside is the authorization. Rejects when no live link
+    /// exists (already revoked or never linked): an unlink of
+    /// nothing would still burn the epoch, griefing the next
+    /// consent's expected value.
+    pub(crate) fn handle_unlink(
+        _ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        if body.len() != LINK_BODY_LEN {
+            return Err(ExecError::Malformed);
+        }
+        let pubkey_bytes: [u8; 32] = body[0..32].try_into().map_err(|_| ExecError::Malformed)?;
+        let pubkey = crypto::ed25519::Ed25519PublicKey::from_bytes(&pubkey_bytes)
+            .map_err(|_| ExecError::Malformed)?;
+        let owner = crypto::ed25519::owner_address(&pubkey);
+        let entry = inner
+            .linked
+            .get(&owner)
+            .copied()
+            .unwrap_or(LinkedEntry { secp: Address::ZERO, epoch: 0 });
+        if entry.secp == Address::ZERO {
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                "unlink: no live link for owner",
+            ));
+        }
+        let epoch = entry.epoch + 1;
+        let consent = crate::msg::unlink_consent_message(&pubkey_bytes, epoch);
+        let sig = crypto::ed25519::Ed25519Signature::from_slice(&body[32..96])
+            .map_err(|_| ExecError::Malformed)?;
+        crypto::ed25519::verify_message(&pubkey, &consent, &sig).map_err(|_| {
+            ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "unlink: trading-key signature invalid",
+            )
+        })?;
+        inner.linked.insert(owner, LinkedEntry { secp: Address::ZERO, epoch });
+        Ok(vec![Event {
+            module: "exchange",
+            kind: "trading_key_unlinked",
+            data: {
+                let mut d = Vec::with_capacity(20 + 8);
+                d.extend_from_slice(&owner.0);
+                d.extend_from_slice(&epoch.to_le_bytes());
+                d
+            },
+        }])
+    }
+
+    /// Handle a deposit-base-for message: fund `owner`'s base
+    /// custody from the sender's ledger. Permissionless — the debit
+    /// is the sender's own funds and the credit can only enlarge
+    /// the beneficiary's withdrawable balance.
+    pub(crate) fn handle_deposit_base_for(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        if body.len() != LINKED_CUSTODY_BODY_LEN {
+            return Err(ExecError::Malformed);
+        }
+        let owner = Address(body[0..20].try_into().map_err(|_| ExecError::Malformed)?);
+        let market = body[20];
+        let amount = u64::from_le_bytes(body[21..29].try_into().map_err(|_| ExecError::Malformed)?);
+        if amount == 0 {
+            return Err(ExecError::rejected(RejectCategory::InvalidInput, "deposit: zero amount"));
+        }
+        self.deposit_base_for(ctx.sender, owner, market, amount, inner)
+    }
+
+    /// Handle a withdraw-linked message: the sender — `owner`'s
+    /// linked ledger account — pulls free base custody out of
+    /// `(owner, market)` into its own ledger balance. This is the
+    /// venue egress path for Ed25519 identities: their custody
+    /// accrues under the Ed25519-derived owner, which no envelope
+    /// can ever sign for, so only the consent-proven linked account
+    /// may move it.
+    pub(crate) fn handle_withdraw_linked(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        if body.len() != LINKED_CUSTODY_BODY_LEN {
+            return Err(ExecError::Malformed);
+        }
+        let owner = Address(body[0..20].try_into().map_err(|_| ExecError::Malformed)?);
+        let market = body[20];
+        let amount = u64::from_le_bytes(body[21..29].try_into().map_err(|_| ExecError::Malformed)?);
+        if amount == 0 {
+            return Err(ExecError::rejected(RejectCategory::InvalidInput, "withdraw: zero amount"));
+        }
+        Self::require_linked(inner, owner, ctx.sender)?;
+        self.withdraw_base_for(owner, ctx.sender, market, amount, inner)
+    }
+
+    /// Handle a sweep-linked message: move `amount` of `owner`'s
+    /// native ledger balance into the sender's. Settlement credits
+    /// the owner's *ledger* on buy fills, rebates, and escrow
+    /// refunds — an Ed25519 owner can never spend that balance
+    /// itself, so the linked account sweeps it to the account that
+    /// can.
+    pub(crate) fn handle_sweep_linked(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        if body.len() != SWEEP_LINKED_BODY_LEN {
+            return Err(ExecError::Malformed);
+        }
+        let owner = Address(body[0..20].try_into().map_err(|_| ExecError::Malformed)?);
+        let amount = u64::from_le_bytes(body[20..28].try_into().map_err(|_| ExecError::Malformed)?);
+        if amount == 0 {
+            return Err(ExecError::rejected(RejectCategory::InvalidInput, "sweep: zero amount"));
+        }
+        Self::require_linked(inner, owner, ctx.sender)?;
+        let ledger = self.ledger.as_ref().ok_or_else(|| {
+            ExecError::rejected(RejectCategory::Internal, "sweep requires ledger wiring")
+        })?;
+        // Debit before credit: a failed debit (insufficient owner
+        // balance) rejects the whole message before anything moves.
+        ledger.debit(&owner, amount).map_err(|_| {
+            ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                "sweep: insufficient owner balance",
+            )
+        })?;
+        ledger.credit(&ctx.sender, amount).map_err(|_| {
+            // The debit already applied — if the credit fails the
+            // units would burn. `MemoryBalances`/EVM credit cannot
+            // fail below supply = u64::MAX (the debited units were
+            // already in circulation), so this is an impossible-path
+            // guard, not a real branch.
+            ExecError::rejected(RejectCategory::Internal, "sweep: credit failed")
+        })?;
+        Ok(vec![Event {
+            module: "exchange",
+            kind: "linked_swept",
+            data: {
+                let mut d = Vec::with_capacity(20 + 20 + 8);
+                d.extend_from_slice(&owner.0);
+                d.extend_from_slice(&ctx.sender.0);
+                d.extend_from_slice(&amount.to_le_bytes());
+                d
+            },
+        }])
+    }
+
+    /// Handle a register-linked message: register an off-chain-
+    /// matched order under a linked `owner`. The link check is the
+    /// only authorization difference from `TAG_REGISTER_ORDER` —
+    /// escrows, limits, and the `(owner, client_id)` keying are
+    /// identical, so batch-settle legs need no awareness of which
+    /// path created the order.
+    pub(crate) fn handle_register_linked(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        if body.len() != REGISTER_LINKED_BODY_LEN {
+            return Err(ExecError::Malformed);
+        }
+        let owner = Address(body[0..20].try_into().map_err(|_| ExecError::Malformed)?);
+        let market = u16::from_le_bytes(body[20..22].try_into().map_err(|_| ExecError::Malformed)?);
+        let side = decode_side(body[22]).ok_or(ExecError::Malformed)?;
+        let price = u64::from_le_bytes(body[23..31].try_into().map_err(|_| ExecError::Malformed)?);
+        let qty = u64::from_le_bytes(body[31..39].try_into().map_err(|_| ExecError::Malformed)?);
+        let client_id =
+            u64::from_le_bytes(body[39..47].try_into().map_err(|_| ExecError::Malformed)?);
+        Self::require_linked(inner, owner, ctx.sender)?;
+
+        let Inner { markets, registered, .. } = &mut *inner;
+        let cfg = markets
+            .get(usize::from(market))
+            .and_then(Option::as_ref)
+            .map(|e| *e.config())
+            .ok_or_else(|| {
+                ExecError::rejected(
+                    RejectCategory::NotFound,
+                    format!("market {market} does not exist"),
+                )
+            })?;
+        if qty == 0
+            || !qty.is_multiple_of(cfg.lot_size.0)
+            || price < cfg.min_price.0
+            || price > cfg.max_price.0
+            || !price.is_multiple_of(cfg.tick_size.0)
+        {
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                "register: price/qty outside market config",
+            ));
+        }
+        let key = OrderKey { owner, client_id };
+        Self::check_order_slot(registered, &key)?;
+        self.register_for(owner, market, side, price, qty, client_id, inner, key)
+    }
+
+    /// Handle a cancel-linked message: cancel a linked owner's
+    /// registered order. Without this path, escrow under an
+    /// Ed25519-owned registration could never leave except by
+    /// being consumed by fills.
+    pub(crate) fn handle_cancel_linked(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        if body.len() != CANCEL_LINKED_BODY_LEN {
+            return Err(ExecError::Malformed);
+        }
+        let owner = Address(body[0..20].try_into().map_err(|_| ExecError::Malformed)?);
+        let client_id =
+            u64::from_le_bytes(body[20..28].try_into().map_err(|_| ExecError::Malformed)?);
+        Self::require_linked(inner, owner, ctx.sender)?;
+        self.cancel_registered_for(owner, client_id, inner)
     }
 
     /// Handle a batch-settle message: apply pre-matched fills from
@@ -864,7 +1247,12 @@ impl ExchangeModule {
         // batches avoid ~16 realloc copies.
         let mut entries: Vec<((Address, Address), u64)> = Vec::with_capacity(fill_count);
         let mut plans: Vec<LegPlan> = Vec::with_capacity(fill_count);
-        let mut consumed: BTreeMap<OrderKey, Qty> = BTreeMap::new();
+        // Per-order consumed-quantity scratch: flat open-addressed
+        // map (the pair table's shape) — `BTreeMap` cost ~30-60ns
+        // per get/insert at large batches on a 28-byte key; the flat
+        // probe is one hash plus 1-3 slots. Ordering is unobservable:
+        // `consumed` is never iterated, only probed.
+        let mut consumed = ConsumedMap::with_legs(fill_count);
         let mut events = Vec::new();
         for i in 0..fill_count {
             match settle_leg(body, 4 + i * FILL_ENTRY_LEN, &configs, registered, &mut consumed)? {
