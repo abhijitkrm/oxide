@@ -33,11 +33,23 @@
 //! 4. **Sequential commit**: writes are applied in block order, so
 //!    the final state is byte-identical to sequential execution.
 //!
+//! ## NOT ON THE PRODUCTION PATH
+//!
+//! `ParallelScheduler` is exercised only by `benches/uniswap_transfer.rs`
+//! and this module's tests — production executes through the module
+//! batch path (`exec.rs::dispatch_run` → `handle_batch*`), where the
+//! EVM module's own version-store speculation is what the `tps_rw`
+//! numbers measure (hft-audit F-07). Before this scheduler may be
+//! wired in, it needs: a persistent worker pool (today it spawns
+//! `num_threads` OS threads per `schedule()` call — ~10–50 µs of
+//! thread setup each, per block) and `Arc` write values (done). The
+//! bench numbers here are design input, not production throughput.
+//!
 //! ## Phase 2 scope
 //!
 //! v0 implements:
-//! - A `ParallelScheduler` that executes txs in parallel using
-//!   rayon's thread pool.
+//! - A `ParallelScheduler` that executes txs in parallel over
+//!   `std::thread::scope` (per-call spawn — see the caveat above).
 //! - Read/write set tracking via a `TxVersion` abstraction.
 //! - Validation and re-execution in preset order.
 //! - Sequential commit to ensure byte-identical results.
@@ -123,10 +135,16 @@ impl From<&[u8]> for OccKey {
 /// state values are variable-length (RLP-encoded).
 #[derive(Debug, Clone, Default)]
 pub struct ReadWriteSet {
-    /// Keys this tx read (for conflict detection).
-    pub reads: HashSet<OccKey>,
-    /// Keys this tx wrote (for commit ordering).
-    pub writes: BTreeMap<OccKey, Vec<u8>>,
+    /// Keys this tx read (for conflict detection). Digest-keyed
+    /// hasher (F-25): `OccKey` is keccak-derived — already uniform —
+    /// so `SipHash` per probe is pure waste on a bench path that runs
+    /// O(keys) lookups per tx.
+    pub reads: HashSet<OccKey, primitives::digest_map::DigestBuildHasher>,
+    /// Keys this tx wrote (for commit ordering). `Arc<[u8]>` shares
+    /// the value between a tx's own set and the cumulative write set —
+    /// the flatten loop bumps a refcount where `Vec<u8>` used to deep-
+    /// copy every written value per tx (F-07).
+    pub writes: BTreeMap<OccKey, std::sync::Arc<[u8]>>,
 }
 
 impl ReadWriteSet {
@@ -146,14 +164,16 @@ impl ReadWriteSet {
         self.reads.insert(key);
     }
 
-    /// Record a write of `key` → `value`.
+    /// Record a write of `key` → `value`. The `Vec` is converted to
+    /// a shared `Arc<[u8]>` HERE — the one alloc — so every later
+    /// merge into a cumulative write set is a refcount bump.
     pub fn record_write(&mut self, key: &[u8], value: Vec<u8>) {
-        self.writes.insert(OccKey::from_slice(key), value);
+        self.writes.insert(OccKey::from_slice(key), value.into());
     }
 
     /// Record a write of a fixed-size `key` → `value`.
     pub fn record_write_key(&mut self, key: OccKey, value: Vec<u8>) {
-        self.writes.insert(key, value);
+        self.writes.insert(key, value.into());
     }
 
     /// Check if this tx's reads conflict with `other`'s writes.
@@ -262,14 +282,17 @@ impl ParallelScheduler {
                 // Apply the re-executed writes to the cumulative set.
                 // Use `record_write_key` to avoid re-converting the
                 // already-typed OccKey back to a slice.
+                // `v` is `Arc<[u8]>` — the clone is a refcount
+                // bump, not a value copy (F-07).
                 for (k, v) in &re_exec.rw_set.writes {
-                    cumulative_writes.record_write_key(*k, v.clone());
+                    cumulative_writes.writes.insert(*k, std::sync::Arc::clone(v));
                 }
                 committed.push(re_exec);
             } else {
-                // No conflict: commit the speculative result.
+                // No conflict: commit the speculative result — same
+                // refcount-bump share as the re-executed branch.
                 for (k, v) in &spec_tx.rw_set.writes {
-                    cumulative_writes.record_write_key(*k, v.clone());
+                    cumulative_writes.writes.insert(*k, std::sync::Arc::clone(v));
                 }
                 committed.push(spec_tx);
             }
@@ -348,10 +371,12 @@ where
         }
     });
 
-    // Flatten the results in order.
+    // Flatten the results in order — `into_inner` MOVES each chunk
+    // out of its mutex: the old `iter().cloned()` copied every
+    // `R` a second time per block (F-07).
     let mut out = Vec::with_capacity(total);
-    for chunk_results in &results {
-        out.extend(primitives::sync::lock_state(chunk_results).iter().cloned());
+    for chunk_results in results {
+        out.extend(primitives::sync::into_inner_state(chunk_results));
     }
     out
 }
@@ -378,7 +403,7 @@ mod tests {
         rw.record_write(b"key2", b"value2".to_vec());
         assert!(rw.reads.contains(&OccKey::from_slice(b"key1")));
         assert_eq!(
-            rw.writes.get(&OccKey::from_slice(b"key2")).map(|v: &Vec<u8>| v.as_slice()),
+            rw.writes.get(&OccKey::from_slice(b"key2")).map(|v: &std::sync::Arc<[u8]>| &**v),
             Some(b"value2".as_slice())
         );
     }

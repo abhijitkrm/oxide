@@ -13,6 +13,7 @@
 //! | `match_single_level` | one taker fully fills one resting maker | p50 < 300ns ("match-op p50 < 300ns") |
 //! | `match_sweep_10_levels` | market order sweeps 10 one-order levels | p50 < 3µs (10 × 300ns match-ops) |
 //! | `mixed_workload` | deterministic mixed place/match/cancel stream | ≥ 1M ops/s/core ("mixed workload ≥ 1M ops/s") |
+//! | `fok_prescan_bitboard` vs `fok_prescan_linear` | FOK `capped_fillable` pre-scan: bitboard walk vs the displaced linear band scan | head-to-head (hft-audit F-22): bitboard must win decisively on a sparse book |
 //!
 //! `rest_cancel_pair` at p50 < 400ns is exactly 5M simple ops/s
 //! single-core (2 ops per pair) — the "engine-only ≥ 5M ops/s"
@@ -425,6 +426,50 @@ fn mixed_workload_folded(c: &mut Criterion) {
     });
 }
 
+/// Head-to-head gate for the F-22 fix: the FOK pre-scan
+/// (`capped_fillable`) walks the opposing side's *active* levels via
+/// the bitboard instead of scanning all `level_count` slots. On this
+/// book — 1,000 levels, liquidity only in ticks 500..510 — the linear
+/// scan pays ~500 idle level visits (plus a divide per visit) before
+/// reaching liquidity; the bitboard pays only the 11 active levels.
+///
+/// What is measured: one `capped_fillable_probe` call (new code) vs
+/// `capped_fillable_linear` (the displaced implementation, kept
+/// `#[doc(hidden)]` solely as this baseline). No gate number — the
+/// requirement is a decisive relative win; criterion's own
+/// regression tracking guards it thereafter.
+fn fok_prescan(c: &mut Criterion) {
+    let mut e = engine();
+    let mut fills = Vec::with_capacity(64);
+    // 11 resting asks at ticks 500..510 — ~500 idle levels below and
+    // ~490 above, the shape where the linear scan burns the most time.
+    for i in 0..11u64 {
+        let out = e.place(limit(Side::Sell, 500 + i, 1, 9, TimeInForce::Gtc), &mut fills).unwrap();
+        debug_assert!(matches!(out, OrderOutcome::Resting { .. }));
+    }
+    let req = NewOrder {
+        side: Side::Buy,
+        order_type: OrderType::Limit,
+        tif: TimeInForce::Fok,
+        price: Price(1_000_000_000 + 600 * 1_000_000),
+        qty: Qty(11_000),
+        owner: Address([3; 20]),
+        stp: StpMode::None,
+    };
+    let mut group = c.benchmark_group("fok_prescan");
+    group.bench_function("bitboard", |b| {
+        b.iter(|| {
+            black_box(e.capped_fillable_probe(black_box(&req), black_box(Some(req.price.0))))
+        });
+    });
+    group.bench_function("linear", |b| {
+        b.iter(|| {
+            black_box(e.capped_fillable_linear(black_box(&req), black_box(Some(req.price.0))))
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     rest_cancel_pair,
@@ -432,6 +477,7 @@ criterion_group!(
     match_sweep_10_levels,
     mixed_workload,
     rest_cancel_pair_folded,
-    mixed_workload_folded
+    mixed_workload_folded,
+    fok_prescan
 );
 criterion_main!(benches);

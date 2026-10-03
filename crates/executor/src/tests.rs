@@ -629,7 +629,9 @@ impl Module for PreverifyTrackingModule {
         // Return a non-zero sender — a zero sender is the
         // "no pre-verification" placeholder and is no longer
         // cached by `ingest_tx`.
-        msgs.iter().map(|raw| Ok(PreverifiedTx { raw, sender: [0x42; 20] })).collect()
+        msgs.iter()
+            .map(|raw| Ok(PreverifiedTx { raw, sender: [0x42; 20], verified_locally: false }))
+            .collect()
     }
     fn handle_batch_preverified(
         &self,
@@ -723,7 +725,9 @@ impl Module for CtxRecordingModule {
         // A non-zero sender marks "the module verified this
         // payload" — the executor caches it so `execute_block`
         // takes the preverified path.
-        msgs.iter().map(|raw| Ok(PreverifiedTx { raw, sender: [0x42; 20] })).collect()
+        msgs.iter()
+            .map(|raw| Ok(PreverifiedTx { raw, sender: [0x42; 20], verified_locally: false }))
+            .collect()
     }
 }
 
@@ -2939,7 +2943,7 @@ fn tx_outcome_store_overwrite_semantics() {
     let h = Hash([1u8; 32]);
     store.record(h, TxOutcome::Skipped { reason: TxSkipReason::GasLimit });
     // The tx lands in a later block — Executed supersedes.
-    let executed = TxOutcome::Executed { events: vec![], error: None };
+    let executed = TxOutcome::Executed { events: Vec::new().into(), error: None };
     store.record(h, executed.clone());
     assert_eq!(store.outcomes.get(&h), Some(&executed));
     // A stale re-proposal skipping afterwards cannot rewrite it.

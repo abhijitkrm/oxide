@@ -38,7 +38,9 @@ are exempt — optimize for *clarity* there.
 4. **Fixed-point only.** Prices/quantities are `u64` scaled integers
    (1e8 / 1e6 — see primitives). Floats in state are forbidden:
    they break cross-validator determinism. Multiply via `u128`, divide
-   with banker's-mode rounding, document rounding on every op.
+   with round-half-up (`mul_div_half_up` — the one rounding direction
+   for the whole codebase, chosen as the fairness rule at the single
+   implementation site in primitives), document rounding on every op.
 5. **Cache-line hygiene.** Hot structs are `#[repr(C, align(64))]`, fields
    ordered hot→cold with a comment marking the split; no false sharing
    between writer threads; sequential (array) layouts beat pointer-chasing

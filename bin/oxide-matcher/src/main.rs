@@ -94,6 +94,9 @@ struct CliConfig {
     nonce_state: Option<std::path::PathBuf>,
     settlement_key: Option<zeroize::Zeroizing<[u8; 32]>>,
     settlement_outbox: Option<std::path::PathBuf>,
+    risk: matcher::RiskConfig,
+    sequencer_core: Option<u32>,
+    worker_base_core: Option<u32>,
 }
 
 /// Parse CLI flags into a `CliConfig`.
@@ -136,6 +139,24 @@ fn parse_cli() -> CliConfig {
         // forgets an in-flight batch (fills drained, outcome unknown).
         settlement_outbox: parse_flag_opt::<String>("--settlement-outbox")
             .map(std::path::PathBuf::from),
+        // Pre-trade risk thresholds (hft-audit F-23). The defaults
+        // are venue-scale — `max_orders_per_second: 0` = unlimited,
+        // since admission throttling belongs upstream; operators
+        // that want a matcher-side ceiling set the flag.
+        risk: matcher::RiskConfig {
+            max_orders_per_second: parse_flag("--risk-max-orders-per-sec", 0u64),
+            max_order_qty: parse_flag("--risk-max-order-qty", 1_000_000_000u64),
+            max_price_deviation_bps: parse_flag("--risk-max-price-dev-bps", 1_000u64),
+            max_resting_per_account: parse_flag("--risk-max-resting", 10_000u32),
+        },
+        // Thread pinning (hft-audit F-02): `--pin-sequencer` keeps
+        // the order-book sequencer resident on one core;
+        // `--pin-worker-base N` pins market worker i to N+i (the
+        // multi-market stride is documented, so operators carve
+        // disjoint cores). Both default unpinned — the safe value
+        // for dev boxes where pinning collides with other load.
+        sequencer_core: parse_flag_opt::<u32>("--pin-sequencer"),
+        worker_base_core: parse_flag_opt::<u32>("--pin-worker-base"),
     }
 }
 
@@ -205,6 +226,9 @@ fn build_server_config(cli: &CliConfig) -> ServerConfig {
         nonce_state_path: cli.nonce_state.clone(),
         settlement_key: cli.settlement_key.clone(),
         settlement_outbox: cli.settlement_outbox.clone(),
+        risk: cli.risk,
+        sequencer_core: cli.sequencer_core,
+        worker_base_core: cli.worker_base_core,
     }
 }
 
@@ -252,6 +276,7 @@ fn single_market_config() -> trading::MarketConfig {
     }
 }
 
+#[allow(clippy::too_many_lines)] // a CLI entry point is declaration-dense by shape
 fn main() {
     // Supervision before anything can spawn: a panic on a critical
     // actor's thread (sequencer, settlement pump) aborts the process
@@ -280,6 +305,36 @@ fn main() {
     }
     if let Some(p) = &cli.settlement_outbox {
         println!("  settlement outbox: {}", p.display());
+    }
+
+    // Pin validation before any thread spawns (hft-audit F-02): a
+    // core outside the online set is a deployment typo — fail at
+    // startup, same convention as the settlement-key check, rather
+    // than silently running unpinned in production.
+    let online = primitives::pin::online_cpus();
+    for (flag, core) in
+        [("--pin-sequencer", cli.sequencer_core), ("--pin-worker-base", cli.worker_base_core)]
+    {
+        if let Some(c) = core
+            && c >= online
+        {
+            eprintln!("error: {flag} {c} is outside the online CPU set ({online} cores online)");
+            std::process::exit(1);
+        }
+    }
+    if let Some(base) = cli.worker_base_core {
+        // The multi-market stride is base+i for i in 0..markets —
+        // validate the last worker's core too, not just the base.
+        let last =
+            base.saturating_add(u32::try_from(cli.markets).unwrap_or(u32::MAX).saturating_sub(1));
+        if cli.mode == "multi" && last >= online {
+            eprintln!(
+                "error: --pin-worker-base {base} + {} markets needs core {last} \
+                 ({online} cores online)",
+                cli.markets
+            );
+            std::process::exit(1);
+        }
     }
 
     // The settlement operator is always the key-derived secp256k1
@@ -351,7 +406,8 @@ fn main() {
         }
         "ring" => {
             println!("oxide-matcher: funding {} accounts (single-market ring)...", cli.accounts);
-            let mut server = MatchingServer::new(single_market_config(), cli.accounts);
+            let mut server =
+                MatchingServer::with_risk_config(single_market_config(), cli.accounts, cli.risk);
             server.set_chain_id(cli.chain_id);
             if let Some(p) = &cli.nonce_state {
                 server.set_nonce_store(p.clone());
@@ -362,7 +418,8 @@ fn main() {
         }
         "mutex" => {
             println!("oxide-matcher: funding {} accounts (single-market mutex)...", cli.accounts);
-            let mut server = MatchingServer::new(single_market_config(), cli.accounts);
+            let mut server =
+                MatchingServer::with_risk_config(single_market_config(), cli.accounts, cli.risk);
             server.set_chain_id(cli.chain_id);
             if let Some(p) = &cli.nonce_state {
                 server.set_nonce_store(p.clone());

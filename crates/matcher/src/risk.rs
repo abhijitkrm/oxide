@@ -74,19 +74,31 @@ pub struct RiskConfig {
 }
 
 impl Default for RiskConfig {
+    /// Venue-scale defaults (hft-audit F-23).
+    ///
+    /// The old defaults were retail-sized: 100 orders/s would
+    /// throttle any real market maker, and 1,000 resting orders is
+    /// under one book's active depth for a two-sided MM. At the
+    /// matcher tier the expensive gate (per-account deque lookup on
+    /// every order) now defaults OFF — admission throttling belongs
+    /// at the network/chain edge, and operators that want it here
+    /// set it explicitly. The fat-finger bounds stay enabled: they
+    /// cost one comparison each and catch real errors.
     fn default() -> Self {
         Self {
-            // 100 orders/sec is generous for a human trader; HFT
-            // clients can request a higher limit.
-            max_orders_per_second: 100,
-            // 1_000_000 qty units = 1 base unit (scale-6). Large
-            // enough for normal trading, small enough to catch
-            // fat-finger quantities.
+            // 0 = unlimited: `RateLimiter::check` early-returns
+            // before touching the per-account deque map, so this is
+            // the zero-cost default, not a bigger bucket.
+            max_orders_per_second: 0,
+            // 1_000_000_000 qty units = 1,000 base units (scale-6).
+            // Catches fat-finger quantities without bounding flow.
             max_order_qty: 1_000_000_000,
             // 10% price band — rejects orders more than 10% from mid.
             max_price_deviation_bps: 1_000,
-            // 1000 resting orders per account — prevents book spam.
-            max_resting_per_account: 1_000,
+            // 10,000 resting orders per account — venue-scale market
+            // making (two-sided across a deep book) fits; book spam
+            // from one account is still bounded.
+            max_resting_per_account: 10_000,
         }
     }
 }

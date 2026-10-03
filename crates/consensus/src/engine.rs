@@ -1747,6 +1747,26 @@ impl OxideBft {
         self.blocks.len()
     }
 
+    /// Diagnostic dump of `(height, view, kind, tx_count)` per stored
+    /// block — used by simulation harnesses to attribute a missing
+    /// proposal to the engine's actual stored state (e.g. an empty
+    /// block where the tx should have been). `#[doc(hidden)]`: not a
+    /// consensus-semantics API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn debug_stored_blocks(&self) -> Vec<(u64, u64, &'static str, usize)> {
+        self.blocks
+            .values()
+            .map(|(h, b)| {
+                let (kind, txs) = match b {
+                    BlockBody::Complete(p) => ("complete", p.txs.len()),
+                    BlockBody::Awaiting => ("awaiting", 0),
+                };
+                (h.height.value(), h.view.value(), kind, txs)
+            })
+            .collect()
+    }
+
     /// Whether `block_hash` resolves to a stored, *authenticated*
     /// proposal — `Awaiting` (header verified, body pending) or
     /// `Complete` (header + body verified). Entries enter `blocks`

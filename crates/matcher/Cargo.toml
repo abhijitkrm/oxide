@@ -67,3 +67,8 @@ harness = false
 [[bench]]
 name = "alloc_accounting"
 harness = false
+
+# SPSC ring vs the displaced crossbeam channel (hft-audit F-03).
+[[bench]]
+name = "ring"
+harness = false

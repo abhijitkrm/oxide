@@ -583,9 +583,19 @@ impl MultiNodeDevnet {
         let leader_idx = usize::from(self.validator_set.leader(self.engines[0].current_view()));
 
         // Leader proposes.
-        let (header, proposal) = self.engines[leader_idx]
-            .propose()
-            .unwrap_or_else(|| panic!("leader {leader_idx} should propose"));
+        let (header, proposal) = self.engines[leader_idx].propose().unwrap_or_else(|| {
+            let e = &self.engines[leader_idx];
+            panic!(
+                "leader {leader_idx} should propose \
+                 (view={:?} next_height={} high_qc={:?} stored_blocks={} last_voted={:?} blocks={:?})",
+                e.current_view(),
+                e.next_height_value(),
+                e.high_qc().map(|q| q.view.value()),
+                e.stored_block_count(),
+                e.last_voted_view(),
+                e.debug_stored_blocks(),
+            )
+        });
 
         // Leader self-votes through the engine's single signing
         // path (C10): `vote()` records the vote locks and appends

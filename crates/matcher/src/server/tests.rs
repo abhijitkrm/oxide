@@ -400,7 +400,7 @@ fn batch_settler_batch_rejected_advances_nonce() {
     confirmer.execute(
         &tx,
         executor::TxOutcome::Executed {
-            events: vec![],
+            events: vec![].into(),
             error: Some("settle: sender is not the settlement operator".to_string()),
         },
         1,
@@ -432,7 +432,8 @@ fn batch_settler_reconciles_partial_failures() {
             events: vec![
                 executor::Event { module: "exchange", kind: "settlement_failed", data: vec![] },
                 executor::Event { module: "exchange", kind: "fill_rejected", data: vec![] },
-            ],
+            ]
+            .into(),
             error: None,
         },
         1,
@@ -556,7 +557,7 @@ async fn ring_concurrent_exchanges_isolate_responses() {
     }
     // ONE ring: every request contends on the same pair — the
     // exact shape of the old round-robin collision.
-    let ring = std::sync::Arc::new(crate::RingMatcher::new(server, 1, 64));
+    let ring = std::sync::Arc::new(crate::RingMatcher::new(server, 1, 64, None));
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let mut handles = Vec::new();
@@ -577,7 +578,7 @@ async fn ring_concurrent_exchanges_isolate_responses() {
                 })
                 .collect();
             let expected = reqs.len();
-            let responses = submit_batch_ring(&ring, &counter, reqs).await;
+            let responses = submit_batch_ring(&ring, &counter, &reqs).await;
             (i, expected, responses)
         }));
     }

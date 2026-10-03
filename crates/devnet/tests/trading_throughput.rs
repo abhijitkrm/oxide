@@ -148,16 +148,19 @@ fn run_raw_engine(n_trades: usize) {
     );
     assert_eq!(total_fills, n_trades, "each taker should match exactly one maker");
 
-    // Gate: raw matching engine must sustain ≥ 1M ops/s
-    // (plan.md §13 Phase 3, matching.rs bench gate). This is the
-    // "engine-only ≥ 5M ops/s" gate de-rated for the full place()
-    // call (validation + book lookup + match + fill generation).
-    // The 1M floor is conservative for CI runners; the 16-core
-    // x86_64 rig is the source for absolute gate claims.
+    // Gate: raw matching engine must sustain ≥ 5M ops/s
+    // (plan.md §13 Phase 3, matching.rs bench gate — the engine-only
+    // floor applied to the full place() call: validation + book
+    // lookup + match + fill generation). Ratcheted from 1M (hft-
+    // audit F-12): the last reference-rig measurement was 38.1M
+    // ops/s, so 5M de-rates ~7.6× for shared CI runners — a real
+    // regression (bitboard removal, per-level division, a lock on
+    // the sweep path) cannot hide inside that margin. Absolute gate
+    // claims still come from the dedicated rig, not this floor.
     if n_trades >= 100_000 {
         assert!(
-            tps >= 1_000_000.0,
-            "raw engine throughput gate failed: {tps:.0} orders/s < 1M orders/s (plan.md §13 Phase 3)"
+            tps >= 5_000_000.0,
+            "raw engine throughput gate failed: {tps:.0} orders/s < 5M orders/s (plan.md §13 Phase 3)"
         );
     }
 }
@@ -187,6 +190,19 @@ fn run_exchange_settlement(n_trades: usize) {
         executor::TxContext { sender: primitives::Address([0x09; 20]), nonce: 0, fee: 100 };
     let taker_ctx =
         executor::TxContext { sender: primitives::Address([0x01; 20]), nonce: 0, fee: 100 };
+
+    // DvP base custody: a sell escrows its `qty` out of
+    // `base_balances` — the module's custody map, not the ledger —
+    // so without a deposit every maker sell rejects
+    // `InsufficientFunds` and the takers rest as bids to the
+    // `max_resting` cap. One deposit covers all makers (1 native
+    // unit == 1 scale-6 base unit of custody); untimed.
+    let deposit = u64::try_from(n_trades)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(maker_sell(primitives::Address([0x09; 20])).qty.0);
+    exchange
+        .handle(&maker_ctx, &exchange::msg::deposit_base(0, deposit))
+        .expect("maker base deposit");
 
     // Pre-build the place-order messages (not timed).
     eprintln!("exchange: building {n_trades} maker + taker messages...");
@@ -221,16 +237,22 @@ fn run_exchange_settlement(n_trades: usize) {
         "all makers should be matched after {n_trades} taker buys"
     );
 
-    // Gate: exchange settlement must sustain ≥ 100k ops/s
+    // Gate: exchange settlement must sustain ≥ 400k ops/s
     // (plan.md §13 Phase 3). This is the full settlement path
     // (matching + ledger transfer + event emission), not just the
-    // matching engine. The 100k floor is conservative for CI
-    // runners; the 16-core x86_64 rig is the source for absolute
-    // gate claims.
+    // matching engine. Ratcheted from 100k (hft-audit F-12): the
+    // recorded reference measurement is 2.37M ops/s on the 16-core
+    // rig; shared-runner measurements: 551k at 1M trades, 451k at
+    // 100M (scale pressure on the settlement bookkeeping, not a
+    // per-op regression). The 400k floor keeps ~12% headroom under
+    // the slowest observed shared-runner pass while still failing
+    // on a real regression — and it is 4× tighter than the floor
+    // it replaced. Absolute gate claims come from the dedicated
+    // rig, not this floor.
     if n_trades >= 100_000 {
         assert!(
-            tps >= 100_000.0,
-            "exchange throughput gate failed: {tps:.0} orders/s < 100k orders/s (plan.md §13 Phase 3)"
+            tps >= 400_000.0,
+            "exchange throughput gate failed: {tps:.0} orders/s < 400k orders/s (plan.md §13 Phase 3)"
         );
     }
 }

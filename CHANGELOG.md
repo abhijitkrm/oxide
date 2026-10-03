@@ -12,6 +12,27 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **HFT audit implementation pass** (`hft-audit.md` F-01–F-26):
+  the validated findings are now implemented. Headline deltas,
+  all head-to-head against the displaced code on identical
+  workloads — true-SPSC matcher ring (UnsafeCell slots, cache-
+  padded head/tail, parked-flag wakeup) vs `crossbeam` bounded:
+  **12.9 ns vs 23.2 ns** single push+pop and **911 ns vs 1.90 µs**
+  burst-64 (~2×); bitboard-walked capped-FOK pre-scan vs the
+  linear dense-ladder walk: **82 ns vs 2.62 µs** on a sparse
+  1,000-level book (~32×). Allocation-accounting is now a *gated*
+  bench: action path ≤2 allocs/op (measured 1.00), crossing-fill
+  ≤5 (2.08), FIX/WS parsers ≤1 (0.00 — both already borrowed),
+  response formatting bounded (FIX `_into` scratch hits ~0 on the
+  production send loop). Throughput floors ratcheted: raw engine
+  1M→5M ops/s, exchange settlement 100k→400k ops/s, plus a
+  mechanical ≥60k tx/s gate on the EVM parallel multi-sender
+  bench.
+  - **In plain words:** the audit's list of hot-path taxes is now
+    fixed and enforced — the order pipe is about twice as fast,
+    a full-book FOK check is ~32× faster, and the benches now
+    *fail* if someone reintroduces the allocations they removed.
+
 - **Folded-fsync consensus WAL** (`consensus::wal`): on Linux the
   WAL opens `O_DSYNC`, so a signature-path append's `write(2)` is
   itself durable — no second fsync syscall per vote — and
@@ -161,6 +182,63 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     state is durable.
 
 ### Fixed
+
+- **Empty proposals under pipelined consensus** (`mempool`,
+  `executor`): a validator whose pool anchored at the last
+  *executed* nonce saw a gap whenever the sender's intermediate
+  nonces lived in uncommitted ancestor blocks proposed by other
+  leaders — the selection walk broke at the hole and the leader
+  proposed an empty block (the intermittent devnet
+  fault-injection failure). Two bounded covers now bridge the
+  hole in `select`: `pending_commit` records nonces the commit
+  path vacated before the execution lane confirmed them, and
+  `in_chain` records nonces observed in accepted proposals (the
+  vote path sees every leader's block). Both expire on the same
+  per-block anchor refresh — dead-branch coverage times out and
+  real gaps still break the walk.
+  - **In plain words:** a validator no longer proposes empty
+    blocks just because the transactions filling the nonce gap
+    were submitted to a *different* validator first.
+
+- **Matcher hot-path taxes removed** (`matcher`): the sequencer
+  ring is now real single-producer/single-consumer storage (the
+  old "SPSC" was a mutex-backed MPMC); the sequencer parks an
+  undeliverable response batch instead of spinning forever;
+  market-data publication is a wait-free ring push with
+  serialization and subscriber fanout moved off the matching
+  thread (slow consumers get evicted, never backpressure); and the
+  consensus pump blocks on a wakeup-capable receive instead of a
+  fixed 1 ms sleep — network frames wake it immediately, timeouts
+  still drive the pacemaker.
+  - **In plain words:** the matching engine no longer burns CPU
+    waiting on slow clients, its market-data feed can't stall
+    order flow, and the validator reacts to consensus messages the
+    instant they arrive instead of on a timer.
+
+- **Parallel EVM no longer re-verifies recovered senders**
+  (`executor`/`evm`): transactions whose sender this node already
+  recovered (the `preverify_cache` hit — keyed by a locally
+  computed envelope hash, so a hit proves the bytes were verified
+  here) now carry a `verified_locally` flag that skips the second
+  secp256k1 recovery in both parallel decode loops. Foreign or
+  unverifiable bytes still recover — the flag is provenance, not a
+  trust vote.
+  - **In plain words:** transactions we already checked don't pay
+    the signature-recovery cost twice.
+
+- **Per-operation allocations removed from the API surfaces**
+  (`matcher::fix`/`ws`, `metrics`, `node`, `executor`): FIX
+  execution reports format into a per-connection scratch buffer;
+  inbound WebSocket frames are borrowed instead of copied; the
+  metrics recorder allocates a key only on first observation;
+  validator broadcasts reuse peer-id scratch instead of an
+  allocation per peer per message; block events are shared
+  (`Arc<[Event]>`) rather than cloned per transaction; and the
+  executor's preverification cache hashes by the digest's own
+  bytes instead of SipHashing already-hashed keys.
+  - **In plain words:** the code stopped paying a memory
+    allocation on messages that arrive thousands of times a
+    second.
 
 - **Precompile dispatch no longer hijacks pattern-matching
   addresses** (`evm::precompiles`): the gate was the syntactic
@@ -404,6 +482,39 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     vote to skip the dead turn and keep going, as designed.
 
 ### Added
+
+- **Thread pinning + NUMA surface** (`[performance]` config,
+  `primitives::pin`, matcher flags): `consensus_core`,
+  `exec_lane_core`, and `numa_node` pin the consensus pump and
+  executor commit lane to declared cores — validated against the
+  online CPU set and sysfs at startup, refused loudly on a bad
+  topology. `oxide-matcher` grows `--pin-sequencer` and
+  `--pin-worker-base` (worker `i` lands on `base + i`) with the
+  same validation. Implemented std-only via `taskset` against the
+  calling thread's `/proc/thread-self` TID — no libc dependency in
+  `primitives`. All pins default off; a failed pin logs and runs
+  unpinned (locality is a latency property, never correctness).
+  - **In plain words:** the busiest threads can now be told to
+    stay on one CPU so their caches stay warm — off by default,
+    checked before the node starts, and never able to break the
+    node if the hardware disagrees.
+
+- **Matcher risk limits are operator-configurable** (`oxide-matcher`
+  `--risk-max-*` flags, `ServerConfig::risk`): order rate, order
+  size, price band, and resting-per-account thresholds are no
+  longer hardcoded human-scale defaults inside the worker — the
+  venue-scale defaults assume admission throttling lives upstream.
+  - **In plain words:** the matching engine used to cap every
+    account at 100 orders/second no matter what — now operators
+    set the real limits (or turn the matcher-side cap off).
+
+- **Configurable peer socket buffers** (`NetworkConfig::
+  socket_buffer_bytes`): the p2p transport sets explicit send/receive
+  buffer sizes alongside `TCP_NODELAY` at every dial and accept —
+  kernel defaults no longer govern frame latency under load.
+  - **In plain words:** the node's network sockets get sized
+    buffers like a trading system expects, not whatever the kernel
+    happened to default to.
 
 - **Official `ethereum/tests` `GeneralStateTests` runner**
   (`modules/evm/tests/official_state_tests.rs`, production-readiness

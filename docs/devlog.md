@@ -22377,3 +22377,262 @@ isolation + pinning, spin-then-park idle knobs, huge pages for
 arenas, `lto = "full"`/target-cpu/PGO measurement, io_uring, and one
 end-to-end ingest→ack HDR histogram so the composed-path taxes stop
 being visible only via microbench arithmetic.
+
+## Session: HFT audit implementation — 26 findings resolved
+
+The `hft-audit.md` findings (F-01 through F-26) moved from
+validated-and-open to implemented-or-documented. This session was
+the fix pass; the ordering below follows the audit.
+
+**F-01 — consensus pump wakeup.** The validator loop's idle
+`sleep(1 ms)` tail is gone: `TcpTransport::recv_timeout` blocks on
+the inbound channel so an arriving frame wakes the pump
+immediately, while the bounded timeout preserves the pacemaker/
+gossip cadence. A frame the wakeup returns is stashed into the
+normal drain path — byte accounting and admission logic unchanged.
+
+**F-02 — CPU pinning + NUMA surface.** New `primitives::pin` —
+`pin_current_thread`, `online_cpus`, `numa_node_present` — kept
+std-only (the `taskset -pc <core> <tid>` route against
+`/proc/thread-self`, since primitives may not link libc). New
+`[performance]` config section (`consensus_core`,
+`exec_lane_core`, `numa_node`) validated at startup by
+`NodeConfig::perf_pin_errors` inside `validate_effective_config`;
+`oxide-matcher` grows `--pin-sequencer` / `--pin-worker-base` with
+the same online-set check before any thread spawns. Pinned
+through `spawn_supervised_pinned` on the three single-writer
+threads: matcher sequencer, exec lane, consensus pump (plus
+per-market workers at `base + i`). A failed pin logs once and the
+actor runs unpinned — locality is a latency property, never a
+correctness one.
+
+**F-03 — true SPSC ring.** `matcher::ring` is now real SPSC
+storage: `UnsafeCell<MaybeUninit<T>>` slots, cache-padded
+head/tail atomics, the SAFETY invariants written out (single
+writer per index, init-before-publish, drop-once-on-close). The
+wakeup became a parked flag — `signal()` is one `AtomicBool::swap`
+on the hot path; the mutex+condvar only fire when the consumer is
+actually parked. Poison recovery rides `into_inner`. Bench
+(`benches/ring.rs`, head-to-head vs the displaced
+`crossbeam_channel::bounded` on identical payloads): **12.9 ns vs
+23.2 ns** single push+pop, **911 ns vs 1.90 µs** at burst-64 —
+~2×, the MPMC slot-stamp/backoff machinery the SPSC ring drops.
+
+**F-04 — bounded sequencer spin.** A response batch that can't
+push (client lagging behind its lease) parks per-ring and retries
+once per pass instead of spinning the sequencer; the lease caps
+in-flight batches at one per ring, so the parked set is bounded
+by `num_rings`.
+
+**F-05 — market-data isolation.** `publish_*` on the sequencer is
+now a wait-free ring push of the typed message — no serde, no
+lock, no per-subscriber work. A separate fanout task owns the
+subscriber map, serializes once into a shared `Arc<str>`, and
+broadcasts through bounded per-subscriber queues; a full queue
+evicts that subscriber only, a closed receiver is reaped, and a
+full internal ring sheds (counted) without touching the fanout.
+Tests cover queue-depth eviction, closed-receiver eviction,
+per-subscriber independence, and ring-full shedding.
+
+**F-06 — parallel recovery skip.** `PreverifiedTx` gains a
+`verified_locally` provenance flag set only when the sender came
+from the local `preverify_cache` — safe because the cache key is
+`hash_one(Domain::Transaction, envelope_bytes)` computed locally
+at dispatch, so a hit proves these exact bytes passed this node's
+verification. Both Phase-1 decode loops skip `recover_signer`
+under the flag; cache-miss paths still recover.
+
+**F-07 — OCC marked + fixed.** The doc now says what the code is
+(a custom scoped-thread scheduler, bench-only) instead of
+claiming rayon; the version map uses fixed-size `OccKey`
+representations and `v.clone()` per write is gone where ownership
+transfer sufficed.
+
+**F-08 — shared event storage.** `TxOutcome::Executed.events` is
+`Arc<[Event]>`; the block event log appends the slice without a
+per-event clone. Settlement and tests read through the same
+deref — ordering and error semantics unchanged.
+
+**F-09 + F-22 — index-space sweep + bitboard FOK.**
+`BookBackend` gained index-space accessors; the match sweep,
+maker-removal, and resting-entry paths operate on level indexes
+directly — `level_head`'s price→index division moved out of the
+inner FIFO loop (it was once per *fill*, not per level).
+`capped_fillable` walks the active-level bitboard instead of the
+whole 2^18 dense ladder; the linear scan stays as the documented
+displaced baseline in the bench. Head-to-head on a sparse
+1,000-level book: **82 ns vs 2.62 µs — ~32×**. Regression tests
+prove the bitboard walk and linear scan agree under caps, STP,
+and partial fills.
+
+**F-10 — socket buffers.** `configure_peer_socket` sets
+`TCP_NODELAY` + explicit send/recv buffer sizing
+(`socket_buffer_bytes`, plumbed from `NetworkConfig` through both
+transport contexts to all six dial/accept call sites).
+
+**F-11 — TLS budget documented.** The rustls write cost is now
+recorded where the design is decided — ~4 µs/frame under the
+stream lock is the priced floor; the mitigations (batched frames,
+fewer records) landed via the `write_frames` scratch path rather
+than a second cipher layer.
+
+**F-12 — gates ratcheted.** `trading_throughput.rs` floors raised:
+raw engine 1M→5M ops/s (~7.6× under the 38.1M reference
+measurement — the documented engine gate, de-rated for shared
+CI), exchange settlement 100k→400k ops/s (~5.9× under the 2.37M
+recorded). `tps_rw` gained a mechanical parallel gate: ≥60k tx/s
+on 10k transfers × 100 senders (serial is ~28k, measured ~128k).
+`alloc_accounting` is now *asserted*, not informational — per-row
+allocs/op ceilings (~2× observed: actions ≤2, crossing ≤5,
+parsers ≤1, formatters ≤2) panic the bench on regression, and a
+missing row fails loudly instead of silently un-gating.
+
+**F-13 — metrics fast path.** `LatencyMetrics::record` does
+`get_mut` first; the `String` key is allocated only on first
+observation of an operation. The doc rule stands: never call on a
+per-order/per-tx path — the recorder locks.
+
+**F-14 — scratch writes + slice submission.** The writer loop
+drains outbound frames into a per-connection scratch buffer and
+emits one write+flush per batch (the trait grew a scratch-aware
+override; TLS reuses its ciphertext buffer under the same lock
+ordering). `submit_batch_ring` takes `&[VerifiedOrder]` — the
+single-order path passes a one-element slice instead of
+`vec![req]`; the parked-response vector is reused across passes.
+
+**F-15 — Notify-based waits.** Response rings carry a per-ring
+`tokio::sync::Notify`; producers wait on a `space` signal instead
+of `yield_now` spinning — no more tokio-worker burn under
+saturation.
+
+**F-16 — FIX/WS allocation floor.** The parse side was already
+borrowed (measured 0.00 allocs/op — the audit text predated the
+borrowed tag lookup). What remained: the formatter `String` per
+response and a `to_string()` on every inbound WS frame.
+`format_fix_execution_report_into` writes into a per-connection
+scratch `String` (cleared, not freed); both FIX loops use it. WS
+receive borrows `Utf8Bytes`/lossy-Cow instead of copying. The WS
+response `String` is API-bound — `Message::Text` must own its
+bytes — documented as such.
+
+**F-17 — rounding reconciled.** The performance-first skill now
+says round-half-up (`mul_div_half_up`), matching the code's single
+documented direction; "banker's-mode" was the stale text.
+
+**F-18 — lease-starvation SLO written down.** `acquire_ring`'s
+doc now states the contract plainly: throughput-bounded, not
+latency-bounded — no FIFO ticketing, saturation defers excess
+waiters; a hard p99 belongs upstream (client timeout + retry
+endpoint) until measured.
+
+**F-19 — settlement exposure stated.** The settler module doc now
+names the window: seal interval + consensus inclusion, bounded by
+`MAX_PENDING_RETRIES`/`RESUBMIT_AFTER_TICKS`; the interval is a
+config knob sized against the venue's risk envelope.
+
+**F-20/F-21 — poison + liveness.** The parked-flag wakeup
+recovers via `into_inner`; `is_connected` is gone in favor of
+real push/pop liveness on the rings themselves.
+
+**F-23 — risk configuration.** `RiskConfig` threads
+`ServerConfig` → `run_server_multi` → `MultiMarketMatcher::
+with_options` → `MarketWorker::run`; `oxide-matcher` exposes
+`--risk-max-*` flags; venue-scale defaults no longer carry the
+human-scale 100 orders/s cap (upstream admission owns rate
+limits). Deterministic clock injection preserved for tests.
+
+**F-24 — fanout allocs.** `send_to_addr` + a reusable peer-id
+scratch kill the per-peer `addr.0.to_vec()` on tx fanout,
+proposal/vote/QC/TC broadcasts, and sync requests; `msg.from`
+clones happen only where the map insert needs ownership.
+
+**F-25 — digest map.** `primitives::digest_map::DigestMap` derives
+buckets from the digest bytes directly (the key is already a
+BLAKE3 output — SipHash was pure waste); `preverify_cache` uses
+it. Collision-correct (full-key eq on the bucket walk), tested.
+
+**F-26 — acknowledged.** The resting-commitment fold (2–3 leaf
+hashes per filled maker) is a protocol-versioned change —
+measured-in, gated, deliberately not touched this pass. Profile
+first; a leaf/qty split is the candidate design.
+
+**Build-profile note.** `lto`, `target-cpu`, and PGO measurement
+from the §8.3 enablement list stay open — they change the binary
+contract and deserve their own bench day, not a line item in this
+pass.
+
+## Session: mempool nonce coverage — the devnet fault-injection flake
+
+`cargo test -p devnet` intermittently panicked at
+`run_with_faulty_leader`'s flush round: `leader 2 should propose`
+with `view=6 next_height=5 high_qc=Some(5) stored_blocks=1` and the
+single stored block being a *complete block with 0 txs* at height
+4, view 5.
+
+### Root cause
+
+Two interacting pieces, both mempool-side — the consensus engine
+and exec lane were innocent:
+
+1. **Empty proposals from a phantom nonce gap.** `select` anchors
+   each sender's walk at `executed_nonces + 1` and breaks on the
+   first nonce not in the per-sender queue. Under pipelined
+   consensus, though, the sender's nonce chain is contiguous across
+   the *chain*, not across any one validator's pool: the sim
+   submits each round's tx only to that round's leader, so a later
+   leader holds nonce 4 while nonces 2,3 live in uncommitted
+   ancestor blocks proposed by other validators. The anchor sees a
+   gap, the walk breaks, the proposal carries zero txs.
+
+2. **The commit/execute clock skew.** `remove_committed` vacates
+   committed txs from the queue synchronously at finalization, but
+   `refresh_anchors` only rebuilds `executed_nonces` when the async
+   execution lane finishes the block — under parallel test load the
+   two clocks diverge and the queue shows a hole the committed tx
+   already filled.
+
+### Fix — two bounded covers in `Mempool`
+
+- `pending_commit: HashMap<Address, BTreeMap<nonce, commit-height>>`
+  — `remove_committed` records each committed tx's nonce *from the
+  block bytes* (a validator that never pooled the tx still needs
+  the bridge); `select` steps over covered nonces;
+  `refresh_anchors` expires entries at/below the just-executed
+  height, so a consumed slot is covered by the new anchor and a
+  skipped slot un-bridges (a refilled nonce stays selectable).
+
+- `in_chain: HashMap<Address, BTreeMap<nonce, proposal-height>>` —
+  `Executor::process_proposal` calls `note_in_chain` on the accept
+  path for every proposal it validates — own proposals and foreign
+  leaders' alike (the vote path is where every validator sees every
+  proposal). `select` steps over a queue hole an ancestor block
+  covers; `refresh_anchors` expires a cover when the rebuilt anchor
+  passes the nonce (executed) or when the covering height falls
+  `CHAIN_COVER_TTL` (2× the in-flight proposal window) behind the
+  executed tip (dead branch — the gap is real again).
+
+Both maps are bounded by in-flight occupancy and expire on the same
+per-block refresh that already rebuilt the anchors — no unbounded
+growth, no cross-test/process state.
+
+### Why the old fix attempts failed
+
+Bumping `executed_nonces` from committed bytes was clobbered by
+`refresh_anchors` rebuilding the map from `by_sender` keys — and an
+unconditional advance would have permanently skipped real gaps (a
+dropped nonce would dead-lock the sender's queue forever). The two-
+cover design keeps `executed_nonces` authoritative for execution
+while letting selection see "this nonce is already spoken for by
+the chain."
+
+### Verification
+
+`select_bridges_committed_unexecuted_gap` and
+`select_bridges_in_flight_ancestor_gap` regression tests reproduce
+both holes (bridge, then correct expiry — including the
+skipped-nonce un-bridge case). The devnet suite — including all
+five fault-injection tests under full parallel load — passes
+repeatedly where it used to fail ~1-in-4 runs. The richer
+`run_round` panic (engine state dump: view, next_height, high_qc,
+stored blocks, last_voted) stays — it is what made the flake
+diagnosable in minutes instead of hours.

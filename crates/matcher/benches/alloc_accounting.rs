@@ -13,11 +13,12 @@
 //!   `HashMap<String, String>` per message; `extract_str` hands out
 //!   owned `String`s; `format_*` build response `String`s).
 //!
-//! Informational only — no gate. The numbers are the budget any
-//! allocation-free hot-path claim must beat, and the baseline a
-//! future arena/ring-string refactor must improve on. The counting
-//! shim lives in its own bench binary so the two atomic increments
-//! per alloc never skew the timing benches.
+//! Gated (hft-audit F-12): `alloc_report` asserts each row stays
+//! within its committed allocs/op ceiling — the numbers below are
+//! the budget any allocation-free hot-path claim must hold, and
+//! the ratchet a regression trips. The counting shim lives in its
+//! own bench binary so the two atomic increments per alloc never
+//! skew the timing benches.
 
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
@@ -295,13 +296,20 @@ fn bench_allocs(c: &mut Criterion) {
 
     let resp = OrderResponse::resting(trading::OrderId(42), 0);
     g.bench_function("fix_report", |b| {
+        // Production shape: the send loop formats into a per-
+        // connection scratch String (`format_.._into`), so the
+        // steady-state path is allocation-free. The owned wrapper
+        // still costs one String per call — the convenience price.
+        let mut scratch = String::with_capacity(256);
         b.iter_custom(|iters| {
             measured("fix_report", iters, || {
                 for _ in 0..iters {
-                    black_box(matcher::fix::format_fix_execution_report(
+                    matcher::fix::format_fix_execution_report_into(
                         black_box(&resp),
                         "clid-001",
-                    ));
+                        &mut scratch,
+                    );
+                    black_box(&scratch);
                 }
             })
         });
@@ -340,6 +348,33 @@ fn alloc_report(c: &mut Criterion) {
                 eprintln!("{name:<18} {:>10} {a:>12.2} {b:>10.1}", row.ops);
             }
             eprintln!();
+
+            // Gate (hft-audit F-12): allocs-per-op ceilings, ~2×
+            // the last reference measurement so allocator jitter and
+            // platform differences can't flake CI, tight enough that
+            // a real regression — a HashMap back in the FIX parser,
+            // a Vec per action response — fails the bench. Rows
+            // missing from the table (a renamed bench) fail loudly
+            // rather than silently un-gating that path.
+            let ceilings: &[(&str, f64)] = &[
+                ("cancel_action", 2.0),
+                ("amend_action", 2.0),
+                ("crossing_fill", 5.0),
+                ("fix_parse_order", 1.0),
+                ("ws_parse_order", 1.0),
+                ("fix_report", 1.0),
+                ("ws_response", 2.0),
+            ];
+            for (name, ceiling) in ceilings {
+                let Some((_, row)) = rows.iter().find(|(n, _)| n == name) else {
+                    panic!("allocation gate: bench row {name} produced no measurements");
+                };
+                let a = row.allocs as f64 / row.ops.max(1) as f64;
+                assert!(
+                    a <= *ceiling,
+                    "allocation gate failed: {name} = {a:.2} allocs/op > {ceiling} ceiling"
+                );
+            }
         });
     });
 }

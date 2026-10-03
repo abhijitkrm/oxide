@@ -10,6 +10,10 @@ CONFIRMED, none yet implemented**; verdicts and per-finding evidence in
 re-review of the per-order / per-tx / per-message paths with a pure
 nanosecond-and-throughput lens (§8): five new findings (F-22–F-26) and
 a system-level enablement checklist.
+**Resolution pass:** all 26 findings implemented, gated, or documented
+— per-finding status and where the fix landed in §9. Measured deltas:
+SPSC ring ~2× over the displaced `crossbeam` bounded channel; bitboard
+FOK pre-scan ~32× over the linear ladder walk.
 **Date:** 2026-10-04.
 **Scope:** hot paths of the matching/trading stack, consensus/validator
 loop, executor + EVM execution, p2p transport, storage journal,
@@ -1082,3 +1086,73 @@ scan mislabeled cold, on the shared sequencer thread), one
 throughput-ceiling misconfiguration (F-23), and a set of small,
 free wins (F-24, F-25) plus the system checklist that turns
 nanosecond components into a nanosecond node.
+
+---
+
+## 9. Resolution status (implementation pass)
+
+Every finding below is either **FIXED** (code changed + verified),
+**GATED** (enforcement added), **DOCUMENTED** (design decision written
+down where it belongs), or **ACKNOWLEDGED** (deliberately deferred with
+the reason recorded). Line numbers refer to the audited revision, not
+the post-fix tree.
+
+| # | Status | Where it landed |
+|---|---|---|
+| F-01 | **FIXED** | `TcpTransport::recv_timeout` blocks on the inbound channel; the pump's 1 ms sleep tail is gone — frames wake the loop immediately, the bounded timeout keeps the pacemaker cadence. `crates/p2p/src/tcp.rs`, `crates/node/src/validator_net.rs`. |
+| F-02 | **FIXED** | `primitives::pin` (std-only: `taskset -pc` on `/proc/thread-self`), `spawn_supervised_pinned`, `[performance]` config section (`consensus_core`, `exec_lane_core`, `numa_node`) validated by `NodeConfig::perf_pin_errors`; matcher CLI `--pin-sequencer`/`--pin-worker-base`. Pinned threads: sequencer, exec lane, consensus pump, per-market workers (`base + i`). Failed pin = log + run unpinned. |
+| F-03 | **FIXED** | `crates/matcher/src/ring.rs` rewritten as true SPSC — `UnsafeCell<MaybeUninit<T>>` slots, cache-padded atomics, parked-flag wakeup (mutex+condvar only when the consumer is actually parked). Bench `benches/ring.rs` vs `crossbeam::bounded`: **12.9 ns vs 23.2 ns** single op, **911 ns vs 1.90 µs** burst — ~2×. |
+| F-04 | **FIXED** | The sequencer parks an unpushable response batch per ring (bounded by `num_rings` — one lease in flight each) and retries each pass; the global-mutex wakeup is gone with the ring rewrite. `crates/matcher/src/lib.rs`. |
+| F-05 | **FIXED** | `market_data.rs` split: `publish_*` is a wait-free ring push of the typed message; a separate fanout task owns subscribers, serializes once into `Arc<str>`, and broadcasts through bounded per-subscriber queues — full queue evicts that subscriber, closed receivers are reaped, full internal ring sheds + counts. Tests cover every eviction class. |
+| F-06 | **FIXED** | `PreverifiedTx.verified_locally` — set only on a `preverify_cache` hit (the key is the locally computed envelope hash, so a hit proves these bytes passed this node's verification). Both parallel Phase-1 decode loops skip `recover_signer` under the flag; misses still recover. |
+| F-07 | **DOCUMENTED + FIXED** | OCC is now honestly labeled bench-only; the doc's rayon claim is corrected to the custom scoped-thread scheduler it actually is; the version map uses fixed-size `OccKey`s and no longer clones values where ownership transfer suffices. Not wired to production — as designed. |
+| F-08 | **FIXED** | `TxOutcome::Executed.events` is `Arc<[Event]>` — appended to the block log without per-event clones; settlement and tests read through the same deref. Ordering and error semantics unchanged. |
+| F-09 | **FIXED** | `BookBackend` exposes index-space accessors; the sweep/maker-removal/resting-entry paths operate on level indexes — `level_head`'s division moved out of the inner FIFO loop (it was once per *fill*). `crates/trading/src/book.rs`, `engine.rs`. |
+| F-10 | **FIXED** | `configure_peer_socket` (nodelay + sized buffers via `socket_buffer_bytes`) at all six p2p dial/accept sites; the field threads `NetworkConfig` → both transport contexts. |
+| F-11 | **DOCUMENTED** | The ~4 µs/frame rustls write budget is recorded at the design site; the mitigation (batched frames, one flush per batch, ciphertext scratch reuse) landed through F-14's `write_frames` override rather than a second cipher layer. |
+| F-12 | **GATED** | Floors ratcheted: raw engine 1M→5M ops/s, exchange settlement 100k→400k ops/s (`trading_throughput.rs`); `tps_rw` asserts ≥60k tx/s on the 10k×100-sender parallel row; `alloc_accounting` asserts per-row allocs/op ceilings (~2× observed) and fails on a missing row. |
+| F-13 | **FIXED** | `LatencyMetrics::record` uses `get_mut` first — the `String` key allocates only on first observation. `crates/metrics/src/lib.rs`. |
+| F-14 | **FIXED** | `submit_batch_ring` takes `&[VerifiedOrder]` (no `vec![req]` on the single-order path); the writer loop drains frames into a per-connection scratch and emits one write+flush per batch — plain TCP and TLS both override `write_frames` with a scratch-aware path. |
+| F-15 | **FIXED** | Response rings carry a per-ring `tokio::sync::Notify`; producers wait on `space` instead of `yield_now`. No tokio-worker burn under saturation. |
+| F-16 | **FIXED (remaining surface) + DOCUMENTED** | The parsers were already borrowed — the bench measures 0.00 allocs/op. What landed: `format_fix_execution_report_into` (per-connection scratch `String`, cleared not freed) on both FIX send loops; WS inbound frames borrow `Utf8Bytes`/lossy-Cow instead of `to_string()`. The WS *response* `String` is API-bound (`Message::Text` owns its bytes) — documented at the bench. |
+| F-17 | **FIXED** | The skill text now says round-half-up — matching `mul_div_half_up`, the single documented direction for the codebase. `.devin/skills/performance-first/SKILL.md`. |
+| F-18 | **DOCUMENTED** | `acquire_ring` doc now states the SLO plainly: throughput-bounded (saturation defers excess waiters), not latency-bounded; a hard p99 belongs upstream via client timeout + retry. |
+| F-19 | **DOCUMENTED** | The settler module doc names the exposure window: seal interval + consensus inclusion, bounded by `MAX_PENDING_RETRIES`/`RESUBMIT_AFTER_TICKS`; the interval is config, sized against the venue's risk envelope. |
+| F-20 | **FIXED** | The parked-flag wakeup recovers poison via `into_inner` (the mutex is only touched when the consumer is parked); `senders.rs`'s poison contract holds. Part of the F-03 rewrite. |
+| F-21 | **FIXED** | `is_connected` deleted — real liveness probes on push/pop now; a dead consumer surfaces as `Disconnected` on the next exchange, not a tautological `true`. |
+| F-22 | **FIXED** | `capped_fillable` walks the active-level bitboard (the index-space accessors from F-09) instead of the dense ladder; the linear scan stays as the bench baseline. **82 ns vs 2.62 µs — ~32×** on a sparse 1,000-level book; equivalence tests cover caps/STP/partial fills. |
+| F-23 | **FIXED** | `RiskConfig` threads `ServerConfig` → `run_server_multi` → `MultiMarketMatcher::with_options` → `MarketWorker::run`; `oxide-matcher` exposes `--risk-max-*`; venue-scale defaults drop the human-scale 100 orders/s cap (upstream admission owns rate limits). |
+| F-24 | **FIXED** | `send_to_addr` + a reusable peer-id scratch on every broadcast loop (tx fanout, proposal/vote/QC/TC, sync); `msg.from` clones only where map insert needs ownership. |
+| F-25 | **FIXED** | `primitives::digest_map::DigestMap` buckets on the digest bytes directly — no SipHash on an already-hashed key; `preverify_cache` uses it; collision-correct by full-key eq. |
+| F-26 | **ACKNOWLEDGED** | Measured-in and gated; the leaf/qty split is a protocol-versioned change — profile first, deliberately untouched this pass. |
+
+### Verification-surfaced fix (landed this pass)
+
+Running the full suite surfaced a real defect the audit missed — an
+intermittent devnet fault-injection failure: `leader should propose`
+at the flush round, caused by the leader's mempool emitting an *empty*
+proposal when a live tx was queued. Root cause: `select` anchors at
+`executed_nonce + 1` and breaks on the first nonce missing from the
+local queue, but under pipelined consensus the missing nonces live in
+uncommitted ancestor blocks pooled by *other* leaders — a phantom gap
+no single validator can see. Fixed in `crates/mempool/src/lib.rs` with
+two bounded, per-block-expiring covers: `pending_commit` (nonces
+vacated by commit before the exec lane confirms — commit/execute clock
+skew under load) and `in_chain` (nonces observed in accepted proposals,
+fed by `Executor::process_proposal` on the vote path, TTL'd at 2× the
+in-flight window so dead branches un-bridge). Regression tests:
+`select_bridges_committed_unexecuted_gap`,
+`skipped_committed_nonce_unbridges_on_execution`,
+`select_bridges_in_flight_ancestor_gap`. The devnet suite passes
+repeatedly under full parallel load where it failed ~1-in-4.
+
+### Still open (by design, not oversight)
+
+- `lto = "full"` / `target-cpu=native` / PGO measurement — changes the
+  binary contract; deserves its own bench day against the gate suite.
+- `io_uring` for WAL + sockets — the syscall-boundary change on the
+  write path; the `O_DSYNC` fold already took the cheap half.
+- The end-to-end ingest→ack HDR histogram at the matcher edge — the
+  composed-path measurement, per F-13's never-per-order rule.
+- Huge pages for the arenas — `performance.numa_node` validates the
+  topology; the mmap/THP policy itself is a separate decision.

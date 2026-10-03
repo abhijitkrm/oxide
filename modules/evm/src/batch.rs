@@ -174,7 +174,9 @@ impl EvmModule {
                 }
                 let sender = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
                 let caller = alloy_primitives_address(sender.0);
-                Ok(PreverifiedTx { raw: raw.as_ref(), sender: caller })
+                // This function IS this node's ingest-time
+                // recovery — the flag's exact provenance meaning.
+                Ok(PreverifiedTx { raw: raw.as_ref(), sender: caller, verified_locally: true })
             })
             .collect()
     }
@@ -233,11 +235,20 @@ impl EvmModule {
         ctx: &TxContext,
         txs: &[PreverifiedTx<'_>],
     ) -> Vec<Result<Vec<Event>, ExecError>> {
-        // Phase 1: decode and re-recover the sender. RLP decode is
-        // ~79 ns/tx; secp256k1 recovery is ~30 µs/tx. We re-recover
-        // the sender and check it matches the pre-recovered value.
-        // A byzantine proposer cannot forge a sender — any mismatch
-        // is rejected before state transition.
+        // Phase 1: decode and resolve the caller. RLP decode is
+        // ~79 ns/tx; secp256k1 recovery is ~30 µs/tx. Provenance
+        // splits the work (hft-audit F-06):
+        //
+        // - `verified_locally` — the sender came from this node's
+        //   own ingest-time recovery (executor preverify cache, keyed
+        //   by a locally-computed tx hash over these exact bytes).
+        //   Re-recovery would only re-derive what was already proven;
+        //   skip it. Decode + chain-id still run — a tx must parse
+        //   and match this chain regardless of who verified it.
+        // - Otherwise — `pv.sender` is an unproven claim; recover
+        //   from the signature and compare. A byzantine proposer
+        //   cannot forge a sender: any mismatch is rejected before
+        //   state transition.
         let decoded: Vec<DecodedTx> = txs
             .par_iter()
             .map(|pv| {
@@ -245,18 +256,20 @@ impl EvmModule {
                 if signed.chain_id() != self.chain_id {
                     return Err(ExecError::Malformed);
                 }
-                // Re-recover the sender from the signature. This is
-                // the security gate: we do NOT trust `pv.sender`.
-                let recovered = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
-                let recovered_addr = alloy_primitives_address(recovered.0);
-                // Check the pre-recovered sender matches the
-                // signature-recovered sender. A mismatch means the
-                // proposer supplied a wrong sender — reject it.
-                if recovered_addr != pv.sender {
-                    return Err(ExecError::Malformed);
-                }
+                let caller = if pv.verified_locally {
+                    pv.sender
+                } else {
+                    // Unproven sender — the security gate: recover
+                    // and compare, reject any mismatch.
+                    let recovered = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
+                    let recovered_addr = alloy_primitives_address(recovered.0);
+                    if recovered_addr != pv.sender {
+                        return Err(ExecError::Malformed);
+                    }
+                    recovered_addr
+                };
                 let tx_hash = alloy_primitives::keccak256(pv.raw);
-                Ok((signed, recovered_addr, tx_hash, pv.raw.to_vec()))
+                Ok((signed, caller, tx_hash, pv.raw.to_vec()))
             })
             .collect();
 
@@ -653,8 +666,12 @@ impl EvmModule {
             return Vec::new();
         }
 
-        // Phase 1: decode and re-recover the sender. We do NOT
-        // trust `pv.sender` — a byzantine proposer could forge it.
+        // Phase 1: decode and resolve the caller — same provenance
+        // split as `handle_batch_preverified` (hft-audit F-06):
+        // `verified_locally` means this node already recovered the
+        // sender at ingest, so the ~30 µs/tx recovery inside
+        // `par_iter` is skipped; any other `pv.sender` is an
+        // unproven claim and is recovered-and-compared as before.
         let decoded: Vec<DecodedTx> = txs
             .par_iter()
             .map(|pv| {
@@ -662,15 +679,18 @@ impl EvmModule {
                 if signed.chain_id() != self.chain_id {
                     return Err(ExecError::Malformed);
                 }
-                // Re-recover the sender from the signature and
-                // check it matches the pre-recovered value.
-                let recovered = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
-                let recovered_addr = alloy_primitives_address(recovered.0);
-                if recovered_addr != pv.sender {
-                    return Err(ExecError::Malformed);
-                }
+                let caller = if pv.verified_locally {
+                    pv.sender
+                } else {
+                    let recovered = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
+                    let recovered_addr = alloy_primitives_address(recovered.0);
+                    if recovered_addr != pv.sender {
+                        return Err(ExecError::Malformed);
+                    }
+                    recovered_addr
+                };
                 let tx_hash = alloy_primitives::keccak256(pv.raw);
-                Ok((signed, recovered_addr, tx_hash, pv.raw.to_vec()))
+                Ok((signed, caller, tx_hash, pv.raw.to_vec()))
             })
             .collect();
 

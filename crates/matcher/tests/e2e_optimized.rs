@@ -380,7 +380,7 @@ async fn bench_ring_batch(n_orders: usize, n_accounts: usize, port: u16, batch_s
     for key in &keys {
         funded.fund_account(&owner_address(&key.verifying_key()), 1_000_000_000_000);
     }
-    let ring_matcher = Arc::new(matcher::RingMatcher::new(funded, 8, 8192));
+    let ring_matcher = Arc::new(matcher::RingMatcher::new(funded, 8, 8192, None));
     // The SharedMatcher is only used for the mutex path fallback in
     // the server (settlement isn't measured here).
     let tcp_matcher = Arc::clone(&matcher);

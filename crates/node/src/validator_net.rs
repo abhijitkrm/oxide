@@ -524,6 +524,18 @@ pub fn run(spec: ValidatorNetSpec) {
     // Drained from the engine's `certified_out` queue every loop.
     let mut sync_store = crate::block_sync::SyncStore::open(data_dir.as_deref());
 
+    // Pin the pump thread (hft-audit F-02): the loop below IS the
+    // consensus hot path — propose/vote/timeout handling serialized
+    // on this one thread. A failed pin degrades locality, never
+    // correctness: log and continue unpinned (topology is already
+    // validated at startup, so a failure here means the core went
+    // offline since boot).
+    if let Some(core) = node_config.consensus_core
+        && let Err(e) = primitives::pin::pin_current_thread(core)
+    {
+        eprintln!("{log_tag}: pin consensus pump to core {core} failed: {e} — running unpinned");
+    }
+
     // Run the consensus message pump loop until shutdown.
     run_consensus_loop(
         &mut engine,
@@ -739,6 +751,7 @@ fn to_transport_config(network: &config::NetworkConfig) -> p2p::tcp::TcpTranspor
         connect_timeout: network.connect_timeout(),
         read_timeout: network.read_timeout(),
         max_message_bytes: network.max_message_bytes,
+        socket_buffer_bytes: network.tcp_buffer_bytes,
         ..Default::default()
     }
 }
@@ -770,11 +783,33 @@ fn fanout_tx(
     let mut buf = Vec::with_capacity(1 + tx_bytes.len());
     buf.push(MSG_TX);
     buf.extend_from_slice(tx_bytes);
+    let mut peer_scratch = Vec::with_capacity(20);
     for addr in engine.validator_set().validator_addresses() {
         if *addr != our_addr {
-            let _ = transport.send(&addr.0.to_vec(), &buf);
+            send_to_addr(transport, &mut peer_scratch, addr, &buf);
         }
     }
+}
+
+/// Send `bytes` to the peer whose peer-id is the staking address
+/// `addr`, reusing `scratch` for the id (hft-audit F-24).
+///
+/// `Transport::send` takes `&PeerId` = `&Vec<u8>` (the id doubles as
+/// the peer-table lookup key), so `addr.0.to_vec()` used to allocate
+/// a fresh 20-byte Vec per peer per broadcast — committee-size
+/// allocations for every proposal, vote, QC, timeout and gossip
+/// frame. The scratch Vec is cleared and refilled per send: one
+/// allocation per broadcast loop total, and the caller amortizes it
+/// further by keeping the scratch alive across rounds.
+fn send_to_addr(
+    transport: &mut p2p::tcp::TcpTransport,
+    scratch: &mut Vec<u8>,
+    addr: &primitives::Address,
+    bytes: &[u8],
+) {
+    scratch.clear();
+    scratch.extend_from_slice(&addr.0);
+    let _ = transport.send(scratch, bytes);
 }
 
 /// The consensus message pump loop: proposes, votes, drains the
@@ -908,6 +943,19 @@ fn run_consensus_loop(
     let mut inject_nonce = tx_inject.as_ref().map(|i| app.executed_nonce_of(&i.sender));
     let mut inject_next = std::time::Instant::now();
 
+    // Reusable peer-id scratch for broadcast sends (F-24): `send`
+    // takes `&PeerId` = `&Vec<u8>`, so `addr.0.to_vec()` used to
+    // allocate a 20-byte Vec per peer per message — committee ×
+    // message-count allocations a pass. One scratch Vec, cleared
+    // and refilled per send, makes it one allocation per PUMP.
+    let mut peer_scratch: Vec<u8> = Vec::with_capacity(20);
+
+    // A frame the idle tail-wait popped — `recv_timeout` must consume
+    // a message to wake on it, so the woken frame is stashed here and
+    // Phase 3 processes it before draining the queue (F-01). Never
+    // holds more than one frame and never across a shutdown break.
+    let mut wake_msg: Option<ports::transport::InboundMessage> = None;
+
     loop {
         // Graceful shutdown: SIGINT/SIGTERM sets the flag, we break
         // cleanly so the transport can flush and the WAL can be
@@ -968,7 +1016,7 @@ fn run_consensus_loop(
                 proposal.encode(&mut buf);
                 for addr in engine.validator_set().validator_addresses() {
                     if *addr != our_addr {
-                        let _ = transport.send(&addr.0.to_vec(), &buf);
+                        send_to_addr(transport, &mut peer_scratch, addr, &buf);
                     }
                 }
             }
@@ -992,14 +1040,17 @@ fn run_consensus_loop(
                 // `leader` is a committee index into the live set.
                 if let Some(leader_addr) = engine.validator_set().validator_addresses().get(leader)
                 {
-                    let _ = transport.send(&leader_addr.0.to_vec(), &buf);
+                    send_to_addr(transport, &mut peer_scratch, leader_addr, &buf);
                 }
                 voted_views.insert(proposal_view);
             }
         }
 
-        // Phase 3: drain inbound transport messages.
-        while let Some(msg) = transport.recv() {
+        // Phase 3: drain inbound transport messages. `wake_msg`
+        // carries a frame the tail-wait already popped (a blocking
+        // receive must consume to wake — hft-audit F-01); it is
+        // processed first, then the queue drains non-blocking.
+        while let Some(msg) = wake_msg.take().or_else(|| transport.recv()) {
             if msg.bytes.is_empty() {
                 continue;
             }
@@ -1041,9 +1092,17 @@ fn run_consensus_loop(
                         // accounting stays simple and honest bursts
                         // (≤1 proposal per view per leader) sit far
                         // below the cap.
-                        let budget = proposal_verify_budget
-                            .entry(msg.from.clone())
-                            .or_insert((std::time::Instant::now(), 0));
+                        // `get_mut`-then-`entry` (F-24): the map is
+                        // committee-sized and long-lived, so nearly
+                        // every frame hits — `entry(msg.from.clone())`
+                        // would clone the peer id per FRAME to build
+                        // a key it then discards.
+                        let budget = match proposal_verify_budget.get_mut(&msg.from) {
+                            Some(b) => b,
+                            None => proposal_verify_budget
+                                .entry(msg.from.clone())
+                                .or_insert((std::time::Instant::now(), 0)),
+                        };
                         if budget.0.elapsed() >= std::time::Duration::from_secs(1) {
                             *budget = (std::time::Instant::now(), 0);
                         }
@@ -1620,7 +1679,7 @@ fn run_consensus_loop(
             qc.encode(&mut qc_buf);
             for addr in engine.validator_set().validator_addresses() {
                 if *addr != our_addr {
-                    let _ = transport.send(&addr.0.to_vec(), &qc_buf);
+                    send_to_addr(transport, &mut peer_scratch, addr, &qc_buf);
                 }
             }
             let _ = engine.deliver_qc(qc);
@@ -1696,7 +1755,7 @@ fn run_consensus_loop(
                 sig.encode(&mut buf);
                 for addr in engine.validator_set().validator_addresses() {
                     if *addr != our_addr {
-                        let _ = transport.send(&addr.0.to_vec(), &buf);
+                        send_to_addr(transport, &mut peer_scratch, addr, &buf);
                     }
                 }
                 // Self-collect: feed our own timeout signature to the
@@ -1716,7 +1775,7 @@ fn run_consensus_loop(
                     tc.encode(&mut tc_buf);
                     for addr in engine.validator_set().validator_addresses() {
                         if *addr != our_addr {
-                            let _ = transport.send(&addr.0.to_vec(), &tc_buf);
+                            send_to_addr(transport, &mut peer_scratch, addr, &tc_buf);
                         }
                     }
                     view_start = std::time::Instant::now();
@@ -1862,7 +1921,7 @@ fn run_consensus_loop(
                                 count: crate::block_sync::SYNC_PAGE_CAP,
                             },
                         ));
-                        let _ = transport.send(&addr.0.to_vec(), &buf);
+                        send_to_addr(transport, &mut peer_scratch, &addr, &buf);
                         sync_last_req = Some(std::time::Instant::now());
                         break;
                     }
@@ -1953,16 +2012,21 @@ fn run_consensus_loop(
             }
         }
 
-        // Yield to avoid busy-spinning when no messages are available.
-        // `transport.recv()` uses non-blocking `try_recv()`, so the loop
-        // would spin at 100% CPU without this sleep. A 1ms sleep keeps
-        // CPU usage near-zero while providing ~1ms message latency,
-        // 10x better than the previous `recv_timeout(10ms)` approach.
-        // The consensus hot path (propose -> vote -> QC) is message-driven:
-        // when messages arrive, `recv()` returns them immediately and
-        // the sleep is never reached. The sleep only fires when the
-        // transport is idle (waiting for the next network round).
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        // Idle wait — wakeup-capable, not a blind sleep (hft-audit
+        // F-01): `recv_timeout` parks on the inbound channel's
+        // condvar, so an arriving proposal/vote/QC wakes the pump
+        // THIS pass instead of up to a millisecond late — the sleep
+        // made every message pay up to 1ms of queue latency while
+        // claiming to be the fast path. The 1ms bound keeps the
+        // pacemaker, gossip drain, and sync cadence identical to the
+        // sleep it replaced: those duties need the loop to run on a
+        // ~ms quantum, and the timeout is exactly that quantum.
+        // A wait that ends with a frame stashes it in `wake_msg`;
+        // Phase 3 next pass processes it before draining — nothing
+        // popped to wake is ever dropped.
+        if wake_msg.is_none() {
+            wake_msg = transport.recv_timeout(std::time::Duration::from_millis(1));
+        }
     }
 }
 
@@ -2157,9 +2221,10 @@ fn on_verified_timeout(
             let mut tc_buf = Vec::with_capacity(1 + 200);
             tc_buf.push(MSG_TC);
             tc.encode(&mut tc_buf);
+            let mut peer_scratch = Vec::with_capacity(20);
             for addr in engine.validator_set().validator_addresses() {
                 if *addr != our_addr {
-                    let _ = transport.send(&addr.0.to_vec(), &tc_buf);
+                    send_to_addr(transport, &mut peer_scratch, addr, &tc_buf);
                 }
             }
             *view_start = std::time::Instant::now();

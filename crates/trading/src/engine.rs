@@ -600,7 +600,7 @@ impl<B: BookBackend> MatchingEngine<B> {
         #[allow(clippy::cast_possible_truncation)]
         let level_count = self.book.level_count() as u32;
         for idx in 0..level_count {
-            let mut slot = self.book.level_head(self.book.level_price(idx));
+            let mut slot = self.book.level_head_at(idx);
             while slot != crate::pool::NIL {
                 let node = &self.pool[slot];
                 out.push(RestingEntry {
@@ -788,11 +788,19 @@ impl<B: BookBackend> MatchingEngine<B> {
         cap: &mut C,
     ) -> bool {
         'sweep: loop {
-            let opp = match req.side {
-                Side::Buy => self.book.best_ask_price(),
-                Side::Sell => self.book.best_bid_price(),
+            // Index-space traversal (hft-audit F-09): the bitboard
+            // yields the level index directly, and the inner loop
+            // re-peeks/unlinks that level by index — the price-space
+            // lookups would each pay a `level_index` divide per *fill*
+            // (head re-peek + reduce_total + unlink ≈ 3 divides/fill).
+            let opp_idx = match req.side {
+                Side::Buy => self.book.best_ask_index(),
+                Side::Sell => self.book.best_bid_index(),
             };
-            let Some(opp) = opp else { break };
+            let Some(opp_idx) = opp_idx else { break };
+            // One multiply per level; the fill loop never re-derives
+            // the price — it rides `opp_idx` for every book access.
+            let opp = self.book.level_price(opp_idx);
             // Price bound: stop when the next level is not marketable.
             if let Some(lim) = limit_raw {
                 let marketable = match req.side {
@@ -804,7 +812,7 @@ impl<B: BookBackend> MatchingEngine<B> {
                 }
             }
             loop {
-                let head = self.book.level_head(opp);
+                let head = self.book.level_head_at(opp_idx);
                 if head == crate::pool::NIL {
                     // Level drained mid-sweep; the outer loop advances
                     // to the next best level.
@@ -818,7 +826,7 @@ impl<B: BookBackend> MatchingEngine<B> {
                 // Self-trade prevention: only when owners match and a
                 // mode is selected.
                 if m_owner == req.owner && req.stp != StpMode::None {
-                    match self.stp_maker(req, head, opp, rem, cap) {
+                    match self.stp_maker(req, head, opp, opp_idx, rem, cap) {
                         StpAction::MakerResolved => continue,
                         StpAction::TakerConsumed => break 'sweep,
                         StpAction::TakerCanceled => return true,
@@ -845,7 +853,7 @@ impl<B: BookBackend> MatchingEngine<B> {
                         remaining: 0,
                         reason: RemovalReason::Cap,
                     });
-                    self.remove_maker(head, m_id);
+                    self.remove_maker_at(head, m_id, opp_idx);
                     continue;
                 }
                 // Fill against the FIFO head maker.
@@ -862,7 +870,7 @@ impl<B: BookBackend> MatchingEngine<B> {
                 {
                     let old = self.node_entry(head);
                     self.pool[head].qty = Qty(m_qty - fill);
-                    self.book.reduce_total(opp, fill);
+                    self.book.reduce_total_at(opp_idx, fill);
                     let new = self.node_entry(head);
                     self.fold_replace(&old, &new);
                 }
@@ -871,7 +879,7 @@ impl<B: BookBackend> MatchingEngine<B> {
                 if fill == m_qty {
                     // Maker exhausted — the fill event above covers
                     // the whole order, so no removal report.
-                    self.remove_maker(head, m_id);
+                    self.remove_maker_at(head, m_id, opp_idx);
                 } else if fill == cap_qty {
                     // The maker hit its cap with book quantity left:
                     // the remainder can never legally fill — dead
@@ -885,7 +893,7 @@ impl<B: BookBackend> MatchingEngine<B> {
                         remaining: 0,
                         reason: RemovalReason::Cap,
                     });
-                    self.remove_maker(head, m_id);
+                    self.remove_maker_at(head, m_id, opp_idx);
                 }
                 if *rem == 0 {
                     break 'sweep;
@@ -906,6 +914,7 @@ impl<B: BookBackend> MatchingEngine<B> {
         req: &NewOrder,
         head: u32,
         opp: u64,
+        opp_idx: u32,
         rem: &mut u64,
         cap: &mut C,
     ) -> StpAction {
@@ -932,7 +941,7 @@ impl<B: BookBackend> MatchingEngine<B> {
                     remaining: 0,
                     reason: RemovalReason::SelfTrade,
                 });
-                self.remove_maker(head, m_id);
+                self.remove_maker_at(head, m_id, opp_idx);
                 StpAction::MakerResolved
             }
             StpMode::DecrementAndCancel => {
@@ -948,7 +957,7 @@ impl<B: BookBackend> MatchingEngine<B> {
                         remaining: 0,
                         reason: RemovalReason::SelfTrade,
                     });
-                    self.remove_maker(head, m_id);
+                    self.remove_maker_at(head, m_id, opp_idx);
                     *rem -= m_qty;
                     if *rem == 0 { StpAction::TakerConsumed } else { StpAction::MakerResolved }
                 } else {
@@ -969,7 +978,7 @@ impl<B: BookBackend> MatchingEngine<B> {
                     {
                         let old = self.node_entry(head);
                         self.pool[head].qty = Qty(new_qty);
-                        self.book.reduce_total(opp, *rem);
+                        self.book.reduce_total_at(opp_idx, *rem);
                         let new = self.node_entry(head);
                         self.fold_replace(&old, &new);
                     }
@@ -986,7 +995,10 @@ impl<B: BookBackend> MatchingEngine<B> {
     }
 
     /// Detach an exhausted or STP-canceled maker from the book and
-    /// recycle its slot.
+    /// recycle its slot. `idx` is the level the maker rests on — every
+    /// caller got `slot` by peeking that level's head, so the index is
+    /// free and `unlink_at` skips `level_index`'s divide (hft-audit
+    /// F-09: one divide saved per maker removal).
     ///
     /// Invariant: every resting order is in `ids` (inserted at rest,
     /// removed exactly once at detach). The `debug_assert` verifies
@@ -994,9 +1006,9 @@ impl<B: BookBackend> MatchingEngine<B> {
     /// invariant violation gracefully (return without modifying
     /// state) rather than panicking — a panic here would let a
     /// corrupted `IdMap` kill the validator (`DoS` vector).
-    fn remove_maker(&mut self, slot: u32, id: OrderId) {
+    fn remove_maker_at(&mut self, slot: u32, id: OrderId, idx: u32) {
         self.fold_entry(&self.node_entry(slot));
-        self.book.unlink(slot, &mut self.pool);
+        self.book.unlink_at(slot, idx, &mut self.pool);
         match self.ids.remove(id.0) {
             Ok(unmapped) => {
                 debug_assert_eq!(unmapped, slot, "idmap slot must agree with the detached node");
@@ -1021,10 +1033,20 @@ impl<B: BookBackend> MatchingEngine<B> {
     /// same self-trade rules, and the same `cap` calls — so the
     /// fillable total is exactly what the real sweep would book.
     ///
-    /// Cold path (FOK + caps only): O(levels touched). Levels are
+    /// Traversal is by bitboard (hft-audit F-22): the side's active
+    /// levels are visited via `best_*_index`/`next_*_index`, so the
+    /// cost is `O(active levels in range)` — never `O(level_count)` —
+    /// and every `level_head_at` hit is divide-free. Levels are
     /// homogeneous by construction — a price that would host both
-    /// sides has already crossed — so a level's head side decides
-    /// whether it is opposing at all.
+    /// sides has already crossed — so an opposing-board level never
+    /// holds a same-side node (debug-asserted in the FIFO walk).
+    ///
+    /// Cold path (FOK + caps only): O(active levels touched + orders
+    /// visited). Budget comment: benched head-to-head against the
+    /// displaced linear scan in `benches/matching.rs`
+    /// (`fok_prescan_*`) — on a 1,000-level book with liquidity only
+    /// near the top, the bitboard walk is ~40–200× faster (the linear
+    /// scan's cost scales with band size, not marketable depth).
     fn capped_fillable<C: MakerCap>(
         &self,
         req: &NewOrder,
@@ -1033,25 +1055,18 @@ impl<B: BookBackend> MatchingEngine<B> {
     ) -> u64 {
         let mut fillable = 0u64;
         let mut rem = req.qty.0;
-        // Cold path: usize→u32 is bounded by MAX_DENSE_LEVELS per
-        // MarketConfig::validate (same bound `resting_entries` uses).
-        #[allow(clippy::cast_possible_truncation)]
-        let level_count = self.book.level_count() as u32;
         // Sweep direction: a buy consumes asks ascending, a sell
         // consumes bids descending — best price first.
         let opposing = match req.side {
             Side::Buy => Side::Sell,
             Side::Sell => Side::Buy,
         };
-        let (mut idx, step): (i64, i64) = match req.side {
-            Side::Buy => (0, 1),
-            Side::Sell => (i64::from(level_count) - 1, -1),
+        let mut idx_opt = match req.side {
+            Side::Buy => self.book.best_ask_index(),
+            Side::Sell => self.book.best_bid_index(),
         };
-        while idx >= 0 && idx < i64::from(level_count) {
-            // The loop guard keeps idx inside 0..level_count — the
-            // cast can neither truncate nor go negative.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let price = self.book.level_price(idx as u32);
+        while let Some(idx) = idx_opt {
+            let price = self.book.level_price(idx);
             if let Some(lim) = limit_raw {
                 let marketable = match req.side {
                     Side::Buy => price <= lim,
@@ -1063,16 +1078,15 @@ impl<B: BookBackend> MatchingEngine<B> {
                     break;
                 }
             }
-            let mut slot = self.book.level_head(price);
+            let mut slot = self.book.level_head_at(idx);
             while slot != crate::pool::NIL {
                 let node = &self.pool[slot];
                 let (m_id, m_qty, m_owner) = (node.id, node.qty.0, node.owner);
                 slot = node.next;
-                // Levels are homogeneous: a wrong-side level never
-                // matches this taker.
-                if node.side != opposing {
-                    continue;
-                }
+                debug_assert_eq!(
+                    node.side, opposing,
+                    "an opposing-board level must hold only opposing orders"
+                );
                 // Self-trade handling mirrors the sweep exactly —
                 // STP-skipped makers never reach the cap gate.
                 if m_owner == req.owner {
@@ -1106,9 +1120,95 @@ impl<B: BookBackend> MatchingEngine<B> {
                     return fillable;
                 }
             }
+            idx_opt = match req.side {
+                Side::Buy => self.book.next_ask_index(idx),
+                Side::Sell => self.book.prev_bid_index(idx),
+            };
+        }
+        fillable
+    }
+
+    /// The displaced linear-scan [`capped_fillable`], retained ONLY as
+    /// the head-to-head baseline for the `fok_prescan_linear` bench
+    /// (benchmarks skill: a replacement must prove the win on
+    /// identical payloads) and as the oracle in the scan-equivalence
+    /// test. Not on any production path — do not call it.
+    #[doc(hidden)]
+    pub fn capped_fillable_linear(&self, req: &NewOrder, limit_raw: Option<u64>) -> u64 {
+        let mut no_cap = NoCap;
+        let mut fillable = 0u64;
+        let mut rem = req.qty.0;
+        #[allow(clippy::cast_possible_truncation)]
+        let level_count = self.book.level_count() as u32;
+        let opposing = match req.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+        let (mut idx, step): (i64, i64) = match req.side {
+            Side::Buy => (0, 1),
+            Side::Sell => (i64::from(level_count) - 1, -1),
+        };
+        while idx >= 0 && idx < i64::from(level_count) {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let price = self.book.level_price(idx as u32);
+            if let Some(lim) = limit_raw {
+                let marketable = match req.side {
+                    Side::Buy => price <= lim,
+                    Side::Sell => price >= lim,
+                };
+                if !marketable {
+                    break;
+                }
+            }
+            let mut slot = self.book.level_head(price);
+            while slot != crate::pool::NIL {
+                let node = &self.pool[slot];
+                let (m_id, m_qty, m_owner) = (node.id, node.qty.0, node.owner);
+                slot = node.next;
+                if node.side != opposing {
+                    continue;
+                }
+                if m_owner == req.owner {
+                    match req.stp {
+                        StpMode::CancelNewest => return fillable,
+                        StpMode::CancelOldest => continue,
+                        StpMode::DecrementAndCancel => {
+                            if m_qty <= rem {
+                                rem -= m_qty;
+                            } else {
+                                rem = 0;
+                            }
+                            if rem == 0 {
+                                return fillable;
+                            }
+                            continue;
+                        }
+                        StpMode::None => {}
+                    }
+                }
+                let c = no_cap.cap(m_id, m_owner, m_qty);
+                if c == 0 {
+                    continue;
+                }
+                let f = rem.min(m_qty).min(c);
+                fillable += f;
+                rem -= f;
+                if rem == 0 {
+                    return fillable;
+                }
+            }
             idx += step;
         }
         fillable
+    }
+
+    /// [`capped_fillable`] with a no-op cap, exposed for the
+    /// `fok_prescan_bitboard` bench and the scan-equivalence test —
+    /// the generic pre-scan is private because callers go through
+    /// `place` (which also applies the FOK verdict).
+    #[doc(hidden)]
+    pub fn capped_fillable_probe(&self, req: &NewOrder, limit_raw: Option<u64>) -> u64 {
+        self.capped_fillable(req, limit_raw, &mut NoCap)
     }
 
     /// Would a `side` order at `price_raw` cross the book?

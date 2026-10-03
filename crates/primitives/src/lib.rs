@@ -1033,6 +1033,217 @@ pub mod supervision {
             mark_exited(&actor);
         })
     }
+
+    /// [`spawn_supervised`] + optional core pinning (hft-audit
+    /// F-02): when `core` is `Some`, the actor's first action is
+    /// `pin::pin_current_thread` — a failed pin logs once and the
+    /// actor runs unpinned (locality is a performance property,
+    /// never a correctness one; startup validation in the config
+    /// layer is the fail-fast gate for bad topology).
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`spawn_supervised`].
+    pub fn spawn_supervised_pinned<F>(
+        name: &str,
+        critical: bool,
+        core: Option<u32>,
+        f: F,
+    ) -> std::io::Result<std::thread::JoinHandle<()>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let actor = name.to_string();
+        spawn_supervised(name, critical, move || {
+            if let Some(c) = core
+                && let Err(e) = crate::pin::pin_current_thread(c)
+            {
+                eprintln!("{actor}: pin to core {c} failed: {e} — running unpinned");
+            }
+            f();
+        })
+    }
+}
+
+/// Thread pinning and NUMA surface (hft-audit F-02).
+///
+/// Why this module is std-only: `primitives` is on every hot path
+/// and bound to the standard library — so pinning goes through
+/// `taskset(1)` (util-linux, present on every real distro) against
+/// the calling thread's `/proc/thread-self` TID instead of linking
+/// `libc::sched_setaffinity`. A subprocess per pin is a few hundred
+/// µs and runs exactly once per actor thread at startup — cold
+/// path by definition, so no syscall-wrapper `unsafe` enters the
+/// crate.
+///
+/// Non-Linux targets compile to no-ops: the config surface stays
+/// portable and the caller logs the skipped pin.
+pub mod pin {
+    /// Pin the calling thread to logical CPU `core` (Linux).
+    ///
+    /// Spawns `taskset -pc <core> <tid>` — the `-p` form applies the
+    /// mask to the *thread* whose TID `pid` names (taskset operates
+    /// on threads, not just processes). `Ok(())` on success; `Err`
+    /// carries stderr (missing `taskset`, invalid core) for the
+    /// caller to log — a failed pin degrades locality, never
+    /// correctness, so callers continue unpinned.
+    ///
+    /// # Errors
+    ///
+    /// `std::io::Error` if the thread id cannot be read, `taskset`
+    /// is absent, or the affinity set is rejected (offline core,
+    /// cgroup `cpuset` restriction).
+    #[cfg(target_os = "linux")]
+    pub fn pin_current_thread(core: u32) -> std::io::Result<()> {
+        let target = std::fs::read_link("/proc/thread-self")?;
+        let tid = target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.parse::<u32>().ok())
+            .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "could not parse /proc/thread-self tid",
+            )
+        })?;
+        let out = std::process::Command::new("taskset")
+            .args(["-pc", &core.to_string(), &tid.to_string()])
+            .output()?;
+        if out.status.success() {
+            return Ok(());
+        }
+        Err(std::io::Error::other(format!(
+            "taskset -pc {core} {tid} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
+
+    /// Non-Linux no-op — see the module doc.
+    #[cfg(not(target_os = "linux"))]
+    pub fn pin_current_thread(_core: u32) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Logical CPUs this process may run on (the `sched_getaffinity`
+    /// mask, not the machine total — cgroup/affinity restrictions
+    /// count, which is exactly the set a pin must target). Linux
+    /// reads `/sys/devices/system/cpu/online` (`"0-3,8-11"`); other
+    /// platforms fall back to `available_parallelism`.
+    #[cfg(target_os = "linux")]
+    pub fn online_cpus() -> u32 {
+        let mut count = 0u32;
+        if let Ok(s) = std::fs::read_to_string("/sys/devices/system/cpu/online") {
+            for part in s.trim().split(',') {
+                if let Some((lo, hi)) = part.split_once('-') {
+                    if let (Ok(lo), Ok(hi)) = (lo.parse::<u32>(), hi.parse::<u32>()) {
+                        count += hi - lo + 1;
+                    }
+                } else if part.parse::<u32>().is_ok() {
+                    count += 1;
+                }
+            }
+        }
+        if count == 0 {
+            // `usize`→`u32` saturates: a host past 4 billion logical
+            // CPUs reads as u32::MAX — an absurdity ceiling a pin
+            // validator compares against, not a correctness value.
+            count = std::thread::available_parallelism()
+                .map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX));
+        }
+        count
+    }
+
+    /// `available_parallelism` on non-Linux — the doc above applies.
+    #[cfg(not(target_os = "linux"))]
+    pub fn online_cpus() -> u32 {
+        // `usize`→`u32` saturates — see the Linux arm.
+        std::thread::available_parallelism()
+            .map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX))
+    }
+
+    /// Whether NUMA node `node` exists (Linux sysfs); always `true`
+    /// elsewhere — the field is informational off Linux.
+    #[cfg(target_os = "linux")]
+    pub fn numa_node_present(node: u32) -> bool {
+        std::path::Path::new(&format!("/sys/devices/system/node/node{node}")).is_dir()
+    }
+
+    /// Non-Linux: no sysfs to check — accept (the no-op surface is
+    /// documented on the module).
+    #[cfg(not(target_os = "linux"))]
+    pub fn numa_node_present(_node: u32) -> bool {
+        true
+    }
+}
+
+/// Map types for keys that are ALREADY cryptographic digests
+/// (hft-audit F-25).
+///
+/// `Hash` keys are BLAKE3-256 digests — uniformly distributed by
+/// construction. Running them through `HashMap`'s default `SipHash`
+/// re-derives uniformity the key already has: ~25–30 ns per lookup,
+/// twice per tx on the executor's preverify path and once per OCC
+/// read/write probe — pure waste. [`DigestHasher`] folds the key's
+/// first 8 bytes through one multiply-mix (~2 ns), which is all a
+/// uniform key needs.
+///
+/// **This hasher is NOT DoS-resistant by itself** — the property
+/// doing the work is that the keys are cryptographic digests, so an
+/// attacker cannot steer collisions without breaking the underlying
+/// hash. Never use it on attacker-chosen non-digest keys (IDs,
+/// strings, addresses that aren't hash-derived).
+///
+/// ```rust
+/// use primitives::digest_map::DigestMap;
+/// let mut m: DigestMap<u64> = DigestMap::default();
+/// m.insert(primitives::Hash::ZERO, 7);
+/// assert_eq!(m.get(&primitives::Hash::ZERO), Some(&7));
+/// ```
+pub mod digest_map {
+    use std::hash::{BuildHasherDefault, Hasher};
+
+    /// `Hasher` for digest-typed keys: folds the first 8 written
+    /// bytes through a Fibonacci multiply (`0x9E37…` spreads entropy
+    /// into the high bits hashbrown uses for SIMD tag matching, and
+    /// the low bits it uses for bucket index). Later writes are
+    /// folded in too, so the hasher stays correct (not merely fast)
+    /// if a composite key is ever hashed.
+    ///
+    /// For a 32-byte `Hash` the derive calls `write` once — one
+    /// load + one multiply per lookup.
+    #[derive(Default)]
+    pub struct DigestHasher(u64);
+
+    impl Hasher for DigestHasher {
+        #[inline]
+        fn finish(&self) -> u64 {
+            self.0
+        }
+
+        #[inline]
+        fn write(&mut self, bytes: &[u8]) {
+            for chunk in bytes.chunks(8) {
+                let mut b = [0u8; 8];
+                b[..chunk.len()].copy_from_slice(chunk);
+                // Fibonacci hashing constant — a full-width odd
+                // multiplier, the standard avalanche step.
+                self.0 =
+                    self.0.wrapping_add(u64::from_le_bytes(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            }
+        }
+    }
+
+    /// `BuildHasher` alias for [`DigestHasher`] — zero-sized,
+    /// constructible without state.
+    pub type DigestBuildHasher = BuildHasherDefault<DigestHasher>;
+
+    /// A `HashMap` keyed by [`crate::Hash`] with [`DigestBuildHasher`]
+    /// — drop-in replacement for `HashMap<Hash, V>` on digest-keyed
+    /// tables.
+    pub type DigestMap<V> = std::collections::HashMap<crate::Hash, V, DigestBuildHasher>;
+
+    /// A `HashSet` of [`crate::Hash`] with [`DigestBuildHasher`].
+    pub type DigestSet = std::collections::HashSet<crate::Hash, DigestBuildHasher>;
 }
 
 #[cfg(test)]

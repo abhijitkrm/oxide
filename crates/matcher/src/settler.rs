@@ -16,6 +16,20 @@
 //! [`SettleReport`] — the off-chain cache already reflects fills at
 //! `seal_batch` time, so an unlanded envelope is divergence, never
 //! a no-op.
+//!
+//! # Exposure window (hft-audit F-19)
+//!
+//! Batch settlement is deliberate amortization: the fill→settlement
+//! window is the seal interval (default 100 ms) plus consensus
+//! inclusion, and during that window the venue carries under-
+//! settlement risk — fills are accounted off-chain before the chain
+//! confirms them. The bound on that risk is the pending-envelope
+//! budget (`MAX_PENDING_RETRIES` × interval ≈ 6 s of retry backlog,
+//! `RESUBMIT_AFTER_TICKS` ≈ 10 s of outcome wait): past those, the
+//! lane stays pending and the *operator* holds the exposure, not
+//! the code. Operators size `batch_interval_ms` against their risk
+//! envelope; the interval is a config value, not a protocol
+//! constant.
 
 use std::sync::Arc;
 use std::time::Duration;

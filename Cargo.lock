@@ -3003,6 +3003,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "socket2",
  "thiserror",
 ]
 

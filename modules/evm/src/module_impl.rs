@@ -440,7 +440,11 @@ impl Module for EvmModule {
         results
             .into_iter()
             .map(|r| {
-                r.map(|pv| executor::PreverifiedTx { raw: pv.raw, sender: pv.sender.into_array() })
+                r.map(|pv| executor::PreverifiedTx {
+                    raw: pv.raw,
+                    sender: pv.sender.into_array(),
+                    verified_locally: pv.verified_locally,
+                })
             })
             .collect()
     }
@@ -476,6 +480,7 @@ impl Module for EvmModule {
             .map(|pv| PreverifiedTx {
                 raw: pv.raw,
                 sender: revm::primitives::Address::from(pv.sender),
+                verified_locally: pv.verified_locally,
             })
             .collect();
         // Call the inherent `handle_batch_preverified` (3 args).
@@ -509,6 +514,7 @@ impl Module for EvmModule {
             .map(|pv| PreverifiedTx {
                 raw: pv.raw,
                 sender: revm::primitives::Address::from(pv.sender),
+                verified_locally: pv.verified_locally,
             })
             .collect();
         // Call the inherent `handle_batch_parallel_preverified` (3 args).

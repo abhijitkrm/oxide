@@ -234,13 +234,71 @@ pub trait BookBackend {
     fn unlink(&mut self, slot: u32, pool: &mut OrderPool);
 
     /// Peek the FIFO head slot at `price_raw` (`NIL` if empty).
+    ///
+    /// Prefer [`BookBackend::level_head_at`] on the match loop: this
+    /// price-space lookup repeats the `level_index` divide on every
+    /// call, which is once per *fill* when the caller re-peeks after
+    /// each maker removal. Kept for cold paths (state iteration) and
+    /// callers that genuinely only know the price.
     fn level_head(&self, price_raw: u64) -> u32;
 
     /// Subtract `qty` (a fill amount) from the level's resting total.
+    ///
+    /// Prefer [`BookBackend::reduce_total_at`] on the match loop — same
+    /// divide-per-fill cost as [`BookBackend::level_head`].
     fn reduce_total(&mut self, price_raw: u64, qty: u64);
 
     /// Resting quantity aggregate at `price_raw` (L2 data).
     fn level_total(&self, price_raw: u64) -> u64;
+
+    // ── Index-space traversal (hot path) ──────────────────────────
+    //
+    // The match loop and FOK pre-scan walk the opposing side in *level
+    // index* space: bitboard extremum/iteration calls yield indices
+    // directly, so a sweep pays ONE `level_price` multiply per level
+    // and zero `level_index` divides per fill. Price-space lookups pay
+    // the divide (and a bounds branch) on every call — the wrong shape
+    // for an inner loop that re-peeks the same level after each fill.
+    //
+    // Precondition for every `idx` parameter: `idx` was produced by a
+    // bitboard call on the same side's board (`best_*_index`,
+    // `next_ask_index`, `prev_bid_index`) or is otherwise known < the
+    // level count. Feeding an out-of-range or wrong-side index is a
+    // logic error (debug-checked in `unlink_at`).
+
+    /// Highest active bid level index (`bids.highest()`), if any.
+    fn best_bid_index(&self) -> Option<u32>;
+
+    /// Lowest active ask level index (`asks.lowest()`), if any.
+    fn best_ask_index(&self) -> Option<u32>;
+
+    /// Next active ask index above `idx` — `None` exhausts the side.
+    fn next_ask_index(&self, idx: u32) -> Option<u32>;
+
+    /// Next active bid index below `idx` — `None` exhausts the side.
+    fn prev_bid_index(&self, idx: u32) -> Option<u32>;
+
+    /// FIFO head slot at level index `idx` (`NIL` if the level is
+    /// inactive). No divide: the index addresses `levels` directly.
+    fn level_head_at(&self, idx: u32) -> u32;
+
+    /// Resting quantity aggregate at level index `idx`.
+    fn level_total_at(&self, idx: u32) -> u64;
+
+    /// Subtract `qty` (a fill amount) from level `idx`'s resting
+    /// total. No divide — the per-fill cost the price-space
+    /// [`BookBackend::reduce_total`] paid.
+    fn reduce_total_at(&mut self, idx: u32, qty: u64);
+
+    /// Detach node `slot` from level `idx`, where `idx` MUST equal the
+    /// level the node rests on (the caller holds it from the sweep —
+    /// passing it skips `level_index`'s divide).
+    ///
+    /// # Panics
+    /// Debug builds assert `idx` matches the node's price. A mismatch
+    /// in release corrupts the level's head/tail/total — a caller bug,
+    /// not user input.
+    fn unlink_at(&mut self, slot: u32, idx: u32, pool: &mut OrderPool);
 
     /// Total quantity a `taker_side` order could fill given the
     /// current book, bounded by `limit_raw` (the order's limit; `None`
@@ -344,11 +402,24 @@ impl DenseBook {
     /// Called by both `pop_front` (head case) and `unlink` (arbitrary
     /// position); maintains total-qty and bitboard invariants.
     fn detach(&mut self, slot: u32, pool: &mut OrderPool) {
-        let (prev, next, price, side, qty) = {
+        let idx = self.level_index(pool[slot].price.0);
+        self.detach_at(slot, idx, pool);
+    }
+
+    /// [`detach`] with the level index supplied by the caller — the
+    /// match loop already holds it (it got `slot` from that level's
+    /// head), so re-deriving it would pay a divide per maker removal.
+    /// `idx` must equal `level_index(pool[slot].price)`; debug-checked.
+    fn detach_at(&mut self, slot: u32, idx: usize, pool: &mut OrderPool) {
+        let (prev, next, side, qty) = {
             let n = &pool[slot];
-            (n.prev, n.next, n.price.0, n.side, n.qty.0)
+            (n.prev, n.next, n.side, n.qty.0)
         };
-        let idx = self.level_index(price);
+        debug_assert_eq!(
+            idx,
+            self.level_index(pool[slot].price.0),
+            "unlink_at passed an index that is not the node's level"
+        );
         let level = &mut self.levels[idx];
         // Splice neighbors past the detached node.
         if prev == NIL {
@@ -447,6 +518,46 @@ impl BookBackend for DenseBook {
     #[inline]
     fn level_total(&self, price_raw: u64) -> u64 {
         self.levels[self.level_index(price_raw)].total_qty
+    }
+
+    #[inline]
+    fn best_bid_index(&self) -> Option<u32> {
+        self.bids.highest()
+    }
+
+    #[inline]
+    fn best_ask_index(&self) -> Option<u32> {
+        self.asks.lowest()
+    }
+
+    #[inline]
+    fn next_ask_index(&self, idx: u32) -> Option<u32> {
+        self.asks.next_after(idx)
+    }
+
+    #[inline]
+    fn prev_bid_index(&self, idx: u32) -> Option<u32> {
+        self.bids.prev_before(idx)
+    }
+
+    #[inline]
+    fn level_head_at(&self, idx: u32) -> u32 {
+        self.levels[idx as usize].head
+    }
+
+    #[inline]
+    fn level_total_at(&self, idx: u32) -> u64 {
+        self.levels[idx as usize].total_qty
+    }
+
+    #[inline]
+    fn reduce_total_at(&mut self, idx: u32, qty: u64) {
+        let level = &mut self.levels[idx as usize];
+        level.total_qty = level.total_qty.saturating_sub(qty);
+    }
+
+    fn unlink_at(&mut self, slot: u32, idx: u32, pool: &mut OrderPool) {
+        self.detach_at(slot, idx as usize, pool);
     }
 
     fn fillable_qty(&self, taker_side: Side, limit_raw: Option<u64>) -> u64 {

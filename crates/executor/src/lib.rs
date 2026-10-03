@@ -758,15 +758,20 @@ pub struct TxContext {
 /// The sender is recovered from the transaction's signature at
 /// mempool ingestion time (via `Module::preverify_batch`). The
 /// execution layer trusts this sender without re-verifying —
-/// skipping secp256k1 recovery on the block execution hot path.
+/// skipping secp256k1 recovery on the block execution hot path —
+/// but ONLY when [`PreverifiedTx::verified_locally`] proves the
+/// sender came from this node's own ingest recovery (hft-audit
+/// F-06).
 ///
 /// # Security
 ///
 /// The pre-recovered sender must come from a trusted source (the
-/// local mempool's `preverify_batch` call). A byzantine proposer
-/// could provide wrong senders, but this is detectable by state
-/// root comparison across validators. For production multi-validator
-/// deployment, pair this with verification sampling.
+/// local mempool's `preverify_batch` call). `verified_locally` is
+/// the load-bearing flag: it is set only where the cache key — a
+/// `Domain::Transaction` hash computed locally over these exact
+/// bytes — proves this node ran the recovery. A `false` flag keeps
+/// the module's recover-and-compare gate, so a fabricated sender
+/// from any other caller is still rejected.
 #[derive(Debug, Clone)]
 pub struct PreverifiedTx<'a> {
     /// The raw module payload bytes (e.g. RLP-encoded signed EVM tx),
@@ -775,6 +780,18 @@ pub struct PreverifiedTx<'a> {
     pub raw: &'a [u8],
     /// The sender recovered from the signature (20 bytes).
     pub sender: [u8; 20],
+    /// Provenance token for `sender` (hft-audit F-06): `true` iff the
+    /// sender came from THIS node's own ingest-time recovery — the
+    /// executor's preverify-cache drain is the only code that sets
+    /// it, and only when the cache key (a locally-computed
+    /// `Domain::Transaction` hash of `raw`) proves these exact bytes
+    /// were verified here. Consumers may then trust `sender` and
+    /// skip the ~30 µs secp256k1 recovery; every other caller must
+    /// leave it `false`, which keeps the module's defensive
+    /// recover-and-compare gate. Setting it on an unverified sender
+    /// silently misattributes execution — that is an in-process
+    /// contract violation, exactly like fabricating `sender` itself.
+    pub verified_locally: bool,
 }
 
 /// A module: a Cosmos-SDK-style state machine that handles messages.
@@ -901,7 +918,9 @@ pub trait Module: Send + Sync {
         &self,
         msgs: &'a [&'a [u8]],
     ) -> Vec<Result<PreverifiedTx<'a>, ExecError>> {
-        msgs.iter().map(|raw| Ok(PreverifiedTx { raw, sender: [0u8; 20] })).collect()
+        msgs.iter()
+            .map(|raw| Ok(PreverifiedTx { raw, sender: [0u8; 20], verified_locally: false }))
+            .collect()
     }
 
     /// Execute a batch of transactions with pre-recovered senders.
@@ -1362,7 +1381,11 @@ pub enum TxOutcome {
     /// partially succeeded.
     Executed {
         /// Events the module emitted for this tx (empty on `Err`).
-        events: Vec<Event>,
+        /// `Arc`-shared with the block event log (hft-audit F-08):
+        /// the outcome store and `Executor::events` hold the same
+        /// allocation — recording a result bumps a refcount instead
+        /// of deep-copying every event the tx emitted.
+        events: std::sync::Arc<[Event]>,
         /// The module's rejection, if it returned `Err`.
         error: Option<String>,
     },
@@ -1665,7 +1688,10 @@ pub struct Executor {
     /// blocking callers that attest a height the lane never saw.
     exec_sync: std::sync::Arc<(Mutex<ExecSync>, std::sync::Condvar)>,
     /// Pending events from the current block (cleared each block).
-    events: Mutex<Vec<Event>>,
+    /// Each entry is the `Arc<[Event]>` of one tx (or one module's
+    /// `end_block` output) — shared with the tx's [`TxOutcome`] so
+    /// the block log never deep-copies event payloads (F-08).
+    events: Mutex<Vec<std::sync::Arc<[Event]>>>,
     /// Pre-recovered senders, keyed by tx hash. Populated at
     /// `ingest_tx` time via `Module::preverify_batch`. Consumed at
     /// `execute_block` time to skip secp256k1 recovery on the
@@ -1679,7 +1705,7 @@ pub struct Executor {
     /// Only the recovered `sender` is stored — the payload bytes are
     /// re-borrowed from the block's tx at execution time, so no
     /// per-tx `Vec<u8>` is ever cloned into or out of this cache.
-    preverify_cache: Mutex<HashMap<Hash, [u8; 20]>>,
+    preverify_cache: Mutex<primitives::digest_map::DigestMap<[u8; 20]>>,
     /// Minimum batch size to use the parallel speculative execution
     /// path. Configurable via [`Executor::with_config`]. Default:
     /// [`DEFAULT_PARALLEL_THRESHOLD`] (32 txs). Lowered from 100
@@ -1771,6 +1797,13 @@ pub struct Executor {
     /// `None` = in-memory only (tests, sims, and throwaway nodes);
     /// nodes configured with a data directory always install it.
     durability: Option<durability::Durability>,
+    /// Logical CPU the exec lane pins to (`hft-audit` F-02) — the
+    /// whole finalized-block → state-root path runs on one thread,
+    /// so keeping it resident on one core stops cache thrash from
+    /// migrations. `None` = unpinned (default; dev/test never set
+    /// it). Validation (core in the online set) happens at config
+    /// load, not here.
+    exec_lane_core: Option<u32>,
 }
 
 mod app_iface;
@@ -1819,7 +1852,7 @@ impl Executor {
             )),
             events: Mutex::new(Vec::new()),
             tx_outcomes: Mutex::new(TxOutcomeStore::default()),
-            preverify_cache: Mutex::new(HashMap::new()),
+            preverify_cache: Mutex::new(primitives::digest_map::DigestMap::default()),
             parallel_threshold,
             recorder: None,
             mempool_intake_tx: intake_tx,
@@ -1835,6 +1868,7 @@ impl Executor {
             unsigned_tx_policy: UnsignedTxPolicy::Reject,
             history_retention: MAX_RETAINED_HISTORY,
             durability: None,
+            exec_lane_core: None,
         }
     }
 
@@ -1848,6 +1882,20 @@ impl Executor {
     #[must_use]
     pub fn with_chain_id(mut self, chain_id: u64) -> Self {
         self.chain_id = chain_id;
+        self
+    }
+
+    /// Pin the exec lane to logical CPU `core` (hft-audit F-02).
+    ///
+    /// The lane is the single writer for block execution → state
+    /// attestation; pinning stops the scheduler migrating it between
+    /// cores (cold L1/L2 on every hop). A failed pin logs and the
+    /// lane runs unpinned — locality is a latency property, never a
+    /// correctness one. Validate `core` against
+    /// `primitives::pin::online_cpus()` at config time.
+    #[must_use]
+    pub fn with_exec_lane_pin(mut self, core: Option<u32>) -> Self {
+        self.exec_lane_core = core;
         self
     }
 

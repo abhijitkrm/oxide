@@ -2592,7 +2592,7 @@ fn preverified_rejects_wrong_sender() {
     let wrong_addr = revm::primitives::Address::from_slice(&[0x99; 20]);
     let tampered: Vec<PreverifiedTx<'_>> = preverified
         .into_iter()
-        .map(|pv| PreverifiedTx { raw: pv.raw, sender: wrong_addr })
+        .map(|pv| PreverifiedTx { raw: pv.raw, sender: wrong_addr, verified_locally: false })
         .collect();
 
     // Execute: must reject the tampered sender.
@@ -2625,7 +2625,7 @@ fn preverified_parallel_rejects_wrong_sender() {
     let wrong_addr = revm::primitives::Address::from_slice(&[0x99; 20]);
     let tampered: Vec<PreverifiedTx<'_>> = preverified
         .into_iter()
-        .map(|pv| PreverifiedTx { raw: pv.raw, sender: wrong_addr })
+        .map(|pv| PreverifiedTx { raw: pv.raw, sender: wrong_addr, verified_locally: false })
         .collect();
 
     m.begin_block(Height::new(1));

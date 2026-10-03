@@ -21,7 +21,7 @@ use trading::{
 use crate::protocol::{
     self, ActionRequest, OrderAction, OrderRequest, OrderResponse, RejectReason,
 };
-use crate::risk::{RiskDecision, RiskEngine};
+use crate::risk::{RiskConfig, RiskDecision, RiskEngine};
 use crate::settlement::{
     LegCostAcc, LegId, NonceTracker, PRICE_SCALE, SettledFill, buy_reservation_refund,
     evict_gone_client_ids, fill_parties, gone_makers,
@@ -183,7 +183,15 @@ impl MultiMarketMatcher {
     /// create from the given config.
     #[must_use]
     pub fn new(configs: Vec<MarketConfig>, balances: Arc<AtomicBalanceCache>) -> Self {
-        Self::with_options(configs, balances, Arc::new(wall_clock_ms), protocol::CHAIN_ID, None)
+        Self::with_options(
+            configs,
+            balances,
+            Arc::new(wall_clock_ms),
+            protocol::CHAIN_ID,
+            None,
+            RiskConfig::default(),
+            None,
+        )
     }
 
     /// Create a multi-market matcher with a custom millisecond time
@@ -201,7 +209,15 @@ impl MultiMarketMatcher {
         balances: Arc<AtomicBalanceCache>,
         clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     ) -> Self {
-        Self::with_options(configs, balances, clock, protocol::CHAIN_ID, None)
+        Self::with_options(
+            configs,
+            balances,
+            clock,
+            protocol::CHAIN_ID,
+            None,
+            RiskConfig::default(),
+            None,
+        )
     }
 
     /// Create a multi-market matcher with a custom clock and chain
@@ -211,6 +227,9 @@ impl MultiMarketMatcher {
     /// `nonce_store_path` attaches the durable replay-gate checkpoint
     /// (see [`MatchingServer::set_nonce_store`]) — the SHARED tracker
     /// it guards covers all workers/markets.
+    /// `worker_base_core` pins worker `i` to `base + i` (hft-audit
+    /// F-02) — a documented stride so operators carve one disjoint
+    /// core per market; `None` runs workers unpinned.
     ///
     /// # Panics
     ///
@@ -224,6 +243,8 @@ impl MultiMarketMatcher {
         clock: Arc<dyn Fn() -> u64 + Send + Sync>,
         chain_id: u64,
         nonce_store_path: Option<std::path::PathBuf>,
+        risk_config: crate::RiskConfig,
+        worker_base_core: Option<u32>,
     ) -> Self {
         assert!(!configs.is_empty(), "must have at least one market");
         let num_markets = configs.len();
@@ -242,18 +263,24 @@ impl MultiMarketMatcher {
                 .attach_store(path);
         }
 
-        for cfg in configs {
+        for (i, cfg) in configs.into_iter().enumerate() {
             let (tx, rx) = std::sync::mpsc::channel::<MarketMessage>();
             let balances = Arc::clone(&balances);
             let nonces = Arc::clone(&nonces);
             let clock = Arc::clone(&clock);
             // Supervised per-market worker — non-critical: a dead
             // worker strands one market's book, not the process.
+            // Pinned when `worker_base_core` is set (hft-audit F-02):
+            // worker i lands on `base + i`, a documented stride so
+            // operators carve disjoint per-market cores. A base past
+            // the online set is caught by startup validation.
             let actor = format!("market-worker-{}", cfg.market_id);
-            let thread = primitives::supervision::spawn_supervised(&actor, false, move || {
-                MarketWorker::run(cfg, balances, nonces, clock, rx);
-            })
-            .expect("spawn market worker thread");
+            let pin = worker_base_core.map(|base| base + u32::try_from(i).unwrap_or(u32::MAX));
+            let thread =
+                primitives::supervision::spawn_supervised_pinned(&actor, false, pin, move || {
+                    MarketWorker::run(cfg, balances, nonces, clock, rx, risk_config);
+                })
+                .expect("spawn market worker thread");
             market_senders.push(tx);
             threads.push(thread);
         }
@@ -627,6 +654,7 @@ impl MarketWorker {
         nonces: Arc<std::sync::Mutex<NonceTracker>>,
         clock: Arc<dyn Fn() -> u64 + Send + Sync>,
         rx: std::sync::mpsc::Receiver<MarketMessage>,
+        risk_config: crate::RiskConfig,
     ) {
         let vcfg = cfg.validated().expect("market config must be valid");
         let engine = MatchingEngine::new(vcfg, DenseBook::new(vcfg).expect("book creation"))
@@ -635,7 +663,7 @@ impl MarketWorker {
             engine,
             balances,
             nonces,
-            risk: RiskEngine::with_defaults(),
+            risk: RiskEngine::new(risk_config),
             fills: Vec::with_capacity(64),
             settlement_batch: Vec::with_capacity(10_000),
             cost_acc: LegCostAcc::default(),

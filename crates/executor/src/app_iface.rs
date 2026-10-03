@@ -494,6 +494,17 @@ impl AppInterface for Executor {
                 };
             }
         }
+        // Record this proposal's nonce coverage in the mempool. Under
+        // pipelined consensus a block legitimately carries nonces this
+        // validator's pool never saw (each leader only pools its own
+        // submissions) — without the cover, `select` anchors at the
+        // local executed nonce, sees a gap where an ancestor carries
+        // the missing nonces, and proposes empty. Recorded only on the
+        // accept path so rejected-by-static-rules proposals can't grow
+        // the cover set; the map expires by height TTL in
+        // `refresh_anchors` if the covering branch never commits.
+        primitives::sync::lock_state(&self.mempool)
+            .note_in_chain(&proposal.txs, proposal.height.value());
         Verdict::Accept
     }
 
@@ -527,7 +538,8 @@ impl AppInterface for Executor {
         // inside `execute_block`) also covers the async lane: a
         // committed tx can never be re-proposed by a `prepare` that
         // runs while the worker is still draining the backlog.
-        primitives::sync::lock_state(&self.mempool).remove_committed(&block.txs);
+        primitives::sync::lock_state(&self.mempool)
+            .remove_committed(&block.txs, block.height.value());
         let lane_spawned = {
             let (lock, _cv) = &*self.exec_sync;
             primitives::sync::lock_state(lock).lane_spawned

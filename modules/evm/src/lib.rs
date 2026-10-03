@@ -239,8 +239,18 @@ pub struct PreverifiedTx<'a> {
     pub raw: &'a [u8],
     /// The sender recovered from the transaction's secp256k1
     /// signature by the mempool. The execution layer trusts this
-    /// address without re-verifying.
+    /// address without re-verifying when `verified_locally` is set.
     pub sender: revm::primitives::Address,
+    /// Provenance token (hft-audit F-06): `true` iff `sender` came
+    /// from THIS node's own ingest-time recovery — propagated from
+    /// `executor::PreverifiedTx::verified_locally`, which only the
+    /// executor's preverify-cache drain sets, and only for txs whose
+    /// locally-computed hash proves these exact bytes were verified
+    /// here. When set, the batch paths use `sender` directly and
+    /// skip the ~30 µs/tx secp256k1 re-recovery; when `false`, they
+    /// recover and compare — the defensive gate every non-executor
+    /// caller keeps.
+    pub verified_locally: bool,
 }
 
 /// An `eth_call` / `eth_estimateGas` request — the read-only
