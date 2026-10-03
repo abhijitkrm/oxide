@@ -10,6 +10,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ## [Unreleased]
 
+### Documentation
+
+- **Full system audit** (`docs/system-audit.md`): a four-dimension
+  review (security, performance, throughput, stability) of the whole
+  tree, prioritizing the surfaces no prior review had read (rpc,
+  indexer, statesync, broadcast, codec, runtime, supervision,
+  storage recovery). Verifies the hardening already in place and
+  files the remaining seams with a prioritized fix list: equivocation
+  evidence → staking slash is not automated (HIGH), venue egress is
+  unwired (withdraw + Ed25519↔secp256k1 key linkage, HIGH), the
+  order-entry gateway lacks TLS (MED), the `debug_trace*` RPC
+  namespace cannot be disabled (MED), and no kill-9-mid-commit
+  restart test exists.
+- **README refreshed**: status corrected to "Phases 0–3 complete,
+  Phase 4 in progress"; the hardening section no longer lists
+  landed work (C4 mutual TLS, C9 consensus WAL, Ceiling 4) as
+  remaining; Phase 3 marked complete with current measurements; a
+  Phase 4 section documents the fuzz campaign, chaos sim, TLA+
+  model, and fault-injection coverage; stale claims fixed (the
+  transport is the hand-rolled TCP+TLS stack, not commonware; the
+  workspace layout now matches the tree; MSRV 1.91; 2,048 tests).
+
 ### Measured
 
 - **HFT audit implementation pass** (`hft-audit.md` F-01–F-26):

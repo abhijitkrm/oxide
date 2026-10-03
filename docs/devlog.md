@@ -22636,3 +22636,70 @@ repeatedly where it used to fail ~1-in-4 runs. The richer
 `run_round` panic (engine state dump: view, next_height, high_qc,
 stored blocks, last_voted) stays — it is what made the flake
 diagnosable in minutes instead of hours.
+
+## Session: full system audit — security, performance, throughput, stability
+
+A post-HFT-audit pass over the whole tree (~170k LOC), prioritizing
+the surfaces no prior review had read: rpc, indexer, statesync,
+broadcast, codec, runtime, supervision, and the storage recovery
+path — plus re-checks of the security-critical seams. Result:
+`docs/system-audit.md`.
+
+### What the audit verified as strong
+
+- **rpc**: cost-weighted per-source rate limiting (batches pay per
+  element, `debug_trace*` pays its weight), per-IP in-flight caps, a
+  global work-permit semaphore, request timeouts, IPv6 /64 bucketing,
+  a bounded limiter map, and a connection cap that includes idle
+  keep-alives. The limiter cannot become the DoS.
+- **crypto**: PoP-gated BLS aggregation (the rogue-key defense),
+  `#[zeroize(drop)]` secret keys, DST-separated signing domains,
+  EIP-2 low-s + `{0,1}` recovery-id enforcement at the parse boundary.
+- **p2p**: TLS with client-cert verification against the peer-id map
+  (C4), signed-greeting `PeerAuth`, admission control at the
+  listener, bounded outbound queues, `max_message_bytes` below
+  allocation.
+- **statesync**: the trust anchor is a stake-supermajority
+  `ExecCertificate`; chunk hashes verify byte-for-byte before import;
+  the imported root must equal the certified root — fail closed.
+- **storage**: CRC-per-record journal, group commit, torn-tail
+  replay, height-indexed pruning that never deletes unindexed
+  segments, fault-injection crash tests.
+- **supervision**: actor registry, panic hook with critical-actor
+  abort, `/health` fail-closed on dead critical actors.
+
+### The four seams (findings, not bugs in what exists)
+
+1. **S1 (HIGH)** — consensus detects and stores equivocation
+   evidence, but nothing submits a Slash to staking: the economic
+   deterrent is theoretical. Fix: evidence → system-signed Slash
+   pipeline + a multinode double-sign test.
+2. **S2 (HIGH)** — venue egress is unwired: `handle_withdraw_base`
+   returns "withdraw requires ledger wiring", and the
+   Ed25519↔secp256k1 key linkage (protocol.rs's tracked gap) does
+   not exist. Deposits only, today. Fix: one "venue egress
+   authorization" workstream.
+3. **S3 (MED)** — the matcher's FIX/WS listeners are plain TCP. Fix:
+   rustls at the gateway or a validated loopback-only startup check.
+4. **S4 (MED)** — `debug_trace*` is unconditionally public. Fix: a
+   namespace allowlist, default off for debug.
+
+Plus: no kill-9-mid-commit restart test (the recovery path exists,
+unexercised under real crash timing); the 7-day soak and external
+review remain the open Phase 4 gates; leader-egress at target TPS
+(proposals carry full bodies) needs measurement before the testnet
+designs tx-by-hash proposals; and the deferred perf list (full LTO /
+target-cpu / PGO bench day, io_uring, huge pages, F-26 fold split)
+is unchanged.
+
+### README refresh
+
+Status corrected (Phases 0–3 complete, Phase 4 in progress), the
+roadmap table and hardening section updated (C4/C9/Ceiling-4 are
+landed, not "remaining"), Phase 3 marked complete with current
+measurements, a Phase 4 section added (fuzz/chaos/TLA+/fault
+injection), the stale `commonware-p2p` transport claim fixed (the
+shipped transport is the hand-rolled TCP+TLS stack), the workspace
+layout synced with reality (matcher, indexer, statesync, metrics,
+devnet, config; no `state/` crate), MSRV corrected to 1.91, and the
+test count updated (2,048).
