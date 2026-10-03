@@ -22311,3 +22311,36 @@ recovery (~30 µs/tx) that the preverify cache exists to avoid.
 Enforced throughput floors sit 5–24× below claims/measurements, so
 the audit recommends ratcheting gates. Fix order and required
 benches are listed in the audit's remediation plan.
+
+## HFT audit validation pass (F-01…F-19 re-verified; F-20/F-21 filed)
+
+Every finding in `hft-audit.md` was re-verified against the source at
+`87d63b5` by reading the cited code rather than trusting the original
+pass. The delta from the audited `e98bf2f` is docs-only, so line
+citations were expected to hold — each was re-checked anyway, and the
+"absence" claims (pinning/NUMA, socket-buffer sizing) were re-proven
+by repo-wide grep. Result: 19/19 confirmed, none implemented, four
+sharpened: the validator pump's sleep comment disproves itself (the
+sleep is the loop's last statement and runs after every pass, so the
+"+1 ms" tax applies to messages arriving mid-pass too); the matcher
+wakeup is one `Mutex<bool>` shared by all 512 order+response rings
+(`RingMatcher::new`), not the per-ring atomic its doc claims; the
+parallel EVM path additionally copies every payload
+(`pv.raw.to_vec()` per tx, `batch.rs`) inside the same fix window as
+the re-recovery tax; and the `tps_rw` bench's own documented gate
+(">1,000 tx/s") sits three orders of magnitude under the ≥1 GG/s
+headline it would enforce — so the gate ratchet should target a
+committed baseline, not that floor.
+
+Two new findings. **F-20**: the shared `Wakeup` panics on poison
+(`.expect`) where `primitives::sync`'s documented contract classifies
+a bool latch as independently consistent and mandates recovery — a
+poison would cascade panics into every connection's push path; the
+`production-rust` §8 "always recovery" text also contradicts the
+`primitives::sync` panic-for-state contract (same reconcile-the-skill
+class as F-17), and `spawn_supervised` never respawns — critical-actor
+death surfaces only via `/health`. **F-21**: `SpscSender::is_connected`
+is dead code whose predicate is a tautology (`!is_empty() || len <
+capacity` is true in every state for capacity ≥ 1); delete it (the
+F-03 ring rewrite removes it anyway). No remediation priority changes:
+F-01 stays the highest-value single fix, F-03 the most strategic.

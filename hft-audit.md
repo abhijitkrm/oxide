@@ -1,6 +1,11 @@
 # Oxide — HFT / Low-Latency Engineering Audit
 
 **Revision audited:** `e98bf2f` (post gate-6 conformance work), working tree clean.
+**Validation pass:** `87d63b5` (docs-only delta from the audited revision:
+`docs/devlog.md` + this file — all cited code line numbers re-checked
+line-by-line and unchanged), 2026-10-04. **Result: 19/19 findings
+CONFIRMED, none yet implemented**; verdicts and per-finding evidence in
+§7. Two new findings filed (F-20, F-21).
 **Date:** 2026-10-04.
 **Scope:** hot paths of the matching/trading stack, consensus/validator
 loop, executor + EVM execution, p2p transport, storage journal,
@@ -54,6 +59,11 @@ design" claim is a short list of precise, fixable items:
 | F-17 | Info | Rounding wording: code is half-up everywhere (documented); skill text says "banker's" — reconcile the skill text | `crates/primitives/src/lib.rs:501-542` |
 | F-18 | Info | `acquire_ring` starvation under saturation is documented behavior — acceptable, but it is a venue-fairness SLO decision | `crates/matcher/src/lib.rs:1235-1239` |
 | F-19 | Info | Settlement exposure window: 100 ms default batch interval between fill and on-chain settlement | `crates/matcher/src/settler.rs:190,338-358` |
+| F-20 | Low | Shared `Wakeup` panics on poison where the repo's own poison contract mandates recovery; supervision registers but never restarts | `crates/matcher/src/ring.rs:67-71,81-88` |
+| F-21 | Low | `SpscSender::is_connected` is dead code with a tautological predicate — it can never return `false` | `crates/matcher/src/ring.rs:218-223` |
+
+All 21 findings re-verified against source at `87d63b5` — per-finding
+verdicts and evidence in §7.
 
 The single highest-value fix is **F-01** (one-line shape change with a
 1 ms p99 win on every inbound consensus message). The single most
@@ -680,3 +690,166 @@ saturation test with a stalled reader — new).
 - The audit assumes the production wiring in `bin/oxide-validator` and
   `bin/oxide-matcher`; alternate embedders (tests, sims) may configure
   different ring counts/thresholds than the defaults cited here.
+
+---
+
+## 7. Validation pass (2026-10-04, revision `87d63b5`)
+
+**Method.** Every finding was re-verified against the source tree at
+`87d63b5`. The only delta from the audited `e98bf2f` is docs-only
+(`docs/devlog.md`, this file), so all original line citations were
+expected to hold — each was nevertheless re-checked by reading the
+cited code, plus repo-wide greps for the "absence" claims (F-02, F-10).
+No finding was accepted on the original audit's authority alone.
+
+**Result: 19/19 CONFIRMED** (four with precision notes in §7.2 that
+sharpen the original), **0 refuted, 0 yet implemented. Two new
+findings filed** (F-20, F-21, §7.3).
+
+### 7.1 Verdicts
+
+| Finding | Verdict | Key re-checked evidence |
+|---|---|---|
+| F-01 | **CONFIRMED** | `validator_net.rs:1965` — unconditional `std::thread::sleep(Duration::from_millis(1))` as the last statement of the pump loop (loop head `:911`, drain `while let Some(msg) = transport.recv()` at `:1002`); the preceding comment (`:1956-1964`) is self-contradicting (§7.2.1) |
+| F-02 | **CONFIRMED** | repo-wide grep `numa|sched_setaffinity|core_affinity|pin_to_core|set_thread_affinity`: **zero hits in `crates/`** — only README/skills/devlog/hft-audit prose; the devlog itself admits it: "CPU pinning \| Not done \| Requires `core_affinity` crate" (`docs/devlog.md:7746`, `:7826`); threads are named-only `std::thread::Builder` spawns (`primitives/src/lib.rs:1031`) |
+| F-03 | **CONFIRMED** | `ring.rs:33` + `:181` — `crossbeam_channel::bounded` (MPMC); the module doc concedes it at `:114-118` ("only 'SPSC' by convention"); `Wakeup::signal` = `Mutex<bool>` lock + `notify_one` (`:67-71`), invoked from `push` on **every** successful push (`:202-209`) while its own doc claims "a single atomic store + `notify_one`" (`:59-61`); the wakeup is shared by **all** order and response rings (`lib.rs:1082,1094-1096` — one `shared_wakeup`), making it the order path's single shared serialization point; defaults 256×8192 confirmed (`server.rs:942-945`) |
+| F-04 | **CONFIRMED (latent)** | `lib.rs:1126-1139` — on `Full`, `pending = returned; std::hint::spin_loop();` with no bound; exits only on `Ok`/`Disconnected`. Latent because of the lease invariant (one batch pushed, one response popped, lease dropped at `server.rs:140`) — an invariant enforced nowhere in code, only by convention across every current and future transport |
+| F-05 | **CONFIRMED (latent)** | `market_data.rs:254-288` — `serde_json::to_string` (`:255`), global `lock_state(&self.subscribers)` (`:256`), `json.clone()` per matching subscriber (`:278`), full `retain` walk per publish; `publish_l2` takes `Vec<(u64, u64)>` by value (`:232`). Grep `publish_l1|publish_trades|publish_l2|publish_l3` across `crates/`: matches **only** in `market_data.rs` (module doc `:24` + tests `:380-527`) — zero production call sites |
+| F-06 | **CONFIRMED** | `batch.rs:656-675` — "We do NOT trust `pv.sender`"; `signed.recover_sender()` per tx inside `par_iter` (`:667`). Cost source: `executor/src/lib.rs:884-886` ("the single most expensive per-tx operation, ~30 µs/tx"). Serial contrast: `module_impl.rs:448-453` ("skips secp256k1 recovery entirely"). Threshold: `config/src/lib.rs:476-478` (`default_parallel_threshold() == 100`); routing at `exec.rs:393-394`. The preverify cache is even *consumed* (`remove`) at `exec.rs:385` — the recovered sender is handed to the parallel path, which then re-derives it anyway. Plus one more per-tx tax found in re-verification (§7.2.3) |
+| F-07 | **CONFIRMED** | grep `ParallelScheduler`: only `occ.rs` (impl + tests) and `benches/uniswap_transfer.rs:277` — no production call site. Doc/impl mismatch: `:39-40` "using rayon's thread pool" vs `:309-311`/`:335-349` `std::thread::scope` ("a full rayon-based version arrives with the rayon dependency"). Per-`schedule()` spawns + `Vec<Mutex<Vec<R>>>` (`:331-349`); result clone on flatten (`:354`, `R: Clone` bound at `:315`); write-value clones (`:266`, `:272`); `reads: HashSet<OccKey>` with the default SipHash hasher over keccak-derived 32-byte keys (`:124-129`, `Hash` derived at `:67`) |
+| F-08 | **CONFIRMED** | `exec.rs:618` `block_events.extend(events.iter().cloned())` (deep copy of every event); the same events are then stored twice — inside `TxOutcome::Executed { events }` (`:619`) *and* the block log (`:535` `lock_state(&self.events).extend(block_events)`); `Event { data: Vec<u8> }` at `executor/src/lib.rs:1303-1312`. Minor extra: `format!("{e}")` allocates on the error path (`:621`) |
+| F-09 | **CONFIRMED** | `engine.rs:790-807` — sweep takes the opponent level as a raw **price** (`:791-794`) then calls `level_head(opp)` per level iteration (`:807`); `book.rs:379-387` — `best_bid_price`/`best_ask_price` convert the bitboard's level **index** to a price (`min_price + idx * tick`), discarding the index; `book.rs:437-439` — `level_head` recomputes `level_index(price_raw)`; `book.rs:334` — `offset / tick_size` integer division per swept level |
+| F-10 | **CONFIRMED** | grep `set_recv_buffer|set_send_buffer|RCVBUF|SNDBUF` across `crates/`: **zero**. `set_nodelay(true)` correctly present at `tcp.rs:1556,1630,1806,1845,2598,2643` |
+| F-11 | **CONFIRMED** | `tcp.rs:243-254` — `TlsWriteHalf { conn: Arc<Mutex<rustls::Connection>>, wire: Arc<Mutex<TcpStream>> }`, wire-before-conn lock order documented (`:203-211`, `:250-253`); `tls_contention.rs:13` "~4 µs vs ~3.4 µs solo", `:15` "Informational only — no hard gate" |
+| F-12 | **CONFIRMED** | enforced asserts: `trading_throughput.rs:157-162` (raw engine ≥ 1M ops/s) and `:230-235` (settlement ≥ 100k ops/s), run nightly (`nightly.yml:145-151`, `THROUGHPUT_TRADES=1_000_000`); `tps_rw.rs` has **no** throughput assertion — its only assert is behavioral (`:594` "probe txs must succeed"). Recorded measurements `devlog.md:6920-6921`: raw engine 38.1M orders/s, settlement 2.37M orders/s → enforced floors sit **38×/24×** below the last measurements. See §7.2.4 |
+| F-13 | **CONFIRMED** | `metrics/src/lib.rs:101-113` — `histograms.entry(op.to_string())` allocates a `String` per record (even on the existing-key path) under a global `Mutex<HashMap<String, Histogram>>`. Call sites verified per-block/per-RPC only: `app_iface.rs:365` (prepare_proposal), `:659` (finalize_block), `:687`/`:728` (attest_state), `rpc/endpoints.rs:912` (rpc_send_raw_tx) |
+| F-14 | **CONFIRMED** | `tcp.rs:166-183` — fresh `Vec::with_capacity(total)` per batched `write_frames` call; `server.rs:165-172` — `submit_one_ring` → `submit_batch_ring(ring, ring_counter, vec![req])` |
+| F-15 | **CONFIRMED** | `server.rs:116` (push-retry) and `:132` (response-wait) — `tokio::task::yield_now().await` loops on tokio workers |
+| F-16 | **CONFIRMED** | `alloc_accounting.rs:8-20` — self-documents the per-message `HashMap<String, String>` / owned-`String` allocations and states "Informational only — no gate" |
+| F-17 | **CONFIRMED** | `primitives/src/lib.rs:501-542` — "rounding **half-up**" documented on both division ops, ties round upward, "fixed here, once, for the whole codebase"; `performance-first/SKILL.md:41` says "divide with banker's-mode rounding" — the skill text is wrong relative to the code |
+| F-18 | **CONFIRMED** | `lib.rs:1235-1239` — verbatim: "a busy matcher can starve an unlucky waiter under sustained saturation. That is the intended bound" |
+| F-19 | **CONFIRMED** | `settler.rs:190` ("At the default 100 ms settle interval"); `interval_ms` parameter (`:346-358`); `MAX_PENDING_RETRIES = 60` → ~6 s (`:188-200`); `RESUBMIT_AFTER_TICKS = 100` → ~10 s (`:202-207`) |
+| F-20 | **NEW** | filed this pass — §7.3 |
+| F-21 | **NEW** | filed this pass — §7.3 |
+
+### 7.2 Precision notes from re-verification
+
+1. **F-01 — the comment disproves itself.** The block at
+   `validator_net.rs:1956-1964` correctly states the facts (`recv()`
+   is non-blocking `try_recv()`; "A 1ms sleep keeps CPU usage near-zero
+   while providing ~1ms message latency") and then draws a false
+   conclusion: "when messages arrive, `recv()` returns them immediately
+   and the sleep is never reached." The sleep is the loop's last
+   statement and is reached after **every** pass, including passes
+   that processed messages — so a message arriving mid-pass also waits
+   out the remainder of the 1 ms before the *next* intake. The
+   comment's own "~1ms message latency" admission is the accurate
+   description. Note the loop body itself acknowledges the shape of
+   the fix: the matcher sequencer (`lib.rs:1172-1181`) and the exec
+   lane (`lane.rs:72-84`) already block on a wakeup/condvar instead.
+
+2. **F-03 — the wakeup is worse than documented, and fully shared.**
+   `RingMatcher::new` builds **one** `shared_wakeup`
+   (`lib.rs:1082`) and hands it to every order ring *and* every
+   response ring (`:1094-1096`) — 512 rings, one `Mutex<bool>`. Every
+   successful push on any connection locks it. Under concurrent
+   submitters this is a genuine contended lock + potential futex on
+   the order handoff, not the "single atomic store" its doc claims
+   (`ring.rs:59-61`). This strengthens the F-03 remediation: the
+   parked-flag protocol is not just an optimization, it removes a
+   cross-connection serialization point.
+
+3. **F-06 — an additional per-tx tax on the same path.** The parallel
+   decode phase also heap-copies every payload:
+   `batch.rs:673` — `pv.raw.to_vec()` inside the `par_iter` map (the
+   serial preverified path borrows the block bytes,
+   `exec.rs:381-387`). ~100–200 B memcpy + one allocation per tx,
+   dwarfed by the ~30 µs recovery but the same fix window: a
+   proof-token design that trusts locally-recovered senders can also
+   carry borrowed bytes for already-ingested txs.
+
+4. **F-12 — the tps_rw bench's own documented gate is weaker than the
+   headline.** `tps_rw.rs:9-15` documents "Simple transfer TPS:
+   > 1,000 tx/s" as its acceptance gate — three orders of magnitude
+   below the ≥1 GG/s claim quoted in the README. So the headline
+   number is not merely unenforced (the original audit's point); the
+   bench that would enforce it carries a gate 1000× looser than the
+   claim. A ratchet (§5, item 8) should assert against a committed
+   baseline, not against this floor.
+
+### 7.3 New findings
+
+#### F-20 — Shared `Wakeup` panics on poison where the repo's own contract mandates recovery **[Low]**
+
+**Location:** `crates/matcher/src/ring.rs:67-71` (`signal`),
+`:81-88` (`wait`) — `.expect("wakeup mutex poisoned")` on the shared
+flag mutex.
+
+**Evidence.** The codebase has a *documented* poisoned-mutex contract
+(`primitives/src/lib.rs:749-795`): state mutexes panic on poison
+("halting is the only safe response" — torn financial/consensus state),
+but recovery is explicitly legitimate "with the per-key/per-entry
+invariant documented at the type — for structures like the matcher's
+sparse balance overflow (each account word is independently meaningful
+and every op touches it atomically)." A single `bool` wakeup latch is
+the canonical independently-consistent value — the supervision
+registry itself recovers poison for exactly this style of reason
+(`lib.rs:914-923`). The `Wakeup` uses panic-on-poison instead.
+
+**Impact.** If the flag mutex ever poisons (a panic while a thread
+holds it inside `wait`/`signal`), every subsequent `push()` on all 512
+rings panics in `signal()` — converting one thread's fault into a
+venue-wide panic cascade across every connection handler's tokio task.
+The probability is low (the critical sections are a bool store and
+condvar ops), which is why this is Low — but the fix is one line and
+the repo's own contract already adjudicates it.
+
+**Recommendation.** Use
+`lock().unwrap_or_else(std::sync::PoisonError::into_inner)` for the
+flag in both `signal` and `wait` (sound per `lib.rs:775-778`), or
+remove the question entirely via F-03's parked-atomic protocol.
+Related doc debt, same class as F-17: `production-rust` skill §8
+mandates "always recovery", while `primitives::sync` mandates
+panic-for-state — reconcile the two texts so the next contributor
+doesn't have to rediscover which applies. Also worth one clarifying
+sentence in the supervision docs: `spawn_supervised`
+(`primitives/src/lib.rs:1021-1035`) only registers actors and marks
+their death — there is **no in-process respawn**; critical-actor death
+surfaces via `/health` (`unhealthy_critical`, `lib.rs:957-966`), and
+the exec-lane comment "fail fast so the supervisor restarts"
+(`lane.rs:60-63`) means the *operator/process-level* watchdog, not
+anything in-process.
+
+#### F-21 — `SpscSender::is_connected` is dead code with a tautological predicate **[Low]**
+
+**Location:** `crates/matcher/src/ring.rs:218-223`.
+
+**Evidence.** The body is
+`!self.tx.is_empty() || self.len() < self.capacity`. For any ring with
+capacity ≥ 1 this is true in every state: empty → the second disjunct
+(`0 < capacity`); non-empty → the first. It can never return `false`,
+so it cannot detect the one condition its doc claims ("Returns `true`
+if the consumer half is still alive"). Underlying reason:
+crossbeam 0.5 exposes no receiver-disconnect probe that doesn't
+consume a value — the file itself notes this at `:266-269`. Grep
+confirms **zero callers** — the helper is dead.
+
+**Recommendation.** Delete it. If a disconnect probe is genuinely
+needed later, implement it honestly: an `Arc<AtomicBool>` (or
+`Arc<()>` weak-pair) shared by both halves, cleared by the receiver's
+`Drop`, so `is_connected` has a real false case — and add the unit
+test the current shape would fail. A liveness predicate that cannot
+return `false` is exactly the helper that gets adopted blindly.
+
+### 7.4 Remediation deltas
+
+- No priority changes: F-01 remains the highest-value single fix;
+  F-03 the most strategic.
+- F-20 joins **Phase C** (hygiene) — one-line poison-recovery on the
+  flag, plus the skill-text reconciliation with F-17.
+- F-21 is a trivial deletion; fold into any ring.rs touch (it is the
+  same file as F-03's rewrite, which will delete or replace it).
+- F-06's fix window now also covers the per-tx `pv.raw.to_vec()` copy
+  (§7.2.3); its re-bench (tps_rw before/after) should capture both.
+- F-12's ratchet should target a committed baseline file, not the
+  tps_rw bench's own 1k-tx/s floor (§7.2.4).
