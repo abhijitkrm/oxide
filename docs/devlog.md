@@ -22344,3 +22344,36 @@ is dead code whose predicate is a tautology (`!is_empty() || len <
 capacity` is true in every state for capacity ≥ 1); delete it (the
 F-03 ring rewrite removes it anyway). No remediation priority changes:
 F-01 stays the highest-value single fix, F-03 the most strategic.
+
+## HFT audit second pass — optimization review (F-22…F-26)
+
+A re-read of the per-order/per-tx/per-message paths with a pure
+nanosecond-and-throughput lens (engine/book/pool/bitboard/idmap,
+matcher service + risk, vote path, transport, build config). The §4
+strengths held: no allocation, lock, or syscall in the match loop
+itself. Five new findings. **F-22 (High)**: `capped_fillable` walks
+the entire 2^18-level dense ladder with an integer division per level
+— the FOK pre-scan for STP CancelNewest/DecrementAndCancel or any
+capped (reduce-only) FOK costs ~1.5–3 ms on a sparse book, on the
+shared sequencer thread, while its doc claims "O(levels touched)";
+the sibling scans (`fillable_qty`, `sweep_cost`) already iterate the
+bitboard in O(active levels) — the fix is the same index-space
+accessors F-09 introduces. **F-23 (Medium)**: the production matcher
+hardcodes `RiskEngine::with_defaults()` — 100 orders/s and 1000
+resting per account, no config surface, no per-account override —
+three to four orders of magnitude under the venue's own chain-wide
+gate; the rate limiter is also a SipHash HashMap + timestamp deque
+per order (a 64-bit sliding bitmap is alloc-free). **F-24 (Low)**:
+per-message heap copies on the transport path (`bytes.to_vec()` per
+send, per-frame inbound Vec, per-peer address Vec per unicast).
+**F-25 (Low)**: `preverify_cache` SipHashes already-keccak'd keys
+twice per tx on the live dispatch path — full-key fast hasher, never
+a truncated key (a collision would execute under a wrong sender).
+**F-26 (Info)**: the resting-commitment fold costs 2–3 leaf hashes
+per filled maker — measured-in and gated, but a leaf/qty split could
+make fills fold-free; protocol-versioned change, profile first.
+Plus a system-level enablement checklist in the audit (§8.3): core
+isolation + pinning, spin-then-park idle knobs, huge pages for
+arenas, `lto = "full"`/target-cpu/PGO measurement, io_uring, and one
+end-to-end ingest→ack HDR histogram so the composed-path taxes stop
+being visible only via microbench arithmetic.

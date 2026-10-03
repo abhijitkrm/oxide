@@ -6,6 +6,10 @@
 line-by-line and unchanged), 2026-10-04. **Result: 19/19 findings
 CONFIRMED, none yet implemented**; verdicts and per-finding evidence in
 §7. Two new findings filed (F-20, F-21).
+**Second pass:** same day, revision `a809136` — optimization-focused
+re-review of the per-order / per-tx / per-message paths with a pure
+nanosecond-and-throughput lens (§8): five new findings (F-22–F-26) and
+a system-level enablement checklist.
 **Date:** 2026-10-04.
 **Scope:** hot paths of the matching/trading stack, consensus/validator
 loop, executor + EVM execution, p2p transport, storage journal,
@@ -61,6 +65,11 @@ design" claim is a short list of precise, fixable items:
 | F-19 | Info | Settlement exposure window: 100 ms default batch interval between fill and on-chain settlement | `crates/matcher/src/settler.rs:190,338-358` |
 | F-20 | Low | Shared `Wakeup` panics on poison where the repo's own poison contract mandates recovery; supervision registers but never restarts | `crates/matcher/src/ring.rs:67-71,81-88` |
 | F-21 | Low | `SpscSender::is_connected` is dead code with a tautological predicate — it can never return `false` | `crates/matcher/src/ring.rs:218-223` |
+| F-22 | **High** | FOK pre-scan with caps/STP walks the entire 2^18-level dense ladder — one integer division per level, ms-scale, on the shared sequencer thread | `crates/trading/src/engine.rs:1028-1112` |
+| F-23 | Medium | Production matcher hardcodes human-scale risk limits (100 orders/s/account, 1000 resting) with no config surface — per-account ceiling orders of magnitude below the venue's own gates | `crates/matcher/src/multimarket.rs:638`, `crates/matcher/src/risk.rs:76-92` |
+| F-24 | Low | Per-message heap allocation on the transport path (outbound copy per send, inbound Vec per frame, per-peer address Vec per unicast) | `crates/p2p/src/tcp.rs:1992`, `crates/node/src/validator_net.rs:971,995` |
+| F-25 | Low | `preverify_cache` SipHashes already-keccak'd 32-byte keys, twice per tx, on the live dispatch path | `crates/executor/src/exec.rs:372-385` |
+| F-26 | Info | Resting-commitment fold costs 2–3 leaf hashes (~320–480 ns) per filled maker — measured-in, but a leaf/qty split could make fills fold-free (protocol-versioned change; profile first) | `crates/trading/src/engine.rs:862-868,998` |
 
 All 21 findings re-verified against source at `87d63b5` — per-finding
 verdicts and evidence in §7.
@@ -853,3 +862,223 @@ return `false` is exactly the helper that gets adopted blindly.
   (§7.2.3); its re-bench (tps_rw before/after) should capture both.
 - F-12's ratchet should target a committed baseline file, not the
   tps_rw bench's own 1k-tx/s floor (§7.2.4).
+
+---
+
+## 8. Second-pass optimization review (nanosecond / throughput lens)
+
+**Scope.** A re-read of the true per-order, per-tx, and per-message
+paths — trading engine + book internals (`engine.rs`, `book.rs`,
+`pool.rs`, `bitboard.rs`, `idmap.rs`), the matcher service
+(`multimarket.rs`, `risk.rs`, `protocol.rs`, `balance.rs`), the
+consensus vote path (`engine/votes.rs`), the transport recv/send path
+(`tcp.rs`), and the release build config — looking for what a
+second pair of nanosecond-scale eyes finds beyond §3. Five new
+findings; the previously verified strengths (§4) held up under the
+closer look and are not repeated here.
+
+### F-22 — FOK pre-scan with caps/STP walks the entire dense ladder, one integer division per level **[High]**
+
+**Location:** `crates/trading/src/engine.rs:1028-1112`
+(`capped_fillable`).
+
+**Evidence.** The FOK pre-scan has three implementations, and they are
+not equally shaped:
+
+- `fillable_qty` (`book.rs:452-487`) and
+  `fillable_qty_excluding_owner` (`book.rs:489-544`) iterate the
+  **bitboard** — `lowest()` then `next_after()`/`prev_before()` —
+  O(active levels in range), as their trait docs claim.
+- `capped_fillable` (`engine.rs:1046-1110`) iterates **every level
+  index linearly** — `idx` from `0` to `level_count` (buys) or the
+  reverse (sells) — calling `level_price(idx)` (a multiply,
+  `book.rs:603-605`) and then `level_head(price)` → `level_index` →
+  `offset / tick_size` (**an integer division per level**,
+  `book.rs:334`) on *every* level, populated or not. The early
+  `break` fires only when a `limit_raw` bound is passed
+  (`:1055-1065`) — a **market FOK (`limit_raw = None`) never breaks**,
+  so it walks the full ladder.
+
+**Reachability.** `capped_fillable` is the pre-scan for (a) every FOK
+with `StpMode::CancelNewest`/`DecrementAndCancel`
+(`engine.rs:501-503`) and (b) every FOK under a non-trivial
+`MakerCap` (`:505-511`) — e.g. any venue wiring reduce-only orders.
+
+**Impact.** `MAX_DENSE_LEVELS = 2^18` (`bitboard.rs:55`); a sparse
+book (10²–10³ populated levels — the normal case) still costs
+~262,144 iterations × (division + multiply + two loads) ≈ **1.5–3 ms
+per FOK order**, on the single sequencer thread that serves *all*
+markets — 5,000–10,000× the 300 ns single-level match budget, and a
+one-client latency hazard for everyone sharing the thread. The doc
+comment claims "Cold path (FOK + caps only): O(levels touched)"
+(`:1024`) — the implementation is O(*all* levels), not O(levels
+touched); the comment is wrong in exactly the way F-01's was.
+
+**Recommendation.** Iterate the bitboard exactly as `fillable_qty`
+does (`lowest`/`next_after` for buys, `highest`/`prev_before` for
+sells) and consult the FIFO per visited level — identical visit
+order, empty levels skipped for free. This needs the index-space
+accessors F-09 already introduces (`level_head_by_index`); the
+`node.side != opposing` check disappears (a bitboard is single-sided
+by construction). Add a bench: FOK pre-scan against a 10-order book
+in a 2^18-level market — gate p99 < 5 µs — and re-run the FOK rows
+with F-09's change.
+
+### F-23 — Production matcher hardcodes human-scale risk limits; no config surface **[Medium]**
+
+**Location:** `crates/matcher/src/multimarket.rs:638`
+(`risk: RiskEngine::with_defaults()`); `crates/matcher/src/risk.rs:76-92`.
+
+**Evidence.** The wired production matcher constructs its risk engine
+with hardcoded defaults: `max_orders_per_second: 100` (comment:
+"generous for a human trader; HFT clients can request a higher limit"
+— `risk.rs:79-81`) and `max_resting_per_account: 1000`. The module
+doc says thresholds "can be tuned per-market or per-account in future
+versions" (`:29-30`) — that mechanism does not exist, and the
+construction site takes no `RiskConfig` parameter at all.
+
+**Impact.** Every account is capped at **100 orders/s** and 1000
+resting orders by the matcher that actually serves orders — three to
+four orders of magnitude below the venue's own ≥1M orders/s
+chain-wide gate. A 64-trader bench fleet tops out at ~6,400 orders/s
+aggregate before the matching engine is ever the bottleneck; the
+headline throughput numbers are all measured on paths that bypass
+this engine (raw-engine benches, consensus load tests). The risk
+engine is also a per-order cost on the hot path with an allocation
+shape the skills forbid: a SipHash `HashMap<[u8; 20],
+VecDeque<u64>>` lookup plus a `VecDeque` push of a millisecond
+timestamp per order (`risk.rs:111`, `:125-140`).
+
+**Recommendation.**
+1. Thread `RiskConfig` through the matcher/node config (TOML) with
+   HFT-scale defaults — `0` (unlimited) at the matcher tier; the
+   chain's admission path already rate-limits, and a gateway-tier
+   limit of 100/s is an operator decision, not a hardcoded one.
+2. Per-account tiers when the need is real (the doc already promises
+   them).
+3. Replace the timestamp deque with a 64-bit sliding-window bitmap
+   (1 bit per ms, two words, zero heap, no SipHash on the steady
+   path — the account's slot can live next to its balance-cache
+   registration).
+4. Bench the risk path (it runs per order) and add it to the
+   alloc-accounting harness.
+
+### F-24 — Per-message heap allocation on the transport path **[Low]**
+
+**Location:** `crates/p2p/src/tcp.rs:1992` (`bytes.to_vec()` per
+outbound send); the reader thread's per-frame inbound `Vec`; and
+`crates/node/src/validator_net.rs:971,995` (`addr.0.to_vec()` per
+unicast destination).
+
+**Evidence.** Every outbound message is copied into a fresh `Vec` to
+cross the outbound channel (`:1987-1992` — the comment says "Clone
+the bytes into a Vec for the channel"); every inbound frame is a
+fresh `Vec` from the reader thread; and the validator pump materializes
+a peer-address `Vec` per destination per message.
+
+**Impact.** At the current 1 s view cadence and small committees this
+is noise — but it is exactly the allocation class the hot-path rules
+forbid, and broadcast fan-out multiplies it (a proposal to N peers =
+N address Vecs + N payload Vecs; the 50–100 ms cadence target makes
+it 20× more relevant).
+
+**Recommendation.** A peer-address table (unicast by handle, not by
+owned `Vec<Address>` bytes) and a reusable frame-buffer pool (or
+ref-counted `Bytes`-style slices) so the channel moves ownership
+without copying. Measure with the alloc-accounting harness; this is
+a batch-with-F-03-style refactor, not urgent.
+
+### F-25 — `preverify_cache` SipHashes already-hashed keys, twice per tx, on the live path **[Low]**
+
+**Location:** `crates/executor/src/exec.rs:372`
+(`HashMap<Hash, [u8; 20]>`), `:374` (`contains_key`), `:385`
+(`remove`).
+
+**Evidence.** `Hash` is a 32-byte keccak digest; the std default
+hasher runs SipHash-1-3 over all 32 bytes on every lookup, and the
+dispatch path does two lookups per tx (the `all_cached` probe plus
+the `remove`), every block. This is the same class as F-07's
+`HashSet<OccKey>` finding — but F-07 is bench-only and this one is on
+the production dispatch path.
+
+**Recommendation.** Swap in a fast hasher over the **full** 32-byte
+key (FxHash-class; the keys are uniformly distributed keccak output).
+Do **not** truncate the key to a `u64`/`nohash` — the cache maps
+`tx_hash → sender`, and a truncated-key collision would return a
+*wrong sender* and execute a tx under someone else's identity: a
+silent consensus divergence. Full-key + fast hasher has no such
+failure mode. Expected win is tens of ns/tx — trivial next to F-06's
+30 µs, but free to take in the same PR.
+
+### F-26 — The resting-commitment fold costs 2–3 leaf hashes per filled maker **[Info — design note, profile first]**
+
+**Location:** `crates/trading/src/engine.rs:862-868`
+(`fold_replace` — two hashes per qty change), `:998` (`remove_maker`
+— one more on detach).
+
+**Evidence.** Every fill that changes a maker's remaining qty folds
+the old leaf and the new leaf (~2 × 160 ns); a maker exhausted by the
+fold folds a third time on removal. The folded bench rows sit inside
+the match gates, so this cost is *measured-in*, not a regression —
+but at 2–3 hashes per maker-fill it is the same order of magnitude as
+the entire rest of the match step.
+
+**Recommendation.** Only if flamegraphs show the fold dominating the
+folded benches (the skill's profile-before-optimize rule): split the
+leaf into an identity part (`id, side, price, owner` — stable for the
+slot's life, hashable **once** at rest) and a qty part committed via
+the block's fill log (already hashed per block). The fold then costs
+one hash per membership change and zero per fill. Tradeoff: the
+commitment preimage changes — a protocol-versioned change with
+snapshot compatibility, not a patch. Do not reach for this before the
+profile says so; the current shape is honest and gated.
+
+### 8.3 System-level enablement — making the whole node ns-class
+
+The engine numbers are nanosecond-class; whether a *node* behaves
+that way is decided by the layers around it. In priority order:
+
+1. **Core isolation + pinning (F-02, the prerequisite).** Pin the
+   matcher sequencer, exec lane, and consensus pump to isolated cores
+   (`isolcpus`/`nohz_full`), steer NIC IRQ affinity away from those
+   cores, and first-touch every arena from its pinned thread. Without
+   this, every number above inherits scheduler jitter.
+2. **Idle discipline.** Replace every fixed 1 ms condvar timeout (the
+   pump — F-01; the matcher's `wait_for_work(1ms)`,
+   `lib.rs:1180`) with event-driven wakeup plus an optional
+   spin-then-park budget (`--idle-spin-us`: default 0 on shared
+   machines; ~50–100 µs on pinned rigs). Spin-then-park is the
+   standard tail-latency tradeoff; make it a knob, not a religion.
+3. **Huge pages for the arenas.** `OrderPool` at 2^20 × 64 B is
+   64 MiB per market; 2 MiB pages cut TLB misses on the FIFO walks.
+   The skill already specs the graceful fallback; nothing implements
+   it yet.
+4. **Build config.** The release profile is already right
+   (`lto = "thin"`, `codegen-units = 1`, `overflow-checks = true` —
+   keep the overflow checks; the documented money-arithmetic
+   reasoning is correct and the cost is paid where it matters).
+   Measure `lto = "full"` on the gate benches (+1–3% typical), build
+   rig binaries with `-C target-cpu=native`, and treat the nightly
+   gate workloads as a ready-made PGO training set.
+5. **io_uring for WAL + sockets.** The WAL's `O_DSYNC` fold already
+   minimized per-append syscalls; io_uring removes the remaining
+   blocking/thread boundary on the write path and the reader poll on
+   the socket path. The skill lists it; nothing implements it yet.
+6. **One end-to-end latency histogram.** The µs-class taxes (F-03,
+   F-04, F-22, F-23) are currently visible only by arithmetic across
+   microbenches. Wire a single ingest→ack HDR sample per batch at the
+   matcher edge (per F-13's rule: never per-order) so regressions in
+   the composed path surface in one place.
+
+### 8.4 Second-pass summary
+
+The per-order engine path remains the strongest code in the repo —
+the closer look found no allocation, lock, or syscall in the match
+loop itself (the zero-validation/zero-allocation discipline of
+`place` → `sweep` holds; `FillEvent` is `Copy` into a caller buffer;
+the pool, bitboard, and idmap are exactly as claimed in §4). What the
+second pass adds is one genuine hot-path bug (F-22 — an unoptimized
+scan mislabeled cold, on the shared sequencer thread), one
+throughput-ceiling misconfiguration (F-23), and a set of small,
+free wins (F-24, F-25) plus the system checklist that turns
+nanosecond components into a nanosecond node.
