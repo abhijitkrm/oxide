@@ -2102,6 +2102,12 @@ impl OxideBft {
         proposal.encode(&mut body_bytes);
         let body_commitment =
             types::shard::commitment(&body_bytes, self.validator_set.n(), self.erasure_k());
+        // The direct path's body binding: one BLAKE3 pass over the
+        // same canonical encoding the commitment covers. Both fields
+        // ride the signed header — a validator holding the full body
+        // verifies with the cheap hash; the dispersed path keeps the
+        // commitment its shard proofs root into.
+        let body_hash = crypto::hash::Hasher::hash_one(crypto::hash::Domain::BodyHash, &body_bytes);
         let mut header = BlockHeader {
             height,
             view: self.current_view,
@@ -2109,6 +2115,7 @@ impl OxideBft {
             prev_block,
             tx_root,
             body_commitment,
+            body_hash,
             high_qc: self.high_qc.as_ref().map(|v| v.qc().clone()),
             // Embed the TC that brought us into this view, if any
             // (spec §view-changes: "the next leader embeds the TC in
@@ -2272,7 +2279,14 @@ impl OxideBft {
         }
         let mut buf = Vec::new();
         proposal.encode(&mut buf);
-        if types::shard::commitment(&buf, n, k) != header.body_commitment {
+        // Same split as the direct path: the BLAKE3 body hash when
+        // the header carries it, the erasure commitment otherwise.
+        let body_ok = if header.body_hash == Hash::ZERO {
+            types::shard::commitment(&buf, n, k) == header.body_commitment
+        } else {
+            crypto::hash::Hasher::hash_one(crypto::hash::Domain::BodyHash, &buf) == header.body_hash
+        };
+        if !body_ok {
             return Err(ConsensusError::BodyRejected { block_hash });
         }
         match self.app.process_proposal(proposal) {

@@ -347,6 +347,50 @@ fn supply_body_rejects_commitment_mismatch() {
     follower.supply_body(hash, &proposal).expect("duplicate supply is a no-op");
 }
 
+/// The direct path's body binding uses the header's BLAKE3
+/// `body_hash` when present (the fast path — one hash pass instead
+/// of a Reed-Solomon encode) and the erasure commitment otherwise
+/// (synthetic headers). Both bindings must reject a tampered body.
+#[test]
+fn body_hash_binding_rejects_tampered_body_and_falls_back() {
+    let mut leader = make_multi_engine(0);
+    let mut follower = make_multi_engine(1);
+    leader.submit_tx(TxBytes::new(vec![7]));
+    let (header, proposal) = leader.propose().expect("leader proposes");
+    // The propose path stamps the fast-path hash — non-ZERO.
+    assert!(
+        header.body_hash != primitives::Hash::ZERO,
+        "propose must stamp body_hash for the direct-path fast binding"
+    );
+    let hash = OxideBft::block_hash(&header);
+    // Park the body slot — `supply_body` needs the header to have
+    // arrived (the existing commitment-mismatch test does the same).
+    assert!(follower.vote_header(&header).is_some(), "header notarizes");
+
+    // Tampered body rejected under the fast binding.
+    let mut wrong = proposal.clone();
+    wrong.txs = vec![TxBytes::new(vec![8])];
+    assert!(matches!(follower.supply_body(hash, &wrong), Err(ConsensusError::BodyRejected { .. })));
+
+    // A synthetic header with NO body_hash falls back to the
+    // erasure commitment — the same tamper must still reject.
+    let mut legacy = header.clone();
+    legacy.body_hash = primitives::Hash::ZERO;
+    let legacy_hash = OxideBft::block_hash(&legacy);
+    let mut legacy_follower = make_multi_engine(2);
+    assert!(legacy_follower.vote_header(&legacy).is_some(), "legacy header notarizes");
+    assert!(matches!(
+        legacy_follower.supply_body(legacy_hash, &wrong),
+        Err(ConsensusError::BodyRejected { .. })
+    ));
+
+    // The genuine body is accepted on both paths.
+    follower.supply_body(hash, &proposal).expect("genuine body accepted (fast path)");
+    legacy_follower
+        .supply_body(legacy_hash, &proposal)
+        .expect("genuine body accepted (commitment fallback)");
+}
+
 /// A notarized header keeps the block eligible for all
 /// header-level rules while its body propagates: with bodies
 /// supplied every round, the dispersed path commits identically
@@ -1167,6 +1211,7 @@ fn leapfrog_qc_commits_full_ancestor_chain() {
             proposer_signature: None,
             exec_cert: None,
             body_commitment: Hash::ZERO,
+            body_hash: Hash::ZERO,
         };
         let proposal = Proposal {
             height: header.height,
@@ -1603,6 +1648,7 @@ fn vote_rejects_proposal_from_wrong_proposer() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     // Even with a valid signature from key 2, the proposer field
     // doesn't match the expected leader (0), so vote() rejects.
@@ -1644,6 +1690,7 @@ fn vote_rejects_proposal_with_missing_signature() {
         proposer_signature: None, // missing
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     assert!(
         follower.vote(&header, &proposal).is_none(),
@@ -1678,6 +1725,7 @@ fn vote_rejects_proposal_with_forged_signature() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let forged_sk = bls_key(3);
     let signing_hash = OxideBft::proposal_signing_hash(&header);
@@ -1724,6 +1772,7 @@ fn vote_memoises_rejected_proposal() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let forged_sk = bls_key(3);
     let signing_hash = OxideBft::proposal_signing_hash(&header);
@@ -1865,6 +1914,7 @@ fn proposal_known_distinguishes_authentic_from_forged() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let signing_hash = OxideBft::proposal_signing_hash(&forged);
     forged.proposer_signature =
@@ -1909,6 +1959,7 @@ fn proposal_admissible_gates_window_and_leader() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
 
     // In-window edges: [50−10, 50+32] = [40, 82] with the correct
@@ -1955,6 +2006,7 @@ fn vote_header_memoises_rejected_proposal() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let signing_hash = OxideBft::proposal_signing_hash(&header);
     header.proposer_signature =
@@ -2855,6 +2907,7 @@ fn tail_fork_rejects_proposal_without_high_qc() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let vote = engine.vote(&header, &proposal);
     assert!(vote.is_none(), "fork proposal without high_qc must be rejected");
@@ -2894,6 +2947,7 @@ fn tail_fork_rejects_proposal_with_wrong_high_qc() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let vote = engine.vote(&header, &proposal);
     assert!(
@@ -2939,6 +2993,7 @@ fn tail_fork_accepts_proposal_extending_high_qc() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let vote = engine.vote(&header, &proposal);
     assert!(vote.is_some(), "proposal extending high_qc must be accepted");
@@ -2993,6 +3048,7 @@ fn tail_fork_accepts_proposal_with_newer_high_qc() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     engine
         .blocks
@@ -3017,6 +3073,7 @@ fn tail_fork_accepts_proposal_with_newer_high_qc() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let vote = engine.vote(&header, &proposal);
     assert!(
@@ -3062,6 +3119,7 @@ fn tail_fork_rejects_proposal_with_older_high_qc() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let vote = engine.vote(&header, &proposal);
     assert!(
@@ -3089,6 +3147,7 @@ fn tail_fork_accepts_genesis_proposal() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let vote = engine.vote(&header, &proposal);
     assert!(vote.is_some(), "genesis proposal must be accepted");
@@ -3543,6 +3602,7 @@ fn divergence_detection_accepts_matching_exec_cert() {
         prev_block: Hash::ZERO,
         tx_root: OxideBft::tx_root(&proposal.txs),
         body_commitment: types::shard::commitment(&body, 1, 1),
+        body_hash: Hash::ZERO,
         high_qc: None,
         timeout_cert: None,
         proposer: proposer_hash(0),
@@ -3592,6 +3652,7 @@ fn genesis_proposal_with_cert(
         prev_block: Hash::ZERO,
         tx_root: OxideBft::tx_root(&proposal.txs),
         body_commitment: types::shard::commitment(&body, 1, 1),
+        body_hash: Hash::ZERO,
         high_qc: None,
         timeout_cert: None,
         proposer: proposer_hash(0),
@@ -4028,6 +4089,7 @@ fn vote_carries_execution_attestation() {
         prev_block: Hash::ZERO,
         tx_root: OxideBft::tx_root(&proposal.txs),
         body_commitment: types::shard::commitment(&body, 4, 3),
+        body_hash: Hash::ZERO,
         high_qc: None,
         timeout_cert: None,
         proposer: proposer_hash(0),
@@ -4271,6 +4333,7 @@ fn forged_exec_cert_is_rejected_on_root_mismatch() {
         prev_block: Hash::ZERO,
         tx_root: OxideBft::tx_root(&proposal.txs),
         body_commitment: types::shard::commitment(&body, 4, 3),
+        body_hash: Hash::ZERO,
         high_qc: None,
         timeout_cert: None,
         proposer: proposer_hash(0),
@@ -4425,6 +4488,7 @@ fn subquorum_embedded_qc_is_rejected() {
         prev_block: parent_hash,
         tx_root: OxideBft::tx_root(&proposal.txs),
         body_commitment: types::shard::commitment(&body, 4, 3),
+        body_hash: Hash::ZERO,
         high_qc: Some(thin_qc),
         timeout_cert: None,
         proposer: proposer_hash(0),
@@ -7291,6 +7355,7 @@ fn hidden_qc_timeout_release_cannot_fork() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: types::shard::commitment(&body_bytes, 4, k),
+        body_hash: Hash::ZERO,
     };
     h_child1.proposer_signature = Some(byz.sign(
         crypto::hash::Domain::Proposal,
@@ -7324,6 +7389,7 @@ fn hidden_qc_timeout_release_cannot_fork() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: types::shard::commitment(&body_bytes, 4, k),
+        body_hash: Hash::ZERO,
     };
     h_child2.proposer_signature = Some(byz.sign(
         crypto::hash::Domain::Proposal,

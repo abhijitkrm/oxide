@@ -1527,6 +1527,7 @@ mod tests {
             proposer_signature: None,
             exec_cert: None,
             body_commitment: Hash::ZERO,
+            body_hash: Hash::ZERO,
         }
     }
 

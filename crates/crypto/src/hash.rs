@@ -161,6 +161,15 @@ pub enum Domain {
     /// preimage and vice versa. Appended after `PeerHandshake` —
     /// never renumber.
     SignerLink = 20,
+    /// A proposal body's integrity hash: `H(tag ‖ canonical
+    /// proposal encoding)`. Appended after `SignerLink` — never
+    /// renumber. The direct-proposal path verifies this instead of
+    /// recomputing the erasure commitment (~4× cheaper: one BLAKE3
+    /// pass vs a Reed-Solomon encode); the dispersed path keeps the
+    /// shard commitment, which is what its per-shard proofs root
+    /// into. Both fields ride the signed header, so either binding
+    /// is exactly as trustworthy as the other.
+    BodyHash = 21,
 }
 
 /// A domain-separated BLAKE3 hasher. The domain tag is written first,

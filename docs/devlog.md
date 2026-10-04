@@ -22939,3 +22939,93 @@ largest first:
 
 Honest caveat: the 34,966 number is this 8-core cloud box; the
 M1-class rig measured ~1.7× faster per core on the same benches.
+
+## Session: the 100k-TPS levers, pass 2 — body_hash, gas cache, intake pool
+
+Pass 1's phase breakdown named four levers; this pass landed three
+in code (the fourth — execution — measured as not binding) and
+re-profiled the result. End-to-end at 40k txs / 10k-per-block on
+the 4-validator TCP devnet: **34,966 → ~35,100 tx/s** (the earlier
+39,048 reading was single-run noise; three consecutive runs now
+land at 34.8-35.1k). At 100k txs sustained: **21,051 → ~25,800
+tx/s** — the win shows where it matters, under sustained load.
+
+### L2 — body_hash: the vote path's body binding (landed)
+
+The vote phase's largest body-linear cost was re-deriving the
+erasure commitment per vote per engine (3.8ms on a 1.5MB body even
+after the tabled RS encode). The header now carries `body_hash` —
+`H(BodyHash ‖ canonical proposal encoding)` — so the direct path
+verifies with one BLAKE3 pass (~0.9ms, ~4×). The erasure
+commitment stays the dispersed path's binding (its per-shard
+proofs root into it); both fields ride the signed header, so
+either is exactly as trustworthy. `body_hash = 0` (synthetic test
+headers) falls back to the commitment — every existing fixture
+works unchanged. Vote phase share: 22.6% → 16.6% (228.5 → 169.7ms
+at 40k). Wire: appended after `body_commitment` (strict-prefix
+rule, `Domain::BodyHash = 21`); spec §2 "Body binding" documents
+the two-path split; tests cover the round-trip, the fast-path
+tamper rejection, and the fallback.
+
+### L3 — the propose path's gas cap (landed)
+
+The in-chain propose selected the WHOLE backlog (the byte budget
+dwarfs any pool), and its gas-cap loop re-parsed + re-estimated
+every candidate: ~0.42µs/tx × 40k = ~17ms per proposal — the
+largest single term. Pool entries now carry the gas estimate,
+computed once at intake (`PreparedTx.gas`); the proposal loop
+reads it (`select_with_gas`). Propose share: 8.5% → 6.7%
+(102.2 → 77.5ms at 40k).
+
+### L1 — submit: measured, then trimmed (partially landed)
+
+The probe decomposed the 12.2µs/tx intake: the parallel recovery
+is ~10.6µs/tx effective — **hardware-bound** (4 physical cores +
+SMT; ECDSA doesn't SMT-scale, so ~4× on 8 logical CPUs is the
+ceiling; the recovery is already libsecp256k1). The serial phase
+is only ~2µs (parse 0.3, nonce 0.1, validate_preverified 0.19,
+BLAKE3 0.22, insert 1.12). Trims landed: the mempool no longer
+re-hashes, re-parses, or re-estimates batch-intake txs
+(`submit_prepared` — the intake's parallel phase computes the
+hash, routing parsed the envelope, validation knows the gas);
+the BLAKE3 tx-hash moved into the parallel phase. Net serial: ~2 →
+~1.5µs/tx. The dominant term is the hardware floor.
+
+### The intake-pool discovery (the pass's real find)
+
+At 100k txs sustained, submit degraded 12 → 32.8µs/tx. Phase
+instrumentation pinned it: the intake's **recover** phase collapsed
+from ~10.6 to 39-60µs/tx — the rayon parallelism itself, not the
+work. Root cause: the async execution lane executes committed
+blocks on the GLOBAL rayon pool in the background; the intake's
+recovery tasks queued behind the lane's execution tasks once the
+lane had a backlog (exactly rounds 5+, when commits started
+landing). Fix: the Executor builds a dedicated intake pool
+(`intake_pool.install` also captures the EVM's nested `par_iter`
+onto it); the global pool stays the lane's. Two pools time-share
+the cores instead of queueing. Measured at 100k sustained:
+21,051 → ~25,800 tx/s (+22%). `None` on pool-build failure falls
+back to the global pool — a latency property, never correctness.
+
+### L4 — execution: confirmed not binding
+
+`tps_rw`'s multi-sender gate: **65,933 tx/s (floor 60k)** at the
+executor level; the load test's qc_deliver runs 5.7-6.9µs/tx. Not
+the ceiling; no change made.
+
+### Phase breakdown after pass 2 (40k txs, 10k/block)
+
+submit 45.0% (12.9µs/tx) · qc_deliver 24.8% (7.1µs/tx) · vote
+16.3% (4.7µs/tx) · qc_form 6.9% · propose 6.7% (1.9µs/tx).
+
+### The honest 100k picture
+
+Total is ~25.6µs/tx at 10k/block on this box; ~10µs/tx is needed
+for 100k. The dominant remaining term is the parallel ECDSA
+recovery (~10.6µs/tx effective on 4 physical cores — a hardware
+floor, already on libsecp256k1). Scaling math: at the validator
+spec's 16-32 cores the recovery term falls to ~2-4µs/tx and the
+total lands near ~12-15µs/tx → 65-80k tx/s; 100k needs the top of
+the spec (32 cores) plus the remaining serial trims. On this
+4-core cloud box, ~35k (burst) / ~26k (sustained) is the measured
+ceiling after both passes — up from 5.7k where the work started.

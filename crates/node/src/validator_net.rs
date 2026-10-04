@@ -2738,6 +2738,7 @@ mod repair_tests {
                 &proposal.txs.iter().flat_map(|t| t.as_bytes().to_vec()).collect::<Vec<u8>>(),
             ),
             body_commitment: types::shard::commitment(&body, 1, 1),
+            body_hash: Hash::ZERO,
             high_qc: None,
             timeout_cert: None,
             proposer: consensus::proposer_hash(0),

@@ -541,6 +541,7 @@ mod tests {
             proposer_signature: Some(sig),
             exec_cert: None,
             body_commitment: primitives::Hash::ZERO,
+            body_hash: primitives::Hash::ZERO,
         }
     }
 

@@ -34,6 +34,30 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **100k-TPS levers, pass 2** (`consensus`, `types`, `crypto`,
+  `executor`, `mempool`): the vote path's body binding moved to a
+  BLAKE3 `body_hash` header field (~4× cheaper than re-deriving the
+  erasure commitment; the commitment stays for the dispersed shard
+  path — both ride the signed header); the leader's gas-cap loop
+  now reads gas estimates cached in the mempool at intake (was
+  ~17ms of re-parsing per proposal at a 40k-tx backlog); batch
+  intake no longer double-pays hashing/parsing/gas-estimation at
+  mempool insert (`submit_prepared`); and the intake got a
+  dedicated rayon pool after profiling showed its parallel
+  recovery queuing behind the async execution lane's work on the
+  shared global pool (the real find — submit collapsed from 10.6
+  to 39-60µs/tx once commits started landing). Measured on the
+  4-validator devnet: 40k-tx burst **~35,100 tx/s** (three
+  consecutive runs; the single earlier 39,048 reading was noise),
+  100k-tx sustained **21,051 → ~25,800 tx/s (+22%)**. Execution
+  confirmed not binding (tps_rw gate 65,933 tx/s, floor 60k).
+  In plain words: validators check big blocks' fingerprints ~4×
+  faster, the leader builds proposals without re-reading every
+  transaction, and the front door no longer queues behind the
+  executor — the chain holds ~35k tx/s on a 4-core cloud box,
+  with the parallel-signature check now the hardware-bound
+  ceiling (the 32-core validator spec is where 100k opens up).
+- **Batch-parallel tx intake** (`executor`, `consensus`, `ports`,
 - **Batch-parallel tx intake** (`executor`, `consensus`, `ports`,
   `devnet`): the 10k EVM load test's phase profiler showed tx
   intake was 60% of the whole pipeline — every EVM tx paid the

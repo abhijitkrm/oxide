@@ -211,27 +211,33 @@ impl AppInterface for Executor {
             })
             .collect();
         // ── Phase 2: recover (parallel) ────────────────────────────
-        let (env_recoveries, pv_results, group_index) =
+        let recovered =
             self.recover_batch(&txs, &routed, &env_targets, &groups, &group_ids, &group_payloads);
         // ── Phase 3: adjudicate (serial) ───────────────────────────
-        let accepted_txs = self.adjudicate_batch(
-            &txs,
-            &routed,
-            &mut results,
-            &env_recoveries,
-            &pv_results,
-            &group_index,
-        );
+        let accepted_txs = self.adjudicate_batch(&txs, &routed, &mut results, &recovered);
         // ── Phase 4: pool insert (one lock) ────────────────────────
         // Every borrow into `txs` is dead above — move them in.
         if !accepted_txs.is_empty() {
             let mut mempool = primitives::sync::lock_state(&self.mempool);
             let mut cache_entries: Vec<(Hash, [u8; 20])> = Vec::new();
-            for AcceptedTx { result_idx, cacheable, tx_idx } in accepted_txs {
-                match mempool.submit(std::mem::take(&mut txs[tx_idx])) {
+            for AcceptedTx { result_idx, tx_idx, hash, sender, nonce, fee, gas, cache_sender } in
+                accepted_txs
+            {
+                // `submit_prepared` skips the mempool's own re-hash,
+                // re-parse, and gas re-estimate — the intake's
+                // parallel phase already produced all three.
+                let prepared = mempool::PreparedTx {
+                    tx: std::mem::take(&mut txs[tx_idx]),
+                    hash,
+                    sender,
+                    nonce,
+                    fee,
+                    gas,
+                };
+                match mempool.submit_prepared(prepared) {
                     Ok(()) => {
-                        if let Some(entry) = cacheable {
-                            cache_entries.push(entry);
+                        if let Some(sender) = cache_sender {
+                            cache_entries.push((hash, sender));
                         }
                     }
                     Err(e) => {
@@ -275,7 +281,13 @@ impl AppInterface for Executor {
         let candidates = if past_halt {
             Vec::new()
         } else {
-            primitives::sync::lock_state(&self.mempool).select(budget.max_bytes)
+            // `select_with_gas` returns each candidate's precomputed
+            // gas estimate (cached in the pool entry at intake time)
+            // — the gas-cap loop below reads it instead of
+            // re-parsing the envelope and re-estimating per
+            // candidate (~0.42µs/tx; ~17ms per proposal at a 40k-tx
+            // backlog, the largest term in this path).
+            primitives::sync::lock_state(&self.mempool).select_with_gas(budget.max_bytes)
         };
         // Enforce the block gas limit at proposal time. The binding
         // constraint is `min(budget.max_gas, block_gas_limit)` —
@@ -288,20 +300,28 @@ impl AppInterface for Executor {
         // an unparseable context, missing module id, or unregistered
         // module makes `process_proposal` reject the WHOLE block —
         // a single malformed mempool entry could otherwise stall
-        // the chain by poisoning every proposal.
+        // the chain by poisoning every proposal. Entries inserted
+        // through the drain path (`submit`, no module context)
+        // carry `gas = 0` — those still pay the per-candidate
+        // estimate here; batch-intake entries never do.
         let gas_cap = budget.max_gas.min(self.block_gas_limit());
         let mut total_gas: u64 = 0;
         let mut txs = Vec::with_capacity(candidates.len());
-        for tx in candidates {
-            let bytes = tx.as_bytes();
-            let gas = match (parse_tx_context(bytes), parse_module_id(bytes)) {
-                (Some(_), Some(module_id)) => self.modules[usize::from(module_id)]
-                    .as_ref()
-                    .map(|m| m.estimate_gas(module_payload(bytes))),
-                _ => None,
-            };
-            let Some(gas) = gas else {
-                continue;
+        for (tx, cached_gas) in candidates {
+            let gas = if cached_gas > 0 {
+                cached_gas
+            } else {
+                let bytes = tx.as_bytes();
+                let estimated = match (parse_tx_context(bytes), parse_module_id(bytes)) {
+                    (Some(_), Some(module_id)) => self.modules[usize::from(module_id)]
+                        .as_ref()
+                        .map(|m| m.estimate_gas(module_payload(bytes))),
+                    _ => None,
+                };
+                match estimated {
+                    Some(gas) => gas,
+                    None => continue,
+                }
             };
             // Skip (not stop): a tx that doesn't fit leaves room for
             // a smaller later tx.
@@ -857,30 +877,90 @@ impl Executor {
         group_ids: &[u8],
         group_payloads: &'a [Vec<&'a [u8]>],
     ) -> Recovered<'a> {
-        let env_recoveries: Vec<Result<Address, &'static str>> = env_targets
-            .par_iter()
-            .map(|&ri| {
-                let r = &routed[ri];
-                recover_envelope_sender(
-                    self.chain_id,
-                    txs[r.tx_idx].as_bytes(),
-                    &r.ctx,
-                    r.module_id,
-                )
-            })
-            .collect();
+        // The whole parallel phase runs on the intake's dedicated
+        // pool (`install` also captures the modules' nested
+        // `par_iter`s — the EVM's preverify — onto it). On the global
+        // pool these tasks queued behind the async execution lane's
+        // work: measured 10.6 → 39-60µs/tx once the lane started
+        // executing the commit backlog. `None` (pool build failed)
+        // falls back to the global pool — a latency property, never
+        // a correctness one.
+        let intake = self.intake_pool.as_ref();
+        let env_recoveries: Vec<Result<Address, &'static str>> = match intake {
+            Some(pool) => pool.install(|| {
+                env_targets
+                    .par_iter()
+                    .map(|&ri| {
+                        let r = &routed[ri];
+                        recover_envelope_sender(
+                            self.chain_id,
+                            txs[r.tx_idx].as_bytes(),
+                            &r.ctx,
+                            r.module_id,
+                        )
+                    })
+                    .collect()
+            }),
+            None => env_targets
+                .par_iter()
+                .map(|&ri| {
+                    let r = &routed[ri];
+                    recover_envelope_sender(
+                        self.chain_id,
+                        txs[r.tx_idx].as_bytes(),
+                        &r.ctx,
+                        r.module_id,
+                    )
+                })
+                .collect(),
+        };
+        // Full-tx hashes for every routed candidate — the mempool's
+        // dedup key and the preverify-cache key. Pure per-tx CPU, so
+        // it rides the same parallel phase as the recoveries
+        // (~0.22µs/tx serial → ~0.03µs/tx effective); the mempool
+        // insert then skips its own re-hash via `submit_prepared`.
+        let tx_hashes: Vec<Hash> = match intake {
+            Some(pool) => pool.install(|| {
+                routed
+                    .par_iter()
+                    .map(|r| {
+                        crypto::hash::Hasher::hash_one(
+                            crypto::hash::Domain::Transaction,
+                            txs[r.tx_idx].as_bytes(),
+                        )
+                    })
+                    .collect()
+            }),
+            None => routed
+                .par_iter()
+                .map(|r| {
+                    crypto::hash::Hasher::hash_one(
+                        crypto::hash::Domain::Transaction,
+                        txs[r.tx_idx].as_bytes(),
+                    )
+                })
+                .collect(),
+        };
         let mut pv_results: Vec<Vec<Result<PreverifiedTx<'a>, ExecError>>> =
             Vec::with_capacity(group_ids.len());
         for (gi, module_id) in group_ids.iter().enumerate() {
             let members = &groups[module_id];
-            pv_results.push(routed[members[0]].module.preverify_batch(&group_payloads[gi]));
+            let module = routed[members[0]].module.clone();
+            let payloads = &group_payloads[gi];
+            let results = match intake {
+                // `install` captures the module's nested `par_iter`
+                // (the EVM's preverify) onto the intake pool.
+                Some(pool) => pool.install(|| module.preverify_batch(payloads)),
+                None => module.preverify_batch(payloads),
+            };
+            pv_results.push(results);
         }
         // module_id → index into `pv_results`/`group_ids` — the
         // routed slots store the module id (the routing key), not
         // the group ordinal.
         let group_index: HashMap<usize, usize> =
             group_ids.iter().enumerate().map(|(gi, id)| (usize::from(*id), gi)).collect();
-        (env_recoveries, pv_results, group_index)
+        Recovered { env_recoveries, pv_results, group_index, tx_hashes }
     }
 
     /// Phase 3 of [`AppInterface::ingest_tx_batch`]: adjudicate
@@ -893,10 +973,9 @@ impl Executor {
         txs: &'t [TxBytes],
         routed: &[Routed],
         results: &mut [MempoolAck],
-        env_recoveries: &[Result<Address, &'static str>],
-        pv_results: &[Vec<Result<PreverifiedTx<'t>, ExecError>>],
-        group_index: &HashMap<usize, usize>,
+        recovered: &Recovered<'t>,
     ) -> Vec<AcceptedTx> {
+        let Recovered { env_recoveries, pv_results, group_index, tx_hashes } = recovered;
         // 3a. Replay gate — one lock for the whole batch (the old
         // path re-locked per tx; this map is read-mostly and the
         // write side is block execution, so a single short critical
@@ -919,15 +998,15 @@ impl Executor {
         // module validation with the recovered sender, cacheable
         // sender. Accepted txs collect for the pool.
         let mut accepted_txs: Vec<AcceptedTx> = Vec::with_capacity(routed.len());
-        for r in routed {
+        for (pos, r) in routed.iter().enumerate() {
             if matches!(results[r.result_idx], MempoolAck::Rejected { .. }) {
                 continue;
             }
             // Envelope sender compare (non-EVM signed txs).
             let mut envelope_verified = false;
             if let Some(env_slot) = r.env_slot {
-                match env_recoveries[env_slot] {
-                    Ok(recovered) if recovered == r.ctx.sender => envelope_verified = true,
+                match &env_recoveries[env_slot] {
+                    Ok(recovered) if *recovered == r.ctx.sender => envelope_verified = true,
                     Ok(_) => {
                         results[r.result_idx] = MempoolAck::Rejected {
                             reason: "envelope signature does not match declared sender".to_string(),
@@ -962,26 +1041,30 @@ impl Executor {
             // the pool accepts — caching ahead of bounded admission
             // let rejected submissions grow the map past every
             // capacity check.
-            let cacheable = preverified
-                .and_then(|pre| {
-                    if pre.sender != [0u8; 20] {
-                        Some(pre.sender)
-                    } else if envelope_verified {
-                        Some(r.ctx.sender.0)
-                    } else {
-                        None
-                    }
-                })
-                .map(|sender| {
-                    (
-                        crypto::hash::Hasher::hash_one(
-                            crypto::hash::Domain::Transaction,
-                            txs[r.tx_idx].as_bytes(),
-                        ),
-                        sender,
-                    )
-                });
-            accepted_txs.push(AcceptedTx { result_idx: r.result_idx, cacheable, tx_idx: r.tx_idx });
+            let cache_sender = preverified.and_then(|pre| {
+                if pre.sender != [0u8; 20] {
+                    Some(pre.sender)
+                } else if envelope_verified {
+                    Some(r.ctx.sender.0)
+                } else {
+                    None
+                }
+            });
+            // Gas estimate for the pool entry — the proposal
+            // gas-cap loop reads it instead of re-parsing +
+            // re-estimating per candidate (~0.42µs/tx saved there;
+            // ~0.12µs/tx paid here, per module dispatch).
+            let gas = r.module.estimate_gas(payload);
+            accepted_txs.push(AcceptedTx {
+                result_idx: r.result_idx,
+                tx_idx: r.tx_idx,
+                hash: tx_hashes[pos],
+                sender: r.ctx.sender,
+                nonce: r.ctx.nonce,
+                fee: r.ctx.fee,
+                gas,
+                cache_sender,
+            });
         }
         accepted_txs
     }
@@ -1034,13 +1117,14 @@ fn recover_envelope_sender(
 
 /// Phase-2 output of [`AppInterface::ingest_tx_batch`]: the
 /// envelope-recovery verdicts, the per-module preverify results
-/// (borrowing the batch's payload slices), and the module-id →
-/// group-index map.
-type Recovered<'t> = (
-    Vec<Result<Address, &'static str>>,
-    Vec<Vec<Result<PreverifiedTx<'t>, ExecError>>>,
-    HashMap<usize, usize>,
-);
+/// (borrowing the batch's payload slices), the module-id →
+/// group-index map, and every routed tx's BLAKE3 hash.
+struct Recovered<'t> {
+    env_recoveries: Vec<Result<Address, &'static str>>,
+    pv_results: Vec<Vec<Result<PreverifiedTx<'t>, ExecError>>>,
+    group_index: HashMap<usize, usize>,
+    tx_hashes: Vec<Hash>,
+}
 
 /// One batch tx that cleared phase-1 routing in
 /// [`AppInterface::ingest_tx_batch`] — everything the parallel and

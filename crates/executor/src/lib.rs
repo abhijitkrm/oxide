@@ -1697,6 +1697,23 @@ pub struct Executor {
     /// 2 KiB on 64-bit) is negligible and the lookup is a single
     /// indexed load.
     modules: [Option<Arc<dyn Module>>; 256],
+    /// The batch intake's dedicated rayon pool.
+    ///
+    /// Why a separate pool: the async execution lane executes
+    /// committed blocks on the GLOBAL pool in the background. With
+    /// one shared pool, the intake's parallel recovery queued
+    /// behind the lane's execution tasks — measured in the 100k-tx
+    /// EVM load test, the intake's recover phase collapsed from
+    /// ~10.6µs/tx (lane idle) to 39-60µs/tx (lane executing the
+    /// commit backlog), halving chain throughput exactly when the
+    /// pipeline reached steady state. Two pools time-share the
+    /// cores instead of queueing: intake tasks start immediately
+    /// on their own threads while the lane executes. `install`
+    /// also captures nested `par_iter`s (the EVM's preverify) onto
+    /// this pool. `None` = pool construction failed; the intake
+    /// falls back to the global pool (correctness never depends on
+    /// the split — it is a latency property).
+    intake_pool: Option<rayon::ThreadPool>,
     /// The mempool (owned, so the executor is the app's intake).
     /// Behind `Mutex` because `AppInterface` methods take `&self`.
     mempool: Mutex<mempool::Mempool>,
@@ -1872,8 +1889,13 @@ impl Executor {
         // mempool capacity keeps `submit_ahead` rounds of headroom
         // honest: the ring can always hold what the pool can.
         let (intake_tx, intake_rx) = std::sync::mpsc::sync_channel(max_mempool_entries);
+        let intake_pool = rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("oxide-intake-{i}"))
+            .build()
+            .ok();
         Self {
             modules: std::array::from_fn(|_| None),
+            intake_pool,
             mempool: Mutex::new(mempool::Mempool::new(max_mempool_entries)),
             finalized: Mutex::new(BTreeMap::new()),
             state_roots: Mutex::new(BTreeMap::new()),
@@ -2195,14 +2217,26 @@ struct AcceptedTx {
     /// a pool rejection must be written back to. `accepted_txs` is
     /// filtered, so its own position cannot stand in for this.
     result_idx: usize,
-    /// The preverified `(tx_hash, sender)` pair to cache once the
-    /// pool admits the tx — `None` for admitted-unsigned txs with
-    /// no authenticated sender.
-    cacheable: Option<(Hash, [u8; 20])>,
     /// The tx's index into the caller's `Vec<TxBytes>` — the tx is
     /// moved into the pool only after every borrow into the batch
     /// (payload slices in the preverify results) is dead.
     tx_idx: usize,
+    /// The tx's BLAKE3 hash — computed in the intake's parallel
+    /// phase; the mempool's dedup and the preverify cache reuse it
+    /// instead of re-hashing.
+    hash: Hash,
+    /// Envelope fields for the mempool's indices — parsed once at
+    /// routing, reused at insert (`submit_prepared`).
+    sender: Address,
+    nonce: u64,
+    fee: u64,
+    /// The target module's gas estimate — the proposal gas-cap loop
+    /// reads it from the pool entry instead of re-estimating.
+    gas: u64,
+    /// The authenticated sender to cache in the preverify map once
+    /// the pool admits the tx — `None` for admitted-unsigned txs
+    /// with no authenticated sender.
+    cache_sender: Option<[u8; 20]>,
 }
 
 #[cfg(test)]

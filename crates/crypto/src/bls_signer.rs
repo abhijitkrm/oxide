@@ -77,6 +77,10 @@ fn dst(domain: Domain) -> &'static [u8] {
         // link MACs, and the remote-signer daemon refuses requests
         // naming it. Present for exhaustiveness.
         Domain::SignerLink => b"oxide/signer-link",
+        // Never signed — the body hash is a plain BLAKE3 integrity
+        // digest, not a signature preimage. Present for
+        // exhaustiveness.
+        Domain::BodyHash => b"oxide/body-hash",
     }
 }
 
