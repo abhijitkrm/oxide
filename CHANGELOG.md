@@ -34,6 +34,26 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Batch-parallel tx intake** (`executor`, `consensus`, `ports`,
+  `devnet`): the 10k EVM load test's phase profiler showed tx
+  intake was 60% of the whole pipeline — every EVM tx paid the
+  ~43µs secp256k1 sender recovery TWICE (validate, then preverify),
+  serially, with rayon invoked on a 1-element slice per tx. Intake
+  now runs once per batch, parallel across cores, and validation
+  reuses the recovered sender (`Module::validate_preverified`).
+  Measured: intake **90.4 → 12.0µs/tx (7.5×)**; end-to-end on the
+  4-validator TCP devnet **5,689 → 34,966 tx/s (6.1×)** at 10k
+  tx/block. In plain words: the chain's front door was the
+  bottleneck, not execution — now the front door fans out across
+  cores and the chain runs ~6× faster at big block sizes.
+- **Tabled Reed-Solomon encode** (`types::rs`): the vote path
+  re-verifies the body commitment per vote — a full erasure-code
+  encode of the proposal. The naive per-byte GF multiply cost
+  6.74ms on a 1.5MB body; per-coefficient multiplication tables
+  with row-wise XOR-accumulate cut it to **3.80ms (1.77×)**, same
+  hash. In plain words: validators check a big block's integrity
+  fingerprint nearly twice as fast, which directly raises the
+  block-size ceiling.
 - **Batch-settle `consumed` map flattened** (`exchange`): the
   per-order consumed-quantity scratch was a `BTreeMap` (16+ levels
   of pointer-chasing at 65k fills, ~22% of the batch profile) whose

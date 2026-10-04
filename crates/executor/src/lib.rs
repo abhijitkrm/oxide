@@ -861,6 +861,39 @@ pub trait Module: Send + Sync {
         Ok(())
     }
 
+    /// Validate a message for mempool admission with the sender
+    /// already recovered by [`preverify_batch`](Self::preverify_batch).
+    ///
+    /// Why this exists: the EVM's `validate` and `preverify_batch`
+    /// both decode the RLP and recover the secp256k1 sender — the
+    /// two most expensive per-tx intake operations, paid TWICE per
+    /// tx on the old path (~90µs/tx intake measured, of which ~32µs
+    /// was the duplicated recovery+decode). Batch intake now runs
+    /// `preverify_batch` once per module group (parallel across the
+    /// batch) and hands each result here, so the recovery is paid
+    /// exactly once.
+    ///
+    /// The contract is `validate`'s, with one addition: when
+    /// `preverified` carries a sender, the module MUST NOT recover
+    /// again — the preverify pass already authenticated the payload
+    /// signature for these exact bytes. `None` means no preverify
+    /// ran (single-tx path on a module without pre-verification);
+    /// the default delegates to `validate`, so modules that don't
+    /// override this behave exactly as before.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`validate`](Self::validate).
+    fn validate_preverified(
+        &self,
+        ctx: &TxContext,
+        msg: &[u8],
+        preverified: Option<&PreverifiedTx<'_>>,
+    ) -> Result<(), ExecError> {
+        let _ = preverified;
+        self.validate(ctx, msg)
+    }
+
     /// Handle a message. Returns events on success, or an error.
     ///
     /// The `ctx` carries the sender, nonce, and fee parsed from the
@@ -1830,7 +1863,15 @@ impl Executor {
     ///   parallel speculative execution path. Below this threshold,
     ///   serial execution is used.
     pub fn with_config(max_mempool_entries: usize, parallel_threshold: usize) -> Self {
-        let (intake_tx, intake_rx) = std::sync::mpsc::sync_channel(10_000);
+        // The intake ring is the mempool's staging buffer — bounded
+        // by the same admission budget. A fixed 10k slot ring
+        // thrashed at large blocks: a 10k-tx round filled it exactly,
+        // so every subsequent round's submission bounced off the
+        // full ring and retried (measured: submit phase doubled at
+        // 10k txs/round in the EVM load test). Ring capacity =
+        // mempool capacity keeps `submit_ahead` rounds of headroom
+        // honest: the ring can always hold what the pool can.
+        let (intake_tx, intake_rx) = std::sync::mpsc::sync_channel(max_mempool_entries);
         Self {
             modules: std::array::from_fn(|_| None),
             mempool: Mutex::new(mempool::Mempool::new(max_mempool_entries)),
@@ -2158,8 +2199,10 @@ struct AcceptedTx {
     /// pool admits the tx — `None` for admitted-unsigned txs with
     /// no authenticated sender.
     cacheable: Option<(Hash, [u8; 20])>,
-    /// The transaction itself.
-    tx: TxBytes,
+    /// The tx's index into the caller's `Vec<TxBytes>` — the tx is
+    /// moved into the pool only after every borrow into the batch
+    /// (payload slices in the preverify results) is dead.
+    tx_idx: usize,
 }
 
 #[cfg(test)]

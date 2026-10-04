@@ -8,10 +8,14 @@
 //! boundary.
 
 use super::{
-    AcceptedTx, AppInterface, CommitAck, EXEC_LANE_DEPTH, Executor, FinalizedBlock, HashMap,
-    Height, InsertRetained, MODULE_ID_OFFSET, MempoolAck, Proposal, StateAttestation, TxBytes,
-    Verdict, is_signed_envelope, module_payload, parse_module_id, parse_tx_context,
+    AcceptedTx, AppInterface, CommitAck, EXEC_LANE_DEPTH, ExecError, Executor, FinalizedBlock,
+    HashMap, Height, InsertRetained, MODULE_ID_OFFSET, MempoolAck, Module, PreverifiedTx, Proposal,
+    StateAttestation, TxBytes, TxContext, UnsignedTxPolicy, Verdict, envelope_signature,
+    is_signed_envelope, module_payload, parse_module_id, parse_tx_context,
 };
+use primitives::{Address, Hash};
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use std::sync::Arc;
 
 impl AppInterface for Executor {
     fn ingest_tx(&self, tx: TxBytes) -> MempoolAck {
@@ -66,16 +70,26 @@ impl AppInterface for Executor {
                 Err(reason) => return MempoolAck::Rejected { reason: reason.to_string() },
             };
         let payload = module_payload(bytes);
-        if let Err(e) = module.validate(&ctx, payload) {
+        // Pre-recover the sender BEFORE validating: `preverify_batch`
+        // decodes the payload and recovers its signature (the EVM's
+        // ~43µs secp256k1 recovery — the single most expensive per-tx
+        // intake operation), and `validate_preverified` then reuses
+        // that sender instead of recovering again. The old order
+        // (`validate` first, then `preverify_batch`) paid the
+        // recovery twice per tx — measured 90µs/tx intake, halved
+        // here and parallelized across the batch in
+        // `ingest_tx_batch`.
+        //
+        // `msgs` must outlive `preverify_result` — the returned
+        // `PreverifiedTx` borrows the payload slice.
+        let msgs = [payload];
+        let preverify_result = module.preverify_batch(&msgs);
+        if let Err(e) =
+            module.validate_preverified(&ctx, payload, preverify_result[0].as_ref().ok())
+        {
             return MempoolAck::Rejected { reason: format!("validate: {e}") };
         }
 
-        // Pre-recover the sender at ingestion time and cache it.
-        // This amortizes secp256k1 recovery (~30 µs/tx) across the
-        // tx's lifetime in the mempool. At block execution time, the
-        // cached sender is used to skip recovery entirely — the
-        // execution hot path sees only RLP decode + chain ID check.
-        //
         // A cache entry asserts "a trustworthy sender exists for this
         // exact tx hash" — `check_envelope_auth` treats a hit as
         // already-verified, and `execute_block` routes all-cached
@@ -92,11 +106,7 @@ impl AppInterface for Executor {
         //   `all_cached` false, so the group takes the plain
         //   `handle_batch` path (correct per-tx contexts).
         //
-        // `msgs` must outlive `preverify_result` — the returned
-        // `PreverifiedTx` borrows the payload slice.
-        let msgs = [payload];
-        let preverify_result = module.preverify_batch(&msgs);
-        // Compute the cacheable entry now but insert it only if the
+        // The entry is *computed* now but inserted only if the
         // bounded intake accepts the tx below — a cache populated
         // ahead of admission grew on *rejected* submissions (an
         // intake-full flood filled it with senders for txs the pool
@@ -151,140 +161,90 @@ impl AppInterface for Executor {
         }
     }
 
-    /// Phase E: batch mempool intake. Acquires the mempool lock once
-    /// for the entire batch, amortizing the per-tx lock overhead.
-    /// Validation and preverify are still per-tx (they call into
-    /// module code), but the mempool insertion is batched.
-    fn ingest_tx_batch(&self, txs: Vec<TxBytes>) -> Vec<MempoolAck> {
-        let mut results = Vec::with_capacity(txs.len());
-        // Validate and preverify each tx, collecting the accepted
-        // ones for batch submission to the mempool. Each entry
-        // carries its index into `results` (the accepted vec is
-        // filtered — position `i` here is not position `i` in the
-        // caller's batch) and an optional preverified
-        // `(tx_hash, sender)` that is cached only if the pool
-        // accepts the tx.
-        let mut accepted_txs: Vec<AcceptedTx> = Vec::with_capacity(txs.len());
-        for tx in txs {
-            let bytes = tx.as_bytes();
-            let Some(ctx) = parse_tx_context(bytes) else {
-                results.push(MempoolAck::Rejected { reason: "malformed: tx context".to_string() });
-                continue;
-            };
-            // H4 fix: replay protection. Reject txs whose nonce has
-            // already been executed. This check exists in `ingest_tx`
-            // but was missing from the batch path — a replay attack
-            // vector. A tx removed from the mempool after block
-            // selection could be re-submitted via the batch path and
-            // re-executed.
-            {
-                let executed = primitives::sync::lock_state(&self.executed_nonce);
-                let next_expected = executed.map.get(&ctx.sender).copied().unwrap_or(0);
-                if ctx.nonce < next_expected {
-                    results.push(MempoolAck::Rejected {
-                        reason: format!(
-                            "replay: nonce {} < next expected {next_expected}",
-                            ctx.nonce
-                        ),
-                    });
-                    continue;
-                }
-            }
-            // Same reserved-nonce rule as `ingest_tx`.
-            if ctx.nonce == u64::MAX {
-                results.push(MempoolAck::Rejected {
-                    reason: "nonce `u64::MAX` is reserved".to_string(),
-                });
-                continue;
-            }
-            let Some(module_id) = parse_module_id(bytes) else {
-                results
-                    .push(MempoolAck::Rejected { reason: "malformed: no module ID".to_string() });
-                continue;
-            };
-            let Some(module) = self.modules[module_id as usize].as_ref() else {
-                results
-                    .push(MempoolAck::Rejected { reason: format!("unknown module {module_id}") });
-                continue;
-            };
-            // Envelope authentication — same rules as `ingest_tx`.
-            // The bool records whether a signature verified, which
-            // decides what the preverify cache may claim below.
-            let envelope_verified =
-                match self.check_envelope_auth(bytes, &ctx, module_id, module.as_ref(), None) {
-                    Ok(v) => v,
-                    Err(reason) => {
-                        results.push(MempoolAck::Rejected { reason: reason.to_string() });
-                        continue;
-                    }
-                };
-            let payload = module_payload(bytes);
-            if let Err(e) = module.validate(&ctx, payload) {
-                results.push(MempoolAck::Rejected { reason: format!("validate: {e}") });
-                continue;
-            }
-            // Pre-recover the sender at ingestion time. Only cache a
-            // sender that was actually authenticated — the module's
-            // own recovery (non-zero) or the envelope-verified
-            // `ctx.sender`. A zero placeholder on an
-            // admitted-unsigned tx is skipped so `all_cached` stays
-            // false and the group keeps the plain `handle_batch`
-            // path. `msgs` must outlive `preverify_result` — the
-            // returned `PreverifiedTx` borrows the payload slice.
-            // The entry is *computed* here but cached only after the
-            // pool accepts the tx below — caching ahead of bounded
-            // admission let rejected submissions grow the map past
-            // every capacity check.
-            let msgs = [payload];
-            let preverify_result = module.preverify_batch(&msgs);
-            let cacheable = preverify_result[0]
-                .as_ref()
-                .ok()
-                .and_then(|preverified| {
-                    if preverified.sender != [0u8; 20] {
-                        Some(preverified.sender)
-                    } else if envelope_verified {
-                        Some(ctx.sender.0)
-                    } else {
-                        None
-                    }
-                })
-                .map(|sender| {
-                    (
-                        crypto::hash::Hasher::hash_one(
-                            crypto::hash::Domain::Transaction,
-                            tx.as_bytes(),
-                        ),
-                        sender,
-                    )
-                });
-            accepted_txs.push(AcceptedTx { result_idx: results.len(), cacheable, tx });
-            results.push(MempoolAck::Accepted);
-        }
-        // Batch-submit all accepted txs to the mempool in one lock
-        // acquisition.
+    /// Phase E: batch mempool intake — the parallel admission path.
+    ///
+    /// Three phases:
+    /// 1. **Route (serial, cheap):** envelope parse, module lookup,
+    ///    and the envelope *shape* checks per tx — no crypto.
+    /// 2. **Recover (parallel):** every secp256k1 recovery the batch
+    ///    needs runs here — payload recovery through the module's
+    ///    `preverify_batch` (the EVM's is rayon-parallel across the
+    ///    group) and envelope recovery for signed native-module txs
+    ///    (rayon across the batch). This is the phase that matters:
+    ///    recovery is ~43µs/tx serial on the dev rig, and the old
+    ///    path paid it TWICE per EVM tx (`validate` recovered, then
+    ///    `preverify_batch` recovered the same payload again) with
+    ///    zero cross-tx parallelism — measured 90µs/tx intake, the
+    ///    60% share that capped the 4-validator chain at ~6k tx/s.
+    /// 3. **Adjudicate (serial):** the executed-nonce replay check
+    ///    under one lock for the whole batch, the envelope sender
+    ///    compare, `validate_preverified` (reuses the recovered
+    ///    sender — no second recovery), then the batched mempool
+    ///    insert under one lock.
+    ///
+    /// Per-tx rejection reasons are byte-identical to `ingest_tx`.
+    /// One documented precedence shift: a tx failing *both* the
+    /// replay gate and a later gate now reports the later gate's
+    /// reason (the replay check moved after routing so it can run
+    /// under a single lock for the whole batch). The protection is
+    /// identical — a replayed tx is rejected either way; only the
+    /// reason string of a multi-failure tx changes.
+    fn ingest_tx_batch(&self, mut txs: Vec<TxBytes>) -> Vec<MempoolAck> {
+        let mut results: Vec<MempoolAck> = Vec::with_capacity(txs.len());
+        // ── Phase 1: route (serial, cheap) ─────────────────────────
+        let (routed, env_targets, groups) = self.route_batch(&txs, &mut results);
+        // Group payloads hoisted HERE (not inside `recover_batch`)
+        // so the preverify results returned below can borrow them:
+        // `preverify_batch`'s returned `PreverifiedTx` anchors its
+        // lifetime to the `msgs` slice reference, so that reference
+        // must outlive every use of the results — a local inside the
+        // helper would end it at the helper's return.
+        let mut group_ids: Vec<u8> = groups.keys().copied().collect();
+        group_ids.sort_unstable();
+        let group_payloads: Vec<Vec<&[u8]>> = group_ids
+            .iter()
+            .map(|module_id| {
+                groups[module_id]
+                    .iter()
+                    .map(|&ri| module_payload(txs[routed[ri].tx_idx].as_bytes()))
+                    .collect()
+            })
+            .collect();
+        // ── Phase 2: recover (parallel) ────────────────────────────
+        let (env_recoveries, pv_results, group_index) =
+            self.recover_batch(&txs, &routed, &env_targets, &groups, &group_ids, &group_payloads);
+        // ── Phase 3: adjudicate (serial) ───────────────────────────
+        let accepted_txs = self.adjudicate_batch(
+            &txs,
+            &routed,
+            &mut results,
+            &env_recoveries,
+            &pv_results,
+            &group_index,
+        );
+        // ── Phase 4: pool insert (one lock) ────────────────────────
+        // Every borrow into `txs` is dead above — move them in.
         if !accepted_txs.is_empty() {
             let mut mempool = primitives::sync::lock_state(&self.mempool);
-            // `result_idx` is the tx's index in the *caller's*
-            // batch — `accepted_txs` is filtered, so a positional
-            // `enumerate()` would write pool rejections into the
-            // wrong result slots (acknowledging a rejected tx as
-            // Accepted and re-rejecting an unrelated one — the bug
-            // this field fixes).
-            for AcceptedTx { result_idx, cacheable, tx } in accepted_txs {
-                match mempool.submit(tx) {
+            let mut cache_entries: Vec<(Hash, [u8; 20])> = Vec::new();
+            for AcceptedTx { result_idx, cacheable, tx_idx } in accepted_txs {
+                match mempool.submit(std::mem::take(&mut txs[tx_idx])) {
                     Ok(()) => {
-                        // Admitted — now the preverified sender may
-                        // be cached.
-                        if let Some((tx_hash, sender)) = cacheable {
-                            primitives::sync::lock_state(&self.preverify_cache)
-                                .insert(tx_hash, sender);
+                        if let Some(entry) = cacheable {
+                            cache_entries.push(entry);
                         }
                     }
                     Err(e) => {
-                        // Overwrite the Accepted result with the rejection.
                         results[result_idx] = MempoolAck::Rejected { reason: format!("{e:?}") };
                     }
+                }
+            }
+            // One lock for the whole batch's cache inserts (the old
+            // path re-locked per tx).
+            if !cache_entries.is_empty() {
+                let mut cache = primitives::sync::lock_state(&self.preverify_cache);
+                for (tx_hash, sender) in cache_entries {
+                    cache.insert(tx_hash, sender);
                 }
             }
         }
@@ -778,4 +738,331 @@ impl AppInterface for Executor {
             removes: val.removes,
         }
     }
+}
+
+impl Executor {
+    /// Phase 1 of [`AppInterface::ingest_tx_batch`]: route (serial,
+    /// cheap) — envelope parse, module lookup, and the envelope
+    /// *shape* checks per tx, no crypto. The shape checks here are
+    /// the ones `check_envelope_auth` makes before touching a
+    /// signature, so the parallel phase only ever sees txs whose
+    /// recovery is actually needed.
+    ///
+    /// Returns the routed candidates in tx order, the positions
+    /// needing envelope recovery, and the per-module grouping.
+    fn route_batch(
+        &self,
+        txs: &[TxBytes],
+        results: &mut Vec<MempoolAck>,
+    ) -> (Vec<Routed>, Vec<usize>, HashMap<u8, Vec<usize>>) {
+        let mut routed: Vec<Routed> = Vec::with_capacity(txs.len());
+        let mut env_targets: Vec<usize> = Vec::new();
+        // module_id → routed positions, in tx order (stable grouping
+        // keeps `preverify_batch` inputs deterministic).
+        let mut groups: HashMap<u8, Vec<usize>> = HashMap::new();
+        for (tx_idx, tx) in txs.iter().enumerate() {
+            let bytes = tx.as_bytes();
+            let Some(ctx) = parse_tx_context(bytes) else {
+                results.push(MempoolAck::Rejected { reason: "malformed: tx context".to_string() });
+                continue;
+            };
+            let Some(module_id) = parse_module_id(bytes) else {
+                results
+                    .push(MempoolAck::Rejected { reason: "malformed: no module ID".to_string() });
+                continue;
+            };
+            let Some(module) = self.modules[module_id as usize].as_ref() else {
+                results
+                    .push(MempoolAck::Rejected { reason: format!("unknown module {module_id}") });
+                continue;
+            };
+            // Reserved nonce — same rule as `ingest_tx` (executing it
+            // would wrap the next-expected counter and reopen the
+            // sender's whole nonce range to replay).
+            if ctx.nonce == u64::MAX {
+                results.push(MempoolAck::Rejected {
+                    reason: "nonce `u64::MAX` is reserved".to_string(),
+                });
+                continue;
+            }
+            // Envelope shape (no crypto): a self-authenticating
+            // module must not carry an envelope signature (it would
+            // shift the payload offset), and an unsigned tx is
+            // admitted or rejected per the policy.
+            let signed = is_signed_envelope(bytes);
+            if module.authenticates_sender() {
+                if signed {
+                    results.push(MempoolAck::Rejected {
+                        reason: "malformed: envelope signature on self-authenticating module"
+                            .to_string(),
+                    });
+                    continue;
+                }
+            } else if !signed {
+                match self.unsigned_tx_policy {
+                    UnsignedTxPolicy::Allow => {}
+                    UnsignedTxPolicy::Reject => {
+                        results.push(MempoolAck::Rejected {
+                            reason: "unsigned native tx (signature required)".to_string(),
+                        });
+                        continue;
+                    }
+                }
+            }
+            let result_idx = results.len();
+            results.push(MempoolAck::Accepted);
+            // Signed native txs recover the ENVELOPE signature (the
+            // expensive part of `check_envelope_auth`); EVM payloads
+            // recover inside `preverify_batch`. Both happen in the
+            // parallel phase.
+            let env_slot = if signed && !module.authenticates_sender() {
+                env_targets.push(routed.len());
+                Some(env_targets.len() - 1)
+            } else {
+                None
+            };
+            let group = groups.entry(module_id).or_default();
+            let pv_slot = Some((usize::from(module_id), group.len()));
+            group.push(routed.len());
+            routed.push(Routed {
+                result_idx,
+                tx_idx,
+                ctx,
+                module_id,
+                module: module.clone(),
+                env_slot,
+                pv_slot,
+            });
+        }
+        (routed, env_targets, groups)
+    }
+
+    /// Phase 2 of [`AppInterface::ingest_tx_batch`]: recover
+    /// (parallel) — every secp256k1 recovery the batch needs.
+    ///
+    /// 2a. Envelope recovery for signed native txs — one rayon pass
+    /// over the whole batch; the compare against `ctx.sender` stays
+    /// in phase 3 (it needs no crypto). 2b. Payload preverify per
+    /// module group — the EVM's `preverify_batch` is rayon-parallel
+    /// across the group; the default is sequential (no recovery to
+    /// parallelize). Results borrow the payload slices, which borrow
+    /// `txs` — every use is inside the caller, before the pool moves
+    /// any tx.
+    fn recover_batch<'a>(
+        &self,
+        txs: &[TxBytes],
+        routed: &[Routed],
+        env_targets: &[usize],
+        groups: &HashMap<u8, Vec<usize>>,
+        group_ids: &[u8],
+        group_payloads: &'a [Vec<&'a [u8]>],
+    ) -> Recovered<'a> {
+        let env_recoveries: Vec<Result<Address, &'static str>> = env_targets
+            .par_iter()
+            .map(|&ri| {
+                let r = &routed[ri];
+                recover_envelope_sender(
+                    self.chain_id,
+                    txs[r.tx_idx].as_bytes(),
+                    &r.ctx,
+                    r.module_id,
+                )
+            })
+            .collect();
+        let mut pv_results: Vec<Vec<Result<PreverifiedTx<'a>, ExecError>>> =
+            Vec::with_capacity(group_ids.len());
+        for (gi, module_id) in group_ids.iter().enumerate() {
+            let members = &groups[module_id];
+            pv_results.push(routed[members[0]].module.preverify_batch(&group_payloads[gi]));
+        }
+        // module_id → index into `pv_results`/`group_ids` — the
+        // routed slots store the module id (the routing key), not
+        // the group ordinal.
+        let group_index: HashMap<usize, usize> =
+            group_ids.iter().enumerate().map(|(gi, id)| (usize::from(*id), gi)).collect();
+        (env_recoveries, pv_results, group_index)
+    }
+
+    /// Phase 3 of [`AppInterface::ingest_tx_batch`]: adjudicate
+    /// (serial) — the executed-nonce replay gate under one lock for
+    /// the whole batch, the envelope sender compare, module
+    /// validation with the pre-recovered sender, and the cacheable
+    /// sender computation. Returns the accepted txs for the pool.
+    fn adjudicate_batch<'t>(
+        &self,
+        txs: &'t [TxBytes],
+        routed: &[Routed],
+        results: &mut [MempoolAck],
+        env_recoveries: &[Result<Address, &'static str>],
+        pv_results: &[Vec<Result<PreverifiedTx<'t>, ExecError>>],
+        group_index: &HashMap<usize, usize>,
+    ) -> Vec<AcceptedTx> {
+        // 3a. Replay gate — one lock for the whole batch (the old
+        // path re-locked per tx; this map is read-mostly and the
+        // write side is block execution, so a single short critical
+        // section per batch beats N per-tx sections).
+        {
+            let executed = primitives::sync::lock_state(&self.executed_nonce);
+            for r in routed {
+                let next_expected = executed.map.get(&r.ctx.sender).copied().unwrap_or(0);
+                if r.ctx.nonce < next_expected {
+                    results[r.result_idx] = MempoolAck::Rejected {
+                        reason: format!(
+                            "replay: nonce {} < next expected {next_expected}",
+                            r.ctx.nonce
+                        ),
+                    };
+                }
+            }
+        }
+        // 3b. Per-tx adjudication in batch order: envelope compare,
+        // module validation with the recovered sender, cacheable
+        // sender. Accepted txs collect for the pool.
+        let mut accepted_txs: Vec<AcceptedTx> = Vec::with_capacity(routed.len());
+        for r in routed {
+            if matches!(results[r.result_idx], MempoolAck::Rejected { .. }) {
+                continue;
+            }
+            // Envelope sender compare (non-EVM signed txs).
+            let mut envelope_verified = false;
+            if let Some(env_slot) = r.env_slot {
+                match env_recoveries[env_slot] {
+                    Ok(recovered) if recovered == r.ctx.sender => envelope_verified = true,
+                    Ok(_) => {
+                        results[r.result_idx] = MempoolAck::Rejected {
+                            reason: "envelope signature does not match declared sender".to_string(),
+                        };
+                        continue;
+                    }
+                    Err(reason) => {
+                        results[r.result_idx] = MempoolAck::Rejected { reason: reason.to_string() };
+                        continue;
+                    }
+                }
+            }
+            // Module validation with the pre-recovered sender — the
+            // recovery is paid once (phase 2), not twice.
+            let payload = module_payload(txs[r.tx_idx].as_bytes());
+            let preverified = r.pv_slot.as_ref().and_then(|(module_id, slot)| {
+                let group = group_index.get(module_id).copied()?;
+                pv_results
+                    .get(group)
+                    .and_then(|group_results| group_results.get(*slot))
+                    .and_then(|res| res.as_ref().ok())
+            });
+            if let Err(e) = r.module.validate_preverified(&r.ctx, payload, preverified) {
+                results[r.result_idx] = MempoolAck::Rejected { reason: format!("validate: {e}") };
+                continue;
+            }
+            // Cacheable sender: the module's own recovery (non-zero)
+            // or the envelope-verified `ctx.sender`. A zero
+            // placeholder on an admitted-unsigned tx is skipped so
+            // `all_cached` stays false and the group keeps the plain
+            // `handle_batch` path. Computed now, cached only after
+            // the pool accepts — caching ahead of bounded admission
+            // let rejected submissions grow the map past every
+            // capacity check.
+            let cacheable = preverified
+                .and_then(|pre| {
+                    if pre.sender != [0u8; 20] {
+                        Some(pre.sender)
+                    } else if envelope_verified {
+                        Some(r.ctx.sender.0)
+                    } else {
+                        None
+                    }
+                })
+                .map(|sender| {
+                    (
+                        crypto::hash::Hasher::hash_one(
+                            crypto::hash::Domain::Transaction,
+                            txs[r.tx_idx].as_bytes(),
+                        ),
+                        sender,
+                    )
+                });
+            accepted_txs.push(AcceptedTx { result_idx: r.result_idx, cacheable, tx_idx: r.tx_idx });
+        }
+        accepted_txs
+    }
+}
+
+/// Recover the signer of a signed native tx envelope — the parallel
+/// intake's half of [`Executor::check_envelope_auth`].
+///
+/// `check_envelope_auth` recovers AND compares inline; the batch
+/// path splits the two because the recovery (~43µs/tx, the single
+/// most expensive per-tx intake operation) parallelizes across the
+/// batch while the compare is trivial. The rejection reasons are
+/// byte-identical to the inline path's, so a tx rejected by either
+/// path reports the same string.
+///
+/// # Errors
+///
+/// Static rejection strings — the same ones `check_envelope_auth`
+/// returns for a malformed or invalid envelope signature.
+fn recover_envelope_sender(
+    chain_id: u64,
+    bytes: &[u8],
+    ctx: &TxContext,
+    module_id: u8,
+) -> Result<Address, &'static str> {
+    let Some(sig_bytes) = envelope_signature(bytes) else {
+        return Err("malformed: truncated envelope signature");
+    };
+    // v is the last byte. Only 0/1 are accepted — the canonical
+    // recovery IDs secp256k1 produces (2/3 are provably-unused keys,
+    // 27/28 is the Ethereum convention submitters must normalize).
+    let recid = sig_bytes[64];
+    if recid > 1 {
+        return Err("malformed: envelope signature recovery id must be 0 or 1");
+    }
+    let sig = crypto::secp::RecoverableSignature::from_bytes(&sig_bytes[..64], recid)
+        .map_err(|_| "malformed: envelope signature")?;
+    let payload = module_payload(bytes);
+    crypto::eip712::verify_tx_sender(
+        chain_id,
+        &ctx.sender,
+        ctx.nonce,
+        ctx.fee,
+        module_id,
+        payload,
+        &sig,
+    )
+    .map_err(|_| "invalid envelope signature")
+}
+
+/// Phase-2 output of [`AppInterface::ingest_tx_batch`]: the
+/// envelope-recovery verdicts, the per-module preverify results
+/// (borrowing the batch's payload slices), and the module-id →
+/// group-index map.
+type Recovered<'t> = (
+    Vec<Result<Address, &'static str>>,
+    Vec<Vec<Result<PreverifiedTx<'t>, ExecError>>>,
+    HashMap<usize, usize>,
+);
+
+/// One batch tx that cleared phase-1 routing in
+/// [`AppInterface::ingest_tx_batch`] — everything the parallel and
+/// adjudication phases need, keyed back into the caller's batch.
+struct Routed {
+    /// Slot in `results` — the filtered accepted vec cannot stand in
+    /// for it (the positional-write bug the old field documented).
+    result_idx: usize,
+    /// Index into the caller's `Vec<TxBytes>` — the tx is moved into
+    /// the pool only after every borrow into the batch (payload
+    /// slices in the preverify results) is dead.
+    tx_idx: usize,
+    /// The envelope context parsed at routing.
+    ctx: TxContext,
+    /// The routed module.
+    module_id: u8,
+    /// The routed module implementation.
+    module: Arc<dyn Module>,
+    /// Position in the envelope-recovery results for a signed native
+    /// tx; `None` for EVM payloads (self-authenticating) and
+    /// admitted-unsigned txs.
+    env_slot: Option<usize>,
+    /// `(module_id, slot)` into the per-module preverify results.
+    pv_slot: Option<(usize, usize)>,
 }

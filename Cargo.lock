@@ -1795,6 +1795,7 @@ dependencies = [
  "metrics",
  "ports",
  "primitives",
+ "rayon",
  "staking",
  "storage",
  "tempfile",

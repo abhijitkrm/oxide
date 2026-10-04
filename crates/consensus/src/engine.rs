@@ -2920,6 +2920,10 @@ impl ConsensusEngine for OxideBft {
         self.app.ingest_tx(tx)
     }
 
+    fn submit_txs(&mut self, txs: Vec<TxBytes>) -> Vec<MempoolAck> {
+        self.app.ingest_tx_batch(txs)
+    }
+
     fn run_until_idle(&mut self) {
         // Drive propose-vote-commit cycles until no more work.
         while self.step() {}

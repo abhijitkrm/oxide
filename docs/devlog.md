@@ -22839,3 +22839,103 @@ targets. Conclusion recorded in §8: tx-by-hash/commitment proposals
 are a required *pre-testnet design item* (against
 `docs/oxidebft-spec.md`), not a code change today — the audit's
 recommended ordering.
+
+## Session: batch-parallel intake — the 100k-TPS levers, pass 1
+
+The 10k EVM load test's phase profiler located the ceiling: **tx
+intake was 60.4%** of the whole pipelined run (~109µs/tx serial),
+execution only 12%. Two structural fixes landed; end-to-end went
+**5,689 → 34,966 tx/s (6.1×)** at 10k tx/block on the 4-validator
+TCP devnet.
+
+### Probe: where the 109µs went
+
+A temporary probe decomposed the intake path (numbers on the dev
+rig, release profile):
+
+| Component | µs/tx |
+|---|---|
+| `ingest_tx` total | 90.4 |
+| `preverify_batch` (1-element, per-tx call) | 42.2 |
+| `validate` (EVM) | 43.3 |
+| secp256k1 `recover_sender` alone | 42.7 |
+| RLP `decode_raw` alone | 0.13 |
+| db reads (nonce/balance) | 0.03 |
+
+The recovery is essentially ALL of both `validate` and the per-tx
+`preverify_batch` — and the old path paid it **twice per EVM tx**
+(`validate` recovered the sender, then `preverify_batch` recovered
+the same payload again), serially, with rayon invoked on a
+1-element slice per tx.
+
+### Fix 1: one recovery, parallel across the batch
+
+- `Module::validate_preverified(ctx, msg, preverified)` — new trait
+  method (default delegates to `validate`). The EVM overrides it:
+  `validate_core` skips the secp256k1 recovery when the batch
+  preverify already authenticated these exact payload bytes.
+- `ingest_tx_batch` restructured into four phases: **route**
+  (serial, cheap — parse + module lookup + envelope shape), **recover**
+  (parallel — envelope recovery for signed native txs via rayon
+  across the batch; payload preverify per module group via the
+  module's own parallelism), **adjudicate** (serial — replay gate
+  under ONE lock for the batch, envelope compare,
+  `validate_preverified`, cacheable sender), **insert** (one mempool
+  lock, one preverify-cache lock).
+- `ingest_tx` (single) reordered: preverify before validate, so the
+  single path also pays one recovery instead of two (90.4 → 49.9µs).
+- `ConsensusEngine::submit_txs` (ports) — batch intake on the trait,
+  default loops `submit_tx`; `OxideBft` forwards to
+  `ingest_tx_batch`. The load harness now submits in batches (the
+  deployment shape — RPC clients batch), retrying only the
+  intake-ring-full suffix.
+- Intake ring capacity now derives from `max_mempool_entries`
+  (was a fixed 10k that thrashed at 10k-tx rounds).
+- Measured: batch intake **90.4 → 12.0µs/tx (7.5×)** — parallel
+  recovery ~5.3µs effective on 8 cores + ~6µs serial adjudication.
+
+### Fix 2: tabled Reed-Solomon encode
+
+The vote phase's body-linear cost was the body↔commitment
+re-verification: `shard::commitment` Reed-Solomon-encodes the whole
+proposal per vote per engine — **6.74ms** on a 1.5MB body (the
+naive per-byte log/exp GF multiply). Tabled row-wise encode
+(per-coefficient 256-byte tables, XOR-accumulate across the row):
+**6.74 → 3.80ms (1.77×)**, same hash. Vote phase share dropped
+29% → 20%.
+
+### Measured end-to-end (4 validators, TCP, release)
+
+| Config | Before | After |
+|---|---|---|
+| 10k txs, 500/round | 5,689 tx/s | 9,977 tx/s |
+| 20k txs, 5k/round | — | 27,003 tx/s |
+| 40k txs, 10k/round | — | **34,966 tx/s** |
+
+Phase breakdown at 10k/round after both fixes: submit 40.8%
+(12.2µs/tx), qc_deliver 23.3% (6.9µs/tx), vote 22.6% (6.8µs/tx),
+propose 8.5%, qc_form 4.6%.
+
+### The remaining path to 100k (measured, not speculative)
+
+Total is ~30µs/tx at 10k tx/block; 100k needs ≤10µs/tx. The levers,
+largest first:
+
+1. **Submit serial phase (~6µs/tx)** — profile the adjudication
+   loop (parse, nonce lock, `validate_preverified` state checks,
+   BLAKE3 cache key, mempool insert). Also: the harness serializes
+   intake with consensus; production RPC threads overlap them, so
+   the harness number is the conservative bound.
+2. **Vote (~6.8µs/tx at 10k/block)** — remaining cost is the
+   3.8ms/engine commitment + BLS sign/verify. A `body_hash` header
+   field (BLAKE3 of the proposal bytes, checked on the direct path;
+   the RS commitment stays for the dispersed path) would cut the
+   direct-path check ~13× — a protocol change needing a spec
+   update. SIMD GF multiply is the no-protocol alternative.
+3. **Propose (26ms/view)** — intake-ring drain + mempool select +
+   per-tx gas-cap loop.
+4. **Execution (6.9µs/tx)** — already parallel; 145k tx/s ceiling
+   alone. Not binding.
+
+Honest caveat: the 34,966 number is this 8-core cloud box; the
+M1-class rig measured ~1.7× faster per core on the same benches.

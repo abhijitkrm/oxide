@@ -209,110 +209,23 @@ impl Module for EvmModule {
     /// [`ExecError::ModuleRejected`] for nonce, gas, or balance
     /// violations.
     fn validate(&self, _ctx: &TxContext, msg: &[u8]) -> Result<(), ExecError> {
-        // 1. RLP decode — `decode_raw` enforces complete input
-        // consumption: the trust boundary is exactly as strict as
-        // the RPC parse, so a trailing-junk encoding that RPC
-        // rejects can't enter through the mempool/executor path.
-        let signed = tx::SignedTx::decode_raw(msg).map_err(|_| ExecError::Malformed)?;
+        self.validate_core(msg, None)
+    }
 
-        // 2. Chain ID (EIP-155 replay protection).
-        if signed.chain_id() != self.chain_id {
-            return Err(ExecError::Malformed);
-        }
-
-        // 3. Signature recovery.
-        let sender = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
-        let sender_addr = Address(sender.0);
-
-        // 4. Nonce: tx nonce must be ≥ current account nonce.
-        //    This rejects stale (already-used) nonces. Future nonces
-        //    are allowed for mempool queueing.
-        let current_nonce = self.nonce(&sender_addr);
-        if signed.nonce() < current_nonce {
-            return Err(ExecError::rejected(
-                RejectCategory::Precondition,
-                format!("nonce {nonce} < current {current_nonce}", nonce = signed.nonce()),
-            ));
-        }
-
-        // 5. Gas limit: must be positive.
-        let gas_limit = signed.gas_limit();
-        if gas_limit == 0 {
-            return Err(ExecError::rejected(RejectCategory::InvalidInput, "gas_limit is zero"));
-        }
-
-        // HIGH fix: gas_limit must fit within the block gas limit.
-        // A tx with gas_limit > block_gas_limit can never be included
-        // and should be rejected at admission to save mempool space.
-        if gas_limit > self.block_gas_limit() {
-            return Err(ExecError::rejected(
-                RejectCategory::InvalidInput,
-                format!("gas_limit {gas_limit} > block_gas_limit {}", self.block_gas_limit()),
-            ));
-        }
-
-        // 6. Intrinsic gas: gas_limit must cover the intrinsic cost.
-        //    The intrinsic cost is 21_000 (base) + calldata cost
-        //    (16/byte for non-zero, 4/byte for zero) + access list
-        //    cost. We use a conservative lower bound of 21_000 here;
-        //    the full calldata-aware check arrives with the gas
-        //    economics phase (A5).
-        if gas_limit < INTRINSIC_GAS_BASE {
-            return Err(ExecError::rejected(
-                RejectCategory::InvalidInput,
-                format!("gas_limit {gas_limit} < intrinsic {INTRINSIC_GAS_BASE}"),
-            ));
-        }
-
-        // HIGH fix: EIP-1559 fee gates.
-        //   a. max_fee >= base_fee: a tx with max_fee < base_fee
-        //      can never be included (revm rejects it during
-        //      execution). Reject at admission to save resources.
-        //   b. priority_fee <= max_fee: EIP-1559 requires
-        //      max_priority_fee_per_gas <= max_fee_per_gas. A tx
-        //      with priority_fee > max_fee is invalid.
-        let max_fee = u128::try_from(signed.max_fee_per_gas()).map_err(|_| {
-            ExecError::rejected(RejectCategory::InvalidInput, "max_fee overflow u128")
-        })?;
-        let priority_fee = u128::try_from(signed.max_priority_fee_per_gas()).map_err(|_| {
-            ExecError::rejected(RejectCategory::InvalidInput, "priority_fee overflow u128")
-        })?;
-        if max_fee < u128::from(self.current_base_fee()) {
-            return Err(ExecError::rejected(
-                RejectCategory::InvalidInput,
-                format!("max_fee {max_fee} < base_fee {}", self.current_base_fee()),
-            ));
-        }
-        if priority_fee > max_fee {
-            return Err(ExecError::rejected(
-                RejectCategory::InvalidInput,
-                format!("priority_fee {priority_fee} > max_fee {max_fee}"),
-            ));
-        }
-
-        // 7. Balance: sender must cover gas_cost + value.
-        //    gas_cost = gas_limit * max_fee_per_gas (the worst-case
-        //    fee the sender could pay). For legacy txs, gas_price is
-        //    the max fee. For EIP-1559, max_fee_per_gas is the cap.
-        let balance = self.balance(&sender_addr);
-        let value = u128::try_from(signed.value()).map_err(|_| {
-            ExecError::rejected(RejectCategory::InvalidInput, "value overflow u128")
-        })?;
-        // gas_cost = gas_limit * max_fee, checked for overflow.
-        let gas_cost = u128::from(gas_limit).checked_mul(max_fee).ok_or_else(|| {
-            ExecError::rejected(RejectCategory::InvalidInput, "gas cost overflow")
-        })?;
-        let total_needed = gas_cost.checked_add(value).ok_or_else(|| {
-            ExecError::rejected(RejectCategory::InvalidInput, "gas_cost + value overflow")
-        })?;
-        if balance < total_needed {
-            return Err(ExecError::rejected(
-                RejectCategory::InsufficientFunds,
-                format!("insufficient balance: have {balance}, need {total_needed}"),
-            ));
-        }
-
-        Ok(())
+    /// `validate` with the sender already recovered by
+    /// [`preverify_batch`](Self::preverify_batch) — the intake path
+    /// pays the secp256k1 recovery exactly once instead of twice
+    /// (once here, once in preverify). When `preverified` carries a
+    /// sender for these exact payload bytes, the recovery below is
+    /// skipped and the preverified sender drives the nonce/balance
+    /// checks; `None` recovers inline (the standalone path).
+    fn validate_preverified(
+        &self,
+        _ctx: &TxContext,
+        msg: &[u8],
+        preverified: Option<&executor::PreverifiedTx<'_>>,
+    ) -> Result<(), ExecError> {
+        self.validate_core(msg, preverified)
     }
 
     /// The EVM is self-funded: revm charges `gas_used × effective
@@ -1061,6 +974,140 @@ impl Module for EvmModule {
         framework::lock_state(&self.retained_branches).clear();
         *framework::lock_state(&self.cached_state_root) = None;
         framework::lock_state(&self.touched).clear();
+        Ok(())
+    }
+}
+
+impl EvmModule {
+    /// The shared admission body behind [`Module::validate`] and
+    /// [`Module::validate_preverified`]: decode, chain ID, optional
+    /// sender recovery, then the state checks (nonce, gas, fees,
+    /// balance). Pure — reads module state, writes nothing.
+    ///
+    /// `preverified` short-circuits step 3: the batch preverify pass
+    /// already authenticated these exact payload bytes, so paying
+    /// the ~11µs secp256k1 recovery again would double the intake
+    /// cost per tx. The sender address it carries is the recovery
+    /// output for the same bytes — substituting it is equivalent,
+    /// not a trust downgrade.
+    fn validate_core(
+        &self,
+        msg: &[u8],
+        preverified: Option<&executor::PreverifiedTx<'_>>,
+    ) -> Result<(), ExecError> {
+        // 1. RLP decode — `decode_raw` enforces complete input
+        // consumption: the trust boundary is exactly as strict as
+        // the RPC parse, so a trailing-junk encoding that RPC
+        // rejects can't enter through the mempool/executor path.
+        let signed = tx::SignedTx::decode_raw(msg).map_err(|_| ExecError::Malformed)?;
+
+        // 2. Chain ID (EIP-155 replay protection).
+        if signed.chain_id() != self.chain_id {
+            return Err(ExecError::Malformed);
+        }
+
+        // 3. Signature recovery — skipped when the batch preverify
+        // already recovered this payload's sender.
+        let sender = match preverified {
+            Some(pre) => {
+                // The preverify result is keyed to these exact
+                // bytes; a mismatched payload would be an internal
+                // wiring bug, so assert the pairing cheaply.
+                debug_assert_eq!(pre.raw, msg, "preverified sender must match the payload");
+                primitives::Address(pre.sender)
+            }
+            None => signed.recover_sender().map_err(|_| ExecError::Malformed)?,
+        };
+        let sender_addr = Address(sender.0);
+
+        // 4. Nonce: tx nonce must be ≥ current account nonce.
+        //    This rejects stale (already-used) nonces. Future nonces
+        //    are allowed for mempool queueing.
+        let current_nonce = self.nonce(&sender_addr);
+        if signed.nonce() < current_nonce {
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                format!("nonce {nonce} < current {current_nonce}", nonce = signed.nonce()),
+            ));
+        }
+
+        // 5. Gas limit: must be positive.
+        let gas_limit = signed.gas_limit();
+        if gas_limit == 0 {
+            return Err(ExecError::rejected(RejectCategory::InvalidInput, "gas_limit is zero"));
+        }
+
+        // HIGH fix: gas_limit must fit within the block gas limit.
+        // A tx with gas_limit > block_gas_limit can never be included
+        // and should be rejected at admission to save mempool space.
+        if gas_limit > self.block_gas_limit() {
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("gas_limit {gas_limit} > block_gas_limit {}", self.block_gas_limit()),
+            ));
+        }
+
+        // 6. Intrinsic gas: gas_limit must cover the intrinsic cost.
+        //    The intrinsic cost is 21_000 (base) + calldata cost
+        //    (16/byte for non-zero, 4/byte for zero) + access list
+        //    cost. We use a conservative lower bound of 21_000 here;
+        //    the full calldata-aware check arrives with the gas
+        //    economics phase (A5).
+        if gas_limit < INTRINSIC_GAS_BASE {
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("gas_limit {gas_limit} < intrinsic {INTRINSIC_GAS_BASE}"),
+            ));
+        }
+
+        // HIGH fix: EIP-1559 fee gates.
+        //   a. max_fee >= base_fee: a tx with max_fee < base_fee
+        //      can never be included (revm rejects it during
+        //      execution). Reject at admission to save resources.
+        //   b. priority_fee <= max_fee: EIP-1559 requires
+        //      max_priority_fee_per_gas <= max_fee_per_gas. A tx
+        //      with priority_fee > max_fee is invalid.
+        let max_fee = u128::try_from(signed.max_fee_per_gas()).map_err(|_| {
+            ExecError::rejected(RejectCategory::InvalidInput, "max_fee overflow u128")
+        })?;
+        let priority_fee = u128::try_from(signed.max_priority_fee_per_gas()).map_err(|_| {
+            ExecError::rejected(RejectCategory::InvalidInput, "priority_fee overflow u128")
+        })?;
+        if max_fee < u128::from(self.current_base_fee()) {
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("max_fee {max_fee} < base_fee {}", self.current_base_fee()),
+            ));
+        }
+        if priority_fee > max_fee {
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("priority_fee {priority_fee} > max_fee {max_fee}"),
+            ));
+        }
+
+        // 7. Balance: sender must cover gas_cost + value.
+        //    gas_cost = gas_limit * max_fee_per_gas (the worst-case
+        //    fee the sender could pay). For legacy txs, gas_price is
+        //    the max fee. For EIP-1559, max_fee_per_gas is the cap.
+        let balance = self.balance(&sender_addr);
+        let value = u128::try_from(signed.value()).map_err(|_| {
+            ExecError::rejected(RejectCategory::InvalidInput, "value overflow u128")
+        })?;
+        // gas_cost = gas_limit * max_fee, checked for overflow.
+        let gas_cost = u128::from(gas_limit).checked_mul(max_fee).ok_or_else(|| {
+            ExecError::rejected(RejectCategory::InvalidInput, "gas cost overflow")
+        })?;
+        let total_needed = gas_cost.checked_add(value).ok_or_else(|| {
+            ExecError::rejected(RejectCategory::InvalidInput, "gas_cost + value overflow")
+        })?;
+        if balance < total_needed {
+            return Err(ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                format!("insufficient balance: have {balance}, need {total_needed}"),
+            ));
+        }
+
         Ok(())
     }
 }
