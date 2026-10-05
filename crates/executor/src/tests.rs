@@ -2771,11 +2771,15 @@ fn exec_lane_saturates_without_blocking() {
 /// proposal was built — a losing proposal erased its txs forever.
 ///
 /// Under in-flight marking the tx is not re-selected *while its
-/// proposal's position is open*: a pipelined proposal carrying it
-/// again would commit as a deterministic nonce skip. It re-proposes
-/// once the next commit resolves the position — a one-position
-/// delay, never a loss. (The OAI has no "proposal aborted" signal,
-/// so commit is the earliest sound release point.)
+/// proposal's height is open*: a pipelined proposal carrying it
+/// again would commit as a deterministic nonce skip. The app cannot
+/// see which height the engine stamps, so the set is tagged at the
+/// pipeline's upper bound (`IN_FLIGHT_PIPELINE_DEPTH` past the next
+/// committed height) and re-proposes once that height commits — a
+/// bounded delay, never a loss. Releasing on *any* next commit was
+/// unsound under rotating leaders: another leader's earlier block
+/// freed a set that was still pending. (The OAI has no "proposal
+/// aborted" signal, so commit is the earliest sound release point.)
 #[test]
 fn uncommitted_proposal_keeps_txs() {
     let mut executor = test_executor(100);
@@ -2784,22 +2788,30 @@ fn uncommitted_proposal_keeps_txs() {
     let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
     let first = executor.prepare_proposal(&budget);
     assert_eq!(first.txs.len(), 1);
-    // The position is still open: the in-flight tx must not
+    // The height is still open: the in-flight tx must not
     // duplicate into the next proposal — that duplicate would
     // commit as a nonce skip and waste the slot.
     let second = executor.prepare_proposal(&budget);
     assert!(second.txs.is_empty(), "in-flight txs are not re-selected");
     assert_eq!(executor.mempool_len(), 1, "the tx stays pooled");
-    // A commit resolves the open position — even one carrying no
-    // txs — and the pooled tx becomes selectable again.
-    executor.finalize_block(&FinalizedBlock {
+    let empty_block = |h: u64| FinalizedBlock {
         context: types::BlockContext::default(),
-        height: Height::new(0),
+        height: Height::new(h),
         txs: Vec::new(),
         signers: Vec::new(),
-    });
+    };
+    // Commits below the tagged height (0 + depth 2) keep it in flight.
+    for h in 0..2 {
+        executor.finalize_block(&empty_block(h));
+        assert!(
+            executor.prepare_proposal(&budget).txs.is_empty(),
+            "still in flight after committing height {h}"
+        );
+    }
+    // The tagged height commits without the tx: it re-proposes.
+    executor.finalize_block(&empty_block(2));
     let third = executor.prepare_proposal(&budget);
-    assert_eq!(third.txs, first.txs, "the released tx re-proposes once its position resolves");
+    assert_eq!(third.txs, first.txs, "the released tx re-proposes once its height resolves");
 }
 
 /// The mirror image: txs DO leave the pool — but only when a

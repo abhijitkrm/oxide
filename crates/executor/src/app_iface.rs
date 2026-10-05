@@ -13,6 +13,15 @@ use super::{
     Verdict, is_signed_envelope, module_payload, parse_module_id, parse_tx_context,
 };
 
+/// How far past the next committed height a freshly built proposal
+/// can land: `oxideBFT` is a pipelined 2-chain `HotStuff`, so up to two
+/// certified-but-uncommitted ancestors may sit between the committed
+/// tip and the new block. Used to tag the mempool's in-flight set at
+/// an upper bound — over-estimating only delays re-selection of a
+/// lost proposal's txs by ≤ this many commits; under-estimating
+/// would re-propose txs that are still in flight.
+const IN_FLIGHT_PIPELINE_DEPTH: u64 = 2;
+
 /// Admission check for a self-authenticating module's tx, given the
 /// signer its payload recovered to: the envelope `sender` must be
 /// that signer, then the module's stateful gates run.
@@ -406,8 +415,14 @@ impl AppInterface for Executor {
         // proposal's txs re-select rather than leak. Marked only
         // after the gas filter so filtered-out candidates stay
         // eligible.
-        primitives::sync::lock_state(&self.mempool).note_proposed(&txs);
         let height = Height::new(*primitives::sync::lock_state(&self.next_proposal_height));
+        // The engine stamps the real height after this returns; in a
+        // 2-chain pipeline it can sit up to `IN_FLIGHT_PIPELINE_DEPTH`
+        // past the next committed height. Tag at that upper bound:
+        // the mempool releases a set once its tag commits, and late
+        // is the safe direction (early re-selects in-flight txs).
+        primitives::sync::lock_state(&self.mempool)
+            .note_proposed(height.value().saturating_add(IN_FLIGHT_PIPELINE_DEPTH), &txs);
         if let Some(recorder) = &self.recorder {
             recorder.record("prepare_proposal", start.elapsed());
         }
@@ -579,7 +594,8 @@ impl AppInterface for Executor {
         // inside `execute_block`) also covers the async lane: a
         // committed tx can never be re-proposed by a `prepare` that
         // runs while the worker is still draining the backlog.
-        primitives::sync::lock_state(&self.mempool).remove_committed(&block.txs);
+        primitives::sync::lock_state(&self.mempool)
+            .remove_committed(block.height.value(), &block.txs);
         let lane_spawned = {
             let (lock, _cv) = &*self.exec_sync;
             primitives::sync::lock_state(lock).lane_spawned

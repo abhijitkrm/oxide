@@ -121,14 +121,18 @@ pub struct Mempool {
     /// nonce chain — the duplicate then commits as a deterministic
     /// nonce skip and wastes the block space. `select` skips
     /// in-flight hashes, `note_proposed` records each built
-    /// proposal's set, and `remove_committed` resolves the oldest
-    /// position per commit: positions commit strictly in order and
-    /// a descendant can only commit if its parent did, so the
-    /// front of the deque is always the next position to resolve.
-    /// If the committed block carried these txs they are already
-    /// gone from the pool; if a different branch won the position,
-    /// the txs become selectable again.
-    proposed: VecDeque<HashSet<Hash>>,
+    /// proposal's set tagged with the height it proposed for, and
+    /// `remove_committed(h)` resolves every set at height ≤ h. If
+    /// the committed block carried these txs they are already gone
+    /// from the pool; if a different block won the height, the txs
+    /// become selectable again.
+    ///
+    /// Keyed by height, not by deque position: with rotating
+    /// leaders this node proposes only some heights, so "pop one
+    /// set per commit" released our in-flight set on the commit of
+    /// *another* leader's earlier block — while ours was still
+    /// pending — and the next proposal duplicated its txs.
+    proposed: VecDeque<(u64, HashSet<Hash>)>,
 }
 
 /// Maximum outstanding proposal positions tracked for in-flight
@@ -608,7 +612,7 @@ impl Mempool {
                 // position can only commit after its parent, so
                 // this tx's position always resolves before any
                 // proposal carrying the later nonces commits.
-                if self.proposed.iter().any(|set| set.contains(&hash)) {
+                if self.proposed.iter().any(|(_, set)| set.contains(&hash)) {
                     nonce = nonce.saturating_add(1);
                     continue;
                 }
@@ -654,22 +658,26 @@ impl Mempool {
     /// so a lost proposal's work re-selects once its position
     /// resolves on commit (see `proposed`).
     ///
-    /// The set is pushed unconditionally — even for an empty
-    /// proposal — because `remove_committed` resolves exactly one
-    /// position per call and the deque's order must stay aligned
-    /// with the chain's position order. A missed push would release
-    /// a later set early (re-admitting its txs for one position —
-    /// the duplicate-skip this exists to prevent); an extra push
-    /// only delays a release past its position, which is the safe
-    /// direction.
+    /// `height` is a lower bound on the height the proposal will
+    /// occupy; the set is tagged with `max(height, previous tag + 1)`
+    /// (so pipelined proposals never share a tag) and resolves when
+    /// that height — or a later one — commits. Callers that cannot
+    /// know the exact height should over-estimate: a late release
+    /// only delays a lost proposal's txs, an early one duplicates
+    /// them.
     ///
     /// Hashes are recomputed here because `Proposal` carries only
     /// `TxBytes`: O(proposal txs) hashing on the proposal path —
     /// the same price `remove_committed` pays at finalization.
-    pub fn note_proposed(&mut self, txs: &[TxBytes]) {
+    pub fn note_proposed(&mut self, height: u64, txs: &[TxBytes]) {
+        if txs.is_empty() {
+            return;
+        }
         let set: HashSet<Hash> =
             txs.iter().map(|tx| Hasher::hash_one(Domain::Transaction, tx.as_bytes())).collect();
-        self.proposed.push_back(set);
+        let tag =
+            self.proposed.back().map_or(height, |(last, _)| height.max(last.saturating_add(1)));
+        self.proposed.push_back((tag, set));
         while self.proposed.len() > MAX_IN_FLIGHT_PROPOSALS {
             self.proposed.pop_front();
         }
@@ -691,13 +699,13 @@ impl Mempool {
     /// Hashes are recomputed here because `FinalizedBlock` carries
     /// only `TxBytes`: O(block txs) hashing on the commit path.
     ///
-    /// Also resolves the oldest outstanding proposal position: the
-    /// commit answers whether that proposal's txs committed (they
-    /// are already gone via `remove` below) or must re-select (a
-    /// different branch won the position — the released set is
+    /// Also resolves every in-flight proposal at height ≤ `height`:
+    /// the commit answers whether those txs committed (they are
+    /// already gone via `remove` below) or must re-select (a
+    /// different block won the height — the released set is
     /// eligible again on the next `select`).
-    pub fn remove_committed(&mut self, txs: &[TxBytes]) {
-        self.proposed.pop_front();
+    pub fn remove_committed(&mut self, height: u64, txs: &[TxBytes]) {
+        self.proposed.retain(|(h, _)| *h > height);
         for tx in txs {
             let hash = Hasher::hash_one(Domain::Transaction, tx.as_bytes());
             self.remove(&hash);
@@ -935,7 +943,7 @@ mod tests {
         // Selection is a peek — the tx stays pooled until the block
         // finalizes, so a losing proposal can't lose it.
         assert_eq!(pool.len(), 1, "peek select leaves entries pooled");
-        pool.remove_committed(&selected);
+        pool.remove_committed(1, &selected);
         assert_eq!(pool.len(), 0, "finalization removes committed txs");
     }
 
@@ -1038,7 +1046,7 @@ mod tests {
         let (_, nonce1, _) = parse_tx(selected[1].as_bytes()).unwrap();
         assert_eq!(nonce1, 1);
         // Both txs stay pooled until finalization removes them.
-        pool.remove_committed(&selected);
+        pool.remove_committed(1, &selected);
         assert_eq!(pool.len(), 0);
     }
 
@@ -1053,7 +1061,7 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(pool.len(), 2, "peek: both txs stay pooled");
         // After the selected tx commits, one remains for next block.
-        pool.remove_committed(&selected);
+        pool.remove_committed(1, &selected);
         assert_eq!(pool.len(), 1, "one tx remains after commit");
     }
 
@@ -1181,7 +1189,7 @@ mod tests {
         assert_eq!(pool.len(), 10);
         let selected = pool.select(1 << 20);
         assert_eq!(selected.len(), 10, "all 10 txs should be selected");
-        pool.remove_committed(&selected);
+        pool.remove_committed(1, &selected);
         assert_eq!(pool.len(), 0, "pool should be empty after commit");
         // Committing drained every index — a `by_fee` tombstone
         // would leave a non-empty bucket behind.
@@ -1201,7 +1209,7 @@ mod tests {
         // Commit all — removal should clean up the sender queue.
         let selected = pool.select(1 << 20);
         assert_eq!(selected.len(), 3);
-        pool.remove_committed(&selected);
+        pool.remove_committed(1, &selected);
         assert_eq!(pool.len(), 0);
         // The sender's queue should be gone (no orphaned entries).
         // Verify by submitting a new tx from the same sender — it
@@ -1239,7 +1247,7 @@ mod tests {
         assert_eq!(pool.len(), 6, "peek keeps all entries pooled");
         // Commit the selected txs, then the next select takes the
         // spammer's next two capped nonces.
-        pool.remove_committed(&selected);
+        pool.remove_committed(1, &selected);
         let selected2 = pool.select(1 << 20);
         assert_eq!(selected2.len(), 2, "next block takes the next 2 capped txs");
     }
@@ -1339,7 +1347,7 @@ mod tests {
         assert_eq!(selected.len(), 3, "chain stops at cap even with more nonces");
         // Peek: nonces `0..2` selected, all 6 stay pooled; commit
         // removes the selected three.
-        pool.remove_committed(&selected);
+        pool.remove_committed(1, &selected);
         assert_eq!(pool.len(), 3);
     }
 
@@ -1379,7 +1387,7 @@ mod tests {
         let second = pool.select(1 << 20);
         assert_eq!(second, first, "uncommitted txs stay re-proposable");
         // And when a block DOES commit it, it leaves for good.
-        pool.remove_committed(&second);
+        pool.remove_committed(1, &second);
         assert!(pool.select(1 << 20).is_empty());
     }
 
@@ -1394,7 +1402,7 @@ mod tests {
                 pool.submit(build_tx(addr(i), round, 100 + round, &[0])).unwrap();
             }
             let selected = pool.select(1 << 20);
-            pool.remove_committed(&selected);
+            pool.remove_committed(1, &selected);
         }
         assert_eq!(pool.len(), 0);
         assert!(
@@ -1485,7 +1493,7 @@ mod tests {
         pool.submit(build_tx(addr(2), 0, 100, &[9])).unwrap();
 
         let first = pool.select(1 << 20);
-        pool.note_proposed(&first);
+        pool.note_proposed(1, &first);
         // cap=2 → the first proposal carries addr(1) nonces 0,1 and
         // addr(2) nonce 0 (fee ties order across senders; collect
         // nonces per sender instead of asserting an interleave).
@@ -1513,7 +1521,7 @@ mod tests {
                 .unwrap();
         }
         let first = pool.select(1 << 20);
-        pool.note_proposed(&first);
+        pool.note_proposed(1, &first);
         assert!(
             pool.select(1 << 20).is_empty(),
             "in-flight head is excluded while its position is open"
@@ -1521,7 +1529,7 @@ mod tests {
 
         // A different branch won the position: the commit carries
         // none of the proposed txs. The set releases.
-        pool.remove_committed(&[]);
+        pool.remove_committed(1, &[]);
         let reselected = pool.select(1 << 20);
         assert_eq!(
             nonces_of(&reselected),
@@ -1542,18 +1550,18 @@ mod tests {
                 .unwrap();
         }
         let first = pool.select(1 << 20);
-        pool.note_proposed(&first);
+        pool.note_proposed(1, &first);
         let second = pool.select(1 << 20);
-        pool.note_proposed(&second);
+        pool.note_proposed(2, &second);
 
         // Position 1 commits its proposal: those txs leave the
         // pool, and the position resolves.
-        pool.remove_committed(&first);
+        pool.remove_committed(1, &first);
         assert_eq!(pool.len(), 2);
         // Position 2 still open: nonces 2,3 stay in-flight.
         assert!(pool.select(1 << 20).is_empty());
         // Position 2 resolves the same way.
-        pool.remove_committed(&second);
+        pool.remove_committed(2, &second);
         assert_eq!(pool.len(), 0);
     }
 
@@ -1568,25 +1576,43 @@ mod tests {
         pool.submit(build_tx(addr(1), 1, 100, &[1])).unwrap();
 
         let first = pool.select(1 << 20); // carries nonce 0
-        pool.note_proposed(&first);
+        pool.note_proposed(1, &first);
         let second = pool.select(1 << 20); // continues past it: nonce 1
-        pool.note_proposed(&second);
+        pool.note_proposed(2, &second);
         assert_eq!(nonces_of(&second), vec![1]);
 
         // An alien block won position 1: the first set releases,
         // the second stays in-flight.
-        pool.remove_committed(&[]);
+        pool.remove_committed(1, &[]);
         let third = pool.select(1 << 20);
         assert_eq!(
             nonces_of(&third),
             vec![0],
             "released position-1 tx re-selects while position 2 is open"
         );
-        pool.note_proposed(&third);
+        pool.note_proposed(3, &third);
 
         // Position 2 resolves on the next commit — its tx releases.
-        pool.remove_committed(&[]);
+        pool.remove_committed(2, &[]);
         let fourth = pool.select(1 << 20);
         assert_eq!(nonces_of(&fourth), vec![1], "position 2 resolves on its own commit");
+    }
+
+    /// Regression: with rotating leaders this node proposes only
+    /// some heights. The commit of another leader's *earlier* block
+    /// must not release our still-pending proposal's set — the old
+    /// pop-one-per-commit bookkeeping did, so the next proposal
+    /// re-selected (and duplicated) our in-flight txs.
+    #[test]
+    fn foreign_commit_below_our_height_keeps_in_flight() {
+        let mut pool = Mempool::new(100);
+        pool.submit(build_tx(addr(1), 0, 100, &[0])).unwrap();
+        let ours = pool.select(1 << 20);
+        pool.note_proposed(5, &ours);
+        pool.remove_committed(3, &[]);
+        pool.remove_committed(4, &[]);
+        assert!(pool.select(1 << 20).is_empty(), "height 5 is still pending");
+        pool.remove_committed(5, &[]);
+        assert_eq!(nonces_of(&pool.select(1 << 20)), vec![0], "released once height 5 resolves");
     }
 }
