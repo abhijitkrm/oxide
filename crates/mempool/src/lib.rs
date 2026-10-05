@@ -97,6 +97,13 @@ pub struct Mempool {
     /// every other account. The cap bounds any sender's block
     /// share regardless of fee.
     max_per_sender: usize,
+    /// Pool-level per-sender bound, checked at `submit`: at most
+    /// this many pending txs per sender, and no nonce more than
+    /// this far past the sender's last executed nonce (when known).
+    /// Distinct from `max_per_sender` (a per-*block* share): the
+    /// pool deliberately holds several blocks' worth per sender so
+    /// pipelined proposals can continue a nonce chain.
+    max_pending_per_sender: usize,
     /// Per-sender last executed nonce (HIGH fix). The mempool
     /// anchors selection to `executed_nonce + 1` — a tx with a
     /// lower nonce is stale (already executed) and a tx with a
@@ -144,6 +151,14 @@ const MAX_IN_FLIGHT_PROPOSALS: usize = 16;
 /// (e.g. a sequencer-owned settlement lane) legitimately needs
 /// more.
 pub const DEFAULT_MAX_PER_SENDER: usize = 1000;
+
+/// Default pool-level bound on one sender's pending txs (and on how
+/// far its nonces may run ahead of the last executed one): four
+/// blocks' worth at [`DEFAULT_MAX_PER_SENDER`], enough to keep a
+/// pipelined nonce chain fed while stopping one account — which only
+/// has to be funded, not honest — from filling the pool with
+/// far-future nonces that never execute and are never pruned.
+pub const DEFAULT_MAX_PENDING_PER_SENDER: usize = 4 * DEFAULT_MAX_PER_SENDER;
 
 /// Fee density: fee per byte. Higher is better. We store `(fee, size)`
 /// and implement `Ord` by cross-multiplication (fee₁·size₂ vs
@@ -234,6 +249,11 @@ pub enum MempoolError {
     /// replacement's fee is below the required bump (≥110% of the
     /// displaced fee — geth legacypool `ErrReplaceUnderpriced`).
     ReplacementUnderpriced,
+    /// The sender already holds `max_pending_per_sender` pending txs, or the
+    /// nonce sits further than that past its last executed nonce.
+    /// Without this bound one account could fill the whole pool with
+    /// far-future nonces that never execute and are never pruned.
+    SenderLimit,
 }
 
 /// A simple v0 transaction format: `[sender: 20 bytes][nonce: 8 bytes
@@ -266,6 +286,7 @@ impl Mempool {
             by_fee: BTreeMap::new(),
             max_entries,
             max_per_sender: DEFAULT_MAX_PER_SENDER,
+            max_pending_per_sender: DEFAULT_MAX_PENDING_PER_SENDER,
             executed_nonces: HashMap::new(),
             proposed: VecDeque::new(),
         }
@@ -275,6 +296,14 @@ impl Mempool {
     #[must_use]
     pub fn with_max_per_sender(mut self, cap: usize) -> Self {
         self.max_per_sender = cap;
+        self
+    }
+
+    /// Override the pool-level per-sender bound
+    /// ([`DEFAULT_MAX_PENDING_PER_SENDER`]).
+    #[must_use]
+    pub fn with_max_pending_per_sender(mut self, cap: usize) -> Self {
+        self.max_pending_per_sender = cap;
         self
     }
 
@@ -323,6 +352,22 @@ impl Mempool {
         // counting toward `max_entries` and could be "evicted" as a
         // ghost) and letting a *lower*-fee resubmit shadow a
         // higher-fee tx.
+        // Per-sender admission bound (replacements reuse their slot,
+        // so they are exempt from the count): at most
+        // `max_pending_per_sender` pending txs, within that many
+        // nonces of the last executed one when the anchor is known.
+        let cap = u64::try_from(self.max_pending_per_sender).unwrap_or(u64::MAX);
+        let queue = self.by_sender.get(&sender);
+        let is_replacement = queue.is_some_and(|q| q.contains_key(&nonce));
+        if !is_replacement && queue.is_some_and(|q| q.len() >= self.max_pending_per_sender) {
+            return Err(MempoolError::SenderLimit);
+        }
+        if let Some(&executed) = self.executed_nonces.get(&sender)
+            && nonce > executed.saturating_add(cap)
+        {
+            return Err(MempoolError::SenderLimit);
+        }
+
         if let Some(&old_hash) = self.by_sender.get(&sender).and_then(|q| q.get(&nonce))
             && let Some(old) = self.by_hash.get(&old_hash)
         {
@@ -892,6 +937,34 @@ mod tests {
         assert_eq!(pool.len(), 1, "peek select leaves entries pooled");
         pool.remove_committed(&selected);
         assert_eq!(pool.len(), 0, "finalization removes committed txs");
+    }
+
+    /// Regression: the per-sender cap was only applied when building
+    /// a block, so one account could occupy the entire pool.
+    #[test]
+    fn submit_enforces_per_sender_limit() {
+        let mut pool = Mempool::new(100).with_max_pending_per_sender(3);
+        for nonce in 0..3 {
+            assert!(pool.submit(build_tx(addr(1), nonce, 100, &[])).is_ok());
+        }
+        assert_eq!(
+            pool.submit(build_tx(addr(1), 3, 100, &[])),
+            Err(MempoolError::SenderLimit),
+            "a fourth pending tx exceeds the cap"
+        );
+        assert!(
+            pool.submit(build_tx(addr(1), 2, 200, &[])).is_ok(),
+            "a replacement reuses its slot"
+        );
+        assert!(pool.submit(build_tx(addr(2), 0, 100, &[])).is_ok(), "other senders unaffected");
+
+        pool.set_executed_nonce(addr(3), 10);
+        assert!(pool.submit(build_tx(addr(3), 13, 100, &[])).is_ok());
+        assert_eq!(
+            pool.submit(build_tx(addr(3), 14, 100, &[])),
+            Err(MempoolError::SenderLimit),
+            "nonce too far ahead of the executed anchor"
+        );
     }
 
     #[test]
