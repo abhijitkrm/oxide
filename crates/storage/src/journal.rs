@@ -768,41 +768,11 @@ fn new_segment_file(dir: &Path, seq: u32) -> Result<(File, Vec<u8>), JournalErro
 /// IEEE CRC-32 (reflected, poly `0xEDB88320`, init/xorout `0xFFFF_FFFF`)
 /// — the exact variant is part of the on-disk format (spec §2 rule 5).
 ///
-/// Table-based, implemented in-crate to keep the journal core std-only.
+/// Delegates to the shared slice-by-8 implementation in
+/// `primitives` (std-only, no dependency), which the consensus WAL
+/// uses too.
 pub fn crc32(payload: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFF_u32;
-    for &byte in payload {
-        crc = (crc >> 8) ^ CRC_TABLE[((crc ^ u32::from(byte)) & 0xFF) as usize];
-    }
-    !crc
-}
-
-/// CRC-32 reflected lookup table (generated at compile time — no runtime
-/// init, no `OnceLock`, no cost).
-const CRC_TABLE: [u32; 256] = build_crc_table();
-
-/// Build the reflected CRC-32 table: `table[i]` is the remainder of
-/// the byte `i` followed by 7 zero bits over the generator.
-#[allow(clippy::cast_possible_truncation)]
-// Justification: `i` is a u32 loop counter bounded by the literal 256,
-// and 256 always fits usize on every Rust target — the cast is a width
-// formality, not a truncation risk. (`usize::from(u32)` does not
-// exist, and `try_from` is not const-compatible here.)
-const fn build_crc_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
-    let mut i = 0u32;
-    while i < 256 {
-        let mut c = i;
-        let mut k = 0;
-        while k < 8 {
-            // Reflected polynomial: LSB-first long division.
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
-            k += 1;
-        }
-        table[i as usize] = c;
-        i += 1;
-    }
-    table
+    primitives::crc32::checksum(payload)
 }
 
 #[cfg(test)]

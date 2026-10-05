@@ -588,18 +588,7 @@ impl From<codec::DecodeError> for WalError {
 /// CRC32 detects all truncation and single-bit errors, and most
 /// multi-bit errors, with zero false positives in practice.
 fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xEDB8_8320;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    !crc
+    primitives::crc32::checksum(data)
 }
 
 /// Encode `entry` into one WAL frame: `[u32 LE length] [u32 LE CRC32]
