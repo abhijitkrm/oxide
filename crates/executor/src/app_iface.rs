@@ -13,6 +13,30 @@ use super::{
     Verdict, is_signed_envelope, module_payload, parse_module_id, parse_tx_context,
 };
 
+/// Admission check for a self-authenticating module's tx, given the
+/// signer its payload recovered to: the envelope `sender` must be
+/// that signer, then the module's stateful gates run.
+///
+/// The mempool keys dedupe, replace-by-fee and eviction on the
+/// envelope's `sender`; for such modules execution ignores that
+/// field, so unbound it is a free claim — a forged one could evict
+/// another account's pending tx.
+fn validate_self_authenticated(
+    module: &dyn super::Module,
+    ctx: &super::TxContext,
+    payload: &[u8],
+    signer: &[u8; 20],
+) -> Result<(), MempoolAck> {
+    if *signer != ctx.sender.0 {
+        return Err(MempoolAck::Rejected {
+            reason: "envelope sender does not match payload signer".to_string(),
+        });
+    }
+    module
+        .validate_authenticated(ctx, payload, signer)
+        .map_err(|e| MempoolAck::Rejected { reason: format!("validate: {e:?}") })
+}
+
 impl AppInterface for Executor {
     fn ingest_tx(&self, tx: TxBytes) -> MempoolAck {
         // A4: route mempool admission through `Module::validate`.
@@ -92,8 +116,8 @@ impl AppInterface for Executor {
             let Some(sender) = recovered_sender else {
                 return MempoolAck::Rejected { reason: "validate: malformed".to_string() };
             };
-            if let Err(e) = module.validate_authenticated(&ctx, payload, &sender) {
-                return MempoolAck::Rejected { reason: format!("validate: {e:?}") };
+            if let Err(ack) = validate_self_authenticated(module.as_ref(), &ctx, payload, &sender) {
+                return ack;
             }
         } else if let Err(e) = module.validate(&ctx, payload) {
             return MempoolAck::Rejected { reason: format!("validate: {e:?}") };
@@ -251,8 +275,10 @@ impl AppInterface for Executor {
                         .push(MempoolAck::Rejected { reason: "validate: malformed".to_string() });
                     continue;
                 };
-                if let Err(e) = module.validate_authenticated(&ctx, payload, &sender) {
-                    results.push(MempoolAck::Rejected { reason: format!("validate: {e:?}") });
+                if let Err(ack) =
+                    validate_self_authenticated(module.as_ref(), &ctx, payload, &sender)
+                {
+                    results.push(ack);
                     continue;
                 }
             } else if let Err(e) = module.validate(&ctx, payload) {

@@ -2173,6 +2173,41 @@ fn pipeline_signed_transfer(
     tx::SignedTx::sign_legacy(tx, privkey).expect("sign must succeed").encode_to_bytes()
 }
 
+/// Regression: the envelope's `sender`/`nonce`/`fee` drive mempool
+/// dedupe, replace-by-fee and eviction, so an EVM tx may not claim
+/// values its signature does not back. Before the fix any of these
+/// forgeries was admitted — letting one account evict another's
+/// pending tx (claimed sender + nonce, bumped fee) or pin its own
+/// txs in the pool with a `u64::MAX` fee.
+#[test]
+fn evm_envelope_claims_must_match_signed_tx() {
+    use ports::AppInterface;
+    use std::sync::Arc;
+
+    let (privkey, addr) = test_keypair();
+    let signer = Address(addr.0);
+    let victim = Address([0x77; 20]);
+    let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+    let evm_module = EvmModule::new(1, 7);
+    evm_module.fund_account_for_test(&signer, u128::MAX);
+    let mut executor = executor::Executor::new(1000);
+    executor.register_module(Arc::new(evm_module));
+    let rlp = pipeline_signed_transfer(&privkey, 0, recipient, 1_000_000_000);
+    let gas_price = 1_000_000_000;
+
+    let forged = [
+        ("foreign sender", wrap_evm_tx_envelope(&victim, 0, gas_price, &rlp)),
+        ("wrong nonce", wrap_evm_tx_envelope(&signer, 5, gas_price, &rlp)),
+        ("inflated fee", wrap_evm_tx_envelope(&signer, 0, u64::MAX, &rlp)),
+    ];
+    for (what, envelope) in forged {
+        let ack = executor.ingest_tx(types::TxBytes::new(envelope));
+        assert!(matches!(ack, types::MempoolAck::Rejected { .. }), "{what} must be rejected");
+    }
+    let honest = wrap_evm_tx_envelope(&signer, 0, gas_price, &rlp);
+    assert!(matches!(executor.ingest_tx(types::TxBytes::new(honest)), types::MempoolAck::Accepted));
+}
+
 /// The full EVM pipeline: submit signed EVM txs through the
 /// executor's mempool, propose a block, finalize it, and verify
 /// the state root is non-zero (the EVM executed the txs).

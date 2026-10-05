@@ -234,12 +234,22 @@ impl Module for EvmModule {
     /// consensus pump for gossip traffic).
     fn validate_authenticated(
         &self,
-        _ctx: &TxContext,
+        ctx: &TxContext,
         msg: &[u8],
         sender: &[u8; 20],
     ) -> Result<(), ExecError> {
         let signed = tx::SignedTx::decode_raw(msg).map_err(|_| ExecError::Malformed)?;
         if signed.chain_id() != self.chain_id {
+            return Err(ExecError::Malformed);
+        }
+        // The envelope's nonce and fee drive mempool ordering,
+        // replacement and eviction, but execution ignores them. Bind
+        // them to the signed payload so they cannot be inflated:
+        // the nonce must match exactly, and the fee may not claim
+        // more than the signer agreed to pay (`max_fee_per_gas`,
+        // the value `wrap_evm_tx_envelope` callers put there).
+        let signed_fee = u64::try_from(signed.max_fee_per_gas()).unwrap_or(u64::MAX);
+        if ctx.nonce != signed.nonce() || ctx.fee > signed_fee {
             return Err(ExecError::Malformed);
         }
         self.validate_stateful(&signed, Address(*sender))
