@@ -12,6 +12,29 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Lower message latency and fewer copies on the validator hot
+  path** (`node`, `p2p`, `ports`, `primitives`, `consensus`,
+  `storage`):
+  - The validator loop slept 1 ms on *every* pass, even right after
+    handling messages (its comment said otherwise), adding ≥ 1 ms
+    to each propose → vote → QC hop. It now sleeps only when a pass
+    did no work.
+  - Broadcasts (proposals, QCs, TCs, tx gossip) used to copy the
+    whole message once per peer; the new `Transport::broadcast`
+    shares one buffer across all recipients, plain-TCP batches are
+    written with vectored I/O instead of being concatenated, and
+    `send` takes a byte slice so callers stop allocating a `Vec`
+    per peer address.
+  - CRC-32 for the journal and WAL is now slice-by-8, shared in
+    `primitives::crc32`: **~0.4 → ~1.9 GB/s (≈4.7×)** on M1, 16 MiB
+    input, release build. Same checksum, same on-disk format.
+  - The loop no longer takes a write lock on the staged validator
+    set every pass, and `OXIDE_DEBUG_PROPOSE` is read once per
+    process instead of on every idle `propose`.
+  - **In plain words:** messages between validators go out sooner,
+    big messages are no longer copied once per recipient, and disk
+    checksums are several times faster.
+
 - **Commit-path fsync amortization** (`storage`, `executor`,
   `ports`, `consensus`): the executor journal used to pay one
   `fdatasync` per finalized block on the consensus thread — ~21.5 %
@@ -225,6 +248,65 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     state is durable.
 
 ### Fixed
+
+- **Journal no longer loses records after a crash-then-restart**
+  (`storage`, used by the executor commit journal and block sync):
+  a crash could leave a half-written record at the end of the
+  newest segment. `JournalWriter::create` ignored it and started a
+  *new* segment behind it, but `replay` stops at the first damaged
+  record — so every record fsynced after the restart vanished on
+  the next one. `create` now cuts the newest segment back to its
+  last intact record first (keeping the original bytes as
+  `segment-<n>.log.damaged`), refuses with
+  `JournalError::Corrupt` when the damage is in an older, sealed
+  segment, and fsyncs the directory after creating a segment so
+  the new file itself survives power loss.
+  - **In plain words:** after a crash, a node could later "forget"
+    blocks it had safely written to disk. It now cleans up the
+    half-written leftover before writing anything new.
+
+- **EVM transactions can no longer forge their mempool envelope**
+  (`executor`, `evm`): the envelope's sender, nonce and fee decide
+  mempool dedupe, replacement and eviction, but for EVM txs nothing
+  tied them to the signed payload. One funded account could evict
+  another account's pending tx (claim its sender and nonce with a
+  10 % higher fee) or claim a `u64::MAX` fee to never be evicted.
+  Admission now requires the envelope sender to equal the recovered
+  signer, the nonce to equal the signed nonce, and the fee to be at
+  most the signed `max_fee_per_gas`.
+  - **In plain words:** someone could knock other people's pending
+    transactions out of the queue by lying in a label nobody
+    checked. The label is now checked against the signature.
+
+- **Per-sender mempool bound** (`mempool`): the per-sender cap was
+  only applied when building a block, so one account could fill
+  the whole pool with far-future nonces that never execute and are
+  never pruned. `submit` now rejects (`MempoolError::SenderLimit`)
+  beyond `DEFAULT_MAX_PENDING_PER_SENDER` (4 000) pending txs, or a
+  nonce more than that far past the sender's last executed one.
+  - **In plain words:** one account can no longer hog the waiting
+    room.
+
+- **P2P handshake can't be stalled by a slow stranger** (`p2p`):
+  handshake reads accepted 16 MiB frames from unauthenticated peers
+  (allocated up front) and only had a per-read timeout, so a peer
+  trickling one byte every few seconds held a handshake worker
+  indefinitely — eight such sockets from one IP blocked every
+  inbound connection. Handshakes now have a 10 s overall deadline
+  and an 8 KiB frame cap.
+  - **In plain words:** a single misbehaving machine could stop a
+    validator from accepting new connections. Handshakes now have
+    a time limit and a size limit.
+
+- **Pipelined proposals stop duplicating in-flight txs under
+  leader rotation** (`mempool`, `executor`): the in-flight set was
+  released on *any* next commit, including another leader's
+  earlier block, so the next proposal re-selected txs still
+  pending in ours (each duplicate wastes block space as a nonce
+  skip). Sets are now keyed by height and released only when that
+  height commits.
+  - **In plain words:** blocks stop carrying copies of transactions
+    that are already on their way in.
 
 - **Verify pool survives a panicking job** (`node`): a panic
   inside a signature-verification closure used to kill the worker

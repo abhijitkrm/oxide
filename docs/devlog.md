@@ -22371,3 +22371,62 @@ dedicated investigation (replace-a-validator path).
 5. Open-loop injector semantics (Duplicate = accounted) so
    capacity measurements are honest.
 6. Wiped-node rejoin path.
+
+## Session: review fixes — journal torn tail, envelope binding, handshake DoS, hot-path copies
+
+Code review of the workspace; each bug fix landed failing-test-first.
+
+**Journal torn tail (data loss).** Root cause: `replay` stops at the
+first damaged record, but `JournalWriter::create` never repaired
+it — it opened a successor segment, so a second restart lost every
+record written after the first. Reproduced with a scratch program
+(r1,r2 → torn frame → reopen, write+fsync r3,r4 → reopen: 2 records).
+Fix: `repair_tail` in `create` truncates the *newest* segment to its
+intact prefix (copy kept as `.log.damaged`; a torn header is
+rewritten empty). Damage in a sealed segment is
+`JournalError::Corrupt` — `rotate` fsyncs before creating a
+successor, so that is media corruption, and appending past it would
+write unreachable records. Also `sync_dir` after creating a segment.
+Note: a data dir already in the bad layout (torn segment N, valid
+N+1…) now fails to open with `Corrupt` instead of silently dropping
+N+1…; repair by state sync.
+
+**Envelope binding.** EVM (`authenticates_sender`) txs: the v0
+envelope's sender/nonce/fee were unchecked claims that the mempool
+keys on. `validate_self_authenticated` (both admission paths) binds
+sender to the recovered signer; EVM `validate_authenticated` binds
+nonce exactly and caps fee at `max_fee_per_gas` (the value every
+in-tree `wrap_evm_tx_envelope` caller already uses).
+
+**Mempool sender bound.** `max_per_sender` is a per-*block* share
+(tests rely on the pool holding more for pipelining), so the new
+pool-level bound is a separate `max_pending_per_sender`
+(default 4 × 1000), also bounding nonce lead over the executed
+anchor.
+
+**In-flight sets by height.** Pop-one-per-commit assumed this node
+proposes every position. Now `(height, set)`; the app tags at
+`next_proposal_height + IN_FLIGHT_PIPELINE_DEPTH` (2) because the
+engine stamps the real height after `prepare_proposal` — late
+release only delays a lost proposal's txs by ≤ 2 commits.
+
+**Handshake.** `HANDSHAKE_DEADLINE` (10 s, enforced by a
+`Deadline` reader wrapper across all handshake reads) and
+`HANDSHAKE_MAX_FRAME_BYTES` (8 KiB). Previously 8 workers × per-read
+5 s timeout × 16-connection per-source cap = one IP could pin every
+worker by trickling.
+
+**Hot path.** Conditional idle sleep in the validator pump; shared
+`Arc<[u8]>` frames + `Transport::broadcast`; vectored plain-TCP
+batches; `send(&[u8])`; slice-by-8 CRC (measured 4.7×; LLVM already
+makes the old bitwise WAL loop as fast as the byte table, so the
+WAL gain is the same 4.7×); read-before-write on the staged-set
+lock; cached debug env flag; `take_certified` reuses the buffer.
+
+**Reviewed, deliberately unchanged.** `EXEC_ATTEST_WAIT` (250 ms
+blocking wait in the vote path) is a documented trade-off; shrinking
+it needs every driver to retry votes, so it stays pending a design
+change (async vote path). Matcher sparse-map poison recovery is
+documented as tear-free. `proposal_verify_budget` is keyed by
+handshake-proven committee ids, so it is already committee-sized.
+
