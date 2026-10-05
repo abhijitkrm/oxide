@@ -1948,7 +1948,7 @@ impl OxideBft {
         // there's actual work to commit.
         if !heartbeat && !has_pending_txs && !work_outstanding && self.next_height != Height::new(0)
         {
-            if std::env::var_os("OXIDE_DEBUG_PROPOSE").is_some() {
+            if debug_propose() {
                 eprintln!(
                     "propose() idle: view={:?} next_height={:?} highqc={:?} has_txs={has_pending_txs} work_outstanding={work_outstanding}",
                     self.current_view,
@@ -2001,7 +2001,7 @@ impl OxideBft {
                     // None) leaves a caught-up leader silent forever.
                     (anchor_height.saturating_next(), anchor_hash)
                 } else {
-                    if std::env::var_os("OXIDE_DEBUG_PROPOSE").is_some() {
+                    if debug_propose() {
                         eprintln!(
                             "propose() blocked: view={:?} highqc_view={:?} highqc_block={:?} unknown — waiting for block",
                             self.current_view,
@@ -2508,7 +2508,7 @@ impl OxideBft {
     /// the queue itself is bounded (`MAX_RETAINED_FINALIZED`) and
     /// drops oldest when never drained.
     pub fn take_certified(&mut self) -> Vec<CertifiedBlock> {
-        self.certified_out.drain(..).collect()
+        Vec::from(std::mem::take(&mut self.certified_out))
     }
 
     /// The committed tip — hash and height of the last block this
@@ -2863,5 +2863,15 @@ impl ConsensusEngine for OxideBft {
         OxideBft::exec_certificates(self)
     }
 }
+
+/// Whether `OXIDE_DEBUG_PROPOSE` is set, read once per process. An
+/// idle leader calls `propose` on every driver pass (~1 kHz), and
+/// `std::env::var_os` takes the process-wide environment lock and
+/// allocates on each call.
+fn debug_propose() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("OXIDE_DEBUG_PROPOSE").is_some())
+}
+
 #[cfg(test)]
 mod tests;

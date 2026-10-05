@@ -960,6 +960,11 @@ fn run_consensus_loop(
     let mut inject_next = std::time::Instant::now();
 
     loop {
+        // Set when this pass consumed an inbound message, a verify
+        // verdict, or a gossiped tx — the idle sleep at the bottom
+        // is skipped so their follow-ups (votes, QCs, proposals) go
+        // out without waiting a scheduler tick.
+        let mut progressed = false;
         // Graceful shutdown: SIGINT/SIGTERM sets the flag, we break
         // cleanly so the transport can flush and the WAL can be
         // closed by `Drop`.
@@ -1051,6 +1056,7 @@ fn run_consensus_loop(
 
         // Phase 3: drain inbound transport messages.
         while let Some(msg) = transport.recv() {
+            progressed = true;
             if msg.bytes.is_empty() {
                 continue;
             }
@@ -1539,6 +1545,7 @@ fn run_consensus_loop(
         // stale or contradictory verdict can never move consensus.
         while let Some(done) = verify_pool.try_recv() {
             use crate::verify_pool::VerifyOutcome;
+            progressed = true;
             match done.outcome {
                 VerifyOutcome::Proposal { header, proposal, sig_ok, commit_ok } => {
                     // The dedupe key is claimed only by a verdict
@@ -1629,6 +1636,7 @@ fn run_consensus_loop(
         // iteration — each send is a channel push to the peer's
         // writer task, non-blocking.
         while let Ok(tx_bytes) = gossip_rx.try_recv() {
+            progressed = true;
             fanout_tx(engine, transport, our_addr, &mut seen_txs, &mut seen_txs_fifo, &tx_bytes);
         }
 
@@ -2018,25 +2026,25 @@ fn run_consensus_loop(
         // membership verification before its committee duties start.
         // `next_validator_set` returns `None` outside the window (and
         // clears itself at activation), so this is `None` most of the
-        // time — the `!=` guard avoids paying a committee clone on
-        // every pass.
-        if let Ok(mut pending) = shared_next_validator_set.write() {
-            let staged = engine.next_validator_set().cloned();
-            if *pending != staged {
-                *pending = staged;
-            }
+        // time — the read-side compare avoids taking the write lock
+        // (which stalls the transport's handshake readers) and
+        // paying a committee clone on every pass.
+        let staged = engine.next_validator_set();
+        let stale =
+            shared_next_validator_set.read().is_ok_and(|pending| pending.as_ref() != staged);
+        if stale && let Ok(mut pending) = shared_next_validator_set.write() {
+            *pending = staged.cloned();
         }
 
-        // Yield to avoid busy-spinning when no messages are available.
-        // `transport.recv()` uses non-blocking `try_recv()`, so the loop
-        // would spin at 100% CPU without this sleep. A 1ms sleep keeps
-        // CPU usage near-zero while providing ~1ms message latency,
-        // 10x better than the previous `recv_timeout(10ms)` approach.
-        // The consensus hot path (propose -> vote -> QC) is message-driven:
-        // when messages arrive, `recv()` returns them immediately and
-        // the sleep is never reached. The sleep only fires when the
-        // transport is idle (waiting for the next network round).
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        // Yield to avoid busy-spinning when idle. `transport.recv()`
+        // is a non-blocking `try_recv()`, so without a sleep the loop
+        // would spin at 100% CPU. The sleep is skipped after a pass
+        // that made progress: the consensus hot path (propose → vote
+        // → QC) is message-driven, and sleeping unconditionally added
+        // ≥1ms (more under coarse timer slack) to every round trip.
+        if !progressed {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 
