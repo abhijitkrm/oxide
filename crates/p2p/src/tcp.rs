@@ -57,6 +57,11 @@ use std::time::{Duration, Instant};
 
 use ports::transport::{InboundMessage, PeerId, Transport, TransportCaps, TransportError};
 
+/// An outbound message as queued to a peer's writer thread. Shared
+/// (`Arc`) so a broadcast hands every recipient the same bytes
+/// instead of a per-peer copy.
+type Frame = Arc<[u8]>;
+
 #[cfg(feature = "tls")]
 use crate::tls::TlsConfig;
 
@@ -115,7 +120,7 @@ pub trait PeerStream: Send {
     /// # Errors
     ///
     /// Returns `Err` on I/O error.
-    fn write_frames(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+    fn write_frames(&mut self, frames: &[Frame]) -> io::Result<()> {
         for f in frames {
             self.write_frame(f)?;
         }
@@ -163,22 +168,34 @@ impl PeerStream for TcpStream {
         Ok(())
     }
 
-    fn write_frames(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+    fn write_frames(&mut self, frames: &[Frame]) -> io::Result<()> {
         if frames.len() == 1 {
             // Single-frame fast path: keep the vectored write.
             return self.write_frame(&frames[0]);
         }
-        // Batched frames: one contiguous `[len][payload]…` buffer →
-        // one `write_all` + one `flush` for the whole batch. The
-        // single memcpy per batch is dwarfed by the syscall and
-        // flush savings (N frames would otherwise cost N of each).
-        let total: usize = frames.iter().map(|f| 4 + f.len()).sum();
-        let mut buf = Vec::with_capacity(total);
-        for f in frames {
-            buf.extend_from_slice(&u32::try_from(f.len()).unwrap_or(u32::MAX).to_be_bytes());
-            buf.extend_from_slice(f);
+        // Batched frames: the `[len][payload]…` sequence goes to the
+        // kernel as one iovec list — still one syscall + one flush
+        // for the whole batch, but without first copying up to
+        // `WRITER_BATCH_MAX_BYTES` of payload into a fresh buffer.
+        // ≤ 2 × `WRITER_BATCH_MAX_MESSAGES` = 128 iovecs, well under
+        // every platform's `IOV_MAX` (≥ 1024).
+        let prefixes: Vec<[u8; 4]> = frames
+            .iter()
+            .map(|f| u32::try_from(f.len()).unwrap_or(u32::MAX).to_be_bytes())
+            .collect();
+        let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(frames.len() * 2);
+        for (prefix, f) in prefixes.iter().zip(frames) {
+            slices.push(io::IoSlice::new(prefix));
+            slices.push(io::IoSlice::new(f));
         }
-        self.write_all(&buf)?;
+        let mut rest = &mut slices[..];
+        while !rest.is_empty() {
+            let n = self.write_vectored(rest)?;
+            if n == 0 {
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
+            }
+            io::IoSlice::advance_slices(&mut rest, n);
+        }
         self.flush()
     }
 }
@@ -455,7 +472,7 @@ impl PeerStream for TlsWriteHalf {
         wire.write_all(&ciphertext)
     }
 
-    fn write_frames(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+    fn write_frames(&mut self, frames: &[Frame]) -> io::Result<()> {
         let mut wire = primitives::sync::lock_state(&self.wire);
         let ciphertext = {
             let mut conn = primitives::sync::lock_state(&self.conn);
@@ -1018,7 +1035,7 @@ pub type TcpAddr = String;
 /// takes its accounting with it.
 struct OutboundSlot {
     /// Send side of the peer's writer channel.
-    tx: mpsc::SyncSender<Vec<u8>>,
+    tx: mpsc::SyncSender<Frame>,
     /// Payload bytes currently queued for this peer.
     queued: Arc<AtomicUsize>,
     /// Identity of the connection this slot belongs to. Two
@@ -2025,41 +2042,53 @@ fn install_connected_peer(
     }
 }
 
+/// Queue `frame` on `peer`'s writer, charging its outbound byte
+/// budget — the shared tail of [`Transport::send`] and
+/// [`Transport::broadcast`].
+fn enqueue(
+    streams: &HashMap<PeerId, OutboundSlot>,
+    peer: &[u8],
+    frame: Frame,
+    max_queue_bytes: usize,
+) -> Result<(), TransportError> {
+    let Some(slot) = streams.get(peer) else {
+        return Err(TransportError::UnknownPeer);
+    };
+    let len = frame.len();
+    if !try_reserve_bytes(&slot.queued, max_queue_bytes, len) {
+        return Err(TransportError::ChannelFull);
+    }
+    slot.tx.try_send(frame).map_err(|e| {
+        slot.queued.fetch_sub(len, Ordering::Relaxed);
+        match e {
+            mpsc::TrySendError::Full(_) => TransportError::ChannelFull,
+            mpsc::TrySendError::Disconnected(_) => TransportError::ChannelClosed,
+        }
+    })
+}
+
 impl Transport for TcpTransport {
-    fn send(&mut self, peer: &PeerId, bytes: &[u8]) -> Result<(), TransportError> {
+    fn send(&mut self, peer: &[u8], bytes: &[u8]) -> Result<(), TransportError> {
         if bytes.len() as u64 > self.config.max_message_bytes {
             return Err(TransportError::MessageTooLarge);
         }
-        // Look up the per-peer send channel and send bytes into it.
-        // The lock is held only for the lookup, not during I/O —
-        // the writer thread handles the actual write asynchronously.
         let streams = primitives::sync::lock_state(&self.streams);
-        let Some(slot) = streams.get(peer) else {
-            return Err(TransportError::UnknownPeer);
-        };
-        // Per-peer byte budget: reserve before queueing so a peer
-        // draining slower than we produce bounds its queued payload
-        // at `max_outbound_queue_bytes` instead of
-        // `OUTBOUND_CHANNEL_BOUND × max_message_bytes`. On overflow
-        // the caller sees `ChannelFull` — explicit backpressure,
-        // the slow-consumer policy.
-        if !try_reserve_bytes(&slot.queued, self.config.max_outbound_queue_bytes, bytes.len()) {
-            return Err(TransportError::ChannelFull);
+        enqueue(&streams, peer, Frame::from(bytes), self.config.max_outbound_queue_bytes)
+    }
+
+    /// One shared [`Frame`] for every recipient and one `streams`
+    /// lock for the whole fan-out: a proposal to N validators costs
+    /// one payload copy instead of N.
+    fn broadcast(&mut self, peers: &[&[u8]], bytes: &[u8]) {
+        if bytes.len() as u64 > self.config.max_message_bytes {
+            return;
         }
-        // Clone the bytes into a Vec for the channel. The writer
-        // thread owns the stream and writes the frame. Use
-        // `try_send` (non-blocking) so a full outbound channel
-        // returns `ChannelFull` instead of blocking the caller or
-        // growing the queue without bound.
-        slot.tx.try_send(bytes.to_vec()).map_err(|e| {
-            // The reservation must not outlive the message that
-            // failed to queue — release it on every error path.
-            slot.queued.fetch_sub(bytes.len(), Ordering::Relaxed);
-            match e {
-                mpsc::TrySendError::Full(_) => TransportError::ChannelFull,
-                mpsc::TrySendError::Disconnected(_) => TransportError::ChannelClosed,
-            }
-        })
+        let frame = Frame::from(bytes);
+        let streams = primitives::sync::lock_state(&self.streams);
+        for peer in peers {
+            let _ =
+                enqueue(&streams, peer, Arc::clone(&frame), self.config.max_outbound_queue_bytes);
+        }
     }
 
     fn recv(&mut self) -> Option<InboundMessage> {
@@ -2367,7 +2396,7 @@ const WRITER_BATCH_MAX_BYTES: usize = 1 << 20;
 
 fn writer_loop(
     mut stream: Box<dyn PeerStream>,
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<Frame>,
     queued: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -2386,7 +2415,7 @@ fn writer_loop(
                 // bursts (votes → QCs) queue several frames within
                 // microseconds; batching turns N frames into one
                 // socket write instead of N syscalls + N flushes.
-                let mut batch: Vec<Vec<u8>> = Vec::with_capacity(8);
+                let mut batch: Vec<Frame> = Vec::with_capacity(8);
                 let mut total_bytes: usize = first.len();
                 batch.push(first);
                 while batch.len() < WRITER_BATCH_MAX_MESSAGES {
@@ -2432,7 +2461,7 @@ fn spawn_writer(
     pid: &PeerId,
     conn_id: u64,
 ) -> OutboundSlot {
-    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(OUTBOUND_CHANNEL_BOUND);
+    let (tx, rx) = mpsc::sync_channel::<Frame>(OUTBOUND_CHANNEL_BOUND);
     // The byte counter is shared between `send()` (reserves) and
     // the writer thread (releases on dequeue). It starts at zero
     // and dies with the slot when the connection is replaced.
@@ -2916,6 +2945,32 @@ mod tests {
         assert!(Instant::now() < deadline + Duration::from_secs(1), "stopped promptly");
     }
 
+    /// The plain-TCP batch path writes prefixes and payloads as one
+    /// vectored list; a multi-MiB frame forces partial writes, so
+    /// this exercises the `advance_slices` resume as well.
+    #[test]
+    fn plain_write_frames_round_trips_large_batches() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let frames: Vec<Frame> = (0..64usize)
+            .map(|i| {
+                let len = if i == 7 { 3 << 20 } else { i * 37 };
+                Frame::from((0..len).map(|b| (b ^ i).to_le_bytes()[0]).collect::<Vec<u8>>())
+            })
+            .collect();
+        let expected = frames.clone();
+        let writer = std::thread::spawn(move || {
+            let mut out = TcpStream::connect(addr).expect("connect");
+            out.write_frames(&frames).expect("write batch");
+        });
+        let (mut inp, _) = listener.accept().expect("accept");
+        for want in &expected {
+            let got = read_frame(&mut inp, DEFAULT_MAX_MESSAGE_BYTES).expect("frame");
+            assert_eq!(&got[..], &want[..]);
+        }
+        writer.join().expect("writer thread");
+    }
+
     /// Pre-auth frames are capped far below `max_message_bytes`: a
     /// stranger declaring a 16 MiB greeting is refused before any
     /// payload buffer is allocated.
@@ -3151,7 +3206,7 @@ mod tests {
         let addr = "127.0.0.1:19040";
         let id = vec![0u8];
         let mut transport = TcpTransport::new(addr, id, vec![]);
-        let result = transport.send(&vec![99u8], b"hello");
+        let result = transport.send(&[99u8], b"hello");
         assert_eq!(result, Err(TransportError::UnknownPeer));
     }
 
@@ -4242,7 +4297,7 @@ mod tests {
         let budget = 150;
         // Queue a 100-byte frame: reserve, then enqueue.
         assert!(try_reserve_bytes(&slot.queued, budget, 100));
-        slot.tx.try_send(vec![0u8; 100]).expect("queue has room");
+        slot.tx.try_send(Frame::from(vec![0u8; 100])).expect("queue has room");
         // The reservation stands while the frame sits queued.
         assert!(!try_reserve_bytes(&slot.queued, budget, 100), "100 + 100 > 150");
 
@@ -4536,7 +4591,7 @@ mod tests {
         // Slot for connection 2 (the live replacement): a bare
         // channel suffices — the teardown logic only inspects
         // `conn_id`, never the sender.
-        let (tx, _rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        let (tx, _rx) = mpsc::sync_channel::<Frame>(1);
         primitives::sync::lock_state(&streams).insert(
             pid.clone(),
             OutboundSlot { tx, queued: Arc::new(AtomicUsize::new(0)), conn_id: 2 },

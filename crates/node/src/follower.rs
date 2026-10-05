@@ -678,7 +678,7 @@ fn send_range_request(transport: &mut p2p::tcp::TcpTransport, peer_id: &[u8], fr
     buf.extend_from_slice(&crate::block_sync::encode_request(
         &crate::block_sync::FetchRequest::ByRange { from, count: crate::block_sync::SYNC_PAGE_CAP },
     ));
-    transport.send(&peer_id.to_vec(), &buf).is_ok()
+    transport.send(peer_id, &buf).is_ok()
 }
 
 #[cfg(test)]

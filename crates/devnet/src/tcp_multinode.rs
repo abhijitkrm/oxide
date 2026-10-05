@@ -2088,7 +2088,7 @@ impl TcpMultiNodeDevnet {
         let Some(to_addr) = validator_set.validator_addresses().get(to_seat) else {
             return;
         };
-        if transport.send(&to_addr.0.to_vec(), bytes).is_err()
+        if transport.send(&to_addr.0, bytes).is_err()
             && let Some(inbox) = inboxes.get(to_seat)
         {
             primitives::sync::lock_state(inbox).push_back((my_id.to_vec(), bytes.to_vec()));
@@ -2279,7 +2279,7 @@ impl TcpMultiNodeDevnet {
                     if let Some(leader_addr) =
                         self.validator_set.validator_addresses().get(leader_idx)
                     {
-                        let _ = self.transports[i].send(&leader_addr.0.to_vec(), &buf);
+                        let _ = self.transports[i].send(&leader_addr.0, &buf);
                     }
                     // In-process vote delivery: collect the vote
                     // directly on the leader's engine. This ensures
@@ -2386,7 +2386,7 @@ impl TcpMultiNodeDevnet {
                         // Best-effort TCP broadcast. Failures are
                         // tolerated — the in-process delivery below
                         // is the authoritative path.
-                        let _ = self.transports[i].send(&addr.0.to_vec(), &qc_buf);
+                        let _ = self.transports[i].send(&addr.0, &qc_buf);
                     }
                 }
                 // Self-deliver: the leader that formed the QC must
@@ -2556,7 +2556,7 @@ impl TcpMultiNodeDevnet {
         for addr in self.validator_set.validator_addresses() {
             if addr.0.as_slice() != leader_own.as_slice() {
                 // Tolerate transient send failure (peer mid-reconnect).
-                let _ = self.transports[leader_pos].send(&addr.0.to_vec(), &qc_buf);
+                let _ = self.transports[leader_pos].send(&addr.0, &qc_buf);
             }
         }
 

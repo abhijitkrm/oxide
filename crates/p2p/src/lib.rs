@@ -120,7 +120,7 @@ impl MeshNetwork {
 
     /// Parse a `PeerId` back to a node index. Returns `None` if the
     /// bytes are not a valid little-endian `usize`.
-    pub fn parse_peer_id(pid: &PeerId) -> Option<usize> {
+    pub fn parse_peer_id(pid: &[u8]) -> Option<usize> {
         match pid.len() {
             1 => Some(usize::from(pid[0])),
             2 => Some(u16::from_le_bytes([pid[0], pid[1]]) as usize),
@@ -202,7 +202,7 @@ impl MeshTransport {
 }
 
 impl Transport for MeshTransport {
-    fn send(&mut self, peer: &PeerId, bytes: &[u8]) -> Result<(), TransportError> {
+    fn send(&mut self, peer: &[u8], bytes: &[u8]) -> Result<(), TransportError> {
         let Some(target) = MeshNetwork::parse_peer_id(peer) else {
             return Err(TransportError::UnknownPeer);
         };

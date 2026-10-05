@@ -779,6 +779,26 @@ pub(crate) fn start_rpc(
     Some(rpc_clone)
 }
 
+/// Send `bytes` to every committee member except this node through
+/// [`Transport::broadcast`]: the TCP transport queues one shared
+/// buffer for all of them instead of a payload copy per peer, and
+/// takes its peer-table lock once.
+fn broadcast_committee(
+    engine: &consensus::OxideBft,
+    transport: &mut p2p::tcp::TcpTransport,
+    our_addr: primitives::Address,
+    bytes: &[u8],
+) {
+    let peers: Vec<&[u8]> = engine
+        .validator_set()
+        .validator_addresses()
+        .iter()
+        .filter(|addr| **addr != our_addr)
+        .map(|addr| &addr.0[..])
+        .collect();
+    transport.broadcast(&peers, bytes);
+}
+
 /// Map the `[network]` config onto the transport's tunables.
 ///
 /// `listen_addr`/`peers` are NOT taken from the file by callers that
@@ -821,11 +841,7 @@ fn fanout_tx(
     let mut buf = Vec::with_capacity(1 + tx_bytes.len());
     buf.push(MSG_TX);
     buf.extend_from_slice(tx_bytes);
-    for addr in engine.validator_set().validator_addresses() {
-        if *addr != our_addr {
-            let _ = transport.send(&addr.0.to_vec(), &buf);
-        }
-    }
+    broadcast_committee(engine, transport, our_addr, &buf);
 }
 
 /// The consensus message pump loop: proposes, votes, drains the
@@ -1022,11 +1038,7 @@ fn run_consensus_loop(
                 buf.push(MSG_PROPOSAL);
                 header.encode(&mut buf);
                 proposal.encode(&mut buf);
-                for addr in engine.validator_set().validator_addresses() {
-                    if *addr != our_addr {
-                        let _ = transport.send(&addr.0.to_vec(), &buf);
-                    }
-                }
+                broadcast_committee(engine, transport, our_addr, &buf);
             }
         }
 
@@ -1048,7 +1060,7 @@ fn run_consensus_loop(
                 // `leader` is a committee index into the live set.
                 if let Some(leader_addr) = engine.validator_set().validator_addresses().get(leader)
                 {
-                    let _ = transport.send(&leader_addr.0.to_vec(), &buf);
+                    let _ = transport.send(&leader_addr.0, &buf);
                 }
                 voted_views.insert(proposal_view);
             }
@@ -1700,11 +1712,7 @@ fn run_consensus_loop(
             let mut qc_buf = Vec::with_capacity(1 + 150);
             qc_buf.push(MSG_QC);
             qc.encode(&mut qc_buf);
-            for addr in engine.validator_set().validator_addresses() {
-                if *addr != our_addr {
-                    let _ = transport.send(&addr.0.to_vec(), &qc_buf);
-                }
-            }
+            broadcast_committee(engine, transport, our_addr, &qc_buf);
             let _ = engine.deliver_qc(qc);
         }
 
@@ -1776,11 +1784,7 @@ fn run_consensus_loop(
                     None => buf.push(0u8),
                 }
                 sig.encode(&mut buf);
-                for addr in engine.validator_set().validator_addresses() {
-                    if *addr != our_addr {
-                        let _ = transport.send(&addr.0.to_vec(), &buf);
-                    }
-                }
+                broadcast_committee(engine, transport, our_addr, &buf);
                 // Self-collect: feed our own timeout signature to the
                 // engine so it counts toward the quorum.
                 if let Ok(Some(tc)) = engine.collect_timeout_signature(
@@ -1796,11 +1800,7 @@ fn run_consensus_loop(
                     let mut tc_buf = Vec::with_capacity(1 + 200);
                     tc_buf.push(MSG_TC);
                     tc.encode(&mut tc_buf);
-                    for addr in engine.validator_set().validator_addresses() {
-                        if *addr != our_addr {
-                            let _ = transport.send(&addr.0.to_vec(), &tc_buf);
-                        }
-                    }
+                    broadcast_committee(engine, transport, our_addr, &tc_buf);
                     view_start = std::time::Instant::now();
                     timeout_sent_for_view = None;
                 }
@@ -1944,7 +1944,7 @@ fn run_consensus_loop(
                                 count: crate::block_sync::SYNC_PAGE_CAP,
                             },
                         ));
-                        let _ = transport.send(&addr.0.to_vec(), &buf);
+                        let _ = transport.send(&addr.0, &buf);
                         sync_last_req = Some(std::time::Instant::now());
                         break;
                     }
@@ -2083,7 +2083,7 @@ fn on_admitted_proposal(
     pending_proposals: &mut Vec<(types::BlockHeader, types::Proposal)>,
     sync_target: &mut u64,
     sync_last_req: &mut Option<std::time::Instant>,
-    peer: &Vec<u8>,
+    peer: &[u8],
     header: types::BlockHeader,
     proposal: types::Proposal,
 ) {
@@ -2120,7 +2120,7 @@ fn on_inbound_qc(
     engine: &mut consensus::OxideBft,
     transport: &mut p2p::tcp::TcpTransport,
     qc: types::QuorumCertificate,
-    peer: &Vec<u8>,
+    peer: &[u8],
     verdict: Option<consensus::QcVerdict>,
 ) {
     let unknown = !engine.has_block(&qc.block_hash);
@@ -2239,11 +2239,7 @@ fn on_verified_timeout(
             let mut tc_buf = Vec::with_capacity(1 + 200);
             tc_buf.push(MSG_TC);
             tc.encode(&mut tc_buf);
-            for addr in engine.validator_set().validator_addresses() {
-                if *addr != our_addr {
-                    let _ = transport.send(&addr.0.to_vec(), &tc_buf);
-                }
-            }
+            broadcast_committee(engine, transport, our_addr, &tc_buf);
             *view_start = std::time::Instant::now();
             *timeout_sent_for_view = None;
         }
