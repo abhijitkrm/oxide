@@ -53,7 +53,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ports::transport::{InboundMessage, PeerId, Transport, TransportCaps, TransportError};
 
@@ -599,6 +599,27 @@ const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// already bounded by `TLS_READER_POLL_TIMEOUT` per read attempt.
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Wall-clock budget for a whole handshake (every greeting/proof
+/// frame, both directions). `HANDSHAKE_READ_TIMEOUT` bounds a single
+/// `read` call, so a peer trickling one byte every few seconds could
+/// otherwise pin a handshake worker indefinitely — and with
+/// `HANDSHAKE_WORKERS` workers and a per-source cap above that
+/// count, one IP could starve all inbound connections. 10s is two
+/// read timeouts: ample for a healthy round-trip over a WAN, while a
+/// trickling socket is cut off within `HANDSHAKE_DEADLINE +
+/// HANDSHAKE_READ_TIMEOUT`.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Largest frame a handshake may carry: the signed proof
+/// (`AUTH_NONCE_LEN` + 2-byte length + up to `MAX_AUTH_SIG_BYTES`)
+/// is the biggest, ~4.1 KiB; greetings are tens of bytes. 8 KiB
+/// leaves headroom. Handshake frames arrive *before* the peer is
+/// authenticated, so they must not inherit `max_message_bytes`
+/// (16 MiB): `read_frame` allocates the declared length up front, and
+/// eight workers × 16 MiB of attacker-chosen allocation is not a
+/// budget we grant to strangers.
+const HANDSHAKE_MAX_FRAME_BYTES: u64 = 8 << 10;
+
 /// Number of accept-side handshake workers draining
 /// `HANDSHAKE_QUEUE`. Each worker performs the peer-ID read (+
 /// TLS handshake when enabled) off the accept thread, so the
@@ -786,6 +807,45 @@ fn decode_sig(frame: &[u8]) -> Option<Vec<u8>> {
 /// connection dialed — never a self-claimed one), then answer with
 /// `sig_c`. Returns `false` on any failure; the caller drops the
 /// connection and retries like any connect error.
+/// Read/Write adapter enforcing [`HANDSHAKE_DEADLINE`] across many
+/// reads: every read after the deadline fails with `TimedOut`, so
+/// the per-read socket timeout bounds the overrun.
+struct Deadline<'a, S> {
+    inner: &'a mut S,
+    deadline: Instant,
+}
+
+impl<'a, S> Deadline<'a, S> {
+    fn new(inner: &'a mut S, deadline: Instant) -> Self {
+        Deadline { inner, deadline }
+    }
+}
+
+impl<S: Read> Read for Deadline<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "handshake deadline exceeded"));
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl<S: Write> Write for Deadline<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Frame cap for a handshake read: the configured message cap, but
+/// never above [`HANDSHAKE_MAX_FRAME_BYTES`].
+fn handshake_cap(max_message_bytes: u64) -> u64 {
+    max_message_bytes.min(HANDSHAKE_MAX_FRAME_BYTES)
+}
+
 fn dialer_handshake<S: Read + Write>(
     stream: &mut S,
     auth: &dyn PeerAuth,
@@ -793,12 +853,13 @@ fn dialer_handshake<S: Read + Write>(
     expected_peer: &PeerId,
     max_message_bytes: u64,
 ) -> bool {
+    let stream = &mut Deadline::new(stream, Instant::now() + HANDSHAKE_DEADLINE);
     let nonce_c = auth.challenge();
     let Some(greeting) = encode_greeting(our_id, &nonce_c) else { return false };
     if write_frame(stream, &greeting).is_err() {
         return false;
     }
-    let Ok(frame) = read_frame(stream, max_message_bytes) else { return false };
+    let Ok(frame) = read_frame(stream, handshake_cap(max_message_bytes)) else { return false };
     let Some((nonce_bytes, sig_bytes)) = frame.split_at_checked(AUTH_NONCE_LEN) else {
         return false;
     };
@@ -825,7 +886,8 @@ fn acceptor_handshake<S: Read + Write>(
     allowed: Option<&std::collections::HashSet<PeerId>>,
     max_message_bytes: u64,
 ) -> Option<PeerId> {
-    let frame = read_frame(stream, max_message_bytes).ok()?;
+    let stream = &mut Deadline::new(stream, Instant::now() + HANDSHAKE_DEADLINE);
+    let frame = read_frame(stream, handshake_cap(max_message_bytes)).ok()?;
     let (peer_id, nonce_c) = decode_greeting(&frame)?;
     if let Some(set) = allowed
         && !set.contains(&peer_id)
@@ -855,7 +917,7 @@ fn acceptor_proof_exchange<S: Read + Write>(
     challenge.extend_from_slice(&nonce_a);
     challenge.extend_from_slice(&encode_sig(&sig_a)?);
     write_frame(stream, &challenge).ok()?;
-    let frame = read_frame(stream, max_message_bytes).ok()?;
+    let frame = read_frame(stream, handshake_cap(max_message_bytes)).ok()?;
     let sig_c = decode_sig(&frame)?;
     let t = handshake_transcript(ROLE_DIALER, our_id, peer_id, &nonce_a, nonce_c);
     auth.verify(peer_id, &t, &sig_c).then_some(peer_id.clone())
@@ -2612,7 +2674,11 @@ fn accept_plain_connection(
             max_message_bytes,
         )?,
         // Legacy greeting: the first frame IS the self-claimed ID.
-        None => read_frame(&mut stream, max_message_bytes).ok()?,
+        None => read_frame(
+            &mut Deadline::new(&mut stream, Instant::now() + HANDSHAKE_DEADLINE),
+            handshake_cap(max_message_bytes),
+        )
+        .ok()?,
     };
     // Greeting received — switch to the steady-state timeout the
     // reader loop relies on.
@@ -2666,7 +2732,11 @@ fn accept_tls_connection(
     // the `[id][nonce_c]` greeting when peer auth is configured.
     // This also completes the TLS handshake, during which the client
     // certificate is verified against the trust store.
-    let greeting = read_frame(&mut tls_stream, max_message_bytes).ok()?;
+    // One deadline spans the greeting and the proof exchange below.
+    let deadline = Instant::now() + HANDSHAKE_DEADLINE;
+    let greeting =
+        read_frame(&mut Deadline::new(&mut tls_stream, deadline), handshake_cap(max_message_bytes))
+            .ok()?;
     let (claimed_peer_id, nonce_c) = match shared.peer_auth.as_deref() {
         Some(_) => decode_greeting(&greeting)?,
         None => (greeting, [0u8; AUTH_NONCE_LEN]),
@@ -2699,7 +2769,7 @@ fn accept_tls_connection(
                     return None;
                 }
                 acceptor_proof_exchange(
-                    &mut tls_stream,
+                    &mut Deadline::new(&mut tls_stream, deadline),
                     auth,
                     &shared.our_id,
                     &peer_id,
@@ -2819,8 +2889,50 @@ pub fn bench_tls_connect(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    #[cfg(feature = "tls")]
-    use std::time::Instant;
+
+    /// A peer that trickles bytes slower than the handshake is
+    /// allowed to take is cut off once the overall deadline passes,
+    /// even though every individual read succeeds well inside the
+    /// per-read timeout.
+    #[test]
+    fn handshake_deadline_cuts_off_trickling_peer() {
+        struct Trickle(usize);
+        impl Read for Trickle {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(5));
+                // Prefix byte 2 = 0x01 → declared length 0x0000_0100.
+                buf[0] = u8::from(self.0 == 2);
+                self.0 += 1;
+                Ok(1)
+            }
+        }
+        let mut peer = Trickle(0);
+        let deadline = Instant::now() + Duration::from_millis(50);
+        // Length prefix 0x0000_0100 then a 256-byte body: ~260 reads
+        // at 5ms each — far past the 50ms budget.
+        let mut stream = Deadline::new(&mut peer, deadline);
+        let err = read_frame(&mut stream, HANDSHAKE_MAX_FRAME_BYTES).expect_err("must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(Instant::now() < deadline + Duration::from_secs(1), "stopped promptly");
+    }
+
+    /// Pre-auth frames are capped far below `max_message_bytes`: a
+    /// stranger declaring a 16 MiB greeting is refused before any
+    /// payload buffer is allocated.
+    #[test]
+    fn handshake_frame_cap_rejects_oversized_greeting() {
+        let declared = u32::try_from(DEFAULT_MAX_MESSAGE_BYTES).unwrap();
+        let mut bytes = declared.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 16]);
+        let mut cursor = io::Cursor::new(bytes);
+        let err = read_frame(&mut cursor, handshake_cap(DEFAULT_MAX_MESSAGE_BYTES))
+            .expect_err("oversized pre-auth frame must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            handshake_cap(DEFAULT_MAX_MESSAGE_BYTES)
+                >= (AUTH_NONCE_LEN + 2 + MAX_AUTH_SIG_BYTES) as u64
+        );
+    }
 
     /// A `Read` that replays a script of `io::Result` chunks — one
     /// entry per `read()` call — so partial frames and stalls are
