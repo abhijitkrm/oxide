@@ -123,3 +123,77 @@ async fn exec_cert_over_http() {
     .expect("client task panicked");
     assert_eq!(fetched, cert, "cert must round-trip over the wire unchanged");
 }
+
+/// Counts full state exports; `height` is what a fresh export would
+/// carry, reported cheaply through `snapshot_height`.
+struct CountingProvider {
+    exports: std::sync::atomic::AtomicU64,
+    height: std::sync::atomic::AtomicU64,
+}
+
+impl SnapshotProvider for CountingProvider {
+    fn export_snapshot(&self) -> Result<Vec<u8>, String> {
+        self.exports.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let h = self.height.load(std::sync::atomic::Ordering::SeqCst);
+        Ok(h.to_le_bytes().repeat(64))
+    }
+    fn snapshot_meta(&self) -> Result<(u64, primitives::Hash, u32), String> {
+        // Producing meta costs a full export too — the shape of the
+        // node's executor-backed provider.
+        self.exports.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok((self.height.load(std::sync::atomic::Ordering::SeqCst), primitives::Hash([7; 32]), 2))
+    }
+    fn export_with_meta(&self) -> Result<(Vec<u8>, rpc::SnapshotMeta), String> {
+        self.exports.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let h = self.height.load(std::sync::atomic::Ordering::SeqCst);
+        Ok((h.to_le_bytes().repeat(64), (h, primitives::Hash([7; 32]), 2)))
+    }
+    fn snapshot_height(&self) -> Option<u64> {
+        Some(self.height.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+/// Snapshot serving pays one full state export per *finalized
+/// height*, not per request: repeated manifest and `/snapshot` calls
+/// at an unchanged height reuse the cached export, and a new height
+/// re-exports exactly once (blob and meta from the same export).
+#[test]
+fn snapshot_serving_exports_once_per_height() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let provider = Arc::new(CountingProvider {
+        exports: std::sync::atomic::AtomicU64::new(0),
+        height: std::sync::atomic::AtomicU64::new(7),
+    });
+    let mut rpc = RpcServer::new(1, 1_000_000_000);
+    rpc.set_snapshot_provider(provider.clone());
+
+    for _ in 0..5 {
+        rpc.snapshot_manifest().expect("manifest");
+        rpc.snapshot_blob().expect("blob");
+        rpc.snapshot_chunk(0).expect("chunk");
+    }
+    assert_eq!(provider.exports.load(SeqCst), 1, "unchanged height: one export total");
+
+    provider.height.store(8, SeqCst);
+    let blob = rpc.snapshot_blob().expect("blob at new height");
+    rpc.snapshot_manifest().expect("manifest at new height");
+    assert_eq!(provider.exports.load(SeqCst), 2, "new height: exactly one more export");
+    assert_eq!(blob, 8u64.to_le_bytes().repeat(64), "served blob is the new height's");
+}
+
+/// A provider that cannot report its height cheaply keeps the old
+/// contract: every manifest request re-exports, so the manifest
+/// always describes the latest state.
+#[test]
+fn snapshot_without_height_hint_refreshes_every_manifest() {
+    let blob = vec![1u8; 32];
+    let mut rpc = RpcServer::new(1, 1_000_000_000);
+    rpc.set_snapshot_provider(Arc::new(StubProvider {
+        blob: blob.clone(),
+        root: primitives::Hash([7; 32]),
+    }));
+    for _ in 0..3 {
+        rpc.snapshot_manifest().expect("manifest");
+    }
+    assert_eq!(rpc.snapshot_blob().expect("blob"), blob);
+}

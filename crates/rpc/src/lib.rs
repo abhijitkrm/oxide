@@ -81,9 +81,12 @@ struct CachedSnapshot {
     /// Codec-encoded `ExecutorSnapshot` bytes — chunks are byte
     /// slices of this blob (`[i*chunk_size .. min((i+1)*cs, len)]`).
     blob: Vec<u8>,
-    /// The chunk-hash manifest for `blob`.
+    /// The chunk-hash manifest for `blob` (its `height` keys reuse).
     manifest: statesync::Manifest,
 }
+
+/// Snapshot metadata: `(height, state_root, format_version)`.
+pub type SnapshotMeta = (u64, primitives::Hash, u32);
 
 /// Trait for providing a state snapshot via the `/snapshot` endpoint.
 ///
@@ -111,6 +114,28 @@ pub trait SnapshotProvider: Send + Sync {
     ///
     /// Same conditions as [`export_snapshot`](Self::export_snapshot).
     fn snapshot_meta(&self) -> Result<(u64, primitives::Hash, u32), String>;
+
+    /// The snapshot blob and its metadata from ONE export. The
+    /// default calls the two methods above; providers whose
+    /// `snapshot_meta` itself requires an export (the executor's)
+    /// override it so a cache refresh pays one full-state export,
+    /// not two.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`export_snapshot`](Self::export_snapshot).
+    fn export_with_meta(&self) -> Result<(Vec<u8>, SnapshotMeta), String> {
+        Ok((self.export_snapshot()?, self.snapshot_meta()?))
+    }
+
+    /// The height a fresh export would carry, if knowable without
+    /// exporting. `Some` lets the server reuse its cached export for
+    /// as long as the height is unchanged — the snapshot at a height
+    /// is immutable, so an identical export is pure waste. `None`
+    /// (the default) keeps refresh-on-every-manifest semantics.
+    fn snapshot_height(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A validator-set entry for the `GET /validator-set` endpoint.
@@ -826,21 +851,32 @@ impl RpcServer {
         self.snapshot_provider.as_ref()
     }
 
-    /// Export-or-load the cached chunked snapshot. `refresh`
-    /// re-exports (the manifest endpoint wants the freshest state);
-    /// chunk serving accepts whatever is cached.
+    /// Export-or-load the cached chunked snapshot. `refresh` asks for
+    /// the latest state (the manifest and `/snapshot` endpoints);
+    /// chunk serving accepts whatever is cached so a sync in
+    /// progress keeps slicing the blob its manifest describes.
+    ///
+    /// A refresh re-exports only when the provider's cheap
+    /// [`snapshot_height`](SnapshotProvider::snapshot_height) differs
+    /// from the cached export's height (or is unknown): state at a
+    /// finalized height never changes, so re-exporting it — a full
+    /// state serialization, previously paid twice per manifest
+    /// request — buys nothing.
     fn cached_snapshot(
         &self,
         refresh: bool,
     ) -> Result<std::sync::MutexGuard<'_, Option<CachedSnapshot>>, String> {
         let mut guard = primitives::sync::lock_state(&self.snapshot_cache);
-        if refresh || guard.is_none() {
-            let provider = self
-                .snapshot_provider
-                .as_ref()
-                .ok_or_else(|| "snapshot provider not configured".to_string())?;
-            let blob = provider.export_snapshot()?;
-            let (height, state_root, format_version) = provider.snapshot_meta()?;
+        let provider = self
+            .snapshot_provider
+            .as_ref()
+            .ok_or_else(|| "snapshot provider not configured".to_string())?;
+        let stale = match guard.as_ref() {
+            None => true,
+            Some(cached) => refresh && provider.snapshot_height() != Some(cached.manifest.height),
+        };
+        if stale {
+            let (blob, (height, state_root, format_version)) = provider.export_with_meta()?;
             let (manifest, _) = statesync::chunk_blob(
                 height,
                 state_root,
@@ -851,6 +887,22 @@ impl RpcServer {
             *guard = Some(CachedSnapshot { blob, manifest });
         }
         Ok(guard)
+    }
+
+    /// The full codec-encoded snapshot for `GET /snapshot` (before
+    /// hex-encoding), served from the per-height cache.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the provider's export errors; `Err` also when no
+    /// provider is configured.
+    ///
+    /// # Panics
+    ///
+    /// Same invariants as [`snapshot_manifest`](Self::snapshot_manifest).
+    pub fn snapshot_blob(&self) -> Result<Vec<u8>, String> {
+        let guard = self.cached_snapshot(true)?;
+        Ok(guard.as_ref().expect("populated by cached_snapshot").blob.clone())
     }
 
     /// The codec-encoded sync manifest for the latest snapshot

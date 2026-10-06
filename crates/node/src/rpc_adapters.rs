@@ -135,4 +135,21 @@ impl rpc::SnapshotProvider for ExecutorSnapshotProvider {
         let snap = self.executor.export_snapshot();
         Ok((snap.height, snap.state_root, executor::SNAPSHOT_FORMAT_VERSION))
     }
+
+    /// One export for blob + meta — `snapshot_meta` alone costs a
+    /// full export here, so the default (export, then meta) paid two.
+    fn export_with_meta(&self) -> Result<(Vec<u8>, rpc::SnapshotMeta), String> {
+        let snap = self.executor.export_snapshot();
+        let meta = (snap.height, snap.state_root, executor::SNAPSHOT_FORMAT_VERSION);
+        let mut buf = Vec::new();
+        snap.encode(&mut buf);
+        Ok((buf, meta))
+    }
+
+    /// `export_snapshot` snapshots at `current_height` (after the
+    /// execution lane drains), so an unchanged height means an
+    /// identical export — the RPC cache can serve its copy.
+    fn snapshot_height(&self) -> Option<u64> {
+        Some(self.executor.current_height())
+    }
 }

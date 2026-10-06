@@ -838,11 +838,16 @@ async fn snapshot_handler(
     let Ok(permit) = state.work_permits.clone().try_acquire_owned() else {
         return busy_response();
     };
-    match state.rpc.snapshot_provider().cloned() {
-        Some(provider) => match tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let _ip_slot = ip_slot;
-            provider.export_snapshot()
+    match state.rpc.snapshot_provider() {
+        Some(_) => match tokio::task::spawn_blocking({
+            let rpc = Arc::clone(&state.rpc);
+            move || {
+                let _permit = permit;
+                let _ip_slot = ip_slot;
+                // Per-height cache: repeated `/snapshot` requests at
+                // an unchanged height cost a copy, not an export.
+                rpc.snapshot_blob()
+            }
         })
         .await
         .unwrap_or_else(|_| Err("snapshot export failed".to_string()))
