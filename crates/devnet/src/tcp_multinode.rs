@@ -2771,7 +2771,8 @@ mod tests {
     /// `schedule_rotation` → `rotate_epoch`.
     #[test]
     fn tcp_multinode_key_rotation() {
-        let mut devnet = TcpMultiNodeDevnet::with_base_port(4, 10_000, 21500);
+        let mut devnet =
+            TcpMultiNodeDevnet::with_base_port(4, 10_000, crate::test_ports::reserve(10));
 
         // Record the original key for validator 0.
         let original_key = *devnet.validator_set().validator(0).expect("validator 0");
@@ -2825,7 +2826,8 @@ mod tests {
     /// `validator_remove`.
     #[test]
     fn tcp_multinode_validator_add_remove() {
-        let mut devnet = TcpMultiNodeDevnet::with_base_port(4, 10_000, 21600);
+        let mut devnet =
+            TcpMultiNodeDevnet::with_base_port(4, 10_000, crate::test_ports::reserve(10));
         let initial_n = devnet.validator_set().n();
 
         // Identity 0 must be a validator (have stake) to submit
@@ -2928,7 +2930,8 @@ mod tests {
     /// [`tcp_multinode_validator_add_remove`]).
     #[test]
     fn tcp_multinode_removed_member_cannot_use_stale_seat() {
-        let mut devnet = TcpMultiNodeDevnet::with_base_port(4, 10_000, 21700);
+        let mut devnet =
+            TcpMultiNodeDevnet::with_base_port(4, 10_000, crate::test_ports::reserve(10));
         let removed_addr = txs::identity_addr(1);
         let removed_key = devnet.secret_keys[1].public_key();
 
@@ -3001,7 +3004,8 @@ mod tests {
     /// 4 validators, 3 rounds, 10 txs/round over TCP.
     #[test]
     fn tcp_multinode_4_validators_liveness() {
-        let mut devnet = TcpMultiNodeDevnet::with_base_port(4, 10_000, 21000);
+        let mut devnet =
+            TcpMultiNodeDevnet::with_base_port(4, 10_000, crate::test_ports::reserve(10));
         let (result, _elapsed) = devnet.run_batch(3, 10);
         let n_blocks = result.finalized[0].len();
         assert!(n_blocks > 0, "should have finalized blocks over TCP");
@@ -3022,7 +3026,8 @@ mod tests {
     /// All validators must agree on the same finalized blocks.
     #[test]
     fn tcp_multinode_finality_agreement() {
-        let mut devnet = TcpMultiNodeDevnet::with_base_port(4, 10_000, 21100);
+        let mut devnet =
+            TcpMultiNodeDevnet::with_base_port(4, 10_000, crate::test_ports::reserve(10));
         let (result, _) = devnet.run_batch(3, 10);
         let reference = &result.finalized[0];
         for (i, blocks) in result.finalized.iter().enumerate().skip(1) {
@@ -3038,7 +3043,8 @@ mod tests {
     /// root should be non-zero after running.
     #[test]
     fn tcp_multinode_evm_ledger_executes() {
-        let mut devnet = TcpMultiNodeDevnet::with_base_port(4, 10_000, 21200);
+        let mut devnet =
+            TcpMultiNodeDevnet::with_base_port(4, 10_000, crate::test_ports::reserve(10));
         devnet.run_batch(3, 10);
         let root = devnet.app(0).attest_state(primitives::Height::new(0)).expect("executed");
         assert_ne!(root.root, primitives::Hash::ZERO, "state root should be non-zero");
@@ -3047,7 +3053,8 @@ mod tests {
     /// Single validator (quorum=1) over TCP.
     #[test]
     fn tcp_multinode_single_validator() {
-        let mut devnet = TcpMultiNodeDevnet::with_base_port(1, 10_000, 21300);
+        let mut devnet =
+            TcpMultiNodeDevnet::with_base_port(1, 10_000, crate::test_ports::reserve(10));
         let (result, _) = devnet.run_batch(3, 10);
         assert!(!result.finalized[0].is_empty(), "single validator should finalize over TCP");
     }

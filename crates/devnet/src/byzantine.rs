@@ -465,17 +465,15 @@ impl ByzantineTcpDevnet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU16, Ordering};
 
     /// A global atomic counter for unique base ports. Each test gets
     /// a unique base port, avoiding collisions when tests run in
     /// parallel. The port range starts at 30000 and increments by
     /// 100 per test (enough room for 100 validators per test).
-    static NEXT_PORT: AtomicU16 = AtomicU16::new(30_000);
-
-    /// Allocate a unique base port for a test.
+    /// Reserve a verified-free base port for a test's validators
+    /// (see `crate::test_ports`).
     fn free_port() -> u16 {
-        NEXT_PORT.fetch_add(100, Ordering::SeqCst)
+        crate::test_ports::reserve(10)
     }
 
     #[test]

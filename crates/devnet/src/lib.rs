@@ -28,6 +28,7 @@ pub mod evm_workload;
 pub mod multinode;
 pub mod multiprocess;
 pub mod tcp_multinode;
+pub mod test_ports;
 pub mod txs;
 
 // ── Backward-compat aliases ───────────────────────────────────────
