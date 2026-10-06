@@ -442,15 +442,25 @@ impl Mempool {
         // Per-sender admission bound (replacements reuse their slot,
         // so they are exempt from the count): at most
         // `max_pending_per_sender` pending txs, within that many
-        // nonces of the last executed one when the anchor is known.
+        // nonces of the sender's floor (see below).
         let cap = u64::try_from(self.max_pending_per_sender).unwrap_or(u64::MAX);
         let queue = self.by_sender.get(&sender);
         let is_replacement = queue.is_some_and(|q| q.contains_key(&nonce));
         if !is_replacement && queue.is_some_and(|q| q.len() >= self.max_pending_per_sender) {
             return Err(MempoolError::SenderLimit);
         }
-        if let Some(&executed) = self.executed_nonces.get(&sender)
-            && nonce > executed.saturating_add(cap)
+        // Spread bound: the floor is the last executed nonce when the
+        // anchor is known, otherwise the sender's lowest pooled nonce
+        // (a new, lower nonce becomes the floor itself). Without the
+        // fallback an un-anchored sender could park txs at arbitrary
+        // future nonces that never become selectable.
+        let floor = self
+            .executed_nonces
+            .get(&sender)
+            .copied()
+            .or_else(|| queue.and_then(|q| q.keys().next().copied()).map(|low| low.min(nonce)));
+        if let Some(floor) = floor
+            && nonce > floor.saturating_add(cap)
         {
             return Err(MempoolError::SenderLimit);
         }
@@ -1173,6 +1183,31 @@ mod tests {
         );
     }
 
+    /// Without an executed-nonce anchor the pool still bounds how
+    /// far one sender's chain may spread: the lowest pooled nonce is
+    /// the floor. Before, an un-anchored sender could park txs at
+    /// arbitrary future nonces that never become selectable.
+    #[test]
+    fn unanchored_sender_nonce_spread_is_bounded() {
+        let mut pool = Mempool::new(100).with_max_pending_per_sender(10);
+        assert!(pool.submit(build_tx(addr(9), 1_000, 100, &[])).is_ok(), "first tx sets the floor");
+        assert!(pool.submit(build_tx(addr(9), 1_010, 100, &[])).is_ok(), "within the window");
+        assert_eq!(
+            pool.submit(build_tx(addr(9), 1_011, 100, &[])),
+            Err(MempoolError::SenderLimit),
+            "beyond floor + cap"
+        );
+        // A lower nonce becomes the new floor; the window is always
+        // [lowest pooled, lowest pooled + cap].
+        assert!(pool.submit(build_tx(addr(9), 995, 100, &[])).is_ok());
+        assert_eq!(pool.submit(build_tx(addr(9), 1_005, 100, &[])), Ok(()));
+        assert_eq!(
+            pool.submit(build_tx(addr(9), 1_006, 100, &[])),
+            Err(MempoolError::SenderLimit),
+            "window follows the lowest pooled nonce"
+        );
+    }
+
     #[test]
     fn submit_batch_accepts_multiple() {
         let mut pool = Mempool::new(100);
@@ -1555,6 +1590,11 @@ mod tests {
     #[test]
     fn executed_nonce_max_does_not_wrap_anchor() {
         let mut pool = Mempool::new(100);
+        // Anchor near MAX first: the per-sender spread bound would
+        // reject nonces 0 and MAX together with no anchor (their
+        // spread exceeds the window). Nonce 0 sits below the anchor
+        // and is admissible — the bound limits only the upper side.
+        pool.set_executed_nonce(addr(1), u64::MAX - 1);
         pool.submit(build_tx(addr(1), 0, 100, &[1])).unwrap();
         pool.submit(build_tx(addr(1), u64::MAX, 100, &[2])).unwrap();
         pool.set_executed_nonce(addr(1), u64::MAX);
