@@ -23385,3 +23385,24 @@ upstream lacks are ported onto upstream's structures.
   cap, slice-by-8 CRC, journal directory fsync, exec-lane batch
   drain + single fsync (now inside upstream's pinned spawn),
   graceful-shutdown logging.
+
+## Fix: flaky `equivocation_evidence_slashes_offender`
+
+Failed ~1 in 4 under parallel load on both upstream and the merged
+tree (9/36), always with "leader should propose" at an empty block.
+
+Root cause — a nonce collision whose outcome depended on the async
+execution lane. `run()`'s round txs come from identity 0 with
+nonce = round index, and the index restarted at 0 on every call. The
+test runs `run(2)` (nonces 0, 1), reports evidence from identity 0
+(taking nonce 2), then `run(4)` resubmits nonces 0, 1 (stale) and 2
+(now the evidence tx's). Round 2's tx was admitted only if the lane
+had not yet executed the evidence block; otherwise the replay gate
+rejected it, the leader had no work, `propose()` correctly returned
+`None`, and `run_round` panicked.
+
+Fix: `MultiNodeDevnet` tracks `rounds_run`, so successive
+`run`/`run_with_faulty_leader` calls continue the nonce sequence
+(every other caller runs once on a fresh devnet — unchanged), and the
+test reports evidence from identity 1, whose nonce no round tx uses.
+Devnet suite after: 0/15 failures under the same load.

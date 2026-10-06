@@ -89,6 +89,15 @@ pub struct MultiNodeDevnet {
     /// The mesh network for transport-routed rounds (H4 fix).
     /// `None` for direct-call rounds (backward compat).
     network: Option<p2p::MeshNetwork>,
+    /// Rounds already driven by [`run`](Self::run) /
+    /// [`run_with_faulty_leader`](Self::run_with_faulty_leader).
+    /// Round txs come from identity 0 with nonce = round number, so a
+    /// second call must continue the sequence: restarting at 0
+    /// resubmitted already-executed nonces, and whether those were
+    /// rejected as replays (leaving the leader nothing to propose)
+    /// depended on how far the async execution lane had got — the
+    /// `equivocation_evidence_slashes_offender` flake.
+    rounds_run: usize,
 }
 
 /// The result of running a multi-node devnet: the finalized blocks
@@ -201,7 +210,16 @@ impl MultiNodeDevnet {
             staking_modules.push(node.staking_module);
         }
 
-        Self { engines, apps, staking_modules, validator_set: vs, secret_keys, n, network: None }
+        Self {
+            engines,
+            apps,
+            staking_modules,
+            validator_set: vs,
+            secret_keys,
+            n,
+            network: None,
+            rounds_run: 0,
+        }
     }
 
     /// The number of validators.
@@ -444,7 +462,9 @@ impl MultiNodeDevnet {
     ///
     /// After all rounds, one flush round (no tx) clears the pipeline.
     pub fn run(&mut self, rounds: usize) -> DevnetResult {
-        for round in 0..rounds {
+        let first = self.rounds_run;
+        self.rounds_run += rounds;
+        for round in first..first + rounds {
             let leader_idx = usize::from(self.validator_set.leader(self.engines[0].current_view()));
             let tx = make_round_tx(round);
             self.engines[leader_idx].submit_tx(tx);
@@ -466,9 +486,11 @@ impl MultiNodeDevnet {
     ///
     /// Returns the finalized blocks from each validator.
     pub fn run_with_faulty_leader(&mut self, rounds: usize, faulty_round: usize) -> DevnetResult {
-        for round in 0..rounds {
+        let first = self.rounds_run;
+        self.rounds_run += rounds;
+        for round in first..first + rounds {
             let leader_idx = usize::from(self.validator_set.leader(self.engines[0].current_view()));
-            if round == faulty_round {
+            if round - first == faulty_round {
                 // The leader is faulty: it withholds its proposal.
                 // Followers detect the timeout, form a TC, and
                 // advance the view. The next leader (view+1) proposes.
@@ -1080,9 +1102,12 @@ mod tests {
         assert_eq!(ev.validator, txs::identity_addr(u8::try_from(offender_idx).unwrap_or(0)));
         assert_eq!(ev.epoch, epoch);
 
-        // Report it: validator 0's own funded identity carries the
-        // permissionless evidence envelope (the module ignores
-        // `ctx.sender` — the vote signatures are the proof).
+        // Report it from funded identity 1 — the permissionless
+        // evidence envelope (the module ignores `ctx.sender`; the
+        // vote signatures are the proof). Not identity 0: `run`'s
+        // round txs use identity 0's nonces, and sharing that
+        // sequence made the evidence tx and a round tx race for the
+        // same nonce.
         let payload = staking::msg::evidence(
             ev.validator,
             ev.view.value(),
@@ -1093,9 +1118,9 @@ mod tests {
             ev.second_block_hash.as_bytes(),
             ev.second_signature.as_bytes(),
         );
-        let reporter = txs::identity_addr(0);
+        let reporter = txs::identity_addr(1);
         let nonce = devnet.app(0).executed_nonce_of(&reporter);
-        let tx = txs::signed_tx(0, nonce, 100, framework::module_id::STAKING, &payload);
+        let tx = txs::signed_tx(1, nonce, 100, framework::module_id::STAKING, &payload);
         let leader = usize::from(devnet.validator_set().leader(view));
         devnet.engines_mut()[leader].submit_tx(tx);
 
