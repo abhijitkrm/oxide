@@ -12,6 +12,20 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Documentation
 
+- **Local end-to-end and measurement scripts** (`scripts/`):
+  `e2e-local.sh` drives real `oxide-devnet` processes (no Docker)
+  through liveness, wiped-node rejoin, agreement and tx inclusion —
+  it reproduces the open wiped-node rejoin gap at 7 validators (see
+  `docs/devlog.md`); `measure-admission.sh` reports committed tx/s
+  and fleet CPU per committed tx for an A/B of two binaries. New fuzz targets:
+  `p2p-handshake` (pre-auth handshake parsers) and `mempool-ops`
+  (operation sequences against pool invariants); `journal-replay`
+  now spans multiple segments and checks ordering invariants. CI
+  gains a macOS lint + test job, which compiles the non-Linux code
+  paths the Ubuntu job never sees.
+  - **In plain words:** more of the system is now tested the way it
+    actually runs, on the platform it's developed on.
+
 - **Full system audit** (`docs/system-audit.md`): a four-dimension
   review (security, performance, throughput, stability) of the whole
   tree, prioritizing the surfaces no prior review had read (rpc,
@@ -33,6 +47,17 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   workspace layout now matches the tree; MSRV 1.91; 2,048 tests).
 
 ### Measured
+
+- **Snapshot serving exports once per height** (`rpc`, `node`):
+  `/snapshot/manifest` re-exported the whole state on every request
+  — twice, since the node's `snapshot_meta` exports too — and
+  `/snapshot` exported per request. A per-height cache (keyed by the
+  provider's new cheap `snapshot_height`) now serves repeats, and a
+  refresh costs one export (`export_with_meta`). Manifest at an
+  unchanged height on a 4-validator devnet: **11.2 → 0.57 ms**
+  median; the saving grows with state size.
+  - **In plain words:** a node no longer re-copies its whole state
+    every time a syncing peer asks for the same snapshot.
 
 - **Committee broadcasts share one buffer** (`p2p`, `ports`, `node`):
   `TcpTransport::send` copied the whole message into a fresh buffer
@@ -355,6 +380,38 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     state is durable.
 
 ### Fixed
+
+- **Votes no longer stall the validator loop behind a lagging
+  execution lane** (`consensus`, `node`): with an execution
+  certificate for a height not yet executed locally, the vote path
+  blocked for up to 250 ms per attempt — at 50–100 ms blocks, a
+  stalled consensus thread. The wait is now per-engine
+  (`set_exec_attest_wait`); the validator pump, which retries every
+  pass, sets zero, so the vote is withheld immediately and cast on a
+  later pass. The certificate gate now runs before the high-QC BLS
+  verify, so a retry costs no aggregate verification. Drivers that
+  vote once (in-process devnet) keep the 250 ms default, as does
+  `confirm_exec_cert` (it does not retry).
+  - **In plain words:** a validator whose block execution is a bit
+    behind keeps handling network messages instead of freezing for a
+    quarter second at a time.
+
+- **Mempool nonce spread bounded for un-anchored senders**
+  (`mempool`): the per-sender nonce window applied only when the
+  pool knew the sender's last executed nonce; otherwise one sender
+  could park txs at arbitrary future nonces. The lowest pooled nonce
+  now serves as the floor.
+  - **In plain words:** an account the node hasn't seen execute yet
+    can't scatter transactions across far-future nonces.
+
+- **Multi-node tests no longer collide on ports** (`devnet`): the
+  byzantine and TCP-devnet tests used hard-coded port ranges, so
+  another process on the machine (or a second test run) made the
+  whole suite fail at once. `devnet::test_ports::reserve` picks a
+  process-specific, bind-verified range. Two concurrent byzantine
+  runs: 2–8 failures in 5 of 6 processes before, none after.
+  - **In plain words:** the test suite stops failing just because
+    something else happened to be using the same network ports.
 
 - **New journal segments survive power loss** (`storage`):
   `sync_data` on a segment covers its bytes, not its directory

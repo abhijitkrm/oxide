@@ -882,6 +882,12 @@ fn fanout_tx(
     let mut buf = Vec::with_capacity(1 + tx_bytes.len());
     buf.push(MSG_TX);
     buf.extend_from_slice(tx_bytes);
+    // Full mesh on purpose: admitting a tx recovers its sender into
+    // the preverify cache, which block execution then reuses. A
+    // per-sender holder subset (tried — see docs/devlog.md) left most
+    // validators recovering senders on the execution path instead,
+    // which delayed their votes, dropped them from first-quorum QCs,
+    // and got a briefly restarted validator downtime-jailed.
     broadcast_committee(engine, transport, our_addr, &buf);
 }
 

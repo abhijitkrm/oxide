@@ -23428,3 +23428,72 @@ Head-to-head on the real `enqueue` (`BenchFanout` seam, `p2p` bench
 `fanout`, M1, release): 1 MiB × 100 peers 1.93 ms → 25.2 µs; 1 MiB × 4
 peers 73.4 → 18.6 µs; 256 B × 100 peers 6.91 → 4.39 µs; 256 B × 4
 peers 269 → 196 ns. Informational, no gate.
+
+## Session: review follow-ups 1–9
+
+Each item below: verdict, change (if any), and the evidence.
+
+1. **Journal replay gaps — already safe.** Replay skips a damaged
+   segment's remainder and continues; recovery then fails closed with
+   `JournalGap` when later records skip heights. Locked in with
+   `mid_history_corruption_fails_closed_with_journal_gap`; the
+   `journal-replay` fuzz target now writes up to three segments and
+   checks record order/bounds (520k runs, 5 min, clean). Block sync's
+   journal only serves certified records, so a gap there costs
+   availability, not correctness.
+2. **Unauthenticated handshake — not reachable in production.** Both
+   production transports (`validator_net::build_transport`, used by
+   validator and follower) always set BLS peer auth; only the devnet
+   harness runs without it. Added a wire test that an authenticated
+   acceptor drops a legacy bare-ID greeting without challenging, and
+   the `p2p-handshake` fuzz target (51M runs, 5 min, never admits).
+3. **Vote-path attestation wait — fixed.** `exec_attest_wait` per
+   engine; pump sets zero; cert gate moved ahead of the high-QC BLS
+   verify (independent gates, so order is not safety-relevant) so
+   retries are cheap. `confirm_exec_cert` keeps the bounded wait — the
+   sync-apply path calls it once, and zero would skip the divergence
+   check. Test: `zero_attest_wait_withholds_without_blocking_and_votes_on_retry`.
+4. **Wiped-node rejoin — reproduced, root-caused, NOT fixed (needs a
+   protocol decision).** `scripts/e2e-local.sh 7` fails on the
+   committed baseline too: the restarted validator is downtime-jailed,
+   the epoch rotation removes it, and it then sits at view 0
+   broadcasting timeouts — the audit's symptom. Two causes:
+   (a) attendance is the QC signer bitmap, and a QC carries only the
+   first quorum of votes, so the slowest live validators read as
+   absent (2 of 7 per block at n = 7); with `DOWNTIME_WINDOW` = 100
+   blocks (calibrated for "~1 s blocks" while the chain runs 10–20
+   blocks/s) a few seconds of downtime crosses the 50% line;
+   (b) once removed, the BLS transport authenticator rejects the node
+   (not a member, not a configured observer), so it can never sync,
+   catch up, or unjail. At n = 4 the margin is wider and it passes.
+   Early "can't reproduce" runs had no tx flow (unfunded injectors).
+5. **Gossip ×n admission — tried, measured, reverted.** Per-sender
+   rendezvous holder sets (stake > total − quorum ⇒ ≥ 1 honest) raised
+   committed tx/s at sustainable load (7 validators: ~1.5–2.9k → ~3.5k)
+   but made the e2e rejoin check fail 7/7 vs 0/4 on baseline;
+   restoring full mesh alone fixed it (bisected; the zero attest wait
+   was ruled out first). Mechanism: admission recovers senders into
+   the preverify cache that execution reuses, so non-holders recovered
+   on the execution path, voted late, fell out of first-quorum QCs,
+   and lost attendance. The "×n admission" cost is largely cache
+   warming execution pays anyway; the next lever is sharing the
+   recovered sender (or tx-by-hash proposals), not trimming gossip.
+   (A first cut targeting "upcoming leaders" was worse: it scattered
+   nonce chains and cut throughput ~7×.)
+6. **macOS CI — added** (`quality-macos`: clippy + test, default
+   features). Its lint command immediately flagged a style lint in new
+   code.
+7. **Flake sweep — one real class found and fixed.** 8 full-suite runs:
+   one run failed every `byzantine` test at the transport bind — fixed
+   port ranges. `devnet::test_ports::reserve`; concurrent byzantine
+   runs went from 2–8 failures in 5/6 processes to 0/6. (`tcp_multinode`
+   tests had the same hard-coded ranges; migrated too.)
+8. **Snapshot export per request — fixed.** Per-height cache +
+   `export_with_meta`; manifest at unchanged height 11.2 → 0.57 ms.
+   While measuring, a "whole RPC hangs when peers stall" result turned
+   out to be a zsh 1-indexed array freezing the node under test —
+   retracted; no such bug.
+9. **Un-anchored nonce spread — fixed** (lowest pooled nonce as floor),
+   plus the `mempool-ops` fuzz target (953k runs, 5 min, clean after
+   correcting one over-strict invariant in the target itself:
+   `txpool_snapshot` deliberately omits stale txs).
