@@ -966,6 +966,13 @@ fn run_consensus_loop(
     chain_id: u64,
 ) {
     // (cap documented at module scope — `GOSSIP_SEEN_CAP`)
+    // This pump re-attempts every un-voted pending proposal on each
+    // pass, so a lagging execution lane should withhold a vote
+    // immediately rather than block the pass for the engine's
+    // default attestation wait — inbound QCs, timeouts and proposals
+    // keep flowing while execution catches up, and the next pass
+    // votes once the certified height has executed.
+    engine.set_exec_attest_wait(std::time::Duration::ZERO);
     // Track proposals received from the network. Followers vote on
     // these proposals; the leader proposes locally.
     let mut pending_proposals: Vec<(types::BlockHeader, types::Proposal)> = Vec::new();

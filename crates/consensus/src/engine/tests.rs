@@ -3876,6 +3876,86 @@ fn exec_cert_for_unexecuted_height_withheld() {
     );
 }
 
+/// An app whose execution lane lags: `attest_state_bounded` blocks
+/// for the full `max_wait` (what a real lane does while the height
+/// is owed) and reports "not executed" until `ready` flips.
+struct LaggingApp {
+    ready: std::sync::atomic::AtomicBool,
+}
+
+impl AppInterface for LaggingApp {
+    fn ingest_tx(&self, _tx: TxBytes) -> MempoolAck {
+        MempoolAck::Accepted
+    }
+    fn prepare_proposal(&self, _budget: &types::BlockBudget) -> Proposal {
+        Proposal { height: Height::new(0), txs: Vec::new(), attestation: None }
+    }
+    fn has_queued_txs(&self) -> bool {
+        false
+    }
+    fn process_proposal(&self, _proposal: &Proposal) -> Verdict {
+        Verdict::Accept
+    }
+    fn finalize_block(&self, block: &FinalizedBlock) -> types::CommitAck {
+        types::CommitAck { height: block.height }
+    }
+    fn attest_state(&self, height: Height) -> Option<StateAttestation> {
+        self.ready
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then_some(StateAttestation { height, root: Hash::ZERO })
+    }
+    fn attest_state_bounded(
+        &self,
+        height: Height,
+        max_wait: std::time::Duration,
+    ) -> Option<StateAttestation> {
+        if !self.ready.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(max_wait);
+        }
+        self.attest_state(height)
+    }
+    fn attest_latest(&self) -> Option<StateAttestation> {
+        None
+    }
+}
+
+/// A driver that retries votes every pass (the validator pump)
+/// sets the attestation wait to zero: a lagging execution lane
+/// withholds the vote *immediately* instead of stalling the
+/// consensus thread for `EXEC_ATTEST_WAIT`, and the same proposal
+/// votes on a later attempt once execution lands — withholding
+/// must not consume the view's vote.
+#[test]
+fn zero_attest_wait_withholds_without_blocking_and_votes_on_retry() {
+    let sk = bls_key(1);
+    let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+    let app = Arc::new(LaggingApp { ready: std::sync::atomic::AtomicBool::new(false) });
+    let mut engine = OxideBft::new(app.clone(), vs).with_secret_key(sk.clone());
+    engine.set_exec_attest_wait(std::time::Duration::ZERO);
+
+    let att_msg = engine.attestation_signing_message(Height::new(0), &Hash::ZERO);
+    let att_sig = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg);
+    let cert = ExecCertificate {
+        height: Height::new(0),
+        state_root: Hash::ZERO,
+        epoch: Epoch::new(0),
+        signer_bitmap: vec![0b0000_0001],
+        aggregate_signature: crypto::aggregate(&[att_sig]).expect("aggregate"),
+    };
+    let (header, proposal) = genesis_proposal_with_cert(&sk, cert);
+
+    let start = std::time::Instant::now();
+    assert!(engine.vote(&header, &proposal).is_none(), "lagging execution withholds");
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(100),
+        "withholding must not block the consensus thread ({:?})",
+        start.elapsed()
+    );
+
+    app.ready.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(engine.vote(&header, &proposal).is_some(), "the retry votes once execution lands");
+}
+
 #[test]
 fn verified_exec_cert_is_cached_per_identity() {
     // A cert that passes full validation is cached under its

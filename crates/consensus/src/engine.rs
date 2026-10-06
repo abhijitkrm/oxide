@@ -836,6 +836,13 @@ pub struct OxideBft {
     /// the earlier verdict. Cleared at epoch rotation: verification
     /// is only defined against the epoch's validator set.
     verified_exec_certs: std::collections::BTreeMap<u64, ExecCertificate>,
+    /// How long the vote path may block waiting for the execution
+    /// lane to produce a certified height's local root. Default
+    /// `EXEC_ATTEST_WAIT` (250 ms) suits drivers that call `vote`
+    /// once per proposal; a driver that retries every pass sets zero
+    /// via [`set_exec_attest_wait`](Self::set_exec_attest_wait) so a
+    /// lagging lane never stalls the consensus thread.
+    exec_attest_wait: std::time::Duration,
     /// Negative authentication memo: block hashes that failed
     /// `authenticate_proposal` or the body-commitment check.
     ///
@@ -1053,6 +1060,7 @@ impl OxideBft {
             exec_attest_pool: std::collections::BTreeMap::new(),
             exec_certs: std::collections::BTreeMap::new(),
             verified_exec_certs: std::collections::BTreeMap::new(),
+            exec_attest_wait: votes::EXEC_ATTEST_WAIT,
             rejected_headers: std::collections::HashSet::new(),
             last_attestation: None,
             last_tc: None,
@@ -1262,6 +1270,17 @@ impl OxideBft {
             max_timeout_ms,
         );
         self
+    }
+
+    /// Set the execution-attestation wait (see `exec_attest_wait`).
+    ///
+    /// Zero makes a not-yet-executed certified height withhold the
+    /// vote immediately; the vote is not consumed, so the driver's
+    /// next attempt on the same proposal can still vote. Only safe
+    /// for drivers that retry pending proposals — a call-once driver
+    /// would lose the vote and stall the view until timeout.
+    pub fn set_exec_attest_wait(&mut self, wait: std::time::Duration) {
+        self.exec_attest_wait = wait;
     }
 
     /// Whether this engine may still emit signatures. `false` once a

@@ -33,7 +33,7 @@ use types::ExecDivergence;
 /// the view a bounded slice instead of an unbounded stall. On
 /// expiry the vote is withheld — recoverable on re-delivery, never
 /// a safety risk (withholding is always safe).
-const EXEC_ATTEST_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+pub(crate) const EXEC_ATTEST_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl OxideBft {
     /// Validator: vote on a proposal. Returns the vote, or `None` if
@@ -641,32 +641,12 @@ impl OxideBft {
         if !self.extends_locked_chain(header) {
             return None;
         }
-        // The embedded QC is commit evidence — its bitmap becomes the
-        // committed parent's attendance record — so it must be a real
-        // certificate, not claimed bytes. Verified here (after the
-        // cheap structural checks) rather than in `deliver_qc`: a
-        // fabricated justify must never gather votes at all. Same
-        // cost class as the standalone QC verify in `deliver_qc` —
-        // one aggregate verify per accepted-position proposal.
-        if let Some(hqc) = &header.high_qc {
-            // Quorum is a structural property, not a cryptographic
-            // one — a sub-quorum bitmap is not a certificate even
-            // when its aggregate signature verifies (a QC with a
-            // single honest signer's vote verifies as a valid
-            // aggregate yet carries no quorum). Enforced
-            // unconditionally, matching `deliver_qc`: without it a
-            // Byzantine leader could embed a self-signed "QC" and
-            // have honest voters notarize a chain whose parent never
-            // achieved real consensus. The threshold is voting
-            // *power* — a majority of low-stake signers is not a
-            // quorum under unequal stake.
-            if !self.bitmap_meets_quorum(&hqc.signer_bitmap) {
-                return None;
-            }
-            if self.verify_signatures && self.verify_qc_signature(hqc).is_err() {
-                return None;
-            }
-        }
+        // Ordered before the high-QC signature check on purpose: the
+        // gates are independent conditions (all must pass), so their
+        // order is not a safety property — but under execution lag
+        // this is the gate that fails, and a retrying driver (zero
+        // `exec_attest_wait`) must not pay a BLS aggregate verify on
+        // every attempt before discovering it.
         // Divergence detection (docs/oxidebft-spec.md §6): if the
         // proposal carries an `exec_cert` for a previous block, verify
         // that the certified state root matches our locally computed
@@ -698,15 +678,16 @@ impl OxideBft {
             // certificate, so the vote is withheld. (The old
             // `Hash::ZERO` sentinel here let a forged cert
             // claiming a zero root "match" an unexecuted
-            // height.) The wait is bounded by `EXEC_ATTEST_WAIT`:
-            // a lagging execution lane must never stall the
-            // consensus thread — a timed-out attestation withholds
-            // the vote, which the next delivery can still recover.
+            // height.) The wait is bounded by `exec_attest_wait`
+            // (default `EXEC_ATTEST_WAIT`; zero for drivers that
+            // retry every pass): a lagging execution lane must never
+            // stall the consensus thread — a timed-out attestation
+            // withholds the vote, which a later attempt recovers.
             // A mismatch on a *verified* cert means a
             // stake supermajority really attested a root we did
             // not compute — confirmed divergence; refuse to
             // extend it.
-            let local = self.app.attest_state_bounded(cert.height, EXEC_ATTEST_WAIT)?;
+            let local = self.app.attest_state_bounded(cert.height, self.exec_attest_wait)?;
             if local.root != cert.state_root {
                 // Confirmed divergence — the cert is fully verified
                 // (quorum + signature), so a supermajority attested
@@ -723,6 +704,32 @@ impl OxideBft {
                     local_root: local.root,
                     certified_root: cert.state_root,
                 });
+                return None;
+            }
+        }
+        // The embedded QC is commit evidence — its bitmap becomes the
+        // committed parent's attendance record — so it must be a real
+        // certificate, not claimed bytes. Verified here (after the
+        // cheap structural checks) rather than in `deliver_qc`: a
+        // fabricated justify must never gather votes at all. Same
+        // cost class as the standalone QC verify in `deliver_qc` —
+        // one aggregate verify per accepted-position proposal.
+        if let Some(hqc) = &header.high_qc {
+            // Quorum is a structural property, not a cryptographic
+            // one — a sub-quorum bitmap is not a certificate even
+            // when its aggregate signature verifies (a QC with a
+            // single honest signer's vote verifies as a valid
+            // aggregate yet carries no quorum). Enforced
+            // unconditionally, matching `deliver_qc`: without it a
+            // Byzantine leader could embed a self-signed "QC" and
+            // have honest voters notarize a chain whose parent never
+            // achieved real consensus. The threshold is voting
+            // *power* — a majority of low-stake signers is not a
+            // quorum under unequal stake.
+            if !self.bitmap_meets_quorum(&hqc.signer_bitmap) {
+                return None;
+            }
+            if self.verify_signatures && self.verify_qc_signature(hqc).is_err() {
                 return None;
             }
         }
@@ -1038,7 +1045,9 @@ impl OxideBft {
     /// confirms it. An unverifiable cert returns `false`; a height
     /// not yet executed locally returns `false` too — transient
     /// execution lag, never a confirmed divergence (the bounded
-    /// wait matches the vote path's `EXEC_ATTEST_WAIT`). A verified
+    /// wait is the default `EXEC_ATTEST_WAIT` even when the vote
+    /// path runs with zero: callers here confirm once and do not
+    /// retry, so a zero wait would silently skip the check). A verified
     /// cert attesting a root this engine did not compute latches
     /// `divergence` and returns `false`; callers gate the consume
     /// path on [`OxideBft::divergence`].
