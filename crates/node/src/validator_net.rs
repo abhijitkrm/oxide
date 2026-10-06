@@ -882,12 +882,29 @@ fn fanout_tx(
     let mut buf = Vec::with_capacity(1 + tx_bytes.len());
     buf.push(MSG_TX);
     buf.extend_from_slice(tx_bytes);
-    let mut peer_scratch = Vec::with_capacity(20);
-    for addr in engine.validator_set().validator_addresses() {
-        if *addr != our_addr {
-            send_to_addr(transport, &mut peer_scratch, addr, &buf);
-        }
-    }
+    broadcast_committee(engine, transport, our_addr, &buf);
+}
+
+/// Send `bytes` to every committee member except this node through
+/// [`Transport::broadcast`]: the TCP transport queues one shared
+/// buffer for all of them instead of a payload copy per peer, under
+/// a single peer-table lock. The peer list borrows the committee's
+/// address bytes — no per-peer id allocation (hft-audit F-24's goal,
+/// kept).
+fn broadcast_committee(
+    engine: &consensus::OxideBft,
+    transport: &mut p2p::tcp::TcpTransport,
+    our_addr: primitives::Address,
+    bytes: &[u8],
+) {
+    let peers: Vec<&[u8]> = engine
+        .validator_set()
+        .validator_addresses()
+        .iter()
+        .filter(|addr| **addr != our_addr)
+        .map(|addr| &addr.0[..])
+        .collect();
+    transport.broadcast(&peers, bytes);
 }
 
 /// Send `bytes` to the peer whose peer-id is the staking address
@@ -1125,11 +1142,7 @@ fn run_consensus_loop(
                 buf.push(MSG_PROPOSAL);
                 header.encode(&mut buf);
                 proposal.encode(&mut buf);
-                for addr in engine.validator_set().validator_addresses() {
-                    if *addr != our_addr {
-                        send_to_addr(transport, &mut peer_scratch, addr, &buf);
-                    }
-                }
+                broadcast_committee(engine, transport, our_addr, &buf);
             }
         }
 
@@ -1882,11 +1895,7 @@ fn run_consensus_loop(
             let mut qc_buf = Vec::with_capacity(1 + 150);
             qc_buf.push(MSG_QC);
             qc.encode(&mut qc_buf);
-            for addr in engine.validator_set().validator_addresses() {
-                if *addr != our_addr {
-                    send_to_addr(transport, &mut peer_scratch, addr, &qc_buf);
-                }
-            }
+            broadcast_committee(engine, transport, our_addr, &qc_buf);
             let _ = engine.deliver_qc(qc);
         }
 
@@ -1958,11 +1967,7 @@ fn run_consensus_loop(
                     None => buf.push(0u8),
                 }
                 sig.encode(&mut buf);
-                for addr in engine.validator_set().validator_addresses() {
-                    if *addr != our_addr {
-                        send_to_addr(transport, &mut peer_scratch, addr, &buf);
-                    }
-                }
+                broadcast_committee(engine, transport, our_addr, &buf);
                 // Self-collect: feed our own timeout signature to the
                 // engine so it counts toward the quorum.
                 if let Ok(Some(tc)) = engine.collect_timeout_signature(
@@ -1978,11 +1983,7 @@ fn run_consensus_loop(
                     let mut tc_buf = Vec::with_capacity(1 + 200);
                     tc_buf.push(MSG_TC);
                     tc.encode(&mut tc_buf);
-                    for addr in engine.validator_set().validator_addresses() {
-                        if *addr != our_addr {
-                            send_to_addr(transport, &mut peer_scratch, addr, &tc_buf);
-                        }
-                    }
+                    broadcast_committee(engine, transport, our_addr, &tc_buf);
                     view_start = std::time::Instant::now();
                     timeout_sent_for_view = None;
                 }
@@ -2427,12 +2428,7 @@ fn on_verified_timeout(
             let mut tc_buf = Vec::with_capacity(1 + 200);
             tc_buf.push(MSG_TC);
             tc.encode(&mut tc_buf);
-            let mut peer_scratch = Vec::with_capacity(20);
-            for addr in engine.validator_set().validator_addresses() {
-                if *addr != our_addr {
-                    send_to_addr(transport, &mut peer_scratch, addr, &tc_buf);
-                }
-            }
+            broadcast_committee(engine, transport, our_addr, &tc_buf);
             *view_start = std::time::Instant::now();
             *timeout_sent_for_view = None;
         }

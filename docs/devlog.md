@@ -23406,3 +23406,25 @@ Fix: `MultiNodeDevnet` tracks `rounds_run`, so successive
 (every other caller runs once on a fresh devnet — unchanged), and the
 test reports evidence from identity 1, whose nonce no round tx uses.
 Devnet suite after: 0/15 failures under the same load.
+
+## Follow-up: shared broadcast buffer on top of upstream's transport
+
+Re-lands the one piece of the review's broadcast change the merge
+dropped. Upstream's F-24 removed the per-peer *id* allocation and its
+writer reuses a scratch buffer, but `send` still copied the payload
+per recipient (`bytes.to_vec()` into a `Vec<u8>` channel).
+
+- Outbound channel carries `Frame = Arc<[u8]>`; `write_frames` /
+  `write_frames_scratch` take `&[Frame]` (bodies unchanged — upstream's
+  scratch-buffer writer is kept as is).
+- `send`'s tail is now `enqueue`, shared with the new
+  `Transport::broadcast` (default: send loop; TCP override: one frame,
+  one lock). `send(&PeerId)` keeps its signature.
+- Pump fan-outs (proposal, QC, timeout, TC ×2, tx gossip) use
+  `broadcast_committee`, which borrows the committee's address bytes;
+  the two single-peer sends keep upstream's `send_to_addr`.
+
+Head-to-head on the real `enqueue` (`BenchFanout` seam, `p2p` bench
+`fanout`, M1, release): 1 MiB × 100 peers 1.93 ms → 25.2 µs; 1 MiB × 4
+peers 73.4 → 18.6 µs; 256 B × 100 peers 6.91 → 4.39 µs; 256 B × 4
+peers 269 → 196 ns. Informational, no gate.

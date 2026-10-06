@@ -34,6 +34,21 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Committee broadcasts share one buffer** (`p2p`, `ports`, `node`):
+  `TcpTransport::send` copied the whole message into a fresh buffer
+  for every recipient, so a proposal fan-out paid one payload copy
+  and allocation per validator. Outbound queues now carry a shared
+  `Arc<[u8]>` frame and the new `Transport::broadcast` enqueues one
+  frame for the whole committee under a single peer-table lock; the
+  validator pump's proposal, QC, timeout, TC and tx-gossip fan-outs
+  use it. Enqueue cost (`p2p` bench `fanout`, M1): 1 MiB to 100
+  peers **1.93 ms → 25.2 µs (~77×)**; 1 MiB to 4 peers 73.4 → 18.6 µs
+  (3.9×); 256 B to 100 peers 6.91 → 4.39 µs (1.6×). Queued memory
+  per broadcast drops from N copies to one.
+  - **In plain words:** sending a block to every validator used to
+    copy it once per validator; now every validator's queue points
+    at the same copy.
+
 - **Faster journal/WAL checksums and a cheaper validator loop
   pass** (`primitives`, `storage`, `consensus`, `node`):
   - CRC-32 for the journal and WAL is now slice-by-8, shared in

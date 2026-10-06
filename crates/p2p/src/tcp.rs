@@ -57,6 +57,12 @@ use std::time::{Duration, Instant};
 
 use ports::transport::{InboundMessage, PeerId, Transport, TransportCaps, TransportError};
 
+/// An outbound message as queued to a peer's writer thread. Shared
+/// (`Arc`) so [`Transport::broadcast`] hands every recipient the
+/// same bytes: the fan-out costs one payload copy instead of one per
+/// peer.
+type Frame = Arc<[u8]>;
+
 #[cfg(feature = "tls")]
 use crate::tls::TlsConfig;
 
@@ -115,7 +121,7 @@ pub trait PeerStream: Send {
     /// # Errors
     ///
     /// Returns `Err` on I/O error.
-    fn write_frames(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+    fn write_frames(&mut self, frames: &[Frame]) -> io::Result<()> {
         for f in frames {
             self.write_frame(f)?;
         }
@@ -136,11 +142,7 @@ pub trait PeerStream: Send {
     ///
     /// Returns `Err` on I/O error. `scratch` may be left partially
     /// filled — callers must not rely on its contents across calls.
-    fn write_frames_scratch(
-        &mut self,
-        frames: &[Vec<u8>],
-        scratch: &mut Vec<u8>,
-    ) -> io::Result<()> {
+    fn write_frames_scratch(&mut self, frames: &[Frame], scratch: &mut Vec<u8>) -> io::Result<()> {
         let _ = scratch;
         self.write_frames(frames)
     }
@@ -186,7 +188,7 @@ impl PeerStream for TcpStream {
         Ok(())
     }
 
-    fn write_frames(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+    fn write_frames(&mut self, frames: &[Frame]) -> io::Result<()> {
         if frames.len() == 1 {
             // Single-frame fast path: keep the vectored write.
             return self.write_frame(&frames[0]);
@@ -205,11 +207,7 @@ impl PeerStream for TcpStream {
         self.flush()
     }
 
-    fn write_frames_scratch(
-        &mut self,
-        frames: &[Vec<u8>],
-        scratch: &mut Vec<u8>,
-    ) -> io::Result<()> {
+    fn write_frames_scratch(&mut self, frames: &[Frame], scratch: &mut Vec<u8>) -> io::Result<()> {
         if frames.len() == 1 {
             // Single-frame fast path: keep the vectored write —
             // scratch is untouched.
@@ -509,7 +507,7 @@ impl PeerStream for TlsWriteHalf {
         wire.write_all(&ciphertext)
     }
 
-    fn write_frames(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+    fn write_frames(&mut self, frames: &[Frame]) -> io::Result<()> {
         let mut wire = primitives::sync::lock_state(&self.wire);
         let ciphertext = {
             let mut conn = primitives::sync::lock_state(&self.conn);
@@ -527,11 +525,7 @@ impl PeerStream for TlsWriteHalf {
         wire.write_all(&ciphertext)
     }
 
-    fn write_frames_scratch(
-        &mut self,
-        frames: &[Vec<u8>],
-        scratch: &mut Vec<u8>,
-    ) -> io::Result<()> {
+    fn write_frames_scratch(&mut self, frames: &[Frame], scratch: &mut Vec<u8>) -> io::Result<()> {
         // Same encrypt-batch-then-write shape as `write_frames`, with
         // the ciphertext staged in the caller's scratch (F-14). The
         // scratch MUST stay owned past the `conn` lock — `wire` is
@@ -1121,7 +1115,7 @@ pub type TcpAddr = String;
 /// takes its accounting with it.
 struct OutboundSlot {
     /// Send side of the peer's writer channel.
-    tx: mpsc::SyncSender<Vec<u8>>,
+    tx: mpsc::SyncSender<Frame>,
     /// Payload bytes currently queued for this peer.
     queued: Arc<AtomicUsize>,
     /// Identity of the connection this slot belongs to. Two
@@ -2145,41 +2139,65 @@ fn install_connected_peer(
     }
 }
 
+/// Queue `frame` on `peer`'s writer — the shared tail of
+/// [`Transport::send`] and [`Transport::broadcast`].
+///
+/// Per-peer byte budget: reserve before queueing so a peer draining
+/// slower than we produce bounds its queued payload at
+/// `max_queue_bytes` instead of `OUTBOUND_CHANNEL_BOUND ×
+/// max_message_bytes`. On overflow the caller sees `ChannelFull` —
+/// explicit backpressure, the slow-consumer policy. `try_send`
+/// (non-blocking) likewise turns a full channel into `ChannelFull`
+/// instead of blocking the caller or growing the queue without bound.
+fn enqueue(
+    streams: &HashMap<PeerId, OutboundSlot>,
+    peer: &[u8],
+    frame: Frame,
+    max_queue_bytes: usize,
+) -> Result<(), TransportError> {
+    let Some(slot) = streams.get(peer) else {
+        return Err(TransportError::UnknownPeer);
+    };
+    let len = frame.len();
+    if !try_reserve_bytes(&slot.queued, max_queue_bytes, len) {
+        return Err(TransportError::ChannelFull);
+    }
+    slot.tx.try_send(frame).map_err(|e| {
+        // The reservation must not outlive the message that failed
+        // to queue — release it on every error path.
+        slot.queued.fetch_sub(len, Ordering::Relaxed);
+        match e {
+            mpsc::TrySendError::Full(_) => TransportError::ChannelFull,
+            mpsc::TrySendError::Disconnected(_) => TransportError::ChannelClosed,
+        }
+    })
+}
+
 impl Transport for TcpTransport {
     fn send(&mut self, peer: &PeerId, bytes: &[u8]) -> Result<(), TransportError> {
         if bytes.len() as u64 > self.config.max_message_bytes {
             return Err(TransportError::MessageTooLarge);
         }
-        // Look up the per-peer send channel and send bytes into it.
         // The lock is held only for the lookup, not during I/O —
         // the writer thread handles the actual write asynchronously.
         let streams = primitives::sync::lock_state(&self.streams);
-        let Some(slot) = streams.get(peer) else {
-            return Err(TransportError::UnknownPeer);
-        };
-        // Per-peer byte budget: reserve before queueing so a peer
-        // draining slower than we produce bounds its queued payload
-        // at `max_outbound_queue_bytes` instead of
-        // `OUTBOUND_CHANNEL_BOUND × max_message_bytes`. On overflow
-        // the caller sees `ChannelFull` — explicit backpressure,
-        // the slow-consumer policy.
-        if !try_reserve_bytes(&slot.queued, self.config.max_outbound_queue_bytes, bytes.len()) {
-            return Err(TransportError::ChannelFull);
+        enqueue(&streams, peer, Frame::from(bytes), self.config.max_outbound_queue_bytes)
+    }
+
+    /// One shared [`Frame`] for every recipient and one `streams`
+    /// lock for the whole fan-out: a proposal to N validators costs
+    /// one payload copy + allocation instead of N. Per-peer failures
+    /// are dropped, as callers of a `send` loop ignore them.
+    fn broadcast(&mut self, peers: &[&[u8]], bytes: &[u8]) {
+        if bytes.len() as u64 > self.config.max_message_bytes {
+            return;
         }
-        // Clone the bytes into a Vec for the channel. The writer
-        // thread owns the stream and writes the frame. Use
-        // `try_send` (non-blocking) so a full outbound channel
-        // returns `ChannelFull` instead of blocking the caller or
-        // growing the queue without bound.
-        slot.tx.try_send(bytes.to_vec()).map_err(|e| {
-            // The reservation must not outlive the message that
-            // failed to queue — release it on every error path.
-            slot.queued.fetch_sub(bytes.len(), Ordering::Relaxed);
-            match e {
-                mpsc::TrySendError::Full(_) => TransportError::ChannelFull,
-                mpsc::TrySendError::Disconnected(_) => TransportError::ChannelClosed,
-            }
-        })
+        let frame = Frame::from(bytes);
+        let streams = primitives::sync::lock_state(&self.streams);
+        for peer in peers {
+            let _ =
+                enqueue(&streams, peer, Arc::clone(&frame), self.config.max_outbound_queue_bytes);
+        }
     }
 
     fn recv(&mut self) -> Option<InboundMessage> {
@@ -2559,7 +2577,7 @@ fn configure_peer_socket(stream: &TcpStream, socket_buffer_bytes: usize) {
 
 fn writer_loop(
     mut stream: Box<dyn PeerStream>,
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<Frame>,
     queued: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -2585,7 +2603,7 @@ fn writer_loop(
                 // bursts (votes → QCs) queue several frames within
                 // microseconds; batching turns N frames into one
                 // socket write instead of N syscalls + N flushes.
-                let mut batch: Vec<Vec<u8>> = Vec::with_capacity(8);
+                let mut batch: Vec<Frame> = Vec::with_capacity(8);
                 let mut total_bytes: usize = first.len();
                 batch.push(first);
                 while batch.len() < WRITER_BATCH_MAX_MESSAGES {
@@ -2631,7 +2649,7 @@ fn spawn_writer(
     pid: &PeerId,
     conn_id: u64,
 ) -> OutboundSlot {
-    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(OUTBOUND_CHANNEL_BOUND);
+    let (tx, rx) = mpsc::sync_channel::<Frame>(OUTBOUND_CHANNEL_BOUND);
     // The byte counter is shared between `send()` (reserves) and
     // the writer thread (releases on dequeue). It starts at zero
     // and dies with the slot when the connection is replaced.
@@ -3082,6 +3100,66 @@ pub fn bench_tls_connect(
     // idle connection forever.
     server.sock.set_read_timeout(Some(Duration::from_millis(50))).expect("server read timeout");
     (client, server)
+}
+
+/// `#[doc(hidden)]` bench seam: an outbound peer table of `n` slots
+/// with live writer channels, so the `transport` bench can measure
+/// fan-out enqueue cost on the real [`enqueue`] path — a per-peer
+/// payload copy (what a `send` loop pays) against one shared
+/// [`Frame`] (what [`Transport::broadcast`] pays). Each call drains
+/// the channels afterwards, standing in for the writer threads.
+#[doc(hidden)]
+pub struct BenchFanout {
+    streams: HashMap<PeerId, OutboundSlot>,
+    receivers: Vec<mpsc::Receiver<Frame>>,
+    peers: Vec<PeerId>,
+}
+
+impl BenchFanout {
+    /// A table of `n` peers with ids `[i]`.
+    #[must_use]
+    pub fn new(n: usize) -> Self {
+        let mut streams = HashMap::new();
+        let mut receivers = Vec::with_capacity(n);
+        let mut peers = Vec::with_capacity(n);
+        for i in 0..n {
+            let (tx, rx) = mpsc::sync_channel::<Frame>(OUTBOUND_CHANNEL_BOUND);
+            let id = (i as u64).to_le_bytes().to_vec();
+            let slot = OutboundSlot { tx, queued: Arc::new(AtomicUsize::new(0)), conn_id: 0 };
+            streams.insert(id.clone(), slot);
+            receivers.push(rx);
+            peers.push(id);
+        }
+        Self { streams, receivers, peers }
+    }
+
+    /// Fan `bytes` out with one payload copy per peer — the shape of
+    /// a `send` loop.
+    pub fn per_peer_copy(&self, bytes: &[u8]) {
+        for peer in &self.peers {
+            let _ = enqueue(&self.streams, peer, Frame::from(bytes), usize::MAX);
+        }
+        self.drain();
+    }
+
+    /// Fan `bytes` out with one shared frame — the shape of
+    /// [`Transport::broadcast`].
+    pub fn shared(&self, bytes: &[u8]) {
+        let frame = Frame::from(bytes);
+        for peer in &self.peers {
+            let _ = enqueue(&self.streams, peer, Arc::clone(&frame), usize::MAX);
+        }
+        self.drain();
+    }
+
+    fn drain(&self) {
+        for rx in &self.receivers {
+            while rx.try_recv().is_ok() {}
+        }
+        for slot in self.streams.values() {
+            slot.queued.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4442,7 +4520,7 @@ mod tests {
         let budget = 150;
         // Queue a 100-byte frame: reserve, then enqueue.
         assert!(try_reserve_bytes(&slot.queued, budget, 100));
-        slot.tx.try_send(vec![0u8; 100]).expect("queue has room");
+        slot.tx.try_send(Frame::from(vec![0u8; 100])).expect("queue has room");
         // The reservation stands while the frame sits queued.
         assert!(!try_reserve_bytes(&slot.queued, budget, 100), "100 + 100 > 150");
 
@@ -4736,7 +4814,7 @@ mod tests {
         // Slot for connection 2 (the live replacement): a bare
         // channel suffices — the teardown logic only inspects
         // `conn_id`, never the sender.
-        let (tx, _rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        let (tx, _rx) = mpsc::sync_channel::<Frame>(1);
         primitives::sync::lock_state(&streams).insert(
             pid.clone(),
             OutboundSlot { tx, queued: Arc::new(AtomicUsize::new(0)), conn_id: 2 },

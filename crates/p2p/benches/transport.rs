@@ -11,6 +11,8 @@
 //! | `peer_id_parse`      | < 50 ns    | little-endian byte decode      |
 //! | `transport_create`   | < 1 µs     | Arc clone + channel setup      |
 //! | `partition_heal`     | < 1 µs     | Mutex lock + bool flip         |
+//! | `fanout/*`           | head-to-head (no gate): `shared` vs     |
+//! |                      | `per_peer_copy` on the real `enqueue`  |
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use p2p::MeshNetwork;
@@ -46,5 +48,32 @@ fn bench_partition_heal(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_peer_id_parse, bench_transport_create, bench_partition_heal);
+/// Committee fan-out enqueue: one payload copy per peer (a `send`
+/// loop) vs one shared frame (`Transport::broadcast`), on the real
+/// `enqueue` path. Sizes span a vote-sized frame to a 1 MiB proposal;
+/// peer counts span a small devnet to a 100-validator committee.
+fn bench_fanout(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fanout");
+    for &peers in &[4usize, 100] {
+        let table = p2p::tcp::BenchFanout::new(peers);
+        for &size in &[256usize, 1 << 20] {
+            let payload = vec![0xA5u8; size];
+            group.bench_function(format!("per_peer_copy/{peers}p/{size}B"), |b| {
+                b.iter(|| table.per_peer_copy(black_box(&payload)));
+            });
+            group.bench_function(format!("shared/{peers}p/{size}B"), |b| {
+                b.iter(|| table.shared(black_box(&payload)));
+            });
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_peer_id_parse,
+    bench_transport_create,
+    bench_partition_heal,
+    bench_fanout
+);
 criterion_main!(benches);
