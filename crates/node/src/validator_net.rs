@@ -263,6 +263,47 @@ impl TxInject {
     }
 }
 
+/// A funded secp256k1 account the pump submits equivocation
+/// evidence under (system-audit S1).
+///
+/// The consensus engine preserves conflicting signed votes as
+/// [`types::DoubleSignEvidence`] records; they become slashable
+/// only once a staking `evidence` transaction lands on-chain.
+/// Evidence is *permissionless* — the module authenticates the
+/// offense by re-verifying both BLS vote signatures, ignoring
+/// `ctx.sender` — so any funded account can carry it. This is the
+/// account the operator lends to that job: a dedicated key is
+/// recommended (it pays fees and its nonce stream is consumed
+/// only by evidence), but any funded secp256k1 account works.
+///
+/// `None` disables submission — records still drain so the
+/// engine's bounded queue cannot grow, and the pump logs how
+/// much evidence went unsubmitted. A validator that wants
+/// automatic slashing wires a key; one that doesn't still detects.
+pub struct EvidenceReporter {
+    /// The secp256k1 secret that signs the evidence envelope —
+    /// `Zeroizing` so the pump's copy wipes on drop. The binaries
+    /// load it via `cli::load_secret_key_file(SecretKind::Secp256k1)`.
+    pub key: zeroize::Zeroizing<[u8; 32]>,
+    /// The staking address `key` resolves to — the tx sender and
+    /// nonce owner.
+    pub sender: primitives::Address,
+}
+
+impl EvidenceReporter {
+    /// Build a reporter from raw key material, deriving `sender`
+    /// from `key` so the two can never disagree.
+    ///
+    /// Returns `None` when `key` is not a valid secp256k1 secret —
+    /// callers loading from files should treat `None` as a startup
+    /// refusal, not a silent disable.
+    #[must_use]
+    pub fn new(key: zeroize::Zeroizing<[u8; 32]>) -> Option<Self> {
+        let sender = crypto::signable_pubkey_address(&key[..])?;
+        Some(Self { key, sender })
+    }
+}
+
 /// The injector's resync anchor — the next nonce the sender must
 /// offer for its account to make progress. A stream targeting a
 /// self-authenticating module reads that module's own sender-nonce
@@ -371,6 +412,10 @@ pub struct ValidatorNetSpec {
     /// Optional sustained-load injector — see [`TxInject`].
     /// `None` on production validators.
     pub tx_inject: Option<TxInject>,
+    /// Account that submits detected equivocation evidence — see
+    /// [`EvidenceReporter`]. `None` still drains the engine queue
+    /// (detection stays on) but logs and drops the records.
+    pub evidence_reporter: Option<EvidenceReporter>,
 }
 
 /// Run a networked validator until `spec.shutdown` is set.
@@ -411,6 +456,7 @@ pub fn run(spec: ValidatorNetSpec) {
         repair_peers,
         observer_peers,
         tx_inject,
+        evidence_reporter,
     } = spec;
 
     // Peer identity is the validator's staking address — the stable
@@ -566,6 +612,18 @@ pub fn run(spec: ValidatorNetSpec) {
     // Drained from the engine's `certified_out` queue every loop.
     let mut sync_store = crate::block_sync::SyncStore::open(data_dir.as_deref());
 
+    // Pin the pump thread (hft-audit F-02): the loop below IS the
+    // consensus hot path — propose/vote/timeout handling serialized
+    // on this one thread. A failed pin degrades locality, never
+    // correctness: log and continue unpinned (topology is already
+    // validated at startup, so a failure here means the core went
+    // offline since boot).
+    if let Some(core) = node_config.consensus_core
+        && let Err(e) = primitives::pin::pin_current_thread(core)
+    {
+        eprintln!("{log_tag}: pin consensus pump to core {core} failed: {e} — running unpinned");
+    }
+
     // Run the consensus message pump loop until shutdown.
     run_consensus_loop(
         &mut engine,
@@ -581,6 +639,8 @@ pub fn run(spec: ValidatorNetSpec) {
         &mut sync_store,
         &repair_peers,
         tx_inject,
+        evidence_reporter,
+        node_config.chain_id,
     );
     // Flush any batched certified-record appends before the data
     // dir is handed to the snapshot exporter.
@@ -779,26 +839,6 @@ pub(crate) fn start_rpc(
     Some(rpc_clone)
 }
 
-/// Send `bytes` to every committee member except this node through
-/// [`Transport::broadcast`]: the TCP transport queues one shared
-/// buffer for all of them instead of a payload copy per peer, and
-/// takes its peer-table lock once.
-fn broadcast_committee(
-    engine: &consensus::OxideBft,
-    transport: &mut p2p::tcp::TcpTransport,
-    our_addr: primitives::Address,
-    bytes: &[u8],
-) {
-    let peers: Vec<&[u8]> = engine
-        .validator_set()
-        .validator_addresses()
-        .iter()
-        .filter(|addr| **addr != our_addr)
-        .map(|addr| &addr.0[..])
-        .collect();
-    transport.broadcast(&peers, bytes);
-}
-
 /// Map the `[network]` config onto the transport's tunables.
 ///
 /// `listen_addr`/`peers` are NOT taken from the file by callers that
@@ -810,6 +850,7 @@ fn to_transport_config(network: &config::NetworkConfig) -> p2p::tcp::TcpTranspor
         connect_timeout: network.connect_timeout(),
         read_timeout: network.read_timeout(),
         max_message_bytes: network.max_message_bytes,
+        socket_buffer_bytes: network.tcp_buffer_bytes,
         ..Default::default()
     }
 }
@@ -841,7 +882,33 @@ fn fanout_tx(
     let mut buf = Vec::with_capacity(1 + tx_bytes.len());
     buf.push(MSG_TX);
     buf.extend_from_slice(tx_bytes);
-    broadcast_committee(engine, transport, our_addr, &buf);
+    let mut peer_scratch = Vec::with_capacity(20);
+    for addr in engine.validator_set().validator_addresses() {
+        if *addr != our_addr {
+            send_to_addr(transport, &mut peer_scratch, addr, &buf);
+        }
+    }
+}
+
+/// Send `bytes` to the peer whose peer-id is the staking address
+/// `addr`, reusing `scratch` for the id (hft-audit F-24).
+///
+/// `Transport::send` takes `&PeerId` = `&Vec<u8>` (the id doubles as
+/// the peer-table lookup key), so `addr.0.to_vec()` used to allocate
+/// a fresh 20-byte Vec per peer per broadcast — committee-size
+/// allocations for every proposal, vote, QC, timeout and gossip
+/// frame. The scratch Vec is cleared and refilled per send: one
+/// allocation per broadcast loop total, and the caller amortizes it
+/// further by keeping the scratch alive across rounds.
+fn send_to_addr(
+    transport: &mut p2p::tcp::TcpTransport,
+    scratch: &mut Vec<u8>,
+    addr: &primitives::Address,
+    bytes: &[u8],
+) {
+    scratch.clear();
+    scratch.extend_from_slice(&addr.0);
+    let _ = transport.send(scratch, bytes);
 }
 
 /// The consensus message pump loop: proposes, votes, drains the
@@ -878,6 +945,8 @@ fn run_consensus_loop(
     sync_store: &mut crate::block_sync::SyncStore,
     repair_peers: &[String],
     mut tx_inject: Option<TxInject>,
+    evidence_reporter: Option<EvidenceReporter>,
+    chain_id: u64,
 ) {
     // (cap documented at module scope — `GOSSIP_SEEN_CAP`)
     // Track proposals received from the network. Followers vote on
@@ -975,12 +1044,30 @@ fn run_consensus_loop(
     let mut inject_nonce = tx_inject.as_ref().map(|i| inject_anchor_nonce(app, i));
     let mut inject_next = std::time::Instant::now();
 
+    // Evidence reporter nonce — same seeding contract as
+    // `inject_nonce`: the sender's EXECUTED nonce from committed
+    // executor state, so a restarted pump resumes past consumed
+    // nonces. Advanced only on `Accepted` submissions (a rejected
+    // envelope left its nonce slot free); re-seeded each drain to
+    // the max of the counter and the executed watermark, which
+    // heals a counter that raced ahead of an externally-submitted
+    // tx without ever rewinding in-flight nonces.
+    let mut reporter_nonce = evidence_reporter.as_ref().map(|r| app.executed_nonce_of(&r.sender));
+
+    // Reusable peer-id scratch for broadcast sends (F-24): `send`
+    // takes `&PeerId` = `&Vec<u8>`, so `addr.0.to_vec()` used to
+    // allocate a 20-byte Vec per peer per message — committee ×
+    // message-count allocations a pass. One scratch Vec, cleared
+    // and refilled per send, makes it one allocation per PUMP.
+    let mut peer_scratch: Vec<u8> = Vec::with_capacity(20);
+
+    // A frame the idle tail-wait popped — `recv_timeout` must consume
+    // a message to wake on it, so the woken frame is stashed here and
+    // Phase 3 processes it before draining the queue (F-01). Never
+    // holds more than one frame and never across a shutdown break.
+    let mut wake_msg: Option<ports::transport::InboundMessage> = None;
+
     loop {
-        // Set when this pass consumed an inbound message, a verify
-        // verdict, or a gossiped tx — the idle sleep at the bottom
-        // is skipped so their follow-ups (votes, QCs, proposals) go
-        // out without waiting a scheduler tick.
-        let mut progressed = false;
         // Graceful shutdown: SIGINT/SIGTERM sets the flag, we break
         // cleanly so the transport can flush and the WAL can be
         // closed by `Drop`.
@@ -1038,7 +1125,11 @@ fn run_consensus_loop(
                 buf.push(MSG_PROPOSAL);
                 header.encode(&mut buf);
                 proposal.encode(&mut buf);
-                broadcast_committee(engine, transport, our_addr, &buf);
+                for addr in engine.validator_set().validator_addresses() {
+                    if *addr != our_addr {
+                        send_to_addr(transport, &mut peer_scratch, addr, &buf);
+                    }
+                }
             }
         }
 
@@ -1060,15 +1151,17 @@ fn run_consensus_loop(
                 // `leader` is a committee index into the live set.
                 if let Some(leader_addr) = engine.validator_set().validator_addresses().get(leader)
                 {
-                    let _ = transport.send(&leader_addr.0, &buf);
+                    send_to_addr(transport, &mut peer_scratch, leader_addr, &buf);
                 }
                 voted_views.insert(proposal_view);
             }
         }
 
-        // Phase 3: drain inbound transport messages.
-        while let Some(msg) = transport.recv() {
-            progressed = true;
+        // Phase 3: drain inbound transport messages. `wake_msg`
+        // carries a frame the tail-wait already popped (a blocking
+        // receive must consume to wake — hft-audit F-01); it is
+        // processed first, then the queue drains non-blocking.
+        while let Some(msg) = wake_msg.take().or_else(|| transport.recv()) {
             if msg.bytes.is_empty() {
                 continue;
             }
@@ -1110,9 +1203,17 @@ fn run_consensus_loop(
                         // accounting stays simple and honest bursts
                         // (≤1 proposal per view per leader) sit far
                         // below the cap.
-                        let budget = proposal_verify_budget
-                            .entry(msg.from.clone())
-                            .or_insert((std::time::Instant::now(), 0));
+                        // `get_mut`-then-`entry` (F-24): the map is
+                        // committee-sized and long-lived, so nearly
+                        // every frame hits — `entry(msg.from.clone())`
+                        // would clone the peer id per FRAME to build
+                        // a key it then discards.
+                        let budget = match proposal_verify_budget.get_mut(&msg.from) {
+                            Some(b) => b,
+                            None => proposal_verify_budget
+                                .entry(msg.from.clone())
+                                .or_insert((std::time::Instant::now(), 0)),
+                        };
                         if budget.0.elapsed() >= std::time::Duration::from_secs(1) {
                             *budget = (std::time::Instant::now(), 0);
                         }
@@ -1557,7 +1658,6 @@ fn run_consensus_loop(
         // stale or contradictory verdict can never move consensus.
         while let Some(done) = verify_pool.try_recv() {
             use crate::verify_pool::VerifyOutcome;
-            progressed = true;
             match done.outcome {
                 VerifyOutcome::Proposal { header, proposal, sig_ok, commit_ok } => {
                     // The dedupe key is claimed only by a verdict
@@ -1648,7 +1748,6 @@ fn run_consensus_loop(
         // iteration — each send is a channel push to the peer's
         // writer task, non-blocking.
         while let Ok(tx_bytes) = gossip_rx.try_recv() {
-            progressed = true;
             fanout_tx(engine, transport, our_addr, &mut seen_txs, &mut seen_txs_fifo, &tx_bytes);
         }
 
@@ -1707,12 +1806,87 @@ fn run_consensus_loop(
             }
         }
 
+        // Phase 3d: equivocation evidence → staking (system-audit
+        // S1). The engine preserves conflicting signed votes in a
+        // bounded queue; here each record becomes a signed staking
+        // `evidence` envelope, is admitted locally, and gossips to
+        // the committee on acceptance — the same relay path as
+        // injected txs, so the slash lands whichever validator
+        // proposes next. Evidence is fleet-redundant (every honest
+        // node detects the same pair), so a local rejection —
+        // including the module's own "already applied" dedup —
+        // is informational, never retried.
+        let evidence = engine.take_evidence();
+        if !evidence.is_empty() {
+            match (&evidence_reporter, &mut reporter_nonce) {
+                (Some(reporter), Some(nonce)) => {
+                    *nonce = (*nonce).max(app.executed_nonce_of(&reporter.sender));
+                    for ev in evidence {
+                        let payload = staking::msg::evidence(
+                            ev.validator,
+                            ev.view.value(),
+                            ev.phase as u8,
+                            ev.epoch.value(),
+                            ev.first_block_hash.as_bytes(),
+                            ev.first_signature.as_bytes(),
+                            ev.second_block_hash.as_bytes(),
+                            ev.second_signature.as_bytes(),
+                        );
+                        let tx = crate::cli::build_signed_tx_with(
+                            &reporter.key[..],
+                            reporter.sender,
+                            chain_id,
+                            framework::module_id::STAKING,
+                            &payload,
+                            *nonce,
+                        );
+                        let tx_bytes = tx.as_bytes().to_vec();
+                        let ack = engine.submit_tx(tx);
+                        eprintln!(
+                            "{log_tag}: equivocation evidence vs {} view={} phase={} → {:?}",
+                            ev.validator,
+                            ev.view.value(),
+                            ev.phase as u8,
+                            ack
+                        );
+                        if matches!(ack, types::MempoolAck::Accepted) {
+                            *nonce += 1;
+                            fanout_tx(
+                                engine,
+                                transport,
+                                our_addr,
+                                &mut seen_txs,
+                                &mut seen_txs_fifo,
+                                &tx_bytes,
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    // No reporter key — detection still ran (the
+                    // queue was drained), but nothing can carry the
+                    // records on-chain. Log once per drain so an
+                    // operator sees what their node is declining
+                    // to submit.
+                    eprintln!(
+                        "{log_tag}: {} equivocation evidence record(s) dropped — no \
+                         evidence reporter key configured",
+                        evidence.len()
+                    );
+                }
+            }
+        }
+
         // Phase 4: form QC (if quorum reached).
         if let Some(qc) = engine.try_form_qc() {
             let mut qc_buf = Vec::with_capacity(1 + 150);
             qc_buf.push(MSG_QC);
             qc.encode(&mut qc_buf);
-            broadcast_committee(engine, transport, our_addr, &qc_buf);
+            for addr in engine.validator_set().validator_addresses() {
+                if *addr != our_addr {
+                    send_to_addr(transport, &mut peer_scratch, addr, &qc_buf);
+                }
+            }
             let _ = engine.deliver_qc(qc);
         }
 
@@ -1784,7 +1958,11 @@ fn run_consensus_loop(
                     None => buf.push(0u8),
                 }
                 sig.encode(&mut buf);
-                broadcast_committee(engine, transport, our_addr, &buf);
+                for addr in engine.validator_set().validator_addresses() {
+                    if *addr != our_addr {
+                        send_to_addr(transport, &mut peer_scratch, addr, &buf);
+                    }
+                }
                 // Self-collect: feed our own timeout signature to the
                 // engine so it counts toward the quorum.
                 if let Ok(Some(tc)) = engine.collect_timeout_signature(
@@ -1800,7 +1978,11 @@ fn run_consensus_loop(
                     let mut tc_buf = Vec::with_capacity(1 + 200);
                     tc_buf.push(MSG_TC);
                     tc.encode(&mut tc_buf);
-                    broadcast_committee(engine, transport, our_addr, &tc_buf);
+                    for addr in engine.validator_set().validator_addresses() {
+                        if *addr != our_addr {
+                            send_to_addr(transport, &mut peer_scratch, addr, &tc_buf);
+                        }
+                    }
                     view_start = std::time::Instant::now();
                     timeout_sent_for_view = None;
                 }
@@ -1944,7 +2126,7 @@ fn run_consensus_loop(
                                 count: crate::block_sync::SYNC_PAGE_CAP,
                             },
                         ));
-                        let _ = transport.send(&addr.0, &buf);
+                        send_to_addr(transport, &mut peer_scratch, &addr, &buf);
                         sync_last_req = Some(std::time::Instant::now());
                         break;
                     }
@@ -2036,14 +2218,20 @@ fn run_consensus_loop(
             *pending = staged.cloned();
         }
 
-        // Yield to avoid busy-spinning when idle. `transport.recv()`
-        // is a non-blocking `try_recv()`, so without a sleep the loop
-        // would spin at 100% CPU. The sleep is skipped after a pass
-        // that made progress: the consensus hot path (propose → vote
-        // → QC) is message-driven, and sleeping unconditionally added
-        // ≥1ms (more under coarse timer slack) to every round trip.
-        if !progressed {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        // Idle wait — wakeup-capable, not a blind sleep (hft-audit
+        // F-01): `recv_timeout` parks on the inbound channel's
+        // condvar, so an arriving proposal/vote/QC wakes the pump
+        // THIS pass instead of up to a millisecond late — the sleep
+        // made every message pay up to 1ms of queue latency while
+        // claiming to be the fast path. The 1ms bound keeps the
+        // pacemaker, gossip drain, and sync cadence identical to the
+        // sleep it replaced: those duties need the loop to run on a
+        // ~ms quantum, and the timeout is exactly that quantum.
+        // A wait that ends with a frame stashes it in `wake_msg`;
+        // Phase 3 next pass processes it before draining — nothing
+        // popped to wake is ever dropped.
+        if wake_msg.is_none() {
+            wake_msg = transport.recv_timeout(std::time::Duration::from_millis(1));
         }
     }
 }
@@ -2083,7 +2271,7 @@ fn on_admitted_proposal(
     pending_proposals: &mut Vec<(types::BlockHeader, types::Proposal)>,
     sync_target: &mut u64,
     sync_last_req: &mut Option<std::time::Instant>,
-    peer: &[u8],
+    peer: &Vec<u8>,
     header: types::BlockHeader,
     proposal: types::Proposal,
 ) {
@@ -2120,7 +2308,7 @@ fn on_inbound_qc(
     engine: &mut consensus::OxideBft,
     transport: &mut p2p::tcp::TcpTransport,
     qc: types::QuorumCertificate,
-    peer: &[u8],
+    peer: &Vec<u8>,
     verdict: Option<consensus::QcVerdict>,
 ) {
     let unknown = !engine.has_block(&qc.block_hash);
@@ -2239,7 +2427,12 @@ fn on_verified_timeout(
             let mut tc_buf = Vec::with_capacity(1 + 200);
             tc_buf.push(MSG_TC);
             tc.encode(&mut tc_buf);
-            broadcast_committee(engine, transport, our_addr, &tc_buf);
+            let mut peer_scratch = Vec::with_capacity(20);
+            for addr in engine.validator_set().validator_addresses() {
+                if *addr != our_addr {
+                    send_to_addr(transport, &mut peer_scratch, addr, &tc_buf);
+                }
+            }
             *view_start = std::time::Instant::now();
             *timeout_sent_for_view = None;
         }
@@ -2620,6 +2813,7 @@ mod repair_tests {
                 &proposal.txs.iter().flat_map(|t| t.as_bytes().to_vec()).collect::<Vec<u8>>(),
             ),
             body_commitment: types::shard::commitment(&body, 1, 1),
+            body_hash: Hash::ZERO,
             high_qc: None,
             timeout_cert: None,
             proposer: consensus::proposer_hash(0),

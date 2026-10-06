@@ -9,7 +9,8 @@
 //! skipped the checkpoint would leak or double-count rewards.
 
 use super::{
-    Address, BONDED_POOL, Balances, Event, ExecError, StakingModule, TxContext, UnbondingEntry,
+    Address, BONDED_POOL, Balances, Event, ExecError, RejectCategory, StakingModule, TxContext,
+    UnbondingEntry,
 };
 
 impl StakingModule {
@@ -99,8 +100,9 @@ impl StakingModule {
         {
             let validators = framework::lock_state(&self.validators);
             if !validators.contains_key(&validator) {
-                return Err(ExecError::ModuleRejected(
-                    "delegate: validator not registered".to_string(),
+                return Err(ExecError::rejected(
+                    RejectCategory::NotFound,
+                    "delegate: validator not registered",
                 ));
             }
         }
@@ -119,19 +121,19 @@ impl StakingModule {
                     .copied()
                     .unwrap_or(0)
                     .checked_add(amount)
-                    .ok_or(ExecError::ModuleRejected("stake overflow".to_string()))?,
+                    .ok_or(ExecError::rejected(RejectCategory::Precondition, "stake overflow"))?,
                 delegations
                     .get(&(delegator, validator))
                     .copied()
                     .unwrap_or(0)
                     .checked_add(amount)
-                    .ok_or(ExecError::ModuleRejected("delegation overflow".to_string()))?,
-                totals
-                    .get(&validator)
-                    .copied()
-                    .unwrap_or(0)
-                    .checked_add(amount)
-                    .ok_or(ExecError::ModuleRejected("delegated total overflow".to_string()))?,
+                    .ok_or(ExecError::rejected(
+                        RejectCategory::Precondition,
+                        "delegation overflow",
+                    ))?,
+                totals.get(&validator).copied().unwrap_or(0).checked_add(amount).ok_or(
+                    ExecError::rejected(RejectCategory::Precondition, "delegated total overflow"),
+                )?,
             )
         };
         // Debit first: if the transfer fails nothing is recorded.
@@ -155,7 +157,7 @@ impl StakingModule {
         // All three obligations verified — now write them.
         let stake = validators
             .get_mut(&validator)
-            .ok_or(ExecError::ModuleRejected("delegate: validator vanished".to_string()))?;
+            .ok_or(ExecError::rejected(RejectCategory::Internal, "delegate: validator vanished"))?;
         *stake = new_stake;
         delegations.insert((delegator, validator), new_delegation);
         framework::lock_state(&self.delegated_total).insert(validator, new_total);
@@ -193,10 +195,11 @@ impl StakingModule {
         let delegation = delegations
             .get(&(delegator, validator))
             .copied()
-            .ok_or(ExecError::ModuleRejected("undo_delegate: no delegation".to_string()))?;
+            .ok_or(ExecError::rejected(RejectCategory::NotFound, "undo_delegate: no delegation"))?;
         if delegation < amount {
-            return Err(ExecError::ModuleRejected(
-                "undo_delegate: delegation smaller than undo amount".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                "undo_delegate: delegation smaller than undo amount",
             ));
         }
         // `delegation >= amount` was proven above — saturating is the
@@ -219,9 +222,10 @@ impl StakingModule {
                 totals.insert(validator, t.saturating_sub(amount));
             }
         }
-        let stake = validators
-            .get_mut(&validator)
-            .ok_or(ExecError::ModuleRejected("undo_delegate: validator gone".to_string()))?;
+        let stake = validators.get_mut(&validator).ok_or(ExecError::rejected(
+            RejectCategory::Internal,
+            "undo_delegate: validator gone",
+        ))?;
         // `amount <= delegation <= delegated_total <= stake` by
         // construction — saturating clamps the (unreachable)
         // underflow instead of panicking mid-undo.
@@ -250,13 +254,15 @@ impl StakingModule {
         let mut validators = framework::lock_state(&self.validators);
         let mut delegations = framework::lock_state(&self.delegations);
         let delegation = delegations.get(&(delegator, validator)).copied().ok_or_else(|| {
-            ExecError::ModuleRejected(
-                "undelegate: no delegation from this sender to this validator".to_string(),
+            ExecError::rejected(
+                RejectCategory::NotFound,
+                "undelegate: no delegation from this sender to this validator",
             )
         })?;
         if delegation < amount {
-            return Err(ExecError::ModuleRejected(
-                "undelegate: insufficient delegation".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                "undelegate: insufficient delegation",
             ));
         }
         // Settle on the pre-mutation amounts: the full delegation
@@ -287,9 +293,10 @@ impl StakingModule {
         } else {
             delegations.insert((delegator, validator), new_delegation);
         }
-        let stake = validators
-            .get_mut(&validator)
-            .ok_or(ExecError::ModuleRejected("undelegate: validator not found".to_string()))?;
+        let stake = validators.get_mut(&validator).ok_or(ExecError::rejected(
+            RejectCategory::NotFound,
+            "undelegate: validator not found",
+        ))?;
         *stake = stake.saturating_sub(amount); // delegation ≤ stake by construction
         self.store_delegation_state(validator, delegator, *stake, new_delegation);
         drop(delegations);
@@ -332,30 +339,38 @@ impl StakingModule {
                 .rposition(|e| {
                     e.delegator == delegator && e.validator == validator && e.amount == amount
                 })
-                .ok_or(ExecError::ModuleRejected(
-                    "undo_undelegate: no matching unbonding entry".to_string(),
+                .ok_or(ExecError::rejected(
+                    RejectCategory::NotFound,
+                    "undo_undelegate: no matching unbonding entry",
                 ))?
         };
         let mut validators = framework::lock_state(&self.validators);
         let mut delegations = framework::lock_state(&self.delegations);
-        let stake = validators
-            .get_mut(&validator)
-            .ok_or(ExecError::ModuleRejected("undo_undelegate: validator gone".to_string()))?;
+        let stake = validators.get_mut(&validator).ok_or(ExecError::rejected(
+            RejectCategory::Internal,
+            "undo_undelegate: validator gone",
+        ))?;
         let new_stake = stake
             .checked_add(amount)
-            .ok_or(ExecError::ModuleRejected("stake overflow on undo".to_string()))?;
+            .ok_or(ExecError::rejected(RejectCategory::Precondition, "stake overflow on undo"))?;
         let new_delegation = delegations
             .get(&(delegator, validator))
             .copied()
             .unwrap_or(0)
             .checked_add(amount)
-            .ok_or(ExecError::ModuleRejected("delegation overflow on undo".to_string()))?;
+            .ok_or(ExecError::rejected(
+                RejectCategory::Precondition,
+                "delegation overflow on undo",
+            ))?;
         let new_total = framework::lock_state(&self.delegated_total)
             .get(&validator)
             .copied()
             .unwrap_or(0)
             .checked_add(amount)
-            .ok_or(ExecError::ModuleRejected("delegated total overflow on undo".to_string()))?;
+            .ok_or(ExecError::rejected(
+                RejectCategory::Precondition,
+                "delegated total overflow on undo",
+            ))?;
         // All checks passed — apply the mutation set.
         framework::lock_state(&self.unbonding).remove(pos);
         *stake = new_stake;

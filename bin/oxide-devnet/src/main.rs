@@ -400,6 +400,23 @@ fn run_node(node_index_str: &str) {
         node::validator_net::TxInject::evm_transfers(rate, key, sender, cfg.node.chain_id)
     });
 
+    // Evidence reporter (S1): the devnet node's own funded test
+    // identity carries equivocation records on-chain — the genesis
+    // generator funds `test_identity_address(i)` for exactly this
+    // purpose. DISABLED while `--tx-inject-rate` is set: the
+    // injector already owns that account's nonce stream, and two
+    // nonce owners would race (an evidence envelope losing the
+    // race is never retried — the slash would depend on another
+    // node's record landing).
+    let evidence_reporter = if tx_inject.is_none() {
+        let identity =
+            u8::try_from(node_index).expect("node index fits u8 for devnet test identities");
+        let key = zeroize::Zeroizing::new(crypto::secp::test_identity_key(identity));
+        node::validator_net::EvidenceReporter::new(key)
+    } else {
+        None
+    };
+
     // `--wal-file` overrides the derived `<data_dir>/consensus.wal`
     // path; when neither is set the WAL stays in-memory.
     let wal_path = node::cli::parse_cli_flag("--wal-file").map(PathBuf::from);
@@ -450,6 +467,7 @@ fn run_node(node_index_str: &str) {
             })
             .collect(),
         tx_inject,
+        evidence_reporter,
     });
 }
 
@@ -467,7 +485,7 @@ fn load_bls_key(index: usize) -> crypto::BlsSecretKey {
         // `OXIDE_KEY_PASSPHRASE` in the environment).
         let bytes = node::cli::load_secret_key_file(&path, node::cli::SecretKind::Bls)
             .unwrap_or_else(|e| panic!("invalid BLS key file: {e}"));
-        crypto::BlsSecretKey::from_bytes(&bytes)
+        crypto::BlsSecretKey::from_bytes(&bytes[..])
             .unwrap_or_else(|e| panic!("invalid BLS secret key in {path}: {e:?}"))
     } else {
         // Deterministic devnet fallback — NOT suitable for production.

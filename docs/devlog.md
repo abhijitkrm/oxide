@@ -22430,3 +22430,958 @@ change (async vote path). Matcher sparse-map poison recovery is
 documented as tear-free. `proposal_verify_budget` is keyed by
 handshake-proven committee ids, so it is already committee-sized.
 
+
+## Status-doc sweep — the checklists catch up to the code
+
+Two status documents had drifted behind the work they describe.
+
+- `AGENTS.md` "Current status" still read "Phase 2 complete" —
+  updated to Phases 0–3 complete (all §13 gates met per the
+  recorded benches) with Phase 4 in progress: fuzz campaign,
+  10k-scenario chaos sim, and the TLA+ model landed; external
+  review and the geo-distributed testnet remain.
+- `docs/production-readiness.md` gate sections for 5 and 6 still
+  read "Not started" while the top-level eval already counted
+  them. Gate 5 now records its evidence (the 2026-09-17 soak
+  campaign, committed corpus, nightly CI, the vacuous
+  `journal-replay` harness it caught). Gate 6 is marked `[~]`
+  rather than `[x]` — the vectors, upstream-pinned trie roots,
+  and differential fuzz exist, but the official ethereum/tests
+  runner the gate literally specifies is still deferred; the
+  top-level eval now says so.
+
+## Secret-material zeroization + wire-count caps (Audit 003 remediation)
+
+Post-review remediation pass, priority order.
+
+**Zeroize everywhere a secret lives.** `keystore::open` returns the
+decrypted secret in `Zeroizing<[u8; 32]>` and `passphrase_from_env`
+returns a `Zeroizing<String>`; the PBKDF2-derived AEAD key and the
+in-place decrypt buffer inside `open`/`seal` are `Zeroizing` too.
+`BlsSecretKey::to_bytes` returns `Zeroizing` (the blst `SecretKey`
+itself was already `#[zeroize(drop)]`). `secp` signing paths wipe
+their `key_arr` copies and call `non_secure_erase` on the `SecretKey`
+(the crate offers no drop-time wipe). `ed25519-dalek` gained its
+`zeroize` feature so `SigningKey` is `ZeroizeOnDrop`. Node-side:
+`load_secret_key_file`/`parse_secret_key_bytes` return `Zeroizing`
+and wipe the raw file buffer and the hex-decoded intermediate;
+remote-signer `Session` derives `ZeroizeOnDrop` and both
+`SignerDaemon`/`RemoteSigner` store the link key as
+`Zeroizing<[u8; 32]>`; matcher's `SigningConfig`/`ServerConfig`
+settlement keys are `Zeroizing`. Binaries wipe argv-hex strings and
+decoded Vecs immediately after the real key object is built.
+Non-goal honestly noted: zeroization covers owned Rust buffers —
+compiler-generated copies, OS core dumps, and swap are outside its
+guarantee (OS hardening is a deployment concern).
+
+**Bounded the dead-code decoders.** `p2p::discovery` `PeerList`
+decode pre-sizes by `count.min(rest.len()/4)` — each entry costs ≥4
+bytes of wire — and `p2p::sync`'s `SnapshotClient::set_metadata`
+caps its chunk table at `MAX_CHUNKS` (the encoder rejects larger
+snapshots, so a larger claim is provably hostile). Both were
+unreachable-by-caller dead code, but they carried the pre-fix OOM
+shape; now a future caller inherits the bound. Pinned with
+`decode_huge_peer_count_fails` and
+`snapshot_client_caps_hostile_chunk_count`.
+
+**Doc fix:** `secp.rs` `recover_sender`/`RecoverableSignature::from_bytes`
+docs claimed `recid > 3` was rejected; the implementation rejects
+`recid > 1` (EIP-2 standard `{0,1}` set) — docs corrected.
+
+Deps: `zeroize 1.9.0` added as a direct dep (already transitive via
+blst; MIT/Apache-2.0, published 2025-06 — past the 7-day rule);
+`cargo deny` clean.
+
+## Typed module rejections (audit follow-up)
+
+`ExecError::ModuleRejected(String)` encoded every module-level
+failure — insufficient balance, missing market, wrong owner,
+unwired ledger — as free-form text. Anything downstream that wanted
+the *kind* of failure (RPC classification, mempool retry policy,
+operator alerting) had to string-match. The variant now carries a
+`ModuleRejection { category: RejectCategory, detail: String }`:
+`RejectCategory` is the stable, matchable half (`InsufficientFunds`,
+`Unauthorized`, `NotFound`, `InvalidInput`, `Precondition`,
+`Internal`, `Other`), `detail` stays human-facing. `Display` renders
+`"category_token: detail"`, so the mempool `Rejected { reason }`
+wire string gains a stable lowercase prefix clients can match on
+without a wire-format change — and `ExecError` gained `Display` +
+`Error` impls so seams format `{e}` instead of `{e:?}`.
+
+~205 call sites across all modules re-classified by semantics:
+user-actionable rejections (`InsufficientFunds`/`Unauthorized`/
+`NotFound`/`InvalidInput`/`Precondition`) vs module-side invariant
+breaks (`Internal` — refund failures, missing ledger wiring, engine
+errors). The distinction is deliberate: `Internal` means
+investigate, not retry. Opaque revm error passthroughs stay `Other`
+— honest rather than guessed. `rejection_category()` exposes the
+typed half; `ExecError::rejected(cat, detail)` keeps handler call
+sites one line. Regression test pins the category + rendered
+shape (`module_rejection_carries_category`); ~90 existing
+`matches!(.., ModuleRejected(_))` pattern tests needed no changes
+since the variant stayed a tuple. Two handlers crossed the
+100-line clippy gate from the longer constructor — extraction
+(`check_market_accepts_order`, `check_order_slot`) keeps them
+under.
+
+## Official ethereum/tests GeneralStateTests runner (gate 6)
+
+`modules/evm/tests/official_state_tests.rs` drives the official
+`ethereum/tests` filled `GeneralStateTests` corpus through the
+production EVM path — `sign_* → encode → decode → validate →
+handle → state_root` — not an adapter shim. Fixtures are the
+release tarball subset committed under `tests/fixtures/state/`
+(1,548 files, provenance in `MANIFEST.txt`).
+
+**Re-signing, not bypassing.** Upstream `txbytes` carry unprotected
+`v ∈ {27,28}` legacy signatures, which decode to `chain_id 0` and
+are rejected by the production EIP-155 admission check — correctly.
+Rather than weaken validation, the runner reconstructs each
+transaction from the fixture's declared fields and re-signs with
+the fixture `secretKey` at `config.chainid`, so production signing,
+encoding, recovery, and admission all execute. (Added
+`SignedTx::sign_eip2930` to complete the `sign_*` family.)
+
+**Three real bugs the corpus caught:**
+
+1. *EIP-158 empty-account deletion missing from `state_root`.*
+   Coinbase accounts touched with a zero tip stayed in the trie as
+   empty leaves — every upstream client drops them. ~8,800
+   root mismatches traced to this via the new per-account
+   `post.state` differ; fixed in both the incremental and full
+   trie paths (`a.info.is_empty()` filter).
+2. *Precompile dispatch hijacked pattern-matching addresses.*
+   `PrecompileProvider::run` gated on `is_precompile(addr)` — the
+   `0x00..0OOXX` syntactic pattern — so an ordinary contract at
+   e.g. `0xc0de` or `0x1000` was routed into the native dispatcher
+   and reverted instead of executing its code. Consensus-level
+   bug: any deploy landing on the pattern was uncallable. Now
+   gated on membership in `NATIVE_PRECOMPILES`.
+3. *Block env incomplete.* `prevrandao` and `difficulty` were
+   never wired into `BlockEnv` — `DIFFICULTY`/`PREVRANDAO`
+   returned zero. `set_prevrandao`/`set_difficulty` module setters
+   now exist; production leaves them unset by design (no beacon
+   randomness yet — noted on the field docs).
+
+**Result:** 13,754 pass / 0 unexpected fail / 20 pinned
+divergences / 184 unsupported (26 EIP-4844 blob txs, 158 pre-state
+balances above the module's u128 ledger — both reported, never
+dropped).
+
+**The 20 divergences are all EIP-7610** — "revert creation when the
+destination has non-empty storage," a *retroactive* amendment to
+EIP-684, which is why `[Cancun-Prague]` fills expect it. revm 42
+implements only EIP-684 (its journal collision check never inspects
+storage); reth explicitly opts out of 7610; revm's own statetest
+runner hard-skips the same fixture family. On Oxide the
+precondition — nonce 0 ∧ empty code ∧ non-empty storage — is
+unreachable via transactions post-EIP-161: storage writes only
+happen inside an initialized (nonce ≥ 1) account, so only genesis
+injection can produce it, which is exactly what these fixtures do.
+Enforcement would need the inspector execution path (per-instruction
+hook tax on the hot path), ~130 lines of opcode-prologue
+replication, or a revm fork — disproportionate for a genesis-only
+edge case. Decision: pin each divergent expectation by test name in
+`KNOWN_DIVERGENCES`; the gate still fails on any divergence outside
+the pinned set, so a new regression cannot hide. Revisit if Oxide
+ever imports foreign state or schedules Osaka.
+
+Supporting test-surface additions: `History::pending_receipts` /
+`pending_traces` (read the just-executed tx before `seal_block`),
+`EvmModule::all_accounts_for_test` (per-account post-state diff),
+`handle_returning_result_for_test` (halt reason, not just the
+receipt bit) sharing `handle_inner` with the production `handle`.
+
+**Postscript — the same EIP-158 gap lived in the persistence
+layer.** `checkpoint_bounds_replay` caught it: the height-8
+checkpoint serialized the zero-tip coinbase's touched-empty
+account into `snapshot.bin`, `inspect_state` rebuilt the trie
+*including* it, and the claimed module root — computed by the
+newly EIP-158-filtered `state_root` — didn't reproduce. Snapshot
+rejected, journal replay fell back to height 0, `JournalGap`.
+Three consistent points now share the predicate
+(`persist::DeserializedAccount::is_empty` mirrors revm's
+`AccountInfo::is_empty`): `serialize_committed_account` returns
+`None` for empties (the flush emits `Delete`, so drained accounts
+no longer resurrect on reload — a second real durability bug the
+same predicate fixes), `inspect_state` filters them in the verify
+recompute, and `load_from_storage` skips installing them so a
+ghost can't linger root-inert in the backend. Regression pin:
+`snapshot_omits_eip158_empty_accounts`.
+
+## HFT / low-latency audit (`hft-audit.md`)
+
+A full source-level audit of the hot paths against the
+`performance-first` rules — matching engine, matcher service,
+consensus pump, executor/EVM, p2p, WAL, primitives/codec, and the
+bench/gate apparatus — with every quantitative claim verified
+against the committed benches. Findings carry file:line, quantified
+impact, and remediation; 19 findings (6 High, 6 Medium, 4 Low, 3
+Info) plus a verified-strengths section.
+
+Headline items: the validator pump sleeps 1 ms at the end of every
+pass unconditionally (the comment claims otherwise — the single
+highest-value latency fix); no CPU pinning/NUMA exists despite the
+skill requiring it; the matcher "SPSC" ring is crossbeam MPMC and
+every push takes a global mutex + notify; the sequencer has an
+unbounded spin on a client-drainable ring; the market-data publisher
+would serialize JSON on the sequencer thread (currently unwired —
+fix before wiring); and the EVM parallel path re-runs secp256k1
+recovery (~30 µs/tx) that the preverify cache exists to avoid.
+Enforced throughput floors sit 5–24× below claims/measurements, so
+the audit recommends ratcheting gates. Fix order and required
+benches are listed in the audit's remediation plan.
+
+## HFT audit validation pass (F-01…F-19 re-verified; F-20/F-21 filed)
+
+Every finding in `hft-audit.md` was re-verified against the source at
+`87d63b5` by reading the cited code rather than trusting the original
+pass. The delta from the audited `e98bf2f` is docs-only, so line
+citations were expected to hold — each was re-checked anyway, and the
+"absence" claims (pinning/NUMA, socket-buffer sizing) were re-proven
+by repo-wide grep. Result: 19/19 confirmed, none implemented, four
+sharpened: the validator pump's sleep comment disproves itself (the
+sleep is the loop's last statement and runs after every pass, so the
+"+1 ms" tax applies to messages arriving mid-pass too); the matcher
+wakeup is one `Mutex<bool>` shared by all 512 order+response rings
+(`RingMatcher::new`), not the per-ring atomic its doc claims; the
+parallel EVM path additionally copies every payload
+(`pv.raw.to_vec()` per tx, `batch.rs`) inside the same fix window as
+the re-recovery tax; and the `tps_rw` bench's own documented gate
+(">1,000 tx/s") sits three orders of magnitude under the ≥1 GG/s
+headline it would enforce — so the gate ratchet should target a
+committed baseline, not that floor.
+
+Two new findings. **F-20**: the shared `Wakeup` panics on poison
+(`.expect`) where `primitives::sync`'s documented contract classifies
+a bool latch as independently consistent and mandates recovery — a
+poison would cascade panics into every connection's push path; the
+`production-rust` §8 "always recovery" text also contradicts the
+`primitives::sync` panic-for-state contract (same reconcile-the-skill
+class as F-17), and `spawn_supervised` never respawns — critical-actor
+death surfaces only via `/health`. **F-21**: `SpscSender::is_connected`
+is dead code whose predicate is a tautology (`!is_empty() || len <
+capacity` is true in every state for capacity ≥ 1); delete it (the
+F-03 ring rewrite removes it anyway). No remediation priority changes:
+F-01 stays the highest-value single fix, F-03 the most strategic.
+
+## HFT audit second pass — optimization review (F-22…F-26)
+
+A re-read of the per-order/per-tx/per-message paths with a pure
+nanosecond-and-throughput lens (engine/book/pool/bitboard/idmap,
+matcher service + risk, vote path, transport, build config). The §4
+strengths held: no allocation, lock, or syscall in the match loop
+itself. Five new findings. **F-22 (High)**: `capped_fillable` walks
+the entire 2^18-level dense ladder with an integer division per level
+— the FOK pre-scan for STP CancelNewest/DecrementAndCancel or any
+capped (reduce-only) FOK costs ~1.5–3 ms on a sparse book, on the
+shared sequencer thread, while its doc claims "O(levels touched)";
+the sibling scans (`fillable_qty`, `sweep_cost`) already iterate the
+bitboard in O(active levels) — the fix is the same index-space
+accessors F-09 introduces. **F-23 (Medium)**: the production matcher
+hardcodes `RiskEngine::with_defaults()` — 100 orders/s and 1000
+resting per account, no config surface, no per-account override —
+three to four orders of magnitude under the venue's own chain-wide
+gate; the rate limiter is also a SipHash HashMap + timestamp deque
+per order (a 64-bit sliding bitmap is alloc-free). **F-24 (Low)**:
+per-message heap copies on the transport path (`bytes.to_vec()` per
+send, per-frame inbound Vec, per-peer address Vec per unicast).
+**F-25 (Low)**: `preverify_cache` SipHashes already-keccak'd keys
+twice per tx on the live dispatch path — full-key fast hasher, never
+a truncated key (a collision would execute under a wrong sender).
+**F-26 (Info)**: the resting-commitment fold costs 2–3 leaf hashes
+per filled maker — measured-in and gated, but a leaf/qty split could
+make fills fold-free; protocol-versioned change, profile first.
+Plus a system-level enablement checklist in the audit (§8.3): core
+isolation + pinning, spin-then-park idle knobs, huge pages for
+arenas, `lto = "full"`/target-cpu/PGO measurement, io_uring, and one
+end-to-end ingest→ack HDR histogram so the composed-path taxes stop
+being visible only via microbench arithmetic.
+
+## Session: HFT audit implementation — 26 findings resolved
+
+The `hft-audit.md` findings (F-01 through F-26) moved from
+validated-and-open to implemented-or-documented. This session was
+the fix pass; the ordering below follows the audit.
+
+**F-01 — consensus pump wakeup.** The validator loop's idle
+`sleep(1 ms)` tail is gone: `TcpTransport::recv_timeout` blocks on
+the inbound channel so an arriving frame wakes the pump
+immediately, while the bounded timeout preserves the pacemaker/
+gossip cadence. A frame the wakeup returns is stashed into the
+normal drain path — byte accounting and admission logic unchanged.
+
+**F-02 — CPU pinning + NUMA surface.** New `primitives::pin` —
+`pin_current_thread`, `online_cpus`, `numa_node_present` — kept
+std-only (the `taskset -pc <core> <tid>` route against
+`/proc/thread-self`, since primitives may not link libc). New
+`[performance]` config section (`consensus_core`,
+`exec_lane_core`, `numa_node`) validated at startup by
+`NodeConfig::perf_pin_errors` inside `validate_effective_config`;
+`oxide-matcher` grows `--pin-sequencer` / `--pin-worker-base` with
+the same online-set check before any thread spawns. Pinned
+through `spawn_supervised_pinned` on the three single-writer
+threads: matcher sequencer, exec lane, consensus pump (plus
+per-market workers at `base + i`). A failed pin logs once and the
+actor runs unpinned — locality is a latency property, never a
+correctness one.
+
+**F-03 — true SPSC ring.** `matcher::ring` is now real SPSC
+storage: `UnsafeCell<MaybeUninit<T>>` slots, cache-padded
+head/tail atomics, the SAFETY invariants written out (single
+writer per index, init-before-publish, drop-once-on-close). The
+wakeup became a parked flag — `signal()` is one `AtomicBool::swap`
+on the hot path; the mutex+condvar only fire when the consumer is
+actually parked. Poison recovery rides `into_inner`. Bench
+(`benches/ring.rs`, head-to-head vs the displaced
+`crossbeam_channel::bounded` on identical payloads): **12.9 ns vs
+23.2 ns** single push+pop, **911 ns vs 1.90 µs** at burst-64 —
+~2×, the MPMC slot-stamp/backoff machinery the SPSC ring drops.
+
+**F-04 — bounded sequencer spin.** A response batch that can't
+push (client lagging behind its lease) parks per-ring and retries
+once per pass instead of spinning the sequencer; the lease caps
+in-flight batches at one per ring, so the parked set is bounded
+by `num_rings`.
+
+**F-05 — market-data isolation.** `publish_*` on the sequencer is
+now a wait-free ring push of the typed message — no serde, no
+lock, no per-subscriber work. A separate fanout task owns the
+subscriber map, serializes once into a shared `Arc<str>`, and
+broadcasts through bounded per-subscriber queues; a full queue
+evicts that subscriber only, a closed receiver is reaped, and a
+full internal ring sheds (counted) without touching the fanout.
+Tests cover queue-depth eviction, closed-receiver eviction,
+per-subscriber independence, and ring-full shedding.
+
+**F-06 — parallel recovery skip.** `PreverifiedTx` gains a
+`verified_locally` provenance flag set only when the sender came
+from the local `preverify_cache` — safe because the cache key is
+`hash_one(Domain::Transaction, envelope_bytes)` computed locally
+at dispatch, so a hit proves these exact bytes passed this node's
+verification. Both Phase-1 decode loops skip `recover_signer`
+under the flag; cache-miss paths still recover.
+
+**F-07 — OCC marked + fixed.** The doc now says what the code is
+(a custom scoped-thread scheduler, bench-only) instead of
+claiming rayon; the version map uses fixed-size `OccKey`
+representations and `v.clone()` per write is gone where ownership
+transfer sufficed.
+
+**F-08 — shared event storage.** `TxOutcome::Executed.events` is
+`Arc<[Event]>`; the block event log appends the slice without a
+per-event clone. Settlement and tests read through the same
+deref — ordering and error semantics unchanged.
+
+**F-09 + F-22 — index-space sweep + bitboard FOK.**
+`BookBackend` gained index-space accessors; the match sweep,
+maker-removal, and resting-entry paths operate on level indexes
+directly — `level_head`'s price→index division moved out of the
+inner FIFO loop (it was once per *fill*, not per level).
+`capped_fillable` walks the active-level bitboard instead of the
+whole 2^18 dense ladder; the linear scan stays as the documented
+displaced baseline in the bench. Head-to-head on a sparse
+1,000-level book: **82 ns vs 2.62 µs — ~32×**. Regression tests
+prove the bitboard walk and linear scan agree under caps, STP,
+and partial fills.
+
+**F-10 — socket buffers.** `configure_peer_socket` sets
+`TCP_NODELAY` + explicit send/recv buffer sizing
+(`socket_buffer_bytes`, plumbed from `NetworkConfig` through both
+transport contexts to all six dial/accept call sites).
+
+**F-11 — TLS budget documented.** The rustls write cost is now
+recorded where the design is decided — ~4 µs/frame under the
+stream lock is the priced floor; the mitigations (batched frames,
+fewer records) landed via the `write_frames` scratch path rather
+than a second cipher layer.
+
+**F-12 — gates ratcheted.** `trading_throughput.rs` floors raised:
+raw engine 1M→5M ops/s (~7.6× under the 38.1M reference
+measurement — the documented engine gate, de-rated for shared
+CI), exchange settlement 100k→400k ops/s (~5.9× under the 2.37M
+recorded). `tps_rw` gained a mechanical parallel gate: ≥60k tx/s
+on 10k transfers × 100 senders (serial is ~28k, measured ~128k).
+`alloc_accounting` is now *asserted*, not informational — per-row
+allocs/op ceilings (~2× observed: actions ≤2, crossing ≤5,
+parsers ≤1, formatters ≤2) panic the bench on regression, and a
+missing row fails loudly instead of silently un-gating.
+
+**F-13 — metrics fast path.** `LatencyMetrics::record` does
+`get_mut` first; the `String` key is allocated only on first
+observation of an operation. The doc rule stands: never call on a
+per-order/per-tx path — the recorder locks.
+
+**F-14 — scratch writes + slice submission.** The writer loop
+drains outbound frames into a per-connection scratch buffer and
+emits one write+flush per batch (the trait grew a scratch-aware
+override; TLS reuses its ciphertext buffer under the same lock
+ordering). `submit_batch_ring` takes `&[VerifiedOrder]` — the
+single-order path passes a one-element slice instead of
+`vec![req]`; the parked-response vector is reused across passes.
+
+**F-15 — Notify-based waits.** Response rings carry a per-ring
+`tokio::sync::Notify`; producers wait on a `space` signal instead
+of `yield_now` spinning — no more tokio-worker burn under
+saturation.
+
+**F-16 — FIX/WS allocation floor.** The parse side was already
+borrowed (measured 0.00 allocs/op — the audit text predated the
+borrowed tag lookup). What remained: the formatter `String` per
+response and a `to_string()` on every inbound WS frame.
+`format_fix_execution_report_into` writes into a per-connection
+scratch `String` (cleared, not freed); both FIX loops use it. WS
+receive borrows `Utf8Bytes`/lossy-Cow instead of copying. The WS
+response `String` is API-bound — `Message::Text` must own its
+bytes — documented as such.
+
+**F-17 — rounding reconciled.** The performance-first skill now
+says round-half-up (`mul_div_half_up`), matching the code's single
+documented direction; "banker's-mode" was the stale text.
+
+**F-18 — lease-starvation SLO written down.** `acquire_ring`'s
+doc now states the contract plainly: throughput-bounded, not
+latency-bounded — no FIFO ticketing, saturation defers excess
+waiters; a hard p99 belongs upstream (client timeout + retry
+endpoint) until measured.
+
+**F-19 — settlement exposure stated.** The settler module doc now
+names the window: seal interval + consensus inclusion, bounded by
+`MAX_PENDING_RETRIES`/`RESUBMIT_AFTER_TICKS`; the interval is a
+config knob sized against the venue's risk envelope.
+
+**F-20/F-21 — poison + liveness.** The parked-flag wakeup
+recovers via `into_inner`; `is_connected` is gone in favor of
+real push/pop liveness on the rings themselves.
+
+**F-23 — risk configuration.** `RiskConfig` threads
+`ServerConfig` → `run_server_multi` → `MultiMarketMatcher::
+with_options` → `MarketWorker::run`; `oxide-matcher` exposes
+`--risk-max-*` flags; venue-scale defaults no longer carry the
+human-scale 100 orders/s cap (upstream admission owns rate
+limits). Deterministic clock injection preserved for tests.
+
+**F-24 — fanout allocs.** `send_to_addr` + a reusable peer-id
+scratch kill the per-peer `addr.0.to_vec()` on tx fanout,
+proposal/vote/QC/TC broadcasts, and sync requests; `msg.from`
+clones happen only where the map insert needs ownership.
+
+**F-25 — digest map.** `primitives::digest_map::DigestMap` derives
+buckets from the digest bytes directly (the key is already a
+BLAKE3 output — SipHash was pure waste); `preverify_cache` uses
+it. Collision-correct (full-key eq on the bucket walk), tested.
+
+**F-26 — acknowledged.** The resting-commitment fold (2–3 leaf
+hashes per filled maker) is a protocol-versioned change —
+measured-in, gated, deliberately not touched this pass. Profile
+first; a leaf/qty split is the candidate design.
+
+**Build-profile note.** `lto`, `target-cpu`, and PGO measurement
+from the §8.3 enablement list stay open — they change the binary
+contract and deserve their own bench day, not a line item in this
+pass.
+
+## Session: mempool nonce coverage — the devnet fault-injection flake
+
+`cargo test -p devnet` intermittently panicked at
+`run_with_faulty_leader`'s flush round: `leader 2 should propose`
+with `view=6 next_height=5 high_qc=Some(5) stored_blocks=1` and the
+single stored block being a *complete block with 0 txs* at height
+4, view 5.
+
+### Root cause
+
+Two interacting pieces, both mempool-side — the consensus engine
+and exec lane were innocent:
+
+1. **Empty proposals from a phantom nonce gap.** `select` anchors
+   each sender's walk at `executed_nonces + 1` and breaks on the
+   first nonce not in the per-sender queue. Under pipelined
+   consensus, though, the sender's nonce chain is contiguous across
+   the *chain*, not across any one validator's pool: the sim
+   submits each round's tx only to that round's leader, so a later
+   leader holds nonce 4 while nonces 2,3 live in uncommitted
+   ancestor blocks proposed by other validators. The anchor sees a
+   gap, the walk breaks, the proposal carries zero txs.
+
+2. **The commit/execute clock skew.** `remove_committed` vacates
+   committed txs from the queue synchronously at finalization, but
+   `refresh_anchors` only rebuilds `executed_nonces` when the async
+   execution lane finishes the block — under parallel test load the
+   two clocks diverge and the queue shows a hole the committed tx
+   already filled.
+
+### Fix — two bounded covers in `Mempool`
+
+- `pending_commit: HashMap<Address, BTreeMap<nonce, commit-height>>`
+  — `remove_committed` records each committed tx's nonce *from the
+  block bytes* (a validator that never pooled the tx still needs
+  the bridge); `select` steps over covered nonces;
+  `refresh_anchors` expires entries at/below the just-executed
+  height, so a consumed slot is covered by the new anchor and a
+  skipped slot un-bridges (a refilled nonce stays selectable).
+
+- `in_chain: HashMap<Address, BTreeMap<nonce, proposal-height>>` —
+  `Executor::process_proposal` calls `note_in_chain` on the accept
+  path for every proposal it validates — own proposals and foreign
+  leaders' alike (the vote path is where every validator sees every
+  proposal). `select` steps over a queue hole an ancestor block
+  covers; `refresh_anchors` expires a cover when the rebuilt anchor
+  passes the nonce (executed) or when the covering height falls
+  `CHAIN_COVER_TTL` (2× the in-flight proposal window) behind the
+  executed tip (dead branch — the gap is real again).
+
+Both maps are bounded by in-flight occupancy and expire on the same
+per-block refresh that already rebuilt the anchors — no unbounded
+growth, no cross-test/process state.
+
+### Why the old fix attempts failed
+
+Bumping `executed_nonces` from committed bytes was clobbered by
+`refresh_anchors` rebuilding the map from `by_sender` keys — and an
+unconditional advance would have permanently skipped real gaps (a
+dropped nonce would dead-lock the sender's queue forever). The two-
+cover design keeps `executed_nonces` authoritative for execution
+while letting selection see "this nonce is already spoken for by
+the chain."
+
+### Verification
+
+`select_bridges_committed_unexecuted_gap` and
+`select_bridges_in_flight_ancestor_gap` regression tests reproduce
+both holes (bridge, then correct expiry — including the
+skipped-nonce un-bridge case). The devnet suite — including all
+five fault-injection tests under full parallel load — passes
+repeatedly where it used to fail ~1-in-4 runs. The richer
+`run_round` panic (engine state dump: view, next_height, high_qc,
+stored blocks, last_voted) stays — it is what made the flake
+diagnosable in minutes instead of hours.
+
+## Session: full system audit — security, performance, throughput, stability
+
+A post-HFT-audit pass over the whole tree (~170k LOC), prioritizing
+the surfaces no prior review had read: rpc, indexer, statesync,
+broadcast, codec, runtime, supervision, and the storage recovery
+path — plus re-checks of the security-critical seams. Result:
+`docs/system-audit.md`.
+
+### What the audit verified as strong
+
+- **rpc**: cost-weighted per-source rate limiting (batches pay per
+  element, `debug_trace*` pays its weight), per-IP in-flight caps, a
+  global work-permit semaphore, request timeouts, IPv6 /64 bucketing,
+  a bounded limiter map, and a connection cap that includes idle
+  keep-alives. The limiter cannot become the DoS.
+- **crypto**: PoP-gated BLS aggregation (the rogue-key defense),
+  `#[zeroize(drop)]` secret keys, DST-separated signing domains,
+  EIP-2 low-s + `{0,1}` recovery-id enforcement at the parse boundary.
+- **p2p**: TLS with client-cert verification against the peer-id map
+  (C4), signed-greeting `PeerAuth`, admission control at the
+  listener, bounded outbound queues, `max_message_bytes` below
+  allocation.
+- **statesync**: the trust anchor is a stake-supermajority
+  `ExecCertificate`; chunk hashes verify byte-for-byte before import;
+  the imported root must equal the certified root — fail closed.
+- **storage**: CRC-per-record journal, group commit, torn-tail
+  replay, height-indexed pruning that never deletes unindexed
+  segments, fault-injection crash tests.
+- **supervision**: actor registry, panic hook with critical-actor
+  abort, `/health` fail-closed on dead critical actors.
+
+### The four seams (findings, not bugs in what exists)
+
+1. **S1 (HIGH)** — consensus detects and stores equivocation
+   evidence, but nothing submits a Slash to staking: the economic
+   deterrent is theoretical. Fix: evidence → system-signed Slash
+   pipeline + a multinode double-sign test.
+2. **S2 (HIGH)** — venue egress is unwired: `handle_withdraw_base`
+   returns "withdraw requires ledger wiring", and the
+   Ed25519↔secp256k1 key linkage (protocol.rs's tracked gap) does
+   not exist. Deposits only, today. Fix: one "venue egress
+   authorization" workstream.
+3. **S3 (MED)** — the matcher's FIX/WS listeners are plain TCP. Fix:
+   rustls at the gateway or a validated loopback-only startup check.
+4. **S4 (MED)** — `debug_trace*` is unconditionally public. Fix: a
+   namespace allowlist, default off for debug.
+
+Plus: no kill-9-mid-commit restart test (the recovery path exists,
+unexercised under real crash timing); the 7-day soak and external
+review remain the open Phase 4 gates; leader-egress at target TPS
+(proposals carry full bodies) needs measurement before the testnet
+designs tx-by-hash proposals; and the deferred perf list (full LTO /
+target-cpu / PGO bench day, io_uring, huge pages, F-26 fold split)
+is unchanged.
+
+### README refresh
+
+Status corrected (Phases 0–3 complete, Phase 4 in progress), the
+roadmap table and hardening section updated (C4/C9/Ceiling-4 are
+landed, not "remaining"), Phase 3 marked complete with current
+measurements, a Phase 4 section added (fuzz/chaos/TLA+/fault
+injection), the stale `commonware-p2p` transport claim fixed (the
+shipped transport is the hand-rolled TCP+TLS stack), the workspace
+layout synced with reality (matcher, indexer, statesync, metrics,
+devnet, config; no `state/` crate), MSRV corrected to 1.91, and the
+test count updated (2,048).
+
+## Session: system-audit resolution pass
+
+The audit's fixable findings closed; the open ones are campaigns
+(soak, external review) or documented design items (tx-by-hash,
+`Balances` batch API). `docs/system-audit.md` §8 is the status table
+of record.
+
+### S1 — equivocation evidence reaches staking (HIGH, fixed)
+
+Detection already existed; the evidence died in consensus. Now:
+`Engine` keeps a per-`(validator, phase)` seen-vote log bounded at
+3 entries/validator (one per phase — the history key is
+position-specific so an interleaved Prepare/PreCommit equivocation
+can't overwrite its own evidence). A same-voter conflict in
+`collect_vote_split` is dropped and queued as `DoubleSignEvidence`;
+`validator_net` drains the queue every pump pass and submits a
+staking `evidence` tx signed by a funded reporter key
+(`EvidenceReporter` on `ValidatorNetSpec`, wired from the validator
+key in `oxide-validator`, from `identity(i)` in devnet when tx
+injection is off so nonce streams never collide).
+
+The staking side needed no changes — `handle_evidence` already
+verified both BLS signatures and jailed; it just never saw a tx.
+End-to-end proof: `multinode` test equivocates validator 0, runs
+the pump, and asserts the jail flag is set on *every* replica's
+committed staking state.
+
+One subtlety the tests caught: detection keyed on `(voter, view,
+phase)` rather than `voter` alone — the QC buffer clears per bout,
+so per-voter history without the phase key would miss an
+equivocation split across phases.
+
+A second subtlety the pre-existing phantom-vote test caught: the
+first draft recorded every inbound vote into the history before
+admissibility. That broke the phantom-block guard's contract — a
+vote for a never-proposed hash is *dropped* (it's typically a
+forgery, e.g. `Signature::ZERO`), so recording it let a forged
+"first vote" turn the voter's real vote into a false conflict and
+bogus evidence. Recording now happens at the storage point: a vote
+anchors history only after clearing the idempotent-slot,
+signature, phantom, and conflict gates. Detection still reads
+history *before* those gates (an equivocating second vote is
+dropped + evidenced regardless of whether it would itself be
+admitted — the voter did sign it), and the module re-verifies both
+signatures, so a forged-signature vote that slipped in under
+`verify_per_vote = false` can pollute the bucket but can never
+produce a slash.
+
+### S2 — venue egress authorization (HIGH, fixed)
+
+The audit was half stale: `withdraw_base` was already ledger-wired
+and worked for secp senders. The real gap: settlement credits
+custody under the *ed25519-derived* trading owner
+(`BLAKE3(Ed25519Owner ‖ pubkey)[..20]`), and that address can never
+sign a secp envelope — a one-way vault.
+
+Fix: a committed link registry. `LINK_TRADING_KEY` stores
+`owner → {secp, epoch}` gated on an ed25519 signature over
+`LINK_CONSENT_DOMAIN ‖ secp ‖ pubkey ‖ epoch`; `UNLINK_TRADING_KEY`
+writes `Address::ZERO` (tombstone keeps the epoch monotonic, so a
+captured consent can't resurrect a revoked link); the epoch is in
+the signed preimage, so replay is impossible by construction.
+Linked variants of register/cancel/deposit/withdraw reuse the same
+owner-parameterized cores (`register_for`, `deposit_base_for`,
+`withdraw_base_for(custody_owner, dest, …)`), keeping the old
+self-service paths byte-identical. `WITHDRAW_LINKED` credits the
+linked secp address — the only destination the link authorizes.
+Wire tags append (8–13), never renumber; snapshot codec gains a
+tolerantly-decoded trailing `linked` section (old snapshots still
+import — they just have no links yet).
+
+### S3 — matcher listeners are loopback-only by construction (MED)
+
+All four binds are `127.0.0.1` literals — not a default, the only
+value the code admits. Documented at every bind site + a gateway
+deployment shape (TLS-terminating reverse proxy for remote clients)
+in runbooks §12. TLS stays out of the matcher's hot path.
+
+### S4 — already fixed
+
+`debug_api` defaults off in `NodeConfig`; verified while scoping.
+
+### ST3 — kill-9-mid-commit + a real journal bug (MED, fixed)
+
+`crash_mid_commit_recovers_journaled_block` models the exact crash:
+journal the block, never execute, drop the executor, recover, then
+prove (a) every prefix root matches an honest peer's, (b)
+resubmitting the same block doesn't double-apply, (c) block N+1
+executes cleanly on the recovered state.
+
+Writing its companion test surfaced a genuine replay bug:
+`journal::replay` *returned* at the first torn record — correct for
+a single segment, wrong after any restart, because the writer always
+opens a *new* segment. A crash mid-append followed by hours of
+healthy blocks in segment N+1 meant restart replayed nothing past
+the tear: silent history loss on the recovery path. `replay` now
+records `truncated_at`, stops scanning the damaged segment, and
+continues into later ones. `crash_mid_journal_append_ignores_torn_tail`
+locks it in.
+
+### T2 — settlement batching: measured, then optimized (MED)
+
+The audit asked whether the block path batches. It does —
+`batch_settle` pair-aggregates every leg into one ledger transfer
+per (buyer, seller); the "0.5M vs 24.5M" gap in the audit compared
+the book path to raw matching. Profiling the real residual
+(`perf` on `batch_settle_1k_distinct_pairs`): EVM ledger ops ~28%,
+`consumed` BTreeMap ~22% (two get+insert per leg, 16 levels deep at
+65k fills on a 28-byte key), BLAKE3 leaf hashing ~10%.
+
+The `consumed` scratch never iterates — ordering was paid for and
+never observed. Replaced with `ConsumedMap` (open-addressed flat
+table, same shape as the pair map, fx-hash on the key's four words,
+2× headroom so probes stay ≤ ~3). Measured: 1k distinct-pairs
+903→708 µs (−19%), 16k clustered 6.59→4.11 ms (−38%), same-pair
+137→125 µs (−9%) — the win grows with table depth exactly as the
+tree-depth model predicts.
+
+Left as follow-up with the reason: per-account EVM ledger ops
+(block-undo capture + touched marking are per-account semantics,
+amortizable only across *distinct* accounts) → a `Balances` batch
+API; and CommittedMap leaf-hash deferral → touches the incremental
+root invariant. Both need their own measurement justifications.
+
+### T1 — leader egress: measured analytically (MED)
+
+`ErasureBroadcast` uploads (3f+1)/(2f+1) ≈ 1.4× body. Native
+traffic at the 60k tx/s gate ≈ 15 MB/s — nowhere near binding. The
+venue's max settlement rate (~1.85M fills/s × 74 B/leg ≈ 137 MB/s
+payload) makes leader egress ≈ **190 MB/s ≈ 1.5 Gbps sustained** —
+that binds on a commodity uplink at exactly the workload the design
+targets. Conclusion recorded in §8: tx-by-hash/commitment proposals
+are a required *pre-testnet design item* (against
+`docs/oxidebft-spec.md`), not a code change today — the audit's
+recommended ordering.
+
+## Session: batch-parallel intake — the 100k-TPS levers, pass 1
+
+The 10k EVM load test's phase profiler located the ceiling: **tx
+intake was 60.4%** of the whole pipelined run (~109µs/tx serial),
+execution only 12%. Two structural fixes landed; end-to-end went
+**5,689 → 34,966 tx/s (6.1×)** at 10k tx/block on the 4-validator
+TCP devnet.
+
+### Probe: where the 109µs went
+
+A temporary probe decomposed the intake path (numbers on the dev
+rig, release profile):
+
+| Component | µs/tx |
+|---|---|
+| `ingest_tx` total | 90.4 |
+| `preverify_batch` (1-element, per-tx call) | 42.2 |
+| `validate` (EVM) | 43.3 |
+| secp256k1 `recover_sender` alone | 42.7 |
+| RLP `decode_raw` alone | 0.13 |
+| db reads (nonce/balance) | 0.03 |
+
+The recovery is essentially ALL of both `validate` and the per-tx
+`preverify_batch` — and the old path paid it **twice per EVM tx**
+(`validate` recovered the sender, then `preverify_batch` recovered
+the same payload again), serially, with rayon invoked on a
+1-element slice per tx.
+
+### Fix 1: one recovery, parallel across the batch
+
+- `Module::validate_preverified(ctx, msg, preverified)` — new trait
+  method (default delegates to `validate`). The EVM overrides it:
+  `validate_core` skips the secp256k1 recovery when the batch
+  preverify already authenticated these exact payload bytes.
+- `ingest_tx_batch` restructured into four phases: **route**
+  (serial, cheap — parse + module lookup + envelope shape), **recover**
+  (parallel — envelope recovery for signed native txs via rayon
+  across the batch; payload preverify per module group via the
+  module's own parallelism), **adjudicate** (serial — replay gate
+  under ONE lock for the batch, envelope compare,
+  `validate_preverified`, cacheable sender), **insert** (one mempool
+  lock, one preverify-cache lock).
+- `ingest_tx` (single) reordered: preverify before validate, so the
+  single path also pays one recovery instead of two (90.4 → 49.9µs).
+- `ConsensusEngine::submit_txs` (ports) — batch intake on the trait,
+  default loops `submit_tx`; `OxideBft` forwards to
+  `ingest_tx_batch`. The load harness now submits in batches (the
+  deployment shape — RPC clients batch), retrying only the
+  intake-ring-full suffix.
+- Intake ring capacity now derives from `max_mempool_entries`
+  (was a fixed 10k that thrashed at 10k-tx rounds).
+- Measured: batch intake **90.4 → 12.0µs/tx (7.5×)** — parallel
+  recovery ~5.3µs effective on 8 cores + ~6µs serial adjudication.
+
+### Fix 2: tabled Reed-Solomon encode
+
+The vote phase's body-linear cost was the body↔commitment
+re-verification: `shard::commitment` Reed-Solomon-encodes the whole
+proposal per vote per engine — **6.74ms** on a 1.5MB body (the
+naive per-byte log/exp GF multiply). Tabled row-wise encode
+(per-coefficient 256-byte tables, XOR-accumulate across the row):
+**6.74 → 3.80ms (1.77×)**, same hash. Vote phase share dropped
+29% → 20%.
+
+### Measured end-to-end (4 validators, TCP, release)
+
+| Config | Before | After |
+|---|---|---|
+| 10k txs, 500/round | 5,689 tx/s | 9,977 tx/s |
+| 20k txs, 5k/round | — | 27,003 tx/s |
+| 40k txs, 10k/round | — | **34,966 tx/s** |
+
+Phase breakdown at 10k/round after both fixes: submit 40.8%
+(12.2µs/tx), qc_deliver 23.3% (6.9µs/tx), vote 22.6% (6.8µs/tx),
+propose 8.5%, qc_form 4.6%.
+
+### The remaining path to 100k (measured, not speculative)
+
+Total is ~30µs/tx at 10k tx/block; 100k needs ≤10µs/tx. The levers,
+largest first:
+
+1. **Submit serial phase (~6µs/tx)** — profile the adjudication
+   loop (parse, nonce lock, `validate_preverified` state checks,
+   BLAKE3 cache key, mempool insert). Also: the harness serializes
+   intake with consensus; production RPC threads overlap them, so
+   the harness number is the conservative bound.
+2. **Vote (~6.8µs/tx at 10k/block)** — remaining cost is the
+   3.8ms/engine commitment + BLS sign/verify. A `body_hash` header
+   field (BLAKE3 of the proposal bytes, checked on the direct path;
+   the RS commitment stays for the dispersed path) would cut the
+   direct-path check ~13× — a protocol change needing a spec
+   update. SIMD GF multiply is the no-protocol alternative.
+3. **Propose (26ms/view)** — intake-ring drain + mempool select +
+   per-tx gas-cap loop.
+4. **Execution (6.9µs/tx)** — already parallel; 145k tx/s ceiling
+   alone. Not binding.
+
+Honest caveat: the 34,966 number is this 8-core cloud box; the
+M1-class rig measured ~1.7× faster per core on the same benches.
+
+## Session: the 100k-TPS levers, pass 2 — body_hash, gas cache, intake pool
+
+Pass 1's phase breakdown named four levers; this pass landed three
+in code (the fourth — execution — measured as not binding) and
+re-profiled the result. End-to-end at 40k txs / 10k-per-block on
+the 4-validator TCP devnet: **34,966 → ~35,100 tx/s** (the earlier
+39,048 reading was single-run noise; three consecutive runs now
+land at 34.8-35.1k). At 100k txs sustained: **21,051 → ~25,800
+tx/s** — the win shows where it matters, under sustained load.
+
+### L2 — body_hash: the vote path's body binding (landed)
+
+The vote phase's largest body-linear cost was re-deriving the
+erasure commitment per vote per engine (3.8ms on a 1.5MB body even
+after the tabled RS encode). The header now carries `body_hash` —
+`H(BodyHash ‖ canonical proposal encoding)` — so the direct path
+verifies with one BLAKE3 pass (~0.9ms, ~4×). The erasure
+commitment stays the dispersed path's binding (its per-shard
+proofs root into it); both fields ride the signed header, so
+either is exactly as trustworthy. `body_hash = 0` (synthetic test
+headers) falls back to the commitment — every existing fixture
+works unchanged. Vote phase share: 22.6% → 16.6% (228.5 → 169.7ms
+at 40k). Wire: appended after `body_commitment` (strict-prefix
+rule, `Domain::BodyHash = 21`); spec §2 "Body binding" documents
+the two-path split; tests cover the round-trip, the fast-path
+tamper rejection, and the fallback.
+
+### L3 — the propose path's gas cap (landed)
+
+The in-chain propose selected the WHOLE backlog (the byte budget
+dwarfs any pool), and its gas-cap loop re-parsed + re-estimated
+every candidate: ~0.42µs/tx × 40k = ~17ms per proposal — the
+largest single term. Pool entries now carry the gas estimate,
+computed once at intake (`PreparedTx.gas`); the proposal loop
+reads it (`select_with_gas`). Propose share: 8.5% → 6.7%
+(102.2 → 77.5ms at 40k).
+
+### L1 — submit: measured, then trimmed (partially landed)
+
+The probe decomposed the 12.2µs/tx intake: the parallel recovery
+is ~10.6µs/tx effective — **hardware-bound** (4 physical cores +
+SMT; ECDSA doesn't SMT-scale, so ~4× on 8 logical CPUs is the
+ceiling; the recovery is already libsecp256k1). The serial phase
+is only ~2µs (parse 0.3, nonce 0.1, validate_preverified 0.19,
+BLAKE3 0.22, insert 1.12). Trims landed: the mempool no longer
+re-hashes, re-parses, or re-estimates batch-intake txs
+(`submit_prepared` — the intake's parallel phase computes the
+hash, routing parsed the envelope, validation knows the gas);
+the BLAKE3 tx-hash moved into the parallel phase. Net serial: ~2 →
+~1.5µs/tx. The dominant term is the hardware floor.
+
+### The intake-pool discovery (the pass's real find)
+
+At 100k txs sustained, submit degraded 12 → 32.8µs/tx. Phase
+instrumentation pinned it: the intake's **recover** phase collapsed
+from ~10.6 to 39-60µs/tx — the rayon parallelism itself, not the
+work. Root cause: the async execution lane executes committed
+blocks on the GLOBAL rayon pool in the background; the intake's
+recovery tasks queued behind the lane's execution tasks once the
+lane had a backlog (exactly rounds 5+, when commits started
+landing). Fix: the Executor builds a dedicated intake pool
+(`intake_pool.install` also captures the EVM's nested `par_iter`
+onto it); the global pool stays the lane's. Two pools time-share
+the cores instead of queueing. Measured at 100k sustained:
+21,051 → ~25,800 tx/s (+22%). `None` on pool-build failure falls
+back to the global pool — a latency property, never correctness.
+
+### L4 — execution: confirmed not binding
+
+`tps_rw`'s multi-sender gate: **65,933 tx/s (floor 60k)** at the
+executor level; the load test's qc_deliver runs 5.7-6.9µs/tx. Not
+the ceiling; no change made.
+
+### Phase breakdown after pass 2 (40k txs, 10k/block)
+
+submit 45.0% (12.9µs/tx) · qc_deliver 24.8% (7.1µs/tx) · vote
+16.3% (4.7µs/tx) · qc_form 6.9% · propose 6.7% (1.9µs/tx).
+
+### The honest 100k picture
+
+Total is ~25.6µs/tx at 10k/block on this box; ~10µs/tx is needed
+for 100k. The dominant remaining term is the parallel ECDSA
+recovery (~10.6µs/tx effective on 4 physical cores — a hardware
+floor, already on libsecp256k1). Scaling math: at the validator
+spec's 16-32 cores the recovery term falls to ~2-4µs/tx and the
+total lands near ~12-15µs/tx → 65-80k tx/s; 100k needs the top of
+the spec (32 cores) plus the remaining serial trims. On this
+4-core cloud box, ~35k (burst) / ~26k (sustained) is the measured
+ceiling after both passes — up from 5.7k where the work started.
+
+## Merge: review-fixes × origin/main — overlap resolution
+
+The review fixes (local) and twelve upstream commits (system-audit
+pass, HFT-audit pass, batch-parallel intake, 100k-TPS levers) solved
+several of the same problems independently. Rule applied: where both
+sides fixed the same thing, upstream's version stands; local fixes
+upstream lacks are ported onto upstream's structures.
+
+**Upstream kept (local superseded):**
+- Journal torn tail: upstream ST3 (replay skips the damaged
+  remainder and continues into later segments) replaces local
+  `repair_tail`/`JournalError::Corrupt`.
+- In-flight duplicates under leader rotation: upstream `note_in_chain`
+  (observed proposals from every leader) replaces local
+  height-tagged sets.
+- Pump latency: upstream `recv_timeout` wake (F-01) replaces the
+  local conditional sleep; upstream peer-id scratch (F-24) replaces
+  local `Transport::broadcast`/`send(&[u8])`. Not carried over: the
+  shared `Arc<[u8]>` frame — upstream still copies the payload per
+  peer on fan-out; candidate follow-up.
+- Recover-once intake: upstream `validate_preverified` + batch
+  pipeline replaces local `validate_authenticated` (1a276e6's other
+  parts — injector anchor/lead/backpressure — are kept).
+
+**Ported onto upstream:**
+- EVM envelope binding: `validate_core` takes the envelope on the
+  admission path (`validate_preverified`) and checks sender, nonce
+  and fee ceiling — covers single and batch intake in one place.
+- Per-sender mempool bound: in `insert_prepared`, the single insert
+  body behind `submit` and `submit_prepared`.
+- Staged validator set: read-lock compare before the write lock.
+- Kept as-is (no upstream overlap): P2P handshake deadline + frame
+  cap, slice-by-8 CRC, journal directory fsync, exec-lane batch
+  drain + single fsync (now inside upstream's pinned spawn),
+  graceful-shutdown logging.

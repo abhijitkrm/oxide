@@ -10,6 +10,8 @@
 use std::env;
 use std::path::PathBuf;
 
+use zeroize::{Zeroize, Zeroizing};
+
 use crate::NodeConfig;
 
 /// The fully-resolved runtime configuration: parsed TOML + env +
@@ -618,7 +620,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 /// Panics only if a 32-byte IKM is rejected by the BLS
 /// implementation, which cannot happen.
 pub fn bls_key(byte: u8) -> crypto::BlsSecretKey {
-    let ikm = vec![byte; 32];
+    let ikm = Zeroizing::new(vec![byte; 32]);
     crypto::BlsSecretKey::from_ikm(&ikm).expect("BLS key generation from valid IKM")
 }
 
@@ -683,13 +685,23 @@ pub fn parse_observer_peer(
 /// `want_kind` is ignored for raw encodings — they carry no type
 /// tag, so the caller's flag name is the only contract.
 ///
+/// The secret returns in a [`Zeroizing`] wrapper and the file bytes
+/// are wiped on drop, so key material does not linger in freed heap
+/// memory after the caller constructs the real key object.
+///
 /// # Errors
 ///
 /// `Err` names the path and the precise failure (read error, bad
 /// hex, wrong length, keystore error verbatim — including the
 /// missing-passphrase hint).
-pub fn load_secret_key_file(path: &str, want_kind: SecretKind) -> Result<[u8; 32], String> {
-    let raw = std::fs::read(path).map_err(|e| format!("failed to read {path}: {e}"))?;
+pub fn load_secret_key_file(
+    path: &str,
+    want_kind: SecretKind,
+) -> Result<Zeroizing<[u8; 32]>, String> {
+    // The file's raw bytes are themselves key material in the
+    // hex/raw encodings — the wrapper wipes the read buffer too.
+    let raw =
+        Zeroizing::new(std::fs::read(path).map_err(|e| format!("failed to read {path}: {e}"))?);
     parse_secret_key_bytes(&raw, want_kind).map_err(|e| format!("{path}: {e}"))
 }
 
@@ -708,12 +720,18 @@ pub enum SecretKind {
 }
 
 /// Decode a secret from raw file bytes — the shared sniff used by
-/// [`load_secret_key_file`]. Separated for unit tests.
-fn parse_secret_key_bytes(raw: &[u8], want_kind: SecretKind) -> Result<[u8; 32], String> {
+/// [`load_secret_key_file`]. Separated for unit tests. The return is
+/// [`Zeroizing`] so callers cannot stash the plaintext in an
+/// unprotected buffer by accident.
+fn parse_secret_key_bytes(
+    raw: &[u8],
+    want_kind: SecretKind,
+) -> Result<Zeroizing<[u8; 32]>, String> {
     #[cfg(feature = "keystore")]
     if crypto::keystore::is_keystore(raw) {
         let pass = crypto::keystore::passphrase_from_env().map_err(|e| e.to_string())?;
-        let (kind, secret) = crypto::keystore::open(raw, &pass).map_err(|e| e.to_string())?;
+        let (kind, secret) =
+            crypto::keystore::open(raw, pass.as_str()).map_err(|e| e.to_string())?;
         let expected = match want_kind {
             SecretKind::Bls => crypto::keystore::KeyKind::Bls,
             SecretKind::Secp256k1 => crypto::keystore::KeyKind::Secp256k1,
@@ -742,12 +760,17 @@ fn parse_secret_key_bytes(raw: &[u8], want_kind: SecretKind) -> Result<[u8; 32],
         let text = text.trim();
         let hex = text.strip_prefix("0x").unwrap_or(text);
         if hex.len() == 64 {
-            let bytes = hex_decode(hex)?;
-            return bytes.try_into().map_err(|_| "expected 32 bytes".to_string());
+            // `bytes` briefly holds the plaintext secret — wipe the
+            // decoded Vec after copying out the fixed-size array.
+            let mut bytes = hex_decode(hex)?;
+            let arr: [u8; 32] =
+                bytes.as_slice().try_into().map_err(|_| "expected 32 bytes".to_string())?;
+            bytes.zeroize();
+            return Ok(Zeroizing::new(arr));
         }
     }
     if raw.len() == 32 {
-        return Ok(raw.try_into().expect("32-byte slice"));
+        return Ok(Zeroizing::new(raw.try_into().expect("32-byte slice")));
     }
     Err(format!(
         "expected a 64-char hex key, 32 raw bytes, or an OXKEY keystore \

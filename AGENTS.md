@@ -93,6 +93,14 @@ nightly adds fuzz and long simulations.
 
 ## Current status
 
-Phase 2 complete (EVM + storage). See `plan.md` §13 for the phase
-gate that is currently being worked toward. Do not start Phase N+1
-work before Phase N's gates pass unless the plan says otherwise.
+Phases 0–3 complete: oxideBFT + chain skeleton, EVM + storage
+(12.96 GG/s parallel vs the 1 GG/s gate), and the trading core
+(engine 20.6M mixed ops/s single-core; ~3.7M orders/s chain-wide
+over oxideBFT vs the 1M gate). Phase 4 hardening is in progress:
+the fuzz campaign (11 targets, committed corpus, nightly CI), the
+10k-scenario chaos sim (0 safety violations), and the TLA+ model
+(3 counterexamples found and fixed) are landed; the open gates are
+the external security review and the geo-distributed 20–50
+validator public testnet. See `plan.md` §13 for gate detail. Do
+not start Phase N+1 work before Phase N's gates pass unless the
+plan says otherwise.

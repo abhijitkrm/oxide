@@ -417,7 +417,10 @@ impl Module for LedgerFeeModule {
         let mut balances = primitives::sync::lock_state(&self.balances);
         let balance = balances.entry(ctx.sender).or_insert(0);
         if *balance < ctx.fee {
-            return Err(ExecError::ModuleRejected("insufficient fee balance".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                "insufficient fee balance",
+            ));
         }
         *balance -= ctx.fee;
         *primitives::sync::lock_state(&self.charged_total) += ctx.fee;
@@ -626,7 +629,9 @@ impl Module for PreverifyTrackingModule {
         // Return a non-zero sender — a zero sender is the
         // "no pre-verification" placeholder and is no longer
         // cached by `ingest_tx`.
-        msgs.iter().map(|raw| Ok(PreverifiedTx { raw, sender: [0x42; 20] })).collect()
+        msgs.iter()
+            .map(|raw| Ok(PreverifiedTx { raw, sender: [0x42; 20], verified_locally: false }))
+            .collect()
     }
     fn handle_batch_preverified(
         &self,
@@ -720,7 +725,9 @@ impl Module for CtxRecordingModule {
         // A non-zero sender marks "the module verified this
         // payload" — the executor caches it so `execute_block`
         // takes the preverified path.
-        msgs.iter().map(|raw| Ok(PreverifiedTx { raw, sender: [0x42; 20] })).collect()
+        msgs.iter()
+            .map(|raw| Ok(PreverifiedTx { raw, sender: [0x42; 20], verified_locally: false }))
+            .collect()
     }
 }
 
@@ -1759,7 +1766,7 @@ impl Module for VersionedModule {
     fn migrate(&self, from: u32) -> Result<u32, ExecError> {
         primitives::sync::lock_state(&self.migrate_calls).push(from);
         if self.migrate_fails {
-            return Err(ExecError::ModuleRejected("boom".to_string()));
+            return Err(ExecError::rejected(RejectCategory::Other, "boom"));
         }
         Ok(self.version)
     }
@@ -2771,15 +2778,11 @@ fn exec_lane_saturates_without_blocking() {
 /// proposal was built — a losing proposal erased its txs forever.
 ///
 /// Under in-flight marking the tx is not re-selected *while its
-/// proposal's height is open*: a pipelined proposal carrying it
-/// again would commit as a deterministic nonce skip. The app cannot
-/// see which height the engine stamps, so the set is tagged at the
-/// pipeline's upper bound (`IN_FLIGHT_PIPELINE_DEPTH` past the next
-/// committed height) and re-proposes once that height commits — a
-/// bounded delay, never a loss. Releasing on *any* next commit was
-/// unsound under rotating leaders: another leader's earlier block
-/// freed a set that was still pending. (The OAI has no "proposal
-/// aborted" signal, so commit is the earliest sound release point.)
+/// proposal's position is open*: a pipelined proposal carrying it
+/// again would commit as a deterministic nonce skip. It re-proposes
+/// once the next commit resolves the position — a one-position
+/// delay, never a loss. (The OAI has no "proposal aborted" signal,
+/// so commit is the earliest sound release point.)
 #[test]
 fn uncommitted_proposal_keeps_txs() {
     let mut executor = test_executor(100);
@@ -2788,30 +2791,22 @@ fn uncommitted_proposal_keeps_txs() {
     let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
     let first = executor.prepare_proposal(&budget);
     assert_eq!(first.txs.len(), 1);
-    // The height is still open: the in-flight tx must not
+    // The position is still open: the in-flight tx must not
     // duplicate into the next proposal — that duplicate would
     // commit as a nonce skip and waste the slot.
     let second = executor.prepare_proposal(&budget);
     assert!(second.txs.is_empty(), "in-flight txs are not re-selected");
     assert_eq!(executor.mempool_len(), 1, "the tx stays pooled");
-    let empty_block = |h: u64| FinalizedBlock {
+    // A commit resolves the open position — even one carrying no
+    // txs — and the pooled tx becomes selectable again.
+    executor.finalize_block(&FinalizedBlock {
         context: types::BlockContext::default(),
-        height: Height::new(h),
+        height: Height::new(0),
         txs: Vec::new(),
         signers: Vec::new(),
-    };
-    // Commits below the tagged height (0 + depth 2) keep it in flight.
-    for h in 0..2 {
-        executor.finalize_block(&empty_block(h));
-        assert!(
-            executor.prepare_proposal(&budget).txs.is_empty(),
-            "still in flight after committing height {h}"
-        );
-    }
-    // The tagged height commits without the tx: it re-proposes.
-    executor.finalize_block(&empty_block(2));
+    });
     let third = executor.prepare_proposal(&budget);
-    assert_eq!(third.txs, first.txs, "the released tx re-proposes once its height resolves");
+    assert_eq!(third.txs, first.txs, "the released tx re-proposes once its position resolves");
 }
 
 /// The mirror image: txs DO leave the pool — but only when a
@@ -2948,7 +2943,7 @@ fn tx_outcome_store_overwrite_semantics() {
     let h = Hash([1u8; 32]);
     store.record(h, TxOutcome::Skipped { reason: TxSkipReason::GasLimit });
     // The tx lands in a later block — Executed supersedes.
-    let executed = TxOutcome::Executed { events: vec![], error: None };
+    let executed = TxOutcome::Executed { events: Vec::new().into(), error: None };
     store.record(h, executed.clone());
     assert_eq!(store.outcomes.get(&h), Some(&executed));
     // A stale re-proposal skipping afterwards cannot rewrite it.
@@ -2972,7 +2967,7 @@ fn tx_outcome_records_module_rejection() {
         }
         fn begin_block(&self, _height: Height) {}
         fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
-            Err(ExecError::ModuleRejected("nope".to_string()))
+            Err(ExecError::rejected(RejectCategory::Other, "nope"))
         }
         fn end_block(&self, _height: Height) -> Vec<Event> {
             Vec::new()
@@ -3072,7 +3067,10 @@ impl Module for LedgerFeeCollector {
         let mut ledger = primitives::sync::lock_state(&self.ledger);
         let balance = ledger.entry(ctx.sender).or_insert(0);
         if *balance < ctx.fee {
-            return Err(ExecError::ModuleRejected("insufficient fee balance".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                "insufficient fee balance",
+            ));
         }
         *balance -= ctx.fee;
         Ok(())
@@ -3474,4 +3472,201 @@ fn module_sender_nonce_reports_self_auth_anchor() {
         None,
         "an empty module slot has no sender-nonce state"
     );
+}
+
+/// Regression: module rejections carry a typed [`RejectCategory`]
+/// alongside the human detail, so admission/RPC paths classify
+/// without string-matching — and the rendered reason keeps a stable
+/// `category: detail` shape at the wire seams.
+#[test]
+fn module_rejection_carries_category() {
+    let e = ExecError::rejected(RejectCategory::NotFound, "order 7 not found");
+    assert_eq!(e.rejection_category(), Some(RejectCategory::NotFound));
+    assert_eq!(e.to_string(), "not_found: order 7 not found");
+
+    // Non-module executor errors have no rejection category.
+    assert_eq!(ExecError::Malformed.rejection_category(), None);
+    assert_eq!(ExecError::OutOfGas.rejection_category(), None);
+
+    // User-actionable vs internal categories stay distinguishable —
+    // the distinction RPC admission needs (retryable vs investigate).
+    let funds = ExecError::rejected(RejectCategory::InsufficientFunds, "balance 3 < 9");
+    let wiring = ExecError::rejected(RejectCategory::Internal, "refund failed");
+    assert_ne!(funds.rejection_category(), wiring.rejection_category());
+    assert!(wiring.to_string().starts_with("internal: "));
+}
+
+// ── Kill-9-mid-commit recovery (system-audit ST3) ─────────────────
+//
+// The crash the durability design exists for: `finalize_block`
+// journals the committed block BEFORE any effect lands (WAL), so a
+// SIGKILL during `execute_block` leaves the journaled record with
+// no applied state — and a crash mid-*append* can leave a torn
+// record as the journal's tail. Recovery must replay what is
+// durable, ignore what never verified, and land the exact roots
+// an uncorrupted peer computed — never double-apply, never skip.
+
+/// A journaled-but-unexecuted block models kill-9 mid-commit:
+/// `journal_append` is the WAL write `finalize_block` does before
+/// `execute_block` runs — dropping the executor right after it is
+/// exactly the post-crash durable state (the in-memory `in_flight`
+/// marker evaporates with the process, which is what recovery
+/// sees).
+#[test]
+fn crash_mid_commit_recovers_journaled_block() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut exec = test_executor(100)
+        .with_durability(DurabilityConfig::new(dir.path()).with_checkpoint_interval(4096))
+        .expect("durability config");
+    let counter = Arc::new(CounterModule::new());
+    exec.register_module(counter.clone());
+    for h in 0..3u64 {
+        exec.finalize_block(&repair_block(h, vec![make_tx_with_nonce(1, &[9], h)]));
+    }
+    exec.wait_exec_idle();
+    let prefix_roots: Vec<_> = (0..3u64).map(|h| exec.state_root_at(h)).collect();
+    let count_at_2 = *primitives::sync::lock_state(&counter.count);
+
+    // The crash: block 3's record is durable but its execution
+    // never ran — the journaled-but-unexecuted state the recovery
+    // contract names "in-flight".
+    let mid_commit = repair_block(3, vec![make_tx_with_nonce(1, &[10], 3)]);
+    exec.journal_append(&mid_commit);
+    // `journal_append` is buffer-only; the record turns durable at
+    // the next barrier (here: the engine's pre-WAL
+    // `commit_durability_barrier`, which runs before consensus can
+    // fsync this commit). Model the crash *after* that barrier.
+    exec.journal_sync_pending();
+    drop(exec);
+    drop(counter);
+
+    // The honest peer computes what block 3's root SHOULD be —
+    // the certified state the crashed replica must reproduce.
+    let mut honest = test_executor(100);
+    honest.register_module(Arc::new(CounterModule::new()));
+    for h in 0..4u64 {
+        honest.finalize_block(&repair_block(
+            h,
+            vec![make_tx_with_nonce(1, &[u8::try_from(h + 9).unwrap_or(0)], h)],
+        ));
+    }
+    honest.wait_exec_idle();
+    let honest_tip = honest.state_root_at(3);
+
+    // Restart on the same directory: the journal is the authority.
+    let mut exec2 = test_executor(100)
+        .with_durability(DurabilityConfig::new(dir.path()).with_checkpoint_interval(4096))
+        .expect("durability config");
+    let counter2 = Arc::new(CounterModule::new());
+    exec2.register_module(counter2.clone());
+    let report = exec2.recover_durable_state().expect("recovery").expect("journal exists");
+    assert_eq!(report.recovered_height, 3, "replay reaches the mid-commit block");
+    for (h, root) in prefix_roots.iter().enumerate() {
+        assert_eq!(exec2.state_root_at(h as u64), *root, "prefix root {h} unchanged");
+    }
+    assert_eq!(
+        exec2.state_root_at(3),
+        honest_tip,
+        "replayed block 3 lands the peer's certified root"
+    );
+    assert_eq!(
+        *primitives::sync::lock_state(&counter2.count),
+        count_at_2 + 1,
+        "each block's tx counted exactly once — no double-apply"
+    );
+
+    // Consensus resubmits block 3 after restart (its commit walk
+    // still holds the height): the watermark dedup must make the
+    // re-finalize a no-op, not a second execution.
+    exec2.finalize_block(&mid_commit);
+    exec2.wait_exec_idle();
+    assert_eq!(
+        *primitives::sync::lock_state(&counter2.count),
+        count_at_2 + 1,
+        "idempotent re-commit does not double-apply"
+    );
+    // And the chain continues: block 4 executes normally on top.
+    exec2.finalize_block(&repair_block(4, vec![make_tx_with_nonce(1, &[11], 4)]));
+    exec2.wait_exec_idle();
+    assert_eq!(*primitives::sync::lock_state(&counter2.count), count_at_2 + 2);
+}
+
+/// The other mid-commit crash shape: SIGKILL lands during the
+/// journal *append itself* — the segment's tail is a torn record
+/// that fails CRC. Replay must keep the complete prefix, drop the
+/// torn tail, and continue to later segments (the writer restarts
+/// into a fresh segment, so post-restart history sits past the
+/// tear — skipping it would orphan every block since).
+#[test]
+fn crash_mid_journal_append_ignores_torn_tail() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let journal_dir = || dir.path().join(crate::durability::JOURNAL_DIR_NAME);
+    let mut exec = test_executor(100)
+        .with_durability(DurabilityConfig::new(dir.path()).with_checkpoint_interval(4096))
+        .expect("durability config");
+    let counter = Arc::new(CounterModule::new());
+    exec.register_module(counter.clone());
+    for h in 0..3u64 {
+        exec.finalize_block(&repair_block(h, vec![make_tx_with_nonce(1, &[9], h)]));
+    }
+    exec.wait_exec_idle();
+    let prefix_roots: Vec<_> = (0..3u64).map(|h| exec.state_root_at(h)).collect();
+
+    // Block 3 starts journaling — then the process dies mid-write.
+    // The append already synced blocks 0..2; block 3's record is
+    // torn: chop the tail bytes so the final record fails CRC.
+    exec.journal_append(&repair_block(3, vec![make_tx_with_nonce(1, &[10], 3)]));
+    // Put block 3's bytes on disk (append is buffer-only until a
+    // barrier) so the tear below lands inside a real record.
+    exec.journal_sync_pending();
+    drop(exec);
+    drop(counter);
+    let seg0 = journal_dir().join("segment-0.log");
+    let full = std::fs::read(&seg0).expect("segment exists");
+    std::fs::write(&seg0, &full[..full.len() - 7]).expect("tear the tail mid-record");
+
+    // Restart: replay must cover blocks 0..2 only (the torn record
+    // is dropped), and the writer must resume into a NEW segment —
+    // the torn tail is never appended onto.
+    let mut exec2 = test_executor(100)
+        .with_durability(DurabilityConfig::new(dir.path()).with_checkpoint_interval(4096))
+        .expect("durability config");
+    let counter2 = Arc::new(CounterModule::new());
+    exec2.register_module(counter2.clone());
+    let report = exec2.recover_durable_state().expect("recovery").expect("journal exists");
+    assert_eq!(report.recovered_height, 2, "torn block 3 is not replayed");
+    for (h, root) in prefix_roots.iter().enumerate() {
+        assert_eq!(exec2.state_root_at(h as u64), *root, "prefix root {h} unchanged");
+    }
+    assert!(journal_dir().join("segment-1.log").exists(), "writer resumed on a fresh segment");
+
+    // The SAME block 3 consensus resubmits after restart executes
+    // fresh — and a second crash must now replay it from the new
+    // segment, proving the torn tail did not orphan later history.
+    let mut honest = test_executor(100);
+    honest.register_module(Arc::new(CounterModule::new()));
+    for h in 0..4u64 {
+        honest.finalize_block(&repair_block(
+            h,
+            vec![make_tx_with_nonce(1, &[u8::try_from(h + 9).unwrap_or(0)], h)],
+        ));
+    }
+    honest.wait_exec_idle();
+    let honest_tip = honest.state_root_at(3);
+
+    exec2.finalize_block(&repair_block(3, vec![make_tx_with_nonce(1, &[10], 3)]));
+    exec2.wait_exec_idle();
+    assert_eq!(exec2.state_root_at(3), honest_tip, "re-executed block 3 matches the peer");
+    drop(exec2);
+    drop(counter2);
+
+    let mut exec3 = test_executor(100)
+        .with_durability(DurabilityConfig::new(dir.path()).with_checkpoint_interval(4096))
+        .expect("durability config");
+    let counter3 = Arc::new(CounterModule::new());
+    exec3.register_module(counter3.clone());
+    let report = exec3.recover_durable_state().expect("second recovery").expect("journal");
+    assert_eq!(report.recovered_height, 3, "post-restart history survives past the torn tail");
+    assert_eq!(exec3.state_root_at(3), honest_tip);
+    assert_eq!(*primitives::sync::lock_state(&counter3.count), 4, "0..3 applied once each");
 }

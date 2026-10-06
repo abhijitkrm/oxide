@@ -1045,6 +1045,11 @@ pub struct RingMatcher {
     /// polls the receiver between ring polls and services seal/stats
     /// commands without touching the order rings.
     control_tx: std::sync::mpsc::Sender<ControlCommand>,
+    /// The sequencer's parked-flag wakeup — shared by every order
+    /// ring and signalled explicitly by control senders so a
+    /// seal/stats/action command lands on a sleeping sequencer in
+    /// microseconds, not at the next timeout (hft-audit F-15).
+    wakeup: Arc<ring::Wakeup>,
     /// The chain ID the embedded server verifies signatures
     /// against — copied at construction (the server moves to the
     /// matcher thread, so this can never diverge). Transport threads
@@ -1071,16 +1076,29 @@ impl RingMatcher {
     /// # Panics
     ///
     /// Panics if `num_rings` is 0.
+    ///
+    /// `sequencer_core` pins the sequencer thread (hft-audit F-02);
+    /// `None` runs unpinned. A failed pin logs once — locality is a
+    /// latency property, never a correctness one.
     #[must_use]
-    pub fn new(server: MatchingServer, num_rings: usize, ring_capacity: usize) -> Self {
+    pub fn new(
+        server: MatchingServer,
+        num_rings: usize,
+        ring_capacity: usize,
+        sequencer_core: Option<u32>,
+    ) -> Self {
         assert!(num_rings > 0, "must have at least one ring");
-        // Shared wakeup signal for all rings. A push on any ring
-        // signals this, waking the consumer thread from its idle
-        // `wait_for_work` block. This replaces the previous
-        // `std::thread::yield_now()` busy-spin that burned a full
-        // CPU core at 100% when the matcher was idle.
+        // Shared wakeup signal for all ORDER rings. A push on any
+        // order ring signals this, waking the sequencer from its
+        // parked wait — and control senders signal it explicitly so
+        // seal/stats/action commands wake the sequencer immediately
+        // rather than at the next timeout.
         let shared_wakeup = Arc::new(ring::Wakeup::new());
         // Create ring pairs: (order_tx, order_rx) and (resp_tx, resp_rx).
+        // Order rings wake the (sync) sequencer via the shared parked
+        // flag; response rings wake their (async) consumer task via a
+        // per-ring `Notify` — a condvar would block an executor
+        // thread, and a tokio task cannot sleep on one (F-15).
         let mut order_senders: Vec<ring::SpscSender<Vec<protocol::VerifiedOrder>>> =
             Vec::with_capacity(num_rings);
         let mut order_receivers: Vec<ring::SpscReceiver<Vec<protocol::VerifiedOrder>>> =
@@ -1093,95 +1111,36 @@ impl RingMatcher {
             let (o_tx, o_rx) =
                 ring::spsc_ring_with_wakeup(ring_capacity, Arc::clone(&shared_wakeup));
             let (r_tx, r_rx) =
-                ring::spsc_ring_with_wakeup(ring_capacity, Arc::clone(&shared_wakeup));
+                ring::spsc_ring_with_notify(ring_capacity, Arc::new(tokio::sync::Notify::new()));
             order_senders.push(o_tx);
             order_receivers.push(o_rx);
             response_senders.push(r_tx);
             response_receivers.push(r_rx);
         }
 
-        let mut server = server;
         let chain_id = server.chain_id();
         let (control_tx, control_rx) = std::sync::mpsc::channel::<ControlCommand>();
+        // A response batch the client has not yet drained. The lease
+        // guarantees at most ONE exchange in flight per ring, so a
+        // full response ring can only mean the client is lagging —
+        // the sequencer must NOT spin for it (F-04: the old loop spun
+        // forever and starved every other ring). The batch parks here
+        // and is retried once per pass; a severed/disconnected client
+        // frees it for real.
+        let wake = Arc::clone(&shared_wakeup);
         // Critical: this thread IS the matcher — the single-writer
         // sequencer for every market's order book. A silent death
         // leaves clients connected to a server that never responds.
-        let thread =
-            primitives::supervision::spawn_supervised("matcher-sequencer", true, move || {
-                loop {
-                    let mut did_work = false;
-                    // Round-robin poll all rings.
-                    for (i, order_rx) in order_receivers.iter().enumerate() {
-                        while let Some(batch) = order_rx.pop() {
-                            // Process the WHOLE batch: submit every order
-                            // back-to-back (no interleaving from other
-                            // rings — the batch is atomic).
-                            let responses: Vec<OrderResponse> =
-                                batch.iter().map(|req| server.submit_verified(req)).collect();
-                            // Push the batch response to this connection's
-                            // ring. If the ring is full, spin until the
-                            // client drains it. If the client disconnected
-                            // (connection dropped), drop the responses —
-                            // there is nowhere to send them.
-                            let mut pending = responses;
-                            loop {
-                                match response_senders[i].push(pending) {
-                                    Ok(()) => break,
-                                    Err(crate::ring::PushError::Disconnected(_)) => {
-                                        // Client gone; discard responses.
-                                        break;
-                                    }
-                                    Err(crate::ring::PushError::Full(returned)) => {
-                                        pending = returned;
-                                        std::hint::spin_loop();
-                                    }
-                                }
-                            }
-                            did_work = true;
-                        }
-                    }
-                    // Service control commands (seal/stats) between ring
-                    // polls. These come from the batch settler and
-                    // monitoring — never from the order hot path.
-                    while let Ok(cmd) = control_rx.try_recv() {
-                        match cmd {
-                            ControlCommand::Seal(reply) => {
-                                let batch = server.seal_batch();
-                                let _ = reply.send(batch);
-                            }
-                            ControlCommand::Stats(reply) => {
-                                let stats = MatcherStats {
-                                    orders_processed: server.orders_processed(),
-                                    fills_produced: server.fills_produced(),
-                                    balance_rejections: server.balance_rejections(),
-                                    engine_rejections: server.engine_rejections(),
-                                    risk_rejections: server.risk_rejections(),
-                                    auth_rejections: server.auth_rejections(),
-                                    resting_count: server.resting_count(),
-                                    pending_settlements: server.pending_settlements(),
-                                };
-                                let _ = reply.send(stats);
-                            }
-                            ControlCommand::Action(action, reply) => {
-                                let resp = server.submit_verified_action(action);
-                                let _ = reply.send(resp);
-                            }
-                        }
-                        did_work = true;
-                    }
-                    if !did_work {
-                        // No work on any ring — block on the shared wakeup
-                        // signal until a producer pushes or the 1 ms
-                        // timeout elapses. The timeout ensures the control
-                        // channel (seal/stats) is still serviced
-                        // regularly. This replaces the previous
-                        // `std::thread::yield_now()` busy-spin that burned
-                        // a full CPU core at 100% when idle.
-                        order_receivers[0].wait_for_work(std::time::Duration::from_millis(1));
-                    }
-                }
-            })
-            .expect("spawn matcher-sequencer thread");
+        // Pinned when `sequencer_core` is set: the engine's cache
+        // working set (books, rings, accounts) stays hot on one core
+        // instead of re-warming on every scheduler migration.
+        let thread = primitives::supervision::spawn_supervised_pinned(
+            "matcher-sequencer",
+            true,
+            sequencer_core,
+            move || run_sequencer(server, order_receivers, response_senders, control_rx, wake),
+        )
+        .expect("spawn matcher-sequencer thread");
 
         Self {
             order_rings: order_senders,
@@ -1191,6 +1150,7 @@ impl RingMatcher {
                 .collect(),
             lease_notify: tokio::sync::Notify::new(),
             control_tx,
+            wakeup: shared_wakeup,
             chain_id,
             worker_thread: thread,
         }
@@ -1237,6 +1197,16 @@ impl RingMatcher {
     /// saturation. That is the intended bound — `num_rings`
     /// concurrent exchanges is the system's throughput limit, and
     /// excess requests wait rather than corrupt each other.
+    ///
+    /// SLO (hft-audit F-18): a waiter's queueing delay is unbounded
+    /// in the worst case by design — there is no FIFO ticketing —
+    /// so the venue-level contract is *throughput-bounded*, not
+    /// latency-bounded: any request admitted while a ring is free
+    /// gets `O(ring_cap)` turnaround, and saturation defers excess
+    /// waiters instead of shedding them. Deployments that need a
+    /// hard p99 should place the shed decision upstream (client
+    /// timeout + retry across a second matcher endpoint); FIFO
+    /// ticketing is revisit-worthy only if measured p99s demand it.
     pub async fn acquire_ring(&self, hint: usize) -> RingLease<'_> {
         let mut hint = hint;
         loop {
@@ -1278,6 +1248,10 @@ impl RingMatcher {
         if self.control_tx.send(ControlCommand::Seal(reply_tx)).is_err() {
             return Vec::new();
         }
+        // Wake the sequencer — the control channel itself has no
+        // wake edge, so without this a seal waits out the idle
+        // timeout before being serviced (F-15).
+        self.wakeup.signal();
         reply_rx.recv().unwrap_or_default()
     }
 
@@ -1290,6 +1264,7 @@ impl RingMatcher {
         if self.control_tx.send(ControlCommand::Stats(reply_tx)).is_err() {
             return MatcherStats::default();
         }
+        self.wakeup.signal();
         reply_rx.recv().unwrap_or_default()
     }
 
@@ -1322,6 +1297,7 @@ impl RingMatcher {
         if self.control_tx.send(ControlCommand::Action(action, reply_tx)).is_err() {
             return OrderResponse::rejected(crate::protocol::RejectReason::EngineError);
         }
+        self.wakeup.signal();
         reply_rx
             .recv()
             .unwrap_or_else(|_| OrderResponse::rejected(crate::protocol::RejectReason::EngineError))
@@ -1369,6 +1345,113 @@ impl RingMatcher {
     #[must_use]
     pub fn worker_is_alive(&self) -> bool {
         !self.worker_thread.is_finished()
+    }
+}
+
+/// The sequencer's steady-state loop — extracted from
+/// [`RingMatcher::new`] so construction stays readable and the hot
+/// loop sits at module scope where its budget comments are visible.
+///
+/// Owns the order receivers, response senders, control channel, and
+/// the shared wakeup; runs until every order sender disconnects (the
+/// ring pop path returns `None` only on empty — teardown is the
+/// process ending, so the loop is `loop {}`).
+///
+/// Parking protocol (F-04): a response batch that can't push (client
+/// hasn't drained its previous exchange — the lease caps in-flight
+/// batches at one per ring) moves to `parked` and retries once per
+/// pass, so a lagging client costs itself latency but can never
+/// starve the other rings or the control channel.
+fn run_sequencer(
+    mut server: MatchingServer,
+    order_receivers: Vec<ring::SpscReceiver<Vec<protocol::VerifiedOrder>>>,
+    response_senders: Vec<ring::SpscSender<Vec<OrderResponse>>>,
+    control_rx: std::sync::mpsc::Receiver<ControlCommand>,
+    wake: Arc<ring::Wakeup>,
+) {
+    // Response batches that could not be pushed yet —
+    // `(ring_idx, responses)`. Bounded by `num_rings` (one lease in
+    // flight per ring). Parked instead of spun: the client is either
+    // gone (push errors clear it) or lagging (retried each pass).
+    let mut parked: Vec<(usize, Vec<OrderResponse>)> = Vec::new();
+    loop {
+        let mut did_work = false;
+        // First: retry parked responses — a client that drained
+        // between passes frees its batch here.
+        parked.retain_mut(|(idx, batch)| {
+            // `push` needs ownership on retry; take it and put it
+            // back on failure.
+            match response_senders[*idx].push(std::mem::take(batch)) {
+                // Delivered un-parks; a disconnected client frees the
+                // slot too (its batch is dead weight, not work owed).
+                Ok(()) | Err(crate::ring::PushError::Disconnected(_)) => false,
+                Err(crate::ring::PushError::Full(returned)) => {
+                    *batch = returned;
+                    true // still lagging — stay parked
+                }
+            }
+        });
+        // Round-robin poll all rings.
+        for (i, order_rx) in order_receivers.iter().enumerate() {
+            while let Some(batch) = order_rx.pop() {
+                // Process the WHOLE batch: submit every order
+                // back-to-back (no interleaving from other rings —
+                // the batch is atomic).
+                let responses: Vec<OrderResponse> =
+                    batch.iter().map(|req| server.submit_verified(req)).collect();
+                // Push the batch response to this connection's ring.
+                // Full ⇒ the client has not drained its previous
+                // response (the lease caps in-flight batches at one)
+                // — PARK the batch and move on; a client that never
+                // drains parks its own latency, never the sequencer's.
+                if let Err(crate::ring::PushError::Full(batch)) =
+                    response_senders[i].push(responses)
+                {
+                    parked.push((i, batch));
+                }
+                did_work = true;
+            }
+        }
+        // Service control commands (seal/stats) between ring polls.
+        // These come from the batch settler and monitoring — never
+        // from the order hot path.
+        while let Ok(cmd) = control_rx.try_recv() {
+            match cmd {
+                ControlCommand::Seal(reply) => {
+                    let batch = server.seal_batch();
+                    let _ = reply.send(batch);
+                }
+                ControlCommand::Stats(reply) => {
+                    let stats = MatcherStats {
+                        orders_processed: server.orders_processed(),
+                        fills_produced: server.fills_produced(),
+                        balance_rejections: server.balance_rejections(),
+                        engine_rejections: server.engine_rejections(),
+                        risk_rejections: server.risk_rejections(),
+                        auth_rejections: server.auth_rejections(),
+                        resting_count: server.resting_count(),
+                        pending_settlements: server.pending_settlements(),
+                    };
+                    let _ = reply.send(stats);
+                }
+                ControlCommand::Action(action, reply) => {
+                    let resp = server.submit_verified_action(action);
+                    let _ = reply.send(resp);
+                }
+            }
+            did_work = true;
+        }
+        if !did_work {
+            // No work on any ring — announce parking, then re-check
+            // ring occupancy inside the wakeup so a push that raced
+            // the announcement is seen (the parked-flag protocol
+            // covers the window). The 1 ms timeout bounds
+            // control-channel latency for senders that somehow missed
+            // the explicit signal — and anything else anomalous.
+            wake.wait_for_work(std::time::Duration::from_millis(1), || {
+                order_receivers.iter().any(|r| !r.is_empty())
+            });
+        }
     }
 }
 

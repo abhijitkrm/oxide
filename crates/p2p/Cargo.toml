@@ -21,6 +21,12 @@ tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rcgen"]
 ports = { workspace = true }
 primitives = { workspace = true }
 thiserror = { workspace = true }
+# socket2: setsockopt access (SO_SNDBUF/SO_RCVBUF) std doesn't
+# expose — socket buffers are sized for the consensus message rate
+# so a kernel-default 128 KiB buffer can't truncate bursts into
+# retransmits (hft-audit F-10). MIT/Apache-2.0, already in the
+# workspace lock tree.
+socket2 = "=0.6.5"
 # TLS dependencies (only active with the `tls` feature).
 # rustls: pure-Rust TLS implementation (Apache-2.0/MIT/ISC, GPL-3.0-compatible).
 # Uses the `aws_lc_rs` crypto provider (default for rustls 0.23, FIPS-compatible).

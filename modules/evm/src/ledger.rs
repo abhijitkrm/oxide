@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use executor::ExecError;
+use executor::{ExecError, RejectCategory};
 use framework::{Balances, WEI_PER_UNIT};
 use primitives::Address;
 use revm::primitives::U256;
@@ -48,7 +48,10 @@ fn wei_to_units(wei: U256) -> u64 {
 }
 
 fn insufficient(addr: &Address, have: U256, want: U256) -> ExecError {
-    ExecError::ModuleRejected(format!("ledger: {addr:?} has {have} wei, needs {want} wei"))
+    ExecError::rejected(
+        RejectCategory::InsufficientFunds,
+        format!("ledger: {addr:?} has {have} wei, needs {want} wei"),
+    )
 }
 
 impl EvmModule {
@@ -124,7 +127,10 @@ impl Balances for EvmModule {
         let evm_addr = alloy_primitives_address(addr.0);
         let current = self.balance_wei(evm_addr);
         let next = current.checked_add(wei).ok_or_else(|| {
-            ExecError::ModuleRejected(format!("ledger: {addr:?} balance overflows U256"))
+            ExecError::rejected(
+                RejectCategory::Precondition,
+                format!("ledger: {addr:?} balance overflows U256"),
+            )
         })?;
         self.set_balance(evm_addr, next);
         Ok(())
@@ -150,7 +156,10 @@ impl Balances for EvmModule {
             from_bal.checked_sub(wei).ok_or_else(|| insufficient(from, from_bal, wei))?;
         let to_bal = self.balance_wei(to_addr);
         let new_to = to_bal.checked_add(wei).ok_or_else(|| {
-            ExecError::ModuleRejected(format!("ledger: {to:?} balance overflows U256"))
+            ExecError::rejected(
+                RejectCategory::Precondition,
+                format!("ledger: {to:?} balance overflows U256"),
+            )
         })?;
         self.set_balance(from_addr, new_from);
         self.set_balance(to_addr, new_to);

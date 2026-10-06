@@ -71,7 +71,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use executor::{Event, ExecError, Module, TxContext};
+use executor::{Event, ExecError, Module, RejectCategory, TxContext};
 use framework::{Balances, Committee, KVStore, ParameterSink, module_id, subtree_root};
 use primitives::{Address, Hash, Height};
 
@@ -368,8 +368,9 @@ impl ParameterSink for GovernanceParams {
             b"governance.veto_bps" => (&self.veto_bps, false, true),
             b"governance.timelock" => (&self.timelock, false, false),
             _ => {
-                return Err(ExecError::ModuleRejected(
-                    "governance: unknown governed parameter".to_string(),
+                return Err(ExecError::rejected(
+                    RejectCategory::NotFound,
+                    "governance: unknown governed parameter",
                 ));
             }
         };
@@ -378,16 +379,16 @@ impl ParameterSink for GovernanceParams {
         };
         let v = u64::from_le_bytes(v);
         if nonzero && v == 0 {
-            return Err(ExecError::ModuleRejected(format!(
-                "{}: window must be > 0",
-                String::from_utf8_lossy(key)
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("{}: window must be > 0", String::from_utf8_lossy(key)),
+            ));
         }
         if capped && v > 10_000 {
-            return Err(ExecError::ModuleRejected(format!(
-                "{}: bps must be <= 10_000",
-                String::from_utf8_lossy(key)
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("{}: bps must be <= 10_000", String::from_utf8_lossy(key)),
+            ));
         }
         target.store(v, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -915,7 +916,10 @@ impl GovernanceModule {
         let mut proposals = framework::lock_state(&self.proposals);
         let open = proposals.values().filter(|p| !p.status.is_terminal()).count();
         if open >= MAX_OPEN_PROPOSALS {
-            return Err(ExecError::ModuleRejected("too many open proposals".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                "too many open proposals",
+            ));
         }
         let id = {
             let mut next = framework::lock_state(&self.next_id);
@@ -983,29 +987,34 @@ impl GovernanceModule {
         if amount == 0 {
             // A zero-cost record is pure state growth — the refund
             // loop still walks it at decision time.
-            return Err(ExecError::ModuleRejected("zero deposit".to_string()));
+            return Err(ExecError::rejected(RejectCategory::InvalidInput, "zero deposit"));
         }
-        let ledger = self
-            .ledger
-            .as_ref()
-            .ok_or_else(|| ExecError::ModuleRejected("deposits: no ledger wired".to_string()))?;
+        let ledger = self.ledger.as_ref().ok_or_else(|| {
+            ExecError::rejected(RejectCategory::Internal, "deposits: no ledger wired")
+        })?;
         let height = *framework::lock_state(&self.current_height);
         let mut proposals = framework::lock_state(&self.proposals);
         let proposal = proposals
             .get_mut(&id)
-            .ok_or(ExecError::ModuleRejected("unknown proposal".to_string()))?;
+            .ok_or(ExecError::rejected(RejectCategory::NotFound, "unknown proposal"))?;
         if proposal.status != ProposalStatus::DepositPeriod {
-            return Err(ExecError::ModuleRejected("proposal not collecting deposits".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                "proposal not collecting deposits",
+            ));
         }
         if height >= proposal.deposit_deadline {
-            return Err(ExecError::ModuleRejected("deposit period ended".to_string()));
+            return Err(ExecError::rejected(RejectCategory::Precondition, "deposit period ended"));
         }
         {
             let mut deposits = framework::lock_state(&self.deposits);
             let records = deposits.entry(id).or_default();
             let known_idx = records.iter().position(|(a, _)| *a == ctx.sender);
             if known_idx.is_none() && records.len() >= MAX_DEPOSITORS_PER_PROPOSAL {
-                return Err(ExecError::ModuleRejected("too many depositors".to_string()));
+                return Err(ExecError::rejected(
+                    RejectCategory::Precondition,
+                    "too many depositors",
+                ));
             }
             // Move the funds first — if the debit fails nothing has
             // been recorded and the proposal's tally is untouched.
@@ -1053,33 +1062,41 @@ impl GovernanceModule {
     /// the audit flagged.
     fn handle_vote(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
         let (id, vote) = Self::parse_vote(&msg[1..]).ok_or(ExecError::Malformed)?;
-        let committee = self
-            .committee
-            .as_ref()
-            .ok_or_else(|| ExecError::ModuleRejected("vote: no committee wired".to_string()))?;
+        let committee = self.committee.as_ref().ok_or_else(|| {
+            ExecError::rejected(RejectCategory::Unauthorized, "vote: no committee wired")
+        })?;
         let power = committee.power(&ctx.sender);
         if power == 0 {
-            return Err(ExecError::ModuleRejected("voter has no voting power".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "voter has no voting power",
+            ));
         }
         let height = *framework::lock_state(&self.current_height);
         let mut proposals = framework::lock_state(&self.proposals);
         let proposal = proposals
             .get_mut(&id)
-            .ok_or(ExecError::ModuleRejected("unknown proposal".to_string()))?;
+            .ok_or(ExecError::rejected(RejectCategory::NotFound, "unknown proposal"))?;
         match proposal.status {
             ProposalStatus::Voting => {}
             ProposalStatus::DepositPeriod => {
                 // Unfunded proposals cannot collect votes — a ballot
                 // cast before funding would lock in a tally the
                 // proposal may never earn the right to hold.
-                return Err(ExecError::ModuleRejected("proposal not in voting period".to_string()));
+                return Err(ExecError::rejected(
+                    RejectCategory::Precondition,
+                    "proposal not in voting period",
+                ));
             }
             _ => {
-                return Err(ExecError::ModuleRejected("proposal already finalized".to_string()));
+                return Err(ExecError::rejected(
+                    RejectCategory::Precondition,
+                    "proposal already finalized",
+                ));
             }
         }
         if height >= proposal.end_height {
-            return Err(ExecError::ModuleRejected("voting period ended".to_string()));
+            return Err(ExecError::rejected(RejectCategory::Precondition, "voting period ended"));
         }
 
         // Prior vote record: `[vote:1B][power:8B]` (9B); a 1-byte

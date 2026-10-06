@@ -11,9 +11,8 @@
 use super::{
     Address, Arc, BLOCK_TIME_SECS, Balances, CHAIN_BLOCK_GAS_LIMIT, CacheDB, EmptyDB, Event,
     EvmModule, ExecError, HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS, Hash, Height,
-    INTRINSIC_GAS_BASE, MODULE_ID, Module, PreverifiedTx, SpecId, TxContext,
-    alloy_primitives_address, encode_trie_leaf, fee, history, persist, receipts, sparse_walk, trie,
-    tx, versioned,
+    INTRINSIC_GAS_BASE, MODULE_ID, Module, PreverifiedTx, RejectCategory, SpecId, TxContext,
+    alloy_primitives_address, encode_trie_leaf, fee, persist, sparse_walk, trie, tx, versioned,
 };
 
 impl Module for EvmModule {
@@ -210,49 +209,26 @@ impl Module for EvmModule {
     /// [`ExecError::ModuleRejected`] for nonce, gas, or balance
     /// violations.
     fn validate(&self, _ctx: &TxContext, msg: &[u8]) -> Result<(), ExecError> {
-        // 1. RLP decode — `decode_raw` enforces complete input
-        // consumption: the trust boundary is exactly as strict as
-        // the RPC parse, so a trailing-junk encoding that RPC
-        // rejects can't enter through the mempool/executor path.
-        let signed = tx::SignedTx::decode_raw(msg).map_err(|_| ExecError::Malformed)?;
-
-        // 2. Chain ID (EIP-155 replay protection).
-        if signed.chain_id() != self.chain_id {
-            return Err(ExecError::Malformed);
-        }
-
-        // 3. Signature recovery.
-        let sender = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
-
-        self.validate_stateful(&signed, Address(sender.0))
+        self.validate_core(msg, None, None)
     }
 
-    /// Admission gate with the sender already authenticated by the
-    /// caller's `preverify_batch` — runs the same decode and stateful
-    /// gates as `validate` but skips the duplicate secp256k1
-    /// recovery (~30 µs/tx saved on the caller's thread, which is the
-    /// consensus pump for gossip traffic).
-    fn validate_authenticated(
+    /// `validate` with the sender already recovered by
+    /// [`preverify_batch`](Self::preverify_batch) — the intake path
+    /// pays the secp256k1 recovery exactly once instead of twice
+    /// (once here, once in preverify). When `preverified` carries a
+    /// sender for these exact payload bytes, the recovery below is
+    /// skipped and the preverified sender drives the nonce/balance
+    /// checks; `None` recovers inline (the standalone path).
+    ///
+    /// This is the mempool admission gate, so it also binds the
+    /// envelope to the payload (see `validate_core` step 3b).
+    fn validate_preverified(
         &self,
         ctx: &TxContext,
         msg: &[u8],
-        sender: &[u8; 20],
+        preverified: Option<&executor::PreverifiedTx<'_>>,
     ) -> Result<(), ExecError> {
-        let signed = tx::SignedTx::decode_raw(msg).map_err(|_| ExecError::Malformed)?;
-        if signed.chain_id() != self.chain_id {
-            return Err(ExecError::Malformed);
-        }
-        // The envelope's nonce and fee drive mempool ordering,
-        // replacement and eviction, but execution ignores them. Bind
-        // them to the signed payload so they cannot be inflated:
-        // the nonce must match exactly, and the fee may not claim
-        // more than the signer agreed to pay (`max_fee_per_gas`,
-        // the value `wrap_evm_tx_envelope` callers put there).
-        let signed_fee = u64::try_from(signed.max_fee_per_gas()).unwrap_or(u64::MAX);
-        if ctx.nonce != signed.nonce() || ctx.fee > signed_fee {
-            return Err(ExecError::Malformed);
-        }
-        self.validate_stateful(&signed, Address(*sender))
+        self.validate_core(msg, preverified, Some(ctx))
     }
 
     /// The EVM is self-funded: revm charges `gas_used × effective
@@ -338,55 +314,7 @@ impl Module for EvmModule {
     }
 
     fn handle(&self, _ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
-        // Perf: single RLP decode. Decode once to get both the tx
-        // type (for the receipt) and the signed tx (for execution).
-        // The old code decoded twice — once in handle() for the tx
-        // type, once in execute() for execution. The decode is
-        // ~1 µs, so this saves ~1 µs per tx on the cold path.
-        let signed = tx::SignedTx::decode_raw(msg).map_err(|_| ExecError::Malformed)?;
-        let tx_type = signed.tx_type();
-        // The canonical Ethereum tx hash is keccak256 of the raw
-        // RLP — the same value `eth_sendRawTransaction` returns.
-        let tx_hash = alloy_primitives::keccak256(msg);
-        let (result, caller, call_trace) = self.execute_signed(&signed)?;
-
-        // Phase C: build a receipt from the execution result.
-        // The receipt captures status, gas used, logs, bloom, and
-        // (for CREATE) the created address. This is the data that
-        // `eth_getTransactionReceipt` returns and that goes into the
-        // block's receipts trie.
-        let receipt = receipts::Receipt::from_execution_result(&result, tx_type);
-
-        // Record into the executed-block history for RPC queries
-        // (`eth_getTransactionByHash`, `eth_getTransactionReceipt`,
-        // `eth_getLogs`). `record` assigns the tx_index from the
-        // pending-block position; `msg` (the raw signed RLP) is kept
-        // until `seal_block` computes `transactionsRoot`.
-        framework::lock_state(&self.history).record(
-            history::stored_tx(&signed, caller, tx_hash, 0),
-            receipt.clone(),
-            msg,
-            call_trace,
-        );
-
-        let status_str = if receipt.status { "success" } else { "revert" };
-        let contract_info =
-            receipt.contract_address.map(|a| format!(" contract={a}")).unwrap_or_default();
-        let log_count = receipt.logs.len();
-
-        Ok(vec![Event {
-            module: "evm",
-            kind: "evm_call",
-            data: format!(
-                "gas_used={} status={} base_fee={} logs={}{}",
-                receipt.gas_used,
-                status_str,
-                self.current_base_fee(),
-                log_count,
-                contract_info
-            )
-            .into_bytes(),
-        }])
+        self.handle_inner(msg).map(|(events, _)| events)
     }
 
     /// Batch execution: delegate to the inherent `handle_batch` which
@@ -438,7 +366,11 @@ impl Module for EvmModule {
         results
             .into_iter()
             .map(|r| {
-                r.map(|pv| executor::PreverifiedTx { raw: pv.raw, sender: pv.sender.into_array() })
+                r.map(|pv| executor::PreverifiedTx {
+                    raw: pv.raw,
+                    sender: pv.sender.into_array(),
+                    verified_locally: pv.verified_locally,
+                })
             })
             .collect()
     }
@@ -474,6 +406,7 @@ impl Module for EvmModule {
             .map(|pv| PreverifiedTx {
                 raw: pv.raw,
                 sender: revm::primitives::Address::from(pv.sender),
+                verified_locally: pv.verified_locally,
             })
             .collect();
         // Call the inherent `handle_batch_preverified` (3 args).
@@ -507,6 +440,7 @@ impl Module for EvmModule {
             .map(|pv| PreverifiedTx {
                 raw: pv.raw,
                 sender: revm::primitives::Address::from(pv.sender),
+                verified_locally: pv.verified_locally,
             })
             .collect();
         // Call the inherent `handle_batch_parallel_preverified` (3 args).
@@ -670,6 +604,12 @@ impl Module for EvmModule {
                     .accounts
                     .get(addr)
                     .filter(|a| a.account_state != revm::database::AccountState::NotExisting)
+                    // EIP-158: a touched account that ends up empty
+                    // (nonce 0, balance 0, no code) is deleted from
+                    // the state trie — e.g. the coinbase when the
+                    // tip is zero. Keeping it would put an extra
+                    // leaf in the root every upstream client drops.
+                    .filter(|a| !a.info.is_empty())
                 {
                     let storage_root = if account.storage.is_empty() {
                         trie::EMPTY_ROOT
@@ -704,7 +644,11 @@ impl Module for EvmModule {
             // skipped — they are not part of the committed trie (see
             // the incremental path above).
             for (addr, account) in &db.cache.accounts {
-                if account.account_state == revm::database::AccountState::NotExisting {
+                if account.account_state == revm::database::AccountState::NotExisting
+                    // EIP-158 empty-account deletion — see the
+                    // incremental path above.
+                    || account.info.is_empty()
+                {
                     continue;
                 }
                 let storage_root = if account.storage.is_empty() {
@@ -939,8 +883,11 @@ impl Module for EvmModule {
         let accounts = Self::parse_snapshot_entries(snapshot)?;
         // Rebuild the state trie from the staged accounts — the
         // same keying (keccak256(addr)) and leaf RLP as the live
-        // `state_root` full-build path.
-        let iter = accounts.iter().map(|(addr, acct)| {
+        // `state_root` full-build path, including its EIP-158
+        // exclusion of empty accounts: a foreign or older-binary
+        // snapshot may carry one, and the recompute must agree with
+        // `state_root` on whether it exists.
+        let iter = accounts.iter().filter(|(_, acct)| !acct.is_empty()).map(|(addr, acct)| {
             let storage_root = if acct.storage.is_empty() {
                 trie::EMPTY_ROOT
             } else {
@@ -1045,41 +992,93 @@ impl Module for EvmModule {
 }
 
 impl EvmModule {
-    /// The stateful admission gates shared by `validate` (which
-    /// recovers the signer itself) and `validate_authenticated`
-    /// (which takes the caller's recovered sender): nonce floor,
-    /// gas-limit bounds, EIP-1559 fee ordering, and the balance
-    /// cover check. Pure reads only — admission never mutates state.
-    fn validate_stateful(
+    /// The shared admission body behind [`Module::validate`] and
+    /// [`Module::validate_preverified`]: decode, chain ID, optional
+    /// sender recovery, then the state checks (nonce, gas, fees,
+    /// balance). Pure — reads module state, writes nothing.
+    ///
+    /// `preverified` short-circuits step 3: the batch preverify pass
+    /// already authenticated these exact payload bytes, so paying
+    /// the ~11µs secp256k1 recovery again would double the intake
+    /// cost per tx. The sender address it carries is the recovery
+    /// output for the same bytes — substituting it is equivalent,
+    /// not a trust downgrade.
+    ///
+    /// `envelope` (admission only) is the v0 envelope's claimed
+    /// sender/nonce/fee, checked against the signed payload.
+    fn validate_core(
         &self,
-        signed: &tx::SignedTx,
-        sender_addr: Address,
+        msg: &[u8],
+        preverified: Option<&executor::PreverifiedTx<'_>>,
+        envelope: Option<&TxContext>,
     ) -> Result<(), ExecError> {
+        // 1. RLP decode — `decode_raw` enforces complete input
+        // consumption: the trust boundary is exactly as strict as
+        // the RPC parse, so a trailing-junk encoding that RPC
+        // rejects can't enter through the mempool/executor path.
+        let signed = tx::SignedTx::decode_raw(msg).map_err(|_| ExecError::Malformed)?;
+
+        // 2. Chain ID (EIP-155 replay protection).
+        if signed.chain_id() != self.chain_id {
+            return Err(ExecError::Malformed);
+        }
+
+        // 3. Signature recovery — skipped when the batch preverify
+        // already recovered this payload's sender.
+        let sender = match preverified {
+            Some(pre) => {
+                // The preverify result is keyed to these exact
+                // bytes; a mismatched payload would be an internal
+                // wiring bug, so assert the pairing cheaply.
+                debug_assert_eq!(pre.raw, msg, "preverified sender must match the payload");
+                primitives::Address(pre.sender)
+            }
+            None => signed.recover_sender().map_err(|_| ExecError::Malformed)?,
+        };
+        let sender_addr = Address(sender.0);
+
+        // 3b. Envelope binding (admission). The envelope's sender,
+        // nonce and fee drive mempool dedupe, replace-by-fee and
+        // eviction, but execution ignores them — unbound, they are
+        // free claims: a forged sender + nonce with a fee bump
+        // evicts another account's pending tx, and a `u64::MAX` fee
+        // is never evicted. Sender and nonce must match the signed
+        // payload; the fee may not exceed what the signer agreed to
+        // pay (`max_fee_per_gas` — what every `wrap_evm_tx_envelope`
+        // caller puts there).
+        if let Some(env) = envelope {
+            let signed_fee = u64::try_from(signed.max_fee_per_gas()).unwrap_or(u64::MAX);
+            if env.sender.0 != sender_addr.0 || env.nonce != signed.nonce() || env.fee > signed_fee
+            {
+                return Err(ExecError::Malformed);
+            }
+        }
+
         // 4. Nonce: tx nonce must be ≥ current account nonce.
         //    This rejects stale (already-used) nonces. Future nonces
         //    are allowed for mempool queueing.
         let current_nonce = self.nonce(&sender_addr);
         if signed.nonce() < current_nonce {
-            return Err(ExecError::ModuleRejected(format!(
-                "nonce {nonce} < current {current_nonce}",
-                nonce = signed.nonce()
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                format!("nonce {nonce} < current {current_nonce}", nonce = signed.nonce()),
+            ));
         }
 
         // 5. Gas limit: must be positive.
         let gas_limit = signed.gas_limit();
         if gas_limit == 0 {
-            return Err(ExecError::ModuleRejected("gas_limit is zero".to_string()));
+            return Err(ExecError::rejected(RejectCategory::InvalidInput, "gas_limit is zero"));
         }
 
         // HIGH fix: gas_limit must fit within the block gas limit.
         // A tx with gas_limit > block_gas_limit can never be included
         // and should be rejected at admission to save mempool space.
         if gas_limit > self.block_gas_limit() {
-            return Err(ExecError::ModuleRejected(format!(
-                "gas_limit {gas_limit} > block_gas_limit {}",
-                self.block_gas_limit()
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("gas_limit {gas_limit} > block_gas_limit {}", self.block_gas_limit()),
+            ));
         }
 
         // 6. Intrinsic gas: gas_limit must cover the intrinsic cost.
@@ -1089,9 +1088,10 @@ impl EvmModule {
         //    the full calldata-aware check arrives with the gas
         //    economics phase (A5).
         if gas_limit < INTRINSIC_GAS_BASE {
-            return Err(ExecError::ModuleRejected(format!(
-                "gas_limit {gas_limit} < intrinsic {INTRINSIC_GAS_BASE}"
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("gas_limit {gas_limit} < intrinsic {INTRINSIC_GAS_BASE}"),
+            ));
         }
 
         // HIGH fix: EIP-1559 fee gates.
@@ -1101,20 +1101,23 @@ impl EvmModule {
         //   b. priority_fee <= max_fee: EIP-1559 requires
         //      max_priority_fee_per_gas <= max_fee_per_gas. A tx
         //      with priority_fee > max_fee is invalid.
-        let max_fee = u128::try_from(signed.max_fee_per_gas())
-            .map_err(|_| ExecError::ModuleRejected("max_fee overflow u128".to_string()))?;
-        let priority_fee = u128::try_from(signed.max_priority_fee_per_gas())
-            .map_err(|_| ExecError::ModuleRejected("priority_fee overflow u128".to_string()))?;
+        let max_fee = u128::try_from(signed.max_fee_per_gas()).map_err(|_| {
+            ExecError::rejected(RejectCategory::InvalidInput, "max_fee overflow u128")
+        })?;
+        let priority_fee = u128::try_from(signed.max_priority_fee_per_gas()).map_err(|_| {
+            ExecError::rejected(RejectCategory::InvalidInput, "priority_fee overflow u128")
+        })?;
         if max_fee < u128::from(self.current_base_fee()) {
-            return Err(ExecError::ModuleRejected(format!(
-                "max_fee {max_fee} < base_fee {}",
-                self.current_base_fee()
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("max_fee {max_fee} < base_fee {}", self.current_base_fee()),
+            ));
         }
         if priority_fee > max_fee {
-            return Err(ExecError::ModuleRejected(format!(
-                "priority_fee {priority_fee} > max_fee {max_fee}"
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("priority_fee {priority_fee} > max_fee {max_fee}"),
+            ));
         }
 
         // 7. Balance: sender must cover gas_cost + value.
@@ -1122,19 +1125,21 @@ impl EvmModule {
         //    fee the sender could pay). For legacy txs, gas_price is
         //    the max fee. For EIP-1559, max_fee_per_gas is the cap.
         let balance = self.balance(&sender_addr);
-        let value = u128::try_from(signed.value())
-            .map_err(|_| ExecError::ModuleRejected("value overflow u128".to_string()))?;
+        let value = u128::try_from(signed.value()).map_err(|_| {
+            ExecError::rejected(RejectCategory::InvalidInput, "value overflow u128")
+        })?;
         // gas_cost = gas_limit * max_fee, checked for overflow.
-        let gas_cost = u128::from(gas_limit)
-            .checked_mul(max_fee)
-            .ok_or_else(|| ExecError::ModuleRejected("gas cost overflow".to_string()))?;
-        let total_needed = gas_cost
-            .checked_add(value)
-            .ok_or_else(|| ExecError::ModuleRejected("gas_cost + value overflow".to_string()))?;
+        let gas_cost = u128::from(gas_limit).checked_mul(max_fee).ok_or_else(|| {
+            ExecError::rejected(RejectCategory::InvalidInput, "gas cost overflow")
+        })?;
+        let total_needed = gas_cost.checked_add(value).ok_or_else(|| {
+            ExecError::rejected(RejectCategory::InvalidInput, "gas_cost + value overflow")
+        })?;
         if balance < total_needed {
-            return Err(ExecError::ModuleRejected(format!(
-                "insufficient balance: have {balance}, need {total_needed}"
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                format!("insufficient balance: have {balance}, need {total_needed}"),
+            ));
         }
 
         Ok(())

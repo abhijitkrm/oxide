@@ -72,7 +72,7 @@ impl Executor {
         ctx: &TxContext,
         module_id: u8,
         module: &dyn Module,
-        verified: Option<&HashMap<Hash, [u8; 20]>>,
+        verified: Option<&primitives::digest_map::DigestMap<[u8; 20]>>,
     ) -> Result<bool, &'static str> {
         let signed = is_signed_envelope(bytes);
         if module.authenticates_sender() {
@@ -191,7 +191,7 @@ impl Executor {
         &self,
         txs: &'b [TxBytes],
         local_nonce: &mut BlockNonces<'_>,
-        preverify_cache: &HashMap<Hash, [u8; 20]>,
+        preverify_cache: &primitives::digest_map::DigestMap<[u8; 20]>,
         skipped: &mut Vec<(Hash, TxSkipReason)>,
     ) -> Vec<(u8, Vec<GroupedTx<'b>>)> {
         let mut runs: Vec<(u8, Vec<GroupedTx<'b>>)> = Vec::new();
@@ -369,7 +369,7 @@ impl Executor {
         &self,
         module: &dyn Module,
         group: &[GroupedTx<'_>],
-        preverify_cache: &mut HashMap<Hash, [u8; 20]>,
+        preverify_cache: &mut primitives::digest_map::DigestMap<[u8; 20]>,
     ) -> Vec<Result<Vec<Event>, ExecError>> {
         let all_cached = group.iter().all(|t| preverify_cache.contains_key(&t.tx_hash));
         if !all_cached {
@@ -383,6 +383,12 @@ impl Executor {
             .map(|t| PreverifiedTx {
                 raw: t.payload,
                 sender: preverify_cache.remove(&t.tx_hash).unwrap_or([0u8; 20]),
+                // Provenance (F-06): `all_cached` held, so every
+                // `t.tx_hash` — computed locally from the same bytes
+                // `t.payload` borrows — is in the ingest-verified
+                // cache. The sender IS this node's own recovery;
+                // consumers may skip re-verification.
+                verified_locally: true,
             })
             .collect();
         // Each tx keeps its own authenticated envelope context —
@@ -491,7 +497,10 @@ impl Executor {
         // order — sequential cross-module semantics. Fee-paying runs
         // interleave charge→execute per tx (`charge_and_execute_run`);
         // self-funded runs dispatch as one batch.
-        let mut block_events: Vec<Event> = Vec::new();
+        // `Arc<[Event]>` entries — each is shared with the tx
+        // outcome that produced it (F-08); the block log stores
+        // refcounts, not event copies.
+        let mut block_events: Vec<std::sync::Arc<[Event]>> = Vec::new();
         let mut broken_nonce: HashMap<primitives::Address, u64> = HashMap::new();
         let mut dispatch_skipped: Vec<(Hash, TxSkipReason)> = Vec::new();
 
@@ -537,12 +546,14 @@ impl Executor {
         // end_block for all modules — same context as begin_block.
         // Module scheduled effects (liquidation sweeps, epoch work)
         // emit events that land in the block log AFTER every tx
-        // event — same publish path, one extension.
-        let end_block_events: Vec<Event> = self
+        // event — same publish path, one Arc entry per module.
+        let end_block_events: Vec<std::sync::Arc<[Event]>> = self
             .modules
             .iter()
             .flatten()
-            .flat_map(|module| module.end_block_ctx(block.height, &block.context))
+            .map(|module| module.end_block_ctx(block.height, &block.context))
+            .filter(|evs| !evs.is_empty())
+            .map(std::sync::Arc::from)
             .collect();
         if !end_block_events.is_empty() {
             primitives::sync::lock_state(&self.events).extend(end_block_events);
@@ -576,7 +587,7 @@ impl Executor {
         // reads through the block's delta — the effective post-block
         // value for every pooled sender.
         primitives::sync::lock_state(&self.mempool)
-            .refresh_anchors(|sender| local_nonce.next_expected(sender));
+            .refresh_anchors(block.height.value(), |sender| local_nonce.next_expected(sender));
 
         // H4/H5: persist the updated nonce map. The delta applies in
         // place (`Arc::make_mut` — the base snapshot is dropped first
@@ -609,16 +620,23 @@ impl Executor {
         &self,
         group: &[GroupedTx<'_>],
         results: Vec<Result<Vec<Event>, ExecError>>,
-        block_events: &mut Vec<Event>,
+        block_events: &mut Vec<std::sync::Arc<[Event]>>,
     ) {
         let mut outcomes = primitives::sync::lock_state(&self.tx_outcomes);
         for (t, result) in group.iter().zip(results) {
             let outcome = match result {
                 Ok(events) => {
-                    block_events.extend(events.iter().cloned());
-                    TxOutcome::Executed { events, error: None }
+                    // Share, don't copy (F-08): the outcome and the
+                    // block log hold the same `Arc<[Event]>` — the
+                    // per-event deep clone this replaced made every
+                    // event pay a second heap round-trip per block.
+                    let shared: std::sync::Arc<[Event]> = events.into();
+                    block_events.push(std::sync::Arc::clone(&shared));
+                    TxOutcome::Executed { events: shared, error: None }
                 }
-                Err(e) => TxOutcome::Executed { events: Vec::new(), error: Some(format!("{e:?}")) },
+                Err(e) => {
+                    TxOutcome::Executed { events: Vec::new().into(), error: Some(format!("{e}")) }
+                }
             };
             outcomes.record(t.tx_hash, outcome);
         }

@@ -61,84 +61,93 @@ impl Executor {
         // finalized block to executed state root. A panic here means
         // `attest_state`/`drain` can never complete — fail fast so the
         // supervisor restarts rather than livelock on withheld votes.
-        primitives::supervision::spawn_supervised("exec-lane", true, move || {
-            // RAII: ANY worker exit — panic unwind or clean
-            // disconnect — marks the lane dead and wakes
-            // every waiter. Without this, a panic mid-`execute_block`
-            // left `attest_state` waiting forever on a watermark
-            // that could never advance, and the death surfaced
-            // only as unexplained withheld votes.
-            let _death = LaneDeath { sync: sync.clone() };
-            loop {
-                // Drain every committed block currently queued, waiting
-                // on the condvar while the deque is empty. The commit
-                // path pushes under the same lock and never blocks —
-                // the `saturated` flag (not a full queue) is what
-                // throttles consensus when we fall behind.
-                let batch = {
-                    let (lock, cv) = &*sync;
-                    let mut s = primitives::sync::lock_state(lock);
-                    loop {
-                        if !s.pending.is_empty() {
-                            // Fully drained = caught up: clear the
-                            // saturation signal so the engine resumes
-                            // voting and committing. Clearing only on
-                            // empty (not merely below the threshold)
-                            // keeps the flag honest — a half-drained
-                            // backlog is still debt.
-                            let batch: Vec<FinalizedBlock> = s.pending.drain(..).collect();
-                            s.saturated = false;
-                            break batch;
-                        }
-                        // If the executor is gone there is no one left
-                        // to serve — exit rather than resurrect it.
-                        if weak.upgrade().is_none() {
-                            return;
-                        }
-                        s = cv.wait(s).unwrap_or_else(|_| {
-                            panic!("state mutex poisoned: a holder panicked mid-mutation")
-                        });
-                    }
-                };
-                // The upgrade is redone post-pop: the executor could
-                // have dropped between the wait check and here.
-                let Some(executor) = weak.upgrade() else { return };
-                // Journal ⊇ durable state: the batch's journal
-                // records (buffered on the commit thread) become
-                // durable in ONE fsync here, before any block's
-                // `execute_block` can flush module state to its own
-                // backend. Batching is the whole point — the commit
-                // thread used to pay one fsync per finalized block.
-                executor.journal_sync_pending();
-                for block in batch {
-                    let height = block.height.value();
-                    // Mark the block in-flight BEFORE executing: if
-                    // `execute_block` panics below, `LaneDeath` fires
-                    // with this set and no root recorded — the state
-                    // the recovery path must treat as partially
-                    // applied, never blindly replayed.
-                    {
-                        let (lock, _cv) = &*sync;
-                        primitives::sync::lock_state(lock).in_flight = Some(height);
-                    }
-                    let root = executor.execute_block(&block);
-                    primitives::sync::lock_state(&executor.state_roots).insert_retained(
-                        height,
-                        root,
-                        executor.history_retention,
-                    );
-                    // Blocks arrive in commit order, so the newest
-                    // height is always the watermark.
-                    let (lock, cv) = &*sync;
-                    {
+        // Pinned (hft-audit F-02): `exec_lane_core` keeps the whole
+        // block-execute → attest path on one core so its cache
+        // locality isn't re-warmed on every migrate; `None` runs
+        // unpinned (dev/test default).
+        primitives::supervision::spawn_supervised_pinned(
+            "exec-lane",
+            true,
+            self.exec_lane_core,
+            move || {
+                // RAII: ANY worker exit — panic unwind or clean
+                // disconnect — marks the lane dead and wakes
+                // every waiter. Without this, a panic mid-`execute_block`
+                // left `attest_state` waiting forever on a watermark
+                // that could never advance, and the death surfaced
+                // only as unexplained withheld votes.
+                let _death = LaneDeath { sync: sync.clone() };
+                loop {
+                    // Drain every committed block currently queued, waiting
+                    // on the condvar while the deque is empty. The commit
+                    // path pushes under the same lock and never blocks —
+                    // the `saturated` flag (not a full queue) is what
+                    // throttles consensus when we fall behind.
+                    let batch = {
+                        let (lock, cv) = &*sync;
                         let mut s = primitives::sync::lock_state(lock);
-                        s.in_flight = None;
-                        s.executed = Some(height);
+                        loop {
+                            if !s.pending.is_empty() {
+                                // Fully drained = caught up: clear the
+                                // saturation signal so the engine resumes
+                                // voting and committing. Clearing only on
+                                // empty (not merely below the threshold)
+                                // keeps the flag honest — a half-drained
+                                // backlog is still debt.
+                                let batch: Vec<FinalizedBlock> = s.pending.drain(..).collect();
+                                s.saturated = false;
+                                break batch;
+                            }
+                            // If the executor is gone there is no one left
+                            // to serve — exit rather than resurrect it.
+                            if weak.upgrade().is_none() {
+                                return;
+                            }
+                            s = cv.wait(s).unwrap_or_else(|_| {
+                                panic!("state mutex poisoned: a holder panicked mid-mutation")
+                            });
+                        }
+                    };
+                    // The upgrade is redone post-pop: the executor could
+                    // have dropped between the wait check and here.
+                    let Some(executor) = weak.upgrade() else { return };
+                    // Journal ⊇ durable state: the batch's journal
+                    // records (buffered on the commit thread) become
+                    // durable in ONE fsync here, before any block's
+                    // `execute_block` can flush module state to its own
+                    // backend. Batching is the whole point — the commit
+                    // thread used to pay one fsync per finalized block.
+                    executor.journal_sync_pending();
+                    for block in batch {
+                        let height = block.height.value();
+                        // Mark the block in-flight BEFORE executing: if
+                        // `execute_block` panics below, `LaneDeath` fires
+                        // with this set and no root recorded — the state
+                        // the recovery path must treat as partially
+                        // applied, never blindly replayed.
+                        {
+                            let (lock, _cv) = &*sync;
+                            primitives::sync::lock_state(lock).in_flight = Some(height);
+                        }
+                        let root = executor.execute_block(&block);
+                        primitives::sync::lock_state(&executor.state_roots).insert_retained(
+                            height,
+                            root,
+                            executor.history_retention,
+                        );
+                        // Blocks arrive in commit order, so the newest
+                        // height is always the watermark.
+                        let (lock, cv) = &*sync;
+                        {
+                            let mut s = primitives::sync::lock_state(lock);
+                            s.in_flight = None;
+                            s.executed = Some(height);
+                        }
+                        cv.notify_all();
                     }
-                    cv.notify_all();
                 }
-            }
-        })
+            },
+        )
         .expect("spawn exec lane thread");
     }
 

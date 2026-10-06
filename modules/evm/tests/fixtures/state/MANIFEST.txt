@@ -1,0 +1,42 @@
+Official Ethereum test fixtures (GeneralStateTests) — bounded subset
+=====================================================================
+
+Source:
+  Repository : https://github.com/ethereum/tests
+  Commit     : c67e485ff8b5be9abc8ad15345ec21aa22e290d9
+  Artifact   : fixtures_general_state_tests.tgz (release asset, filled
+               fixtures; the repo no longer carries them unpacked)
+
+Subset selection:
+  All GeneralStateTests directories EXCEPT the following, excluded for
+  size or for requiring runner features this harness does not provide:
+
+    stBadOpcode            (80 MB — bytecode-level fuzz corpus; the
+                            rejection paths it exercises are covered by
+                            stTransactionTest and stExpectSection)
+    stTimeConsuming        (49 MB — deliberately slow quadratic cases)
+    stStackTests           (29 MB — push/pop depth fuzzing)
+    stZeroKnowledge        (12 MB — BLS12-381/pairing stress corpus)
+    stZeroKnowledge2       (10 MB — same, second volume)
+    stRandom, stRandom2    (7 MB — randomly generated transaction mixes)
+    stQuadraticComplexityTest (slow by design)
+
+  Everything else is included: VMTests, Cancun, Shanghai, and all st*
+  directories (1,548 fixture files). Each file expands to one
+  expectation entry per (fork, data-index, gas-index, value-index)
+  combination in its `post` section — thousands of cases in total.
+
+  Entries whose signed transaction is a type this chain does not
+  implement (EIP-4844 blobs, type 0x03) are reported as UNSUPPORTED,
+  not passed and not silently dropped. See the runner in
+  `modules/evm/tests/official_state_tests.rs` for the taxonomy.
+
+Refresh procedure:
+    git clone --depth 1 https://github.com/ethereum/tests /tmp/ethtests
+    cd /tmp/ethtests && tar -xzf fixtures_general_state_tests.tgz
+    # copy the desired directories here, record the new commit above.
+
+License: the ethereum/tests corpus is distributed by the Ethereum
+Foundation under the license in the upstream repository (see
+LICENSE in https://github.com/ethereum/tests — GPL-3.0 compatible
+usage as test data).

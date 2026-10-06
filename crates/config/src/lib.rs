@@ -100,6 +100,10 @@ pub struct Config {
     /// Exchange module configuration (settlement operator).
     #[serde(default)]
     pub exchange: ExchangeConfig,
+
+    /// Thread pinning / NUMA placement (hft-audit F-02).
+    #[serde(default)]
+    pub performance: PerformanceConfig,
 }
 
 /// RPC server configuration (JSON-RPC HTTP endpoint for
@@ -196,6 +200,7 @@ impl Config {
         self.storage.apply_env(get);
         self.genesis.apply_env(get);
         self.exchange.apply_env(get);
+        self.performance.apply_env(get);
         // `rpc` is optional in TOML; an env-set RPC variable creates
         // the section (binaries construct `RpcConfig::default()` when
         // it's absent anyway, so this only makes env reachable).
@@ -241,6 +246,18 @@ pub struct NetworkConfig {
     /// (matches the broadcast crate's erasure chunk size).
     #[serde(default = "default_max_message_bytes")]
     pub max_message_bytes: u64,
+
+    /// Target `SO_SNDBUF`/`SO_RCVBUF` for peer sockets, in bytes
+    /// (hft-audit F-10). Sized for burst profile, not steady state:
+    /// a committee-wide vote/QC round or sync page burst must drain
+    /// without kernel-buffer overflow → retransmit stalls. The
+    /// kernel silently clamps to `net.core.{r,w}mem_max` — the
+    /// transport logs the requested value at startup; compare with
+    /// `sysctl` to detect the clamp. Default: 4 MiB (BDP: ~1.7 Gbps
+    /// ceiling at the 208 KiB kernel default on 1 ms RTT → 4 MiB
+    /// holds ~4k typical 1 KiB frames). `0` keeps kernel defaults.
+    #[serde(default = "default_tcp_buffer_bytes")]
+    pub tcp_buffer_bytes: usize,
 }
 
 fn default_listen_addr() -> String {
@@ -255,6 +272,9 @@ fn default_read_timeout_secs() -> u64 {
 fn default_max_message_bytes() -> u64 {
     16 << 20
 }
+fn default_tcp_buffer_bytes() -> usize {
+    4 << 20
+}
 
 impl Default for NetworkConfig {
     fn default() -> Self {
@@ -264,6 +284,7 @@ impl Default for NetworkConfig {
             connect_timeout_secs: default_connect_timeout_secs(),
             read_timeout_secs: default_read_timeout_secs(),
             max_message_bytes: default_max_message_bytes(),
+            tcp_buffer_bytes: default_tcp_buffer_bytes(),
         }
     }
 }
@@ -613,6 +634,54 @@ impl ExchangeConfig {
     fn apply_env(&mut self, get: &dyn Fn(&str) -> Option<String>) {
         if let Some(v) = get("OXIDE_EXCHANGE_SETTLEMENT_OPERATOR") {
             self.settlement_operator = if v.is_empty() { None } else { Some(v) };
+        }
+    }
+}
+
+// ── Performance config ───────────────────────────────────────────
+
+/// Thread pinning / NUMA placement (hft-audit F-02).
+///
+/// Every field is `Option` and defaults off: unpinned is the safe
+/// default for dev machines and shared CI, and a pin that collides
+/// with another role's is strictly worse than no pin. Production
+/// deployments set disjoint cores per role — validation in
+/// `node::validate_effective_config` checks each configured core is
+/// inside the online set and `numa_node` exists under sysfs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PerformanceConfig {
+    /// Logical CPU the consensus pump thread pins to. The pump
+    /// serializes propose/vote/timeout handling for the BFT engine
+    /// — a single hot thread. `None` = unpinned.
+    #[serde(default)]
+    pub consensus_core: Option<u32>,
+
+    /// Logical CPU the executor commit lane pins to. Block
+    /// execution is one thread's hot loop; pinning stops
+    /// migrations that leave its cache working set cold.
+    /// `None` = unpinned.
+    #[serde(default)]
+    pub exec_lane_core: Option<u32>,
+
+    /// NUMA node the pinned threads are expected on — validated
+    /// against `/sys/devices/system/node/` at startup. Informational
+    /// only: all pinned roles should sit on this node's cores so
+    /// shared state stays node-local. `None` disables the check.
+    #[serde(default)]
+    pub numa_node: Option<u32>,
+}
+
+impl PerformanceConfig {
+    /// Apply overrides from `get` (the process env in production).
+    fn apply_env(&mut self, get: &dyn Fn(&str) -> Option<String>) {
+        if let Some(v) = get("OXIDE_PERFORMANCE_CONSENSUS_CORE") {
+            self.consensus_core = if v.is_empty() { None } else { v.parse().ok() };
+        }
+        if let Some(v) = get("OXIDE_PERFORMANCE_EXEC_LANE_CORE") {
+            self.exec_lane_core = if v.is_empty() { None } else { v.parse().ok() };
+        }
+        if let Some(v) = get("OXIDE_PERFORMANCE_NUMA_NODE") {
+            self.numa_node = if v.is_empty() { None } else { v.parse().ok() };
         }
     }
 }

@@ -21,6 +21,11 @@ metrics = { workspace = true }
 # storage: for the `Snapshot` type used by the Module trait's
 # `export_state`/`import_state` methods (full KV snapshot sync).
 storage = { workspace = true }
+# rayon: parallel secp256k1 recovery across batch intake — the
+# envelope-recovery pass in `ingest_tx_batch` fans the ~43µs/tx
+# recovery across cores (the EVM module's own preverify_batch uses
+# the same workspace-pinned version for the same reason).
+rayon = { workspace = true }
 
 [dev-dependencies]
 consensus = { workspace = true }

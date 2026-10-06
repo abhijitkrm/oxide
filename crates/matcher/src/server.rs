@@ -17,6 +17,20 @@
 //! a batch settlement transaction to consensus via the `TxSubmitter`
 //! trait. This is the bridge between off-chain matching and on-chain
 //! settlement.
+//!
+//! # Exposure posture (system-audit S3)
+//!
+//! Every listener in this file binds `127.0.0.1` as a hardcoded
+//! literal — **loopback-only by construction**, not by config.
+//! Order-entry traffic is plaintext, so the supported deployment for
+//! remote clients is a TLS-terminating proxy (nginx/haproxy/stunnel)
+//! on the same host forwarding to these ports; there is deliberately
+//! no flag that could widen the bind and expose unsigned-transport
+//! order flow to a network path. Orders are signature-authenticated
+//! end-to-end, so the residual plaintext risk is intent
+//! confidentiality (a passive observer on the host/network sees
+//! order flow) — the proxy keeps that surface off the wire.
+//! `docs/runbooks.md` carries the deployment shape.
 
 use crate::protocol::{
     OrderRequest, OrderResponse, RejectReason, decode_action_request, decode_request,
@@ -44,6 +58,11 @@ use trading::MarketConfig;
 /// requests than `num_rings` wait for a free ring rather than share
 /// one and consume each other's responses.
 ///
+/// `orders` is a slice (hft-audit F-14): the single-order callers
+/// borrow `std::slice::from_ref(&req)` — no `vec![req]` heap copy on
+/// the per-order fast path. The verified batch still allocates one
+/// `Vec` per exchange (amortized across the batch, not per order).
+///
 /// # Errors
 ///
 /// Returns a vector of `EngineError` rejections (one per order) if
@@ -53,7 +72,7 @@ use trading::MarketConfig;
 async fn submit_batch_ring(
     ring: &crate::RingMatcher,
     ring_counter: &std::sync::atomic::AtomicUsize,
-    orders: Vec<OrderRequest>,
+    orders: &[OrderRequest],
 ) -> Vec<OrderResponse> {
     // Authenticate on THIS transport thread: Ed25519 verification
     // parallelizes across connections, and the ring only accepts
@@ -72,7 +91,7 @@ async fn submit_batch_ring(
     // multiplication across the whole batch — ~3× cheaper per order
     // than per-item `verify_strict` at the batch sizes clients send.
     let chain_id = ring.chain_id();
-    for (i, item) in crate::protocol::VerifiedOrder::batch_with_chain_id(&orders, chain_id)
+    for (i, item) in crate::protocol::VerifiedOrder::batch_with_chain_id(orders, chain_id)
         .into_iter()
         .enumerate()
     {
@@ -113,23 +132,50 @@ async fn submit_batch_ring(
                 }
                 Err(crate::ring::PushError::Full(returned)) => {
                     pending = returned;
-                    tokio::task::yield_now().await;
+                    // Register interest BEFORE the re-push: a pop
+                    // landing between the failed push and the await
+                    // fires `space` — with the permit armed it is
+                    // observed; arming after the recheck would miss it
+                    // (F-15: Notify wait replaces `yield_now` spin).
+                    let notified = order_sender.space_notify().notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    match order_sender.push(pending) {
+                        Ok(()) => break true,
+                        Err(crate::ring::PushError::Disconnected(_)) => break false,
+                        Err(crate::ring::PushError::Full(back)) => {
+                            pending = back;
+                            notified.await;
+                        }
+                    }
                 }
             }
         };
         if sent {
+            let data = Arc::clone(response_receiver.data_notify());
             let worker_responses = loop {
                 if let Some(r) = response_receiver.pop() {
                     break Some(r);
                 }
-                // The response ring's senders live on the matcher
-                // thread — if it died mid-batch no response can ever
-                // arrive, so bail instead of holding the lease (and
-                // spinning) forever.
-                if !ring.worker_is_alive() {
+                // The response ring's sender lives on the matcher
+                // thread — if it died mid-batch (or severed the ring
+                // for liveness) no response can ever arrive, so bail
+                // instead of holding the lease forever. Then arm the
+                // data-notify and re-check so a response landing
+                // between the first pop and the arm is still caught.
+                if !ring.worker_is_alive() || response_receiver.producer_gone() {
                     break None;
                 }
-                tokio::task::yield_now().await;
+                let notified = data.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some(r) = response_receiver.pop() {
+                    break Some(r);
+                }
+                if !ring.worker_is_alive() || response_receiver.producer_gone() {
+                    break None;
+                }
+                notified.await;
             };
             if let Some(worker_responses) = worker_responses {
                 for (pos, resp) in positions.into_iter().zip(worker_responses) {
@@ -162,12 +208,14 @@ fn transport_chain_id(
 }
 
 /// Submit a single order through the ring matcher (batch of one).
+/// Borrows the request instead of `vec![req]`-copying it — the
+/// per-order fast path takes no allocation it does not need (F-14).
 async fn submit_one_ring(
     ring: &crate::RingMatcher,
     ring_counter: &std::sync::atomic::AtomicUsize,
     req: OrderRequest,
 ) -> OrderResponse {
-    let mut responses = submit_batch_ring(ring, ring_counter, vec![req]).await;
+    let mut responses = submit_batch_ring(ring, ring_counter, std::slice::from_ref(&req)).await;
     responses.pop().unwrap_or(OrderResponse::rejected(crate::protocol::RejectReason::EngineError))
 }
 
@@ -297,6 +345,8 @@ async fn run_binary_tcp_server_impl(
     ring_matcher: Option<Arc<crate::RingMatcher>>,
     ring_counter: Arc<std::sync::atomic::AtomicUsize>,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("binary TCP server listening on 127.0.0.1:{port}");
 
@@ -367,7 +417,7 @@ async fn handle_connection(
             // `BadSignature` in place, never a dropped or reordered
             // response.
             let responses: Vec<OrderResponse> = if let Some(rm) = &ring_matcher {
-                submit_batch_ring(rm, &ring_counter, orders).await
+                submit_batch_ring(rm, &ring_counter, &orders).await
             } else {
                 match matcher.inner.lock() {
                     Ok(mut server) => orders.iter().map(|req| server.submit_order(req)).collect(),
@@ -495,6 +545,8 @@ async fn run_jsonrpc_tcp_server_impl(
     ring_counter: Arc<std::sync::atomic::AtomicUsize>,
     port: u16,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("JSON-RPC server listening on 127.0.0.1:{port}");
 
@@ -628,6 +680,8 @@ async fn run_fix_server_impl(
     ring_counter: Arc<std::sync::atomic::AtomicUsize>,
     port: u16,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("FIX server listening on 127.0.0.1:{port}");
 
@@ -639,6 +693,10 @@ async fn run_fix_server_impl(
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf = vec![0u8; 4096];
+            // Per-connection ExecutionReport scratch (hft-audit
+            // F-16): cleared-and-reused each send, so the
+            // steady-state report path is allocation-free.
+            let mut report_buf = String::with_capacity(256);
             loop {
                 let n = match socket.read(&mut buf).await {
                     Ok(0) | Err(_) => break, // EOF or error.
@@ -680,8 +738,12 @@ async fn run_fix_server_impl(
                         // per message must never be wedged by a
                         // parse failure.
                         let resp = OrderResponse::rejected(RejectReason::Malformed);
-                        let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
-                        let _ = socket.write_all(report.as_bytes()).await;
+                        crate::fix::format_fix_execution_report_into(
+                            &resp,
+                            &cl_ord_id,
+                            &mut report_buf,
+                        );
+                        let _ = socket.write_all(report_buf.as_bytes()).await;
                         continue;
                     };
                     let action_chain_id = transport_chain_id(&matcher, ring_matcher.as_ref());
@@ -689,8 +751,12 @@ async fn run_fix_server_impl(
                         crate::protocol::VerifiedAction::with_chain_id(action_req, action_chain_id)
                     else {
                         let resp = OrderResponse::rejected(RejectReason::BadSignature);
-                        let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
-                        let _ = socket.write_all(report.as_bytes()).await;
+                        crate::fix::format_fix_execution_report_into(
+                            &resp,
+                            &cl_ord_id,
+                            &mut report_buf,
+                        );
+                        let _ = socket.write_all(report_buf.as_bytes()).await;
                         continue;
                     };
                     // Ship the proof token — the core runs the nonce
@@ -700,8 +766,12 @@ async fn run_fix_server_impl(
                     } else {
                         matcher.submit_verified_action(verified)
                     };
-                    let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
-                    let _ = socket.write_all(report.as_bytes()).await;
+                    crate::fix::format_fix_execution_report_into(
+                        &resp,
+                        &cl_ord_id,
+                        &mut report_buf,
+                    );
+                    let _ = socket.write_all(report_buf.as_bytes()).await;
                     continue;
                 }
 
@@ -713,8 +783,12 @@ async fn run_fix_server_impl(
                     // message must never be wedged by a parse
                     // failure.
                     let resp = OrderResponse::rejected(RejectReason::Malformed);
-                    let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
-                    let _ = socket.write_all(report.as_bytes()).await;
+                    crate::fix::format_fix_execution_report_into(
+                        &resp,
+                        &cl_ord_id,
+                        &mut report_buf,
+                    );
+                    let _ = socket.write_all(report_buf.as_bytes()).await;
                     continue;
                 };
                 // Submit to the matching server — through the SPSC
@@ -725,8 +799,8 @@ async fn run_fix_server_impl(
                     matcher.submit(&req)
                 };
                 // Format the FIX ExecutionReport.
-                let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
-                let _ = socket.write_all(report.as_bytes()).await;
+                crate::fix::format_fix_execution_report_into(&resp, &cl_ord_id, &mut report_buf);
+                let _ = socket.write_all(report_buf.as_bytes()).await;
             }
         });
     }
@@ -773,6 +847,8 @@ async fn run_websocket_server_impl(
     ring_counter: Arc<std::sync::atomic::AtomicUsize>,
     port: u16,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("WebSocket server listening on 127.0.0.1:{port}");
 
@@ -794,18 +870,25 @@ async fn run_websocket_server_impl(
 
             while let Some(msg_result) = ws_receiver.next().await {
                 let Ok(msg) = msg_result else { break };
-                let text = match msg {
-                    Message::Text(t) => t.to_string(),
-                    Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
+                // Borrowed frame bytes (hft-audit F-16): the match
+                // is on `&msg` so the Utf8Bytes backing `t` outlives
+                // the borrow — the old `.to_string()` allocated a
+                // copy of every inbound text message. Binary frames
+                // own their decode; order entry is text, so the
+                // borrow is what the hot path pays for.
+                let text: std::borrow::Cow<'_, str> = match &msg {
+                    Message::Text(t) => std::borrow::Cow::Borrowed(&**t),
+                    Message::Binary(b) => String::from_utf8_lossy(b),
                     Message::Close(_) => break,
                     _ => continue,
                 };
+                let text: &str = &text;
 
                 // Check if this is an action request (has "action" field)
                 // or a new order request.
                 if text.contains("\"action\"") {
                     // Parse as an order action (cancel/amend/replace).
-                    let Some(action_req) = crate::ws::parse_ws_action(&text) else {
+                    let Some(action_req) = crate::ws::parse_ws_action(text) else {
                         let _ = ws_sender
                             .send(Message::Text(r#"{"error":"invalid action"}"#.into()))
                             .await;
@@ -835,7 +918,7 @@ async fn run_websocket_server_impl(
                 }
 
                 // Parse the WebSocket order.
-                let Some(req) = crate::ws::parse_ws_order(&text) else {
+                let Some(req) = crate::ws::parse_ws_order(text) else {
                     let _ =
                         ws_sender.send(Message::Text(r#"{"error":"invalid order"}"#.into())).await;
                     continue;
@@ -890,14 +973,29 @@ pub struct ServerConfig {
     /// the key-derived address, which is what the exchange's
     /// `settlement_operator` gate must be configured with. `None`
     /// produces unsigned envelopes — accepted only under the
-    /// executor's `UnsignedTxPolicy::Allow` (devnet).
-    pub settlement_key: Option<[u8; 32]>,
+    /// executor's `UnsignedTxPolicy::Allow` (devnet). `Zeroizing`:
+    /// the key is a long-lived secret — wiped when the config drops.
+    pub settlement_key: Option<zeroize::Zeroizing<[u8; 32]>>,
     /// Durable checkpoint file for the settlement lane's
     /// `{next_nonce, pending}` state — survives restarts so an
     /// in-flight batch is resolved rather than forgotten. `None`
     /// keeps the memory-only behavior (a restart mid-flight then
     /// relies on the executor's `executed_nonce` resync).
     pub settlement_outbox: Option<std::path::PathBuf>,
+    /// Pre-trade risk thresholds for the matching workers
+    /// (`run_server_multi` only — the other entry points build the
+    /// matcher themselves and carry it there). Default:
+    /// venue-scale [`crate::RiskConfig::default`].
+    pub risk: crate::RiskConfig,
+    /// Logical CPU the sequencer thread pins to (hft-audit F-02).
+    /// `run_server_ring`/`run_server_multi` thread it into the
+    /// matcher; `None` runs unpinned. Validate against
+    /// `primitives::pin::online_cpus()` before launch.
+    pub sequencer_core: Option<u32>,
+    /// First logical CPU for per-market worker pins — worker `i`
+    /// lands on `base + i` (`run_server_multi` only). `None` runs
+    /// workers unpinned.
+    pub worker_base_core: Option<u32>,
 }
 
 impl Default for ServerConfig {
@@ -912,6 +1010,9 @@ impl Default for ServerConfig {
             nonce_state_path: None,
             settlement_key: None,
             settlement_outbox: None,
+            risk: crate::RiskConfig::default(),
+            sequencer_core: None,
+            worker_base_core: None,
         }
     }
 }
@@ -928,8 +1029,8 @@ fn build_settler(
 ) -> Arc<BatchSettler> {
     let mut settler =
         BatchSettler::new(sealer, submitter, confirmer, config.batch_interval_ms, sender, 0);
-    if let Some(key) = config.settlement_key {
-        settler = settler.with_signing(key, config.chain_id);
+    if let Some(key) = &config.settlement_key {
+        settler = settler.with_signing(**key, config.chain_id);
     }
     if let Some(path) = &config.settlement_outbox {
         settler = settler.with_outbox(path.clone());
@@ -1034,7 +1135,12 @@ pub async fn run_server_ring(
     sender: primitives::Address,
 ) {
     // The ring matcher owns the server (and thus the one book).
-    let ring = Arc::new(crate::RingMatcher::new(server, DEFAULT_RING_COUNT, DEFAULT_RING_CAPACITY));
+    let ring = Arc::new(crate::RingMatcher::new(
+        server,
+        DEFAULT_RING_COUNT,
+        DEFAULT_RING_CAPACITY,
+        config.sequencer_core,
+    ));
     // Shared lease-scan hint: every request across ALL protocols
     // starts its free-ring search at a different index, so load
     // spreads across rings. Response isolation comes from the
@@ -1155,6 +1261,8 @@ pub async fn run_binary_tcp_server_multi(
     matcher: Arc<crate::MultiMarketMatcher>,
     port: u16,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("binary TCP (multi-market) server listening on 127.0.0.1:{port}");
     loop {
@@ -1262,6 +1370,8 @@ pub async fn run_jsonrpc_tcp_server_multi(
     matcher: Arc<crate::MultiMarketMatcher>,
     port: u16,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("JSON-RPC (multi-market) server listening on 127.0.0.1:{port}");
     loop {
@@ -1339,6 +1449,8 @@ pub async fn run_fix_server_multi(
     matcher: Arc<crate::MultiMarketMatcher>,
     port: u16,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("FIX (multi-market) server listening on 127.0.0.1:{port}");
     loop {
@@ -1347,6 +1459,10 @@ pub async fn run_fix_server_multi(
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf = vec![0u8; 4096];
+            // Per-connection ExecutionReport scratch (hft-audit
+            // F-16): cleared-and-reused each send, so the
+            // steady-state report path is allocation-free.
+            let mut report_buf = String::with_capacity(256);
             loop {
                 let n = match socket.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
@@ -1376,8 +1492,12 @@ pub async fn run_fix_server_multi(
                         // per message must never be wedged by a
                         // parse failure.
                         let resp = OrderResponse::rejected(RejectReason::Malformed);
-                        let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
-                        let _ = socket.write_all(report.as_bytes()).await;
+                        crate::fix::format_fix_execution_report_into(
+                            &resp,
+                            &cl_ord_id,
+                            &mut report_buf,
+                        );
+                        let _ = socket.write_all(report_buf.as_bytes()).await;
                         continue;
                     };
                     let Some(verified) = crate::protocol::VerifiedAction::with_chain_id(
@@ -1385,15 +1505,23 @@ pub async fn run_fix_server_multi(
                         matcher.chain_id(),
                     ) else {
                         let resp = OrderResponse::rejected(RejectReason::BadSignature);
-                        let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
-                        let _ = socket.write_all(report.as_bytes()).await;
+                        crate::fix::format_fix_execution_report_into(
+                            &resp,
+                            &cl_ord_id,
+                            &mut report_buf,
+                        );
+                        let _ = socket.write_all(report_buf.as_bytes()).await;
                         continue;
                     };
                     // Ship the proof token — the market worker runs the
                     // nonce check + dispatch without re-verifying.
                     let resp = matcher.submit_verified_action(verified);
-                    let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
-                    let _ = socket.write_all(report.as_bytes()).await;
+                    crate::fix::format_fix_execution_report_into(
+                        &resp,
+                        &cl_ord_id,
+                        &mut report_buf,
+                    );
+                    let _ = socket.write_all(report_buf.as_bytes()).await;
                     continue;
                 }
                 let Some(req) = crate::fix::parse_fix_order(&text) else {
@@ -1403,13 +1531,17 @@ pub async fn run_fix_server_multi(
                     // message must never be wedged by a parse
                     // failure.
                     let resp = OrderResponse::rejected(RejectReason::Malformed);
-                    let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
-                    let _ = socket.write_all(report.as_bytes()).await;
+                    crate::fix::format_fix_execution_report_into(
+                        &resp,
+                        &cl_ord_id,
+                        &mut report_buf,
+                    );
+                    let _ = socket.write_all(report_buf.as_bytes()).await;
                     continue;
                 };
                 let resp = submit_one_multi(&matcher, req);
-                let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
-                let _ = socket.write_all(report.as_bytes()).await;
+                crate::fix::format_fix_execution_report_into(&resp, &cl_ord_id, &mut report_buf);
+                let _ = socket.write_all(report_buf.as_bytes()).await;
             }
         });
     }
@@ -1424,6 +1556,8 @@ pub async fn run_websocket_server_multi(
     matcher: Arc<crate::MultiMarketMatcher>,
     port: u16,
 ) -> std::io::Result<()> {
+    // S3: loopback is load-bearing — the literal is the policy
+    // (module docs). Never make the host configurable.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("WebSocket (multi-market) server listening on 127.0.0.1:{port}");
     loop {
@@ -1441,13 +1575,20 @@ pub async fn run_websocket_server_multi(
             let (mut ws_sender, mut ws_receiver) = ws_stream.split();
             while let Some(msg_result) = ws_receiver.next().await {
                 let Ok(msg) = msg_result else { break };
-                let text = match msg {
-                    Message::Text(t) => t.to_string(),
-                    Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
+                // Borrowed frame bytes (hft-audit F-16): the match
+                // is on `&msg` so the Utf8Bytes backing `t` outlives
+                // the borrow — the old `.to_string()` allocated a
+                // copy of every inbound text message. Binary frames
+                // own their decode; order entry is text, so the
+                // borrow is what the hot path pays for.
+                let text: std::borrow::Cow<'_, str> = match &msg {
+                    Message::Text(t) => std::borrow::Cow::Borrowed(&**t),
+                    Message::Binary(b) => String::from_utf8_lossy(b),
                     Message::Close(_) => break,
                     _ => continue,
                 };
-                let Some(req) = crate::ws::parse_ws_order(&text) else {
+                let text: &str = &text;
+                let Some(req) = crate::ws::parse_ws_order(text) else {
                     let _ =
                         ws_sender.send(Message::Text(r#"{"error":"invalid order"}"#.into())).await;
                     continue;
@@ -1491,6 +1632,8 @@ pub async fn run_server_multi(
         Arc::new(crate::wall_clock_ms),
         config.chain_id,
         config.nonce_state_path.clone(),
+        config.risk,
+        config.worker_base_core,
     ));
 
     // Batch settler seals from ALL markets via the control channel.

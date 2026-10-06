@@ -449,6 +449,7 @@ mod tests {
             proposer_signature: None,
             exec_cert: None,
             body_commitment: Hash([tag.wrapping_add(3); 32]),
+            body_hash: primitives::Hash::ZERO,
         };
         let child = BlockHeader {
             height: Height::new(height + 1),

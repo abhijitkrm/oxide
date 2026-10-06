@@ -102,6 +102,14 @@ impl Recorder {
         let ns = u64::try_from(duration.as_nanos().min(u128::from(MAX_LATENCY)))
             .expect("clamped to MAX_LATENCY which fits in u64");
         let mut histograms = self.histograms.lock().expect("metrics mutex not poisoned");
+        // `get_mut` first (hft-audit F-13): every call after the
+        // first hits an existing histogram, so `entry(op.to_string())`
+        // was allocating a `String` per record only to discard it.
+        // The `entry` path survives for the one-time miss.
+        if let Some(h) = histograms.get_mut(op) {
+            h.record(ns).expect("value within histogram bounds");
+            return;
+        }
         histograms
             .entry(op.to_string())
             .or_insert_with(|| {

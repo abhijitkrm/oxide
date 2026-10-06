@@ -25,6 +25,7 @@
 //!   input).
 
 use primitives::Address;
+use zeroize::Zeroizing;
 
 /// secp256k1 recovery and signing errors.
 ///
@@ -157,7 +158,10 @@ impl RecoverableSignature {
     /// # Errors
     ///
     /// Returns [`SecpError::InvalidSignature`] if `sig.len() != 64`.
-    /// Returns [`SecpError::InvalidRecoveryId`] if `recid > 3`.
+    /// Returns [`SecpError::InvalidRecoveryId`] if `recid > 1` —
+    /// Oxide accepts only the EIP-2/standard `{0, 1}` recovery IDs;
+    /// the 2/3 values exist in the secp256k1 library's encoding but
+    /// are never produced by a normal signature.
     pub fn from_bytes(sig: &[u8], recid: u8) -> Result<Self, SecpError> {
         if sig.len() != 64 {
             return Err(SecpError::InvalidSignature);
@@ -188,7 +192,8 @@ impl RecoverableSignature {
 ///
 /// Returns [`SecpError::InvalidSignature`] if the signature is
 /// malformed or does not verify.
-/// Returns [`SecpError::InvalidRecoveryId`] if `recid > 3`.
+/// Returns [`SecpError::InvalidRecoveryId`] if `recid > 1` — only
+/// the EIP-2-standard `{0, 1}` recovery IDs are accepted.
 /// Returns [`SecpError::InvalidMessageHashLen`] if `msg_hash.len() != 32`.
 ///
 /// # Performance
@@ -267,14 +272,19 @@ pub fn sign(privkey: &[u8], msg_hash: &[u8]) -> Result<RecoverableSignature, Sec
     if privkey.len() != 32 {
         return Err(SecpError::InvalidSignature);
     }
-    let mut key_arr = [0u8; 32];
+    // `key_arr` copies the caller's slice into owned memory — wrap in
+    // `Zeroizing` so the local copy is wiped on return, and erase the
+    // `secp256k1::SecretKey` explicitly (the type offers only manual
+    // `non_secure_erase`, not a zeroizing Drop).
+    let mut key_arr = Zeroizing::new([0u8; 32]);
     key_arr.copy_from_slice(privkey);
-    let secret =
-        secp256k1::SecretKey::from_byte_array(key_arr).map_err(|_| SecpError::InvalidSignature)?;
+    let mut secret =
+        secp256k1::SecretKey::from_byte_array(*key_arr).map_err(|_| SecpError::InvalidSignature)?;
     let mut hash_arr = [0u8; 32];
     hash_arr.copy_from_slice(msg_hash);
     let msg = secp256k1::Message::from_digest(hash_arr);
     let recoverable = secp256k1::SECP256K1.sign_ecdsa_recoverable(msg, &secret);
+    secret.non_secure_erase();
     let (recid, sig) = recoverable.serialize_compact();
     Ok(RecoverableSignature { sig, recid: RecoveryId::from_secp(recid) })
 }
@@ -295,10 +305,11 @@ pub fn signable_pubkey_address(privkey: &[u8]) -> Option<Address> {
     if privkey.len() != 32 {
         return None;
     }
-    let mut key_arr = [0u8; 32];
+    let mut key_arr = Zeroizing::new([0u8; 32]);
     key_arr.copy_from_slice(privkey);
-    let secret = secp256k1::SecretKey::from_byte_array(key_arr).ok()?;
+    let mut secret = secp256k1::SecretKey::from_byte_array(*key_arr).ok()?;
     let pubkey = secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &secret);
+    secret.non_secure_erase();
     let serialized = pubkey.serialize_uncompressed();
     let hash = keccak256(&serialized[1..65]);
     let mut addr = [0u8; 20];
@@ -364,10 +375,10 @@ pub fn is_test_identity_key(key: &[u8; 32]) -> bool {
 #[must_use]
 pub fn generate_secret_key() -> [u8; 32] {
     let mut rng = secp256k1::rand::rng();
-    let (secret, _pubkey) = secp256k1::SECP256K1.generate_keypair(&mut rng);
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&secret.secret_bytes());
-    key
+    let (mut secret, _pubkey) = secp256k1::SECP256K1.generate_keypair(&mut rng);
+    let key = Zeroizing::new(secret.secret_bytes());
+    secret.non_secure_erase();
+    *key
 }
 
 /// Generate a random private key for testing. Not for production use.

@@ -257,7 +257,18 @@ results.
 
 ### Status
 
-- `[ ]` Not started.
+- `[x]` Complete (2026-09-17 campaign, `5cf1b56`; expanded
+      2026-09-22, `171471c`). Every target soaked ≥10 min with
+      zero crashes (~100M+ execs on the fast targets); the
+      minimized corpus is committed under `fuzz/corpus/`;
+      `fuzz/README.md` records per-target input contracts and the
+      coverage snapshot; the nightly CI job fuzzes all targets at
+      10 min each. The campaign caught a real harness bug —
+      `journal-replay` wrote `0.log`, which `segment_files()`
+      ignores, so its coverage was vacuous — fixed and re-seeded.
+      Two targets added since the campaign: `exchange_settlement`
+      and `evm_parallel_differential` (serial≡batch≡parallel
+      state roots), bringing the suite to 11.
 
 ---
 
@@ -267,20 +278,61 @@ results.
 
 ### Acceptance criteria
 
-- [ ] Gas schedule: verify all opcodes in the active set match
-      reth's gas calculation.
-- [ ] Precompiles: verify sha256, ripemd160, modexp, ecadd, ecmul,
-      ecpairing, blake2f, pointevaluation.
-- [ ] Transaction types: legacy, 2930 (access list), 1559 (EIP-1559
-      fee), 4844 (blob) if claimed.
-- [ ] State transition: run reth's state transition tests against
+- [x] Gas schedule: verify all opcodes in the active set match
+      reth's gas calculation. (13,754 official expectations —
+      every passing post-state root encodes the fill's exact gas
+      accounting via sender balances.)
+- [x] Precompiles: verify sha256, ripemd160, modexp, ecadd, ecmul,
+      ecpairing, blake2f, pointevaluation. (revm's canonical
+      precompile set at each fork; corpus coverage minus the
+      excluded zk-stress directories, plus the hand vectors.)
+- [x] Transaction types: legacy, 2930 (access list), 1559 (EIP-1559
+      fee), 4844 (blob) if claimed — 4844 is not claimed; blob txs
+      are reported unsupported.
+- [x] State transition: run reth's state transition tests against
       Oxide's EVM module.
-- [ ] Document: pass rate, any divergences + root cause.
-- [ ] `cargo test` clean.
+- [x] Document: pass rate, any divergences + root cause.
+- [x] `cargo test` clean.
 
 ### Status
 
-- `[ ]` Not started.
+- `[~]` Substantially covered, now with the official suite wired.
+      `modules/evm/tests/official_state_tests.rs` drives the
+      `ethereum/tests` `GeneralStateTests` filled corpus (release
+      `fixtures_general_state_tests.tgz` @ c67e485; see
+      `modules/evm/tests/fixtures/state/MANIFEST.txt` for the
+      subset + refresh procedure) through the **production**
+      `EvmModule` path — sign → encode → decode → validate →
+      handle → `state_root` — re-signing fixture transactions at
+      `config.chainid` because upstream `txbytes` use unprotected
+      signatures Oxide rejects by design.
+      Result on the committed subset (1,548 files):
+      **13,754 expectations pass, 0 unexpected failures, 20
+      pinned known-divergences, 184 unsupported.**
+
+      Known divergences — all one class: **EIP-7610** (create over
+      an account with non-empty storage must throw). revm 42
+      implements only EIP-684 (nonce/code); the clause is absent
+      upstream too — reth declines to implement it and revm's own
+      statetest runner skips the same fixtures. On Oxide the
+      precondition is unreachable via transactions post-EIP-161
+      (storage writes require an initialized account, which has
+      nonce ≥ 1); only genesis injection can produce it — which is
+      what these fixtures do. The runner pins each divergent
+      expectation by test name; any divergence outside the pinned
+      set fails the gate.
+
+      Unsupported — counted, never silently dropped: 26 EIP-4844
+      blob transactions (type 0x03 not implemented) and 158
+      fixtures with pre-state balances above the module's u128
+      ledger representation.
+
+      Alongside the runner: 44 hand-crafted conformance vectors,
+      MPT state roots pinned to upstream alloy-trie reference
+      vectors, tx-type coverage across legacy/2930/1559/7702, and
+      `evm_parallel_differential` (serial≡batch≡parallel roots).
+      To read `[x]`: EIP-7610 support upstream or scheduled, plus
+      EIP-4844 or a documented deferral of blob transactions.
 
 ---
 
@@ -390,7 +442,14 @@ gates are complete and the operational runbooks are validated.
 
 **Gates completed:** 1 (networking), 2 (metrics), 3 (security
 review + fixes), 4 (sustained-throughput bench), 5 (fuzz soak),
-6 (EVM conformance), 7 (multi-host testnet).
+7 (multi-host testnet). Gate 6 (EVM conformance): the official
+`ethereum/tests` `GeneralStateTests` runner now drives the
+production EVM path — 13,754 expectations pass on the committed
+subset, zero unexpected divergences, 20 pinned EIP-7610
+(create-over-nonempty-storage) divergences matching revm/reth's
+own upstream position, 184 explicitly-unsupported entries
+(EIP-4844 blobs, >u128 balances). Full corpus coverage and an
+EIP-7610 decision are the residual.
 
 **Operational runbooks validated (2026-09-15):**
 

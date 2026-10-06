@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use node::Node;
 use ports::AppInterface;
+use zeroize::Zeroize;
 
 // Codec traits for encoding/decoding consensus messages.
 use codec::{Decode, Encode};
@@ -335,6 +336,28 @@ fn run_validator_node() {
         })
         .collect();
 
+    // `--evidence-key-file` wires the S1 equivocation pipeline:
+    // the engine detects double-signs in every build, but the
+    // records only become slashes once a funded secp256k1 account
+    // carries them on-chain. Absent the flag the node still detects
+    // (and logs what it declined to submit); a PUBLIC test-identity
+    // key is refused outright — its "signature" authenticates as an
+    // identity anyone can recompute, which would spam the evidence
+    // lane with envelopes anyone could have sent.
+    let evidence_reporter = node::cli::parse_cli_flag("--evidence-key-file").map(|path| {
+        let key = node::cli::load_secret_key_file(&path, node::cli::SecretKind::Secp256k1)
+            .unwrap_or_else(|e| panic!("invalid --evidence-key-file '{path}': {e}"));
+        if crypto::is_test_identity_key(&key) {
+            eprintln!(
+                "oxide-validator: --evidence-key-file is a public test-identity scalar — \
+                 a known key cannot authorize evidence submission"
+            );
+            std::process::exit(1);
+        }
+        node::validator_net::EvidenceReporter::new(key)
+            .unwrap_or_else(|| panic!("--evidence-key-file '{path}' is not a valid secp256k1 key"))
+    });
+
     node::validator_net::run(node::validator_net::ValidatorNetSpec {
         log_tag: "oxide-validator".to_string(),
         seat: usize::from(our_seat),
@@ -357,6 +380,7 @@ fn run_validator_node() {
         // A production validator never originates transactions —
         // injection is a devnet/test-harness surface.
         tx_inject: None,
+        evidence_reporter,
     });
 }
 
@@ -407,7 +431,7 @@ fn resolve_signer() -> Arc<dyn crypto::ConsensusSigner> {
         (Some(key_path), None) => {
             let key_bytes = node::cli::load_secret_key_file(&key_path, node::cli::SecretKind::Bls)
                 .unwrap_or_else(|e| panic!("invalid BLS key file {key_path}: {e}"));
-            let our_key = crypto::BlsSecretKey::from_bytes(&key_bytes)
+            let our_key = crypto::BlsSecretKey::from_bytes(&key_bytes[..])
                 .unwrap_or_else(|e| panic!("invalid BLS secret key in {key_path}: {e:?}"));
             Arc::new(our_key)
         }
@@ -431,7 +455,7 @@ fn resolve_signer() -> Arc<dyn crypto::ConsensusSigner> {
             let remote = node::remote_signer::RemoteSigner::connect(
                 &addr,
                 std::time::Duration::from_secs(5),
-                link_key,
+                *link_key,
             )
             .unwrap_or_else(|e| {
                 eprintln!("oxide-validator: cannot reach signer at {addr}: {e}");
@@ -718,33 +742,46 @@ fn handle_export_snapshot(node: &mut Node) -> bool {
 /// key rotation.
 fn handle_key_change(node: &mut Node, chain_id: u64) {
     if let Some(hex_key) = node::cli::parse_cli_flag("--submit-key-change") {
-        let secret_bytes = node::cli::hex_decode(&hex_key)
+        let mut hex_key = zeroize::Zeroizing::new(hex_key);
+        let mut secret_bytes = node::cli::hex_decode(&hex_key)
             .unwrap_or_else(|e| panic!("invalid BLS secret key hex: {e}"));
         let new_sk = crypto::BlsSecretKey::from_bytes(&secret_bytes)
             .unwrap_or_else(|e| panic!("invalid BLS secret key: {e:?}"));
+        // The secret now lives inside `blst`'s zeroize-on-drop key —
+        // wipe the decoded buffer and the argv hex copy.
+        secret_bytes.zeroize();
+        hex_key.zeroize();
         let new_key_bytes = new_sk.public_key().as_bytes().to_vec();
         let pop = new_sk.pop_prove();
 
         // The signer may come from argv (hex) or a file — the file
         // form accepts an encrypted OXKEY keystore, so the staking
         // key never has to sit on a command line.
-        let signer: [u8; 32] = if let Some(file) = node::cli::parse_cli_flag("--signer-key-file") {
-            node::cli::load_secret_key_file(&file, node::cli::SecretKind::Secp256k1)
-                .unwrap_or_else(|e| panic!("invalid --signer-key-file: {e}"))
-        } else if let Some(signer_hex) = node::cli::parse_cli_flag("--signer-key") {
-            let signer_bytes = node::cli::hex_decode(&signer_hex)
-                .unwrap_or_else(|e| panic!("invalid --signer-key hex: {e}"));
-            signer_bytes
-                .try_into()
-                .unwrap_or_else(|_| panic!("--signer-key must be 32 bytes (64 hex chars)"))
-        } else {
-            eprintln!(
-                "oxide-validator: --submit-key-change requires --signer-key <secp256k1-hex> or \
+        // The signer key travels in `Zeroizing` from whichever source
+        // produced it — argv hex and the decoded Vec are both wiped.
+        let signer: zeroize::Zeroizing<[u8; 32]> =
+            if let Some(file) = node::cli::parse_cli_flag("--signer-key-file") {
+                node::cli::load_secret_key_file(&file, node::cli::SecretKind::Secp256k1)
+                    .unwrap_or_else(|e| panic!("invalid --signer-key-file: {e}"))
+            } else if let Some(signer_hex) = node::cli::parse_cli_flag("--signer-key") {
+                let mut signer_hex = zeroize::Zeroizing::new(signer_hex);
+                let mut signer_bytes = node::cli::hex_decode(&signer_hex)
+                    .unwrap_or_else(|e| panic!("invalid --signer-key hex: {e}"));
+                let arr: [u8; 32] = signer_bytes
+                    .as_slice()
+                    .try_into()
+                    .unwrap_or_else(|_| panic!("--signer-key must be 32 bytes (64 hex chars)"));
+                signer_bytes.zeroize();
+                signer_hex.zeroize();
+                zeroize::Zeroizing::new(arr)
+            } else {
+                eprintln!(
+                    "oxide-validator: --submit-key-change requires --signer-key <secp256k1-hex> or \
                  --signer-key-file <path> (hex or OXKEY keystore) — the key-change tx must be \
                  signed by the staking account it rotates"
-            );
-            std::process::exit(1);
-        };
+                );
+                std::process::exit(1);
+            };
         if crypto::is_test_identity_key(&signer) {
             eprintln!(
                 "oxide-validator: --signer-key is a public test-identity scalar — a known key \
@@ -752,7 +789,7 @@ fn handle_key_change(node: &mut Node, chain_id: u64) {
             );
             std::process::exit(1);
         }
-        let validator_addr = crypto::signable_pubkey_address(&signer)
+        let validator_addr = crypto::signable_pubkey_address(&signer[..])
             .expect("--signer-key must be a valid secp256k1 secret");
 
         // The account's executed nonce — the tx must carry the
@@ -760,7 +797,7 @@ fn handle_key_change(node: &mut Node, chain_id: u64) {
         let nonce = node.app().executed_nonce_of(&validator_addr);
         let msg_payload = staking::msg::key_change(validator_addr, &new_key_bytes, pop.as_bytes());
         let tx = node::cli::build_signed_tx_with(
-            &signer,
+            &signer[..],
             validator_addr,
             chain_id,
             framework::module_id::STAKING,
@@ -1242,11 +1279,11 @@ fn run_signer_daemon(args: &[String]) {
     };
     let key_bytes = node::cli::load_secret_key_file(&key_path, node::cli::SecretKind::Bls)
         .unwrap_or_else(|e| panic!("invalid BLS key file {key_path}: {e}"));
-    let key = crypto::BlsSecretKey::from_bytes(&key_bytes)
+    let key = crypto::BlsSecretKey::from_bytes(&key_bytes[..])
         .unwrap_or_else(|e| panic!("invalid BLS secret key in {key_path}: {e:?}"));
     let link_key = node::cli::load_secret_key_file(&link_path, node::cli::SecretKind::Generic)
         .unwrap_or_else(|e| panic!("invalid link key file {link_path}: {e}"));
-    let daemon = node::remote_signer::SignerDaemon::new(key, PathBuf::from(&state_path), link_key)
+    let daemon = node::remote_signer::SignerDaemon::new(key, PathBuf::from(&state_path), *link_key)
         .unwrap_or_else(|e| panic!("cannot open signer state {state_path}: {e}"));
     let daemon = std::sync::Arc::new(daemon);
     let listener = std::net::TcpListener::bind(&listen)
@@ -1311,15 +1348,15 @@ fn run_keygen(args: &[String]) {
         (
             "secp256k1",
             crypto::keystore::KeyKind::Secp256k1,
-            key,
+            zeroize::Zeroizing::new(key),
             format!("address 0x{}", node::cli::hex_encode(&addr.0)),
         )
     } else {
         // BLS keygen is HKDF over an IKM — 32 OS-CSPRNG bytes in,
         // canonical scalar out (`--bls-key-file` reads this format).
-        let mut ikm = [0u8; 32];
-        crypto::fill_random(&mut ikm);
-        let key = crypto::BlsSecretKey::from_ikm(&ikm).expect("32-byte IKM always keygens");
+        let mut ikm = zeroize::Zeroizing::new([0u8; 32]);
+        crypto::fill_random(&mut ikm[..]);
+        let key = crypto::BlsSecretKey::from_ikm(&ikm[..]).expect("32-byte IKM always keygens");
         let pk = key.public_key();
         (
             "BLS12-381",
@@ -1345,7 +1382,7 @@ fn run_keygen(args: &[String]) {
             }
         }
     } else {
-        node::cli::hex_encode(&secret).into_bytes()
+        node::cli::hex_encode(&secret[..]).into_bytes()
     };
 
     if let Err(e) = write_secret_key_file(&output, &file_bytes) {

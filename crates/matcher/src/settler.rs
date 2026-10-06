@@ -16,6 +16,20 @@
 //! [`SettleReport`] — the off-chain cache already reflects fills at
 //! `seal_batch` time, so an unlanded envelope is divergence, never
 //! a no-op.
+//!
+//! # Exposure window (hft-audit F-19)
+//!
+//! Batch settlement is deliberate amortization: the fill→settlement
+//! window is the seal interval (default 100 ms) plus consensus
+//! inclusion, and during that window the venue carries under-
+//! settlement risk — fills are accounted off-chain before the chain
+//! confirms them. The bound on that risk is the pending-envelope
+//! budget (`MAX_PENDING_RETRIES` × interval ≈ 6 s of retry backlog,
+//! `RESUBMIT_AFTER_TICKS` ≈ 10 s of outcome wait): past those, the
+//! lane stays pending and the *operator* holds the exposure, not
+//! the code. Operators size `batch_interval_ms` against their risk
+//! envelope; the interval is a config value, not a protocol
+//! constant.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -271,8 +285,10 @@ pub(crate) fn aggregate_fills(
 /// exchange gates batch settlement on the declared sender matching
 /// the configured settlement operator.
 pub(crate) struct SigningConfig {
-    /// The operator's 32-byte secret key.
-    pub(crate) privkey: [u8; 32],
+    /// The operator's 32-byte secret key — `Zeroizing` so a dropped
+    /// or reconfigured settler doesn't leave the secret in freed
+    /// heap memory.
+    pub(crate) privkey: zeroize::Zeroizing<[u8; 32]>,
     /// EIP-712 chain ID bound into the signature.
     pub(crate) chain_id: u64,
 }
@@ -376,7 +392,7 @@ impl BatchSettler {
     pub fn with_signing(mut self, privkey: [u8; 32], chain_id: u64) -> Self {
         self.sender = crypto::secp::signable_pubkey_address(&privkey)
             .expect("settlement key must be a valid secp256k1 secret");
-        self.signing = Some(SigningConfig { privkey, chain_id });
+        self.signing = Some(SigningConfig { privkey: zeroize::Zeroizing::new(privkey), chain_id });
         self
     }
 
@@ -604,7 +620,7 @@ impl BatchSettler {
         envelope.extend_from_slice(&fee.to_le_bytes());
         if let Some(signing) = &self.signing {
             let sig = crypto::eip712::sign_tx(
-                &signing.privkey,
+                &signing.privkey[..],
                 signing.chain_id,
                 &self.sender,
                 nonce,

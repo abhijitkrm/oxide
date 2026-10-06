@@ -152,6 +152,7 @@ fn junk_proposal_frame(
         proposer_signature: None,
         exec_cert: None,
         body_commitment: primitives::Hash::ZERO,
+        body_hash: primitives::Hash::ZERO,
     };
     // Signed by key 9 — not a committee member. Well-formed, real
     // signing-hash coverage: the rejection lands inside BLS

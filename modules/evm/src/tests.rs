@@ -2200,9 +2200,20 @@ fn evm_envelope_claims_must_match_signed_tx() {
         ("wrong nonce", wrap_evm_tx_envelope(&signer, 5, gas_price, &rlp)),
         ("inflated fee", wrap_evm_tx_envelope(&signer, 0, u64::MAX, &rlp)),
     ];
-    for (what, envelope) in forged {
-        let ack = executor.ingest_tx(types::TxBytes::new(envelope));
+    // The single-tx path...
+    for (what, envelope) in &forged {
+        let ack = executor.ingest_tx(types::TxBytes::new(envelope.clone()));
         assert!(matches!(ack, types::MempoolAck::Rejected { .. }), "{what} must be rejected");
+    }
+    // ...and the batch intake path (parallel preverify, then
+    // `validate_preverified`) apply the same binding.
+    let acks = executor
+        .ingest_tx_batch(forged.iter().map(|(_, e)| types::TxBytes::new(e.clone())).collect());
+    for ((what, _), ack) in forged.iter().zip(&acks) {
+        assert!(
+            matches!(ack, types::MempoolAck::Rejected { .. }),
+            "{what} must be rejected on the batch path"
+        );
     }
     let honest = wrap_evm_tx_envelope(&signer, 0, gas_price, &rlp);
     assert!(matches!(executor.ingest_tx(types::TxBytes::new(honest)), types::MempoolAck::Accepted));
@@ -2627,7 +2638,7 @@ fn preverified_rejects_wrong_sender() {
     let wrong_addr = revm::primitives::Address::from_slice(&[0x99; 20]);
     let tampered: Vec<PreverifiedTx<'_>> = preverified
         .into_iter()
-        .map(|pv| PreverifiedTx { raw: pv.raw, sender: wrong_addr })
+        .map(|pv| PreverifiedTx { raw: pv.raw, sender: wrong_addr, verified_locally: false })
         .collect();
 
     // Execute: must reject the tampered sender.
@@ -2660,7 +2671,7 @@ fn preverified_parallel_rejects_wrong_sender() {
     let wrong_addr = revm::primitives::Address::from_slice(&[0x99; 20]);
     let tampered: Vec<PreverifiedTx<'_>> = preverified
         .into_iter()
-        .map(|pv| PreverifiedTx { raw: pv.raw, sender: wrong_addr })
+        .map(|pv| PreverifiedTx { raw: pv.raw, sender: wrong_addr, verified_locally: false })
         .collect();
 
     m.begin_block(Height::new(1));
@@ -3227,6 +3238,26 @@ fn call_read_returns_contract_output() {
     expected[31] = 0x2a;
     assert_eq!(out.output, expected, "eth_call must return the contract's data");
     assert!(out.gas_used > 21_000, "contract call costs more than a transfer");
+}
+
+#[test]
+fn pattern_shaped_contract_address_executes_code() {
+    // Regression: `run()` used to gate precompile dispatch on the
+    // syntactic `0x00..0OOXX` shape, so a contract at an unregistered
+    // pattern address (module 0xc0, op 0xde) was hijacked into the
+    // dispatcher and reverted. Dispatch must require membership in
+    // `NATIVE_PRECOMPILES` — caught by the official conformance suite.
+    let m = make_module();
+    let pattern_addr = Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0xde]);
+    m.genesis_insert_account(&pattern_addr, 0, 1, RETURN42_RUNTIME.to_vec(), Vec::new());
+    m.begin_block(Height::new(1));
+    let to = alloy_primitives_address(pattern_addr.0);
+    let out = m
+        .call_read(&call_req(to, &[]))
+        .expect("call to pattern-shaped contract address must succeed");
+    let mut expected = [0u8; 32];
+    expected[31] = 0x2a;
+    assert_eq!(out.output, expected, "contract code must run, not the precompile dispatcher");
 }
 
 #[test]
@@ -4301,6 +4332,42 @@ fn state_snapshot_round_trips() {
     assert_eq!(dst.state_root(), src.state_root());
     let oxide_recipient = primitives::Address(recipient.0.into());
     assert_eq!(dst.balance(&oxide_recipient), 1_000_000_000);
+}
+
+/// Regression pin for the checkpoint-replay break: a touched-but-
+/// empty account (zero-tip coinbase, drained selfdestruct
+/// beneficiary) is EIP-158 deleted — absent from the trie AND from
+/// durable state. If the serializer kept it while `state_root`
+/// filtered it, `inspect_state`'s recompute would include it and
+/// disagree with the module's claimed root — the executor would
+/// reject its own checkpoint and lose the snapshot at recovery.
+#[test]
+fn snapshot_omits_eip158_empty_accounts() {
+    use storage::Volatile;
+
+    let src = EvmModule::with_storage(1, 7, Box::new(Volatile::new()));
+    fund(&src, &Address([0x42; 20]));
+    // Committed alongside real state: the cache holds an account
+    // whose nonce, balance, and code are all empty.
+    let ghost = Address([0xEE; 20]);
+    src.genesis_insert_account(&ghost, 0, 0, Vec::new(), Vec::new());
+
+    let snapshot = Module::export_state(&src).expect("evm exports state");
+    let ghost_key = persist::account_key(&ghost);
+    assert!(
+        !snapshot.entries.iter().any(|(k, _)| *k == ghost_key),
+        "empty accounts are deleted state — never serialized"
+    );
+    // The verify recompute must agree with the live trie on what the
+    // account set is — this is the equality checkpoint recovery
+    // relies on when it imports `snapshot.bin`.
+    assert_eq!(Module::inspect_state(&src, &snapshot).unwrap(), src.state_root());
+
+    // Round-trip: the restored module has no ghost account.
+    let dst = EvmModule::with_storage(1, 7, Box::new(Volatile::new()));
+    Module::import_state(&dst, &snapshot).unwrap();
+    assert_eq!(dst.state_root(), src.state_root());
+    assert_eq!(dst.balance(&ghost), 0);
 }
 
 /// A tampered account balance still parses — inspection must

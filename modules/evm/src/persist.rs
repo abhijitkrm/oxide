@@ -159,6 +159,23 @@ pub(crate) struct DeserializedAccount {
     pub storage: Vec<(revm::primitives::U256, revm::primitives::U256)>,
 }
 
+impl DeserializedAccount {
+    /// EIP-161 "empty account" predicate, mirrored on the persisted
+    /// shape: zero nonce, zero balance, and an empty (or absent)
+    /// code hash. Storage does not count toward existence. The live
+    /// cache path uses revm's `AccountInfo::is_empty`, whose
+    /// `is_code_hash_empty_or_zero` accepts both `KECCAK_EMPTY` and
+    /// the zero hash — this predicate must agree with it exactly or
+    /// `inspect_state`'s recompute would diverge from `state_root`
+    /// on the same logical account set.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.nonce == 0
+            && self.balance.is_zero()
+            && (self.code_hash == revm::primitives::KECCAK_EMPTY
+                || self.code_hash == revm::primitives::B256::ZERO)
+    }
+}
+
 pub(crate) fn deserialize_account(data: &[u8]) -> Option<DeserializedAccount> {
     if data.len() < 76 {
         return None;
@@ -1043,6 +1060,16 @@ impl EvmModule {
     /// revm cached). Tombstones are not part of the state trie, so
     /// they must never serialize as live accounts.
     ///
+    /// `None` is also returned for EIP-158 *empty* accounts
+    /// (`AccountInfo::is_empty` — zero nonce, zero balance, empty
+    /// code). The state trie claims they do not exist, so the
+    /// serializer must agree with `state_root` on what "committed
+    /// state" is: persisting one would resurrect a deleted account
+    /// on reload, and exporting one would make `inspect_state`'s
+    /// filtered recompute disagree with the trie the snapshot
+    /// claims to prove. In the flush path `None` becomes a `Delete`
+    /// op — the backend drops the entry exactly as the trie does.
+    ///
     /// The blob layout is `persist::serialize_account`'s: balance,
     /// nonce, `code_hash`, code bytes, then storage slots sorted
     /// ascending by slot key. `DbAccount.storage` is a `U256Map`
@@ -1053,7 +1080,9 @@ impl EvmModule {
         db: &CacheDB<EmptyDB>,
     ) -> Option<Vec<u8>> {
         let account = db.cache.accounts.get(evm_addr)?;
-        if account.account_state == revm::database::AccountState::NotExisting {
+        if account.account_state == revm::database::AccountState::NotExisting
+            || account.info.is_empty()
+        {
             return None;
         }
         let code_bytes: Vec<u8> = if account.info.code_hash == revm::primitives::KECCAK_EMPTY {
@@ -1127,62 +1156,13 @@ impl EvmModule {
                 let Some(account) = persist::deserialize_account(value) else {
                     continue;
                 };
-                let evm_addr = alloy_primitives_address(oxide_addr.0);
-
-                // Insert account info into the cache.
-                let info = revm::database::state::AccountInfo {
-                    balance: account.balance,
-                    nonce: account.nonce,
-                    code_hash: account.code_hash,
-                    account_id: None,
-                    // revm's `Bytecode::default()` contains a STOP opcode,
-                    // which makes `is_empty()` return false and triggers
-                    // EIP-3607 `RejectCallerWithCode`. Use `new_raw` with
-                    // empty bytes to create a truly empty bytecode.
-                    code: if account.code.is_empty() {
-                        Some(revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::new()))
-                    } else {
-                        Some(revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::from_iter(
-                            account.code.iter().copied(),
-                        )))
-                    },
-                };
-                db.cache.accounts.insert(
-                    evm_addr,
-                    revm::database::DbAccount {
-                        info,
-                        // `None` = account exists in cache but EVM hasn't
-                        // interacted with it in this block. This is correct
-                        // for loaded state — revm will read storage from
-                        // the `DbAccount.storage` field. `StorageCleared`
-                        // would incorrectly zero out the storage.
-                        account_state: revm::database::AccountState::None,
-                        // Drop zero-valued slots on the way in —
-                        // blobs written before the sparse-storage
-                        // invariant may carry them; the committed
-                        // map must hold only nonzero entries.
-                        storage: account
-                            .storage
-                            .into_iter()
-                            .filter(|(_, value)| !value.is_zero())
-                            .collect(),
-                    },
-                );
-                // HIGH fix: also populate `cache.contracts` (the code
-                // hash → Bytecode map). revm looks up contract code by
-                // hash via `cache.contracts`, not via the account's
-                // `info.code` field. Without this, after a storage
-                // reload, the EVM can't find contract code by hash —
-                // calling a reloaded contract would behave as if it
-                // has no code (a silent no-op call).
-                if !account.code.is_empty() {
-                    db.cache.contracts.insert(
-                        account.code_hash,
-                        revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::from_iter(
-                            account.code.iter().copied(),
-                        )),
-                    );
+                // EIP-158: an empty account is deleted state — entries
+                // from a pre-filter binary or a foreign snapshot must
+                // not re-enter the cache as phantoms the root disproves.
+                if account.is_empty() {
+                    continue;
                 }
+                Self::install_loaded_account(db, alloy_primitives_address(oxide_addr.0), account);
             }
             drop(db_guard);
         }
@@ -1276,6 +1256,69 @@ impl EvmModule {
                     key: persist::state_version_key(),
                     value: new_version.to_le_bytes().to_vec(),
                 }],
+            );
+        }
+    }
+
+    /// Install one decoded account into the revm cache — the
+    /// per-entry body of `load_from_storage`, split out so the
+    /// range loop reads as decode → filter → install.
+    fn install_loaded_account(
+        db: &mut CacheDB<EmptyDB>,
+        evm_addr: revm::primitives::Address,
+        account: persist::DeserializedAccount,
+    ) {
+        let info = revm::database::state::AccountInfo {
+            balance: account.balance,
+            nonce: account.nonce,
+            code_hash: account.code_hash,
+            account_id: None,
+            // revm's `Bytecode::default()` contains a STOP opcode,
+            // which makes `is_empty()` return false and triggers
+            // EIP-3607 `RejectCallerWithCode`. Use `new_raw` with
+            // empty bytes to create a truly empty bytecode.
+            code: if account.code.is_empty() {
+                Some(revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::new()))
+            } else {
+                Some(revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::from_iter(
+                    account.code.iter().copied(),
+                )))
+            },
+        };
+        db.cache.accounts.insert(
+            evm_addr,
+            revm::database::DbAccount {
+                info,
+                // `None` = account exists in cache but EVM hasn't
+                // interacted with it in this block. This is correct
+                // for loaded state — revm will read storage from
+                // the `DbAccount.storage` field. `StorageCleared`
+                // would incorrectly zero out the storage.
+                account_state: revm::database::AccountState::None,
+                // Drop zero-valued slots on the way in —
+                // blobs written before the sparse-storage
+                // invariant may carry them; the committed
+                // map must hold only nonzero entries.
+                storage: account
+                    .storage
+                    .into_iter()
+                    .filter(|(_, value)| !value.is_zero())
+                    .collect(),
+            },
+        );
+        // HIGH fix: also populate `cache.contracts` (the code
+        // hash → Bytecode map). revm looks up contract code by
+        // hash via `cache.contracts`, not via the account's
+        // `info.code` field. Without this, after a storage
+        // reload, the EVM can't find contract code by hash —
+        // calling a reloaded contract would behave as if it
+        // has no code (a silent no-op call).
+        if !account.code.is_empty() {
+            db.cache.contracts.insert(
+                account.code_hash,
+                revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::from_iter(
+                    account.code.iter().copied(),
+                )),
             );
         }
     }

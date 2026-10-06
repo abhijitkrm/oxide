@@ -74,6 +74,10 @@ pub struct MultiNodeDevnet {
     engines: Vec<OxideBft>,
     /// One executor per validator (kept for post-run inspection).
     apps: Vec<Arc<Executor>>,
+    /// One staking module per validator — the instance the engine's
+    /// executor graph executes evidence/slashing txs against, kept
+    /// for post-run inspection of jail/stake effects (S1 tests).
+    staking_modules: Vec<Arc<staking::StakingModule>>,
     /// The shared validator set.
     validator_set: ValidatorSet,
     /// The BLS secret keys for each validator (used to sign timeout
@@ -130,6 +134,7 @@ impl MultiNodeDevnet {
 
         let mut engines = Vec::with_capacity(n);
         let mut apps = Vec::with_capacity(n);
+        let mut staking_modules = Vec::with_capacity(n);
         // One clock counter shared by every engine — see
         // `SIM_CLOCK_BASE_MS` for why a single source (not
         // per-engine counters) is required.
@@ -193,9 +198,10 @@ impl MultiNodeDevnet {
             .expect("devnet node assembles — deterministic keys are committee members");
             engines.push(node.engine);
             apps.push(node.app);
+            staking_modules.push(node.staking_module);
         }
 
-        Self { engines, apps, validator_set: vs, secret_keys, n, network: None }
+        Self { engines, apps, staking_modules, validator_set: vs, secret_keys, n, network: None }
     }
 
     /// The number of validators.
@@ -282,6 +288,17 @@ impl MultiNodeDevnet {
     pub fn app(&self, i: usize) -> &Executor {
         assert!(i < self.n, "validator index {i} out of range");
         &self.apps[i]
+    }
+
+    /// Access validator `i`'s staking module — the instance evidence
+    /// and slashing txs execute against on that replica.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i >= n`.
+    pub fn staking(&self, i: usize) -> &staking::StakingModule {
+        assert!(i < self.n, "validator index {i} out of range");
+        &self.staking_modules[i]
     }
 
     /// Run `rounds` consensus rounds, each with `txs_per_round`
@@ -583,9 +600,19 @@ impl MultiNodeDevnet {
         let leader_idx = usize::from(self.validator_set.leader(self.engines[0].current_view()));
 
         // Leader proposes.
-        let (header, proposal) = self.engines[leader_idx]
-            .propose()
-            .unwrap_or_else(|| panic!("leader {leader_idx} should propose"));
+        let (header, proposal) = self.engines[leader_idx].propose().unwrap_or_else(|| {
+            let e = &self.engines[leader_idx];
+            panic!(
+                "leader {leader_idx} should propose \
+                 (view={:?} next_height={} high_qc={:?} stored_blocks={} last_voted={:?} blocks={:?})",
+                e.current_view(),
+                e.next_height_value(),
+                e.high_qc().map(|q| q.view.value()),
+                e.stored_block_count(),
+                e.last_voted_view(),
+                e.debug_stored_blocks(),
+            )
+        });
 
         // Leader self-votes through the engine's single signing
         // path (C10): `vote()` records the vote locks and appends
@@ -979,6 +1006,118 @@ mod tests {
         // resubmitted to the new leader).
         let total_txs: usize = result.finalized[0].iter().map(|b| b.txs.len()).sum();
         assert_eq!(total_txs, 5, "all 5 txs must be finalized after recovery");
+    }
+
+    /// System-audit S1, end-to-end: an equivocating validator's two
+    /// conflicting signed votes are detected by an honest engine,
+    /// preserved as `DoubleSignEvidence`, submitted as a staking
+    /// `evidence` transaction, and the offender is jailed on every
+    /// replica. Before S1 the second signed vote was silently
+    /// dropped at the collection slot — detection existed, the
+    /// slash path did not.
+    #[test]
+    fn equivocation_evidence_slashes_offender() {
+        let mut devnet = MultiNodeDevnet::new(4, 10_000);
+        // Two rounds so every engine is mid-chain (view 2, executed
+        // state live) — evidence binds `(view, phase, epoch)`, and
+        // the signatures must verify against the offender's
+        // genesis-registered key.
+        devnet.run(2);
+        let offender_idx: usize = 3;
+        let observer_idx: usize = 0;
+        let view = devnet.engines()[observer_idx].current_view();
+        let epoch = devnet.engines()[observer_idx].epoch();
+
+        // Stage the real proposal the offense lives on: the honest
+        // leader's block at the current view. The first collected
+        // vote must name a stored block at the vote's view (the
+        // phantom guard), so the equivocating first vote needs a
+        // real proposal behind it — which is what an actual
+        // equivocation looks like anyway: both positions existed.
+        let leader_idx = usize::from(devnet.validator_set().leader(view));
+        let (header_a, proposal_a) = devnet.engines_mut()[leader_idx]
+            .propose_heartbeat()
+            .expect("current leader heartbeat-proposes at the test view");
+        let hash_a = OxideBft::block_hash(&header_a);
+        assert!(
+            devnet.engines_mut()[observer_idx].admit_proposal(&header_a, &proposal_a),
+            "observer stores the leader's real proposal"
+        );
+        // The offender signs two votes at the same (view, phase)
+        // for different blocks — the slashable offense. Signed with
+        // its real key: the staking module's verification must see
+        // authentic BLS signatures or the proof rejects.
+        let hash_b = primitives::Hash([0x22; 32]);
+        let make_vote = |hash: primitives::Hash| {
+            let msg = devnet.engines()[observer_idx].vote_signing_message(
+                view,
+                types::VotePhase::Prepare as u8,
+                &hash,
+            );
+            types::Vote {
+                view,
+                phase: types::VotePhase::Prepare,
+                block_hash: hash,
+                signature: devnet.secret_key(offender_idx).sign(crypto::hash::Domain::Vote, &msg),
+                attestation: None,
+                attestation_sig: None,
+            }
+        };
+        let vote_a = make_vote(hash_a);
+        let vote_b = make_vote(hash_b);
+
+        // Both reach the honest observer's collector — the first is
+        // buffered, the second is the preserved conflict.
+        let observer = &mut devnet.engines_mut()[observer_idx];
+        let offender_voter = u16::try_from(offender_idx).unwrap_or(0);
+        observer.collect_vote(offender_voter, vote_a).expect("first signed vote collects");
+        observer
+            .collect_vote(offender_voter, vote_b)
+            .expect("conflicting vote drops without error");
+        let evidence = observer.take_evidence();
+        assert_eq!(evidence.len(), 1, "engine must emit one evidence record");
+        let ev = &evidence[0];
+        assert_eq!(ev.validator, txs::identity_addr(u8::try_from(offender_idx).unwrap_or(0)));
+        assert_eq!(ev.epoch, epoch);
+
+        // Report it: validator 0's own funded identity carries the
+        // permissionless evidence envelope (the module ignores
+        // `ctx.sender` — the vote signatures are the proof).
+        let payload = staking::msg::evidence(
+            ev.validator,
+            ev.view.value(),
+            ev.phase as u8,
+            ev.epoch.value(),
+            ev.first_block_hash.as_bytes(),
+            ev.first_signature.as_bytes(),
+            ev.second_block_hash.as_bytes(),
+            ev.second_signature.as_bytes(),
+        );
+        let reporter = txs::identity_addr(0);
+        let nonce = devnet.app(0).executed_nonce_of(&reporter);
+        let tx = txs::signed_tx(0, nonce, 100, framework::module_id::STAKING, &payload);
+        let leader = usize::from(devnet.validator_set().leader(view));
+        devnet.engines_mut()[leader].submit_tx(tx);
+
+        // Drive the chain: the evidence tx must be proposed,
+        // executed, and committed (2-chain lag — a few rounds).
+        devnet.run(4);
+
+        // The offender is jailed on EVERY replica — deterministic
+        // execution means the slash either lands everywhere or the
+        // replicas diverged.
+        let offender = txs::identity_addr(u8::try_from(offender_idx).unwrap_or(0));
+        for i in 0..devnet.n() {
+            assert!(
+                devnet.staking(i).is_jailed(&offender),
+                "validator {i}: offender must be jailed after evidence"
+            );
+            assert_eq!(
+                devnet.staking(i).power(&offender),
+                0,
+                "validator {i}: jailed offender holds no voting power"
+            );
+        }
     }
 
     /// Fault injection: kill the leader at round 0 (the very first

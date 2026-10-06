@@ -90,6 +90,93 @@ impl<K: Ord, V> InsertRetained<K, V> for BTreeMap<K, V> {
     }
 }
 
+/// The machine-readable class of a module rejection.
+///
+/// `ModuleRejected` used to carry only a free-form string, which made
+/// every semantic distinction — insufficient funds vs missing market
+/// vs wrong owner — unmatchable without string parsing. The category
+/// is the stable half admission, verdict, and RPC paths may branch on;
+/// the human `detail` remains for logs and error messages.
+///
+/// Distinction that matters to callers: `InsufficientFunds`,
+/// `Unauthorized`, `NotFound`, `InvalidInput`, and `Precondition` are
+/// *user-actionable* transaction rejections (the operation failed; the
+/// tx still consumed its nonce and fee like an EVM revert).
+/// `Internal` marks a module-side invariant or wiring break — those
+/// warrant operator attention, not user retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectCategory {
+    /// A balance, escrow, margin, or fee check failed — the account
+    /// could not cover the required amount.
+    InsufficientFunds,
+    /// The sender lacks authority for the operation: not the object
+    /// owner, not the operator, not a committee member, bad signer.
+    Unauthorized,
+    /// A referenced object does not exist: market, order, validator,
+    /// proposal, delegation, account.
+    NotFound,
+    /// The message itself is invalid for this module regardless of
+    /// state: zero amount, out-of-range value, malformed argument.
+    InvalidInput,
+    /// The object exists but state forbids the operation right now:
+    /// already exists, wrong phase, halted or paused, registry full.
+    /// Typically retryable only after state changes.
+    Precondition,
+    /// The module's own state path failed mid-handler — a wiring or
+    /// invariant break (refund failed, engine returned an internal
+    /// error), not user error. Investigate, don't retry.
+    Internal,
+    /// The rejection doesn't fit a narrower category.
+    Other,
+}
+
+impl std::fmt::Display for RejectCategory {
+    /// The stable lowercase token used when the category prefixes a
+    /// rejection reason at wire seams (e.g. `insufficient_funds: …`).
+    /// Treat as an API surface — match tokens are never renamed
+    /// without a versioned change.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let token = match self {
+            RejectCategory::InsufficientFunds => "insufficient_funds",
+            RejectCategory::Unauthorized => "unauthorized",
+            RejectCategory::NotFound => "not_found",
+            RejectCategory::InvalidInput => "invalid_input",
+            RejectCategory::Precondition => "precondition",
+            RejectCategory::Internal => "internal",
+            RejectCategory::Other => "rejected",
+        };
+        f.write_str(token)
+    }
+}
+
+/// A module's rejection of a well-formed message: a typed
+/// [`RejectCategory`] for machines plus a human-readable `detail`
+/// for logs, verdicts, and RPC reason strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleRejection {
+    /// Stable classification — safe to branch on.
+    pub category: RejectCategory,
+    /// Human-readable context (which market, which balance). Not a
+    /// stable API: match on `category`, never on this string.
+    pub detail: String,
+}
+
+impl ModuleRejection {
+    /// A rejection in `category` with a human-readable `detail`.
+    pub fn new(category: RejectCategory, detail: impl Into<String>) -> Self {
+        Self { category, detail: detail.into() }
+    }
+}
+
+impl std::fmt::Display for ModuleRejection {
+    /// Renders `"category: detail"`. At the mempool/RPC seams the
+    /// category token is a stable prefix clients may match on; the
+    /// detail stays free-form.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.category, self.detail)
+    }
+}
+
 /// A module execution error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecError {
@@ -97,11 +184,44 @@ pub enum ExecError {
     Malformed,
     /// The module is not registered.
     UnknownModule(u8),
-    /// The module rejected the message.
-    ModuleRejected(String),
+    /// The module rejected the message. Carries a typed
+    /// [`RejectCategory`] so admission and RPC paths classify
+    /// without string-matching.
+    ModuleRejected(ModuleRejection),
     /// Insufficient gas.
     OutOfGas,
 }
+
+impl ExecError {
+    /// Shorthand constructor for a [`RejectCategory`]-typed module
+    /// rejection — keeps handler call sites one line.
+    pub fn rejected(category: RejectCategory, detail: impl Into<String>) -> Self {
+        Self::ModuleRejected(ModuleRejection::new(category, detail))
+    }
+
+    /// The rejection category, if this is a module rejection.
+    /// Executor-internal variants (`Malformed`, `UnknownModule`,
+    /// `OutOfGas`) are pre-module failures with no module category.
+    pub fn rejection_category(&self) -> Option<RejectCategory> {
+        match self {
+            ExecError::ModuleRejected(r) => Some(r.category),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ExecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecError::Malformed => f.write_str("malformed transaction"),
+            ExecError::UnknownModule(id) => write!(f, "unknown module {id}"),
+            ExecError::ModuleRejected(r) => write!(f, "{r}"),
+            ExecError::OutOfGas => f.write_str("out of gas"),
+        }
+    }
+}
+
+impl std::error::Error for ExecError {}
 
 /// A point-in-time snapshot of the executor's state (plan.md §8).
 ///
@@ -638,15 +758,20 @@ pub struct TxContext {
 /// The sender is recovered from the transaction's signature at
 /// mempool ingestion time (via `Module::preverify_batch`). The
 /// execution layer trusts this sender without re-verifying —
-/// skipping secp256k1 recovery on the block execution hot path.
+/// skipping secp256k1 recovery on the block execution hot path —
+/// but ONLY when [`PreverifiedTx::verified_locally`] proves the
+/// sender came from this node's own ingest recovery (hft-audit
+/// F-06).
 ///
 /// # Security
 ///
 /// The pre-recovered sender must come from a trusted source (the
-/// local mempool's `preverify_batch` call). A byzantine proposer
-/// could provide wrong senders, but this is detectable by state
-/// root comparison across validators. For production multi-validator
-/// deployment, pair this with verification sampling.
+/// local mempool's `preverify_batch` call). `verified_locally` is
+/// the load-bearing flag: it is set only where the cache key — a
+/// `Domain::Transaction` hash computed locally over these exact
+/// bytes — proves this node ran the recovery. A `false` flag keeps
+/// the module's recover-and-compare gate, so a fabricated sender
+/// from any other caller is still rejected.
 #[derive(Debug, Clone)]
 pub struct PreverifiedTx<'a> {
     /// The raw module payload bytes (e.g. RLP-encoded signed EVM tx),
@@ -655,6 +780,18 @@ pub struct PreverifiedTx<'a> {
     pub raw: &'a [u8],
     /// The sender recovered from the signature (20 bytes).
     pub sender: [u8; 20],
+    /// Provenance token for `sender` (hft-audit F-06): `true` iff the
+    /// sender came from THIS node's own ingest-time recovery — the
+    /// executor's preverify-cache drain is the only code that sets
+    /// it, and only when the cache key (a locally-computed
+    /// `Domain::Transaction` hash of `raw`) proves these exact bytes
+    /// were verified here. Consumers may then trust `sender` and
+    /// skip the ~30 µs secp256k1 recovery; every other caller must
+    /// leave it `false`, which keeps the module's defensive
+    /// recover-and-compare gate. Setting it on an unverified sender
+    /// silently misattributes execution — that is an in-process
+    /// contract violation, exactly like fabricating `sender` itself.
+    pub verified_locally: bool,
 }
 
 /// A module: a Cosmos-SDK-style state machine that handles messages.
@@ -724,37 +861,36 @@ pub trait Module: Send + Sync {
         Ok(())
     }
 
-    /// Validate a message whose sender has already been
-    /// cryptographically authenticated at admission — the sender
-    /// recovered by [`preverify_batch`](Self::preverify_batch) for
-    /// self-authenticating modules, or the envelope-verified
-    /// `ctx.sender` for signature-on-envelope modules.
+    /// Validate a message for mempool admission with the sender
+    /// already recovered by [`preverify_batch`](Self::preverify_batch).
     ///
-    /// This exists so admission pays signature recovery **once**:
-    /// a module that recovers a signer inside `validate` (the EVM —
-    /// its payload carries the secp256k1 signature) would otherwise
-    /// recover it again when the executor calls `preverify_batch`
-    /// for the cache — ~30 µs/tx duplicated on the caller's thread.
-    /// The override contract: run every `validate` gate except the
-    /// signature/recovery step, substituting `sender` for the
-    /// internally-recovered value. `sender` is trustworthy — it was
-    /// produced by this node's own `preverify_batch` of these exact
-    /// `msg` bytes, never by the peer.
+    /// Why this exists: the EVM's `validate` and `preverify_batch`
+    /// both decode the RLP and recover the secp256k1 sender — the
+    /// two most expensive per-tx intake operations, paid TWICE per
+    /// tx on the old path (~90µs/tx intake measured, of which ~32µs
+    /// was the duplicated recovery+decode). Batch intake now runs
+    /// `preverify_batch` once per module group (parallel across the
+    /// batch) and hands each result here, so the recovery is paid
+    /// exactly once.
     ///
-    /// The default forwards to [`validate`](Self::validate) and
-    /// ignores `sender`, preserving behavior for modules that do no
-    /// in-`validate` recovery.
+    /// The contract is `validate`'s, with one addition: when
+    /// `preverified` carries a sender, the module MUST NOT recover
+    /// again — the preverify pass already authenticated the payload
+    /// signature for these exact bytes. `None` means no preverify
+    /// ran (single-tx path on a module without pre-verification);
+    /// the default delegates to `validate`, so modules that don't
+    /// override this behave exactly as before.
     ///
     /// # Errors
     ///
     /// Same contract as [`validate`](Self::validate).
-    fn validate_authenticated(
+    fn validate_preverified(
         &self,
         ctx: &TxContext,
         msg: &[u8],
-        sender: &[u8; 20],
+        preverified: Option<&PreverifiedTx<'_>>,
     ) -> Result<(), ExecError> {
-        let _ = sender;
+        let _ = preverified;
         self.validate(ctx, msg)
     }
 
@@ -815,7 +951,9 @@ pub trait Module: Send + Sync {
         &self,
         msgs: &'a [&'a [u8]],
     ) -> Vec<Result<PreverifiedTx<'a>, ExecError>> {
-        msgs.iter().map(|raw| Ok(PreverifiedTx { raw, sender: [0u8; 20] })).collect()
+        msgs.iter()
+            .map(|raw| Ok(PreverifiedTx { raw, sender: [0u8; 20], verified_locally: false }))
+            .collect()
     }
 
     /// Execute a batch of transactions with pre-recovered senders.
@@ -950,10 +1088,13 @@ pub trait Module: Send + Sync {
     /// downgrade) or the transform itself fails.
     fn migrate(&self, from: u32) -> Result<u32, ExecError> {
         if from > self.state_version() {
-            return Err(ExecError::ModuleRejected(format!(
-                "state version {from} is newer than module's declared {}",
-                self.state_version()
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                format!(
+                    "state version {from} is newer than module's declared {}",
+                    self.state_version()
+                ),
+            ));
         }
         Ok(self.state_version())
     }
@@ -1285,7 +1426,11 @@ pub enum TxOutcome {
     /// partially succeeded.
     Executed {
         /// Events the module emitted for this tx (empty on `Err`).
-        events: Vec<Event>,
+        /// `Arc`-shared with the block event log (hft-audit F-08):
+        /// the outcome store and `Executor::events` hold the same
+        /// allocation — recording a result bumps a refcount instead
+        /// of deep-copying every event the tx emitted.
+        events: std::sync::Arc<[Event]>,
         /// The module's rejection, if it returned `Err`.
         error: Option<String>,
     },
@@ -1564,6 +1709,23 @@ pub struct Executor {
     /// 2 KiB on 64-bit) is negligible and the lookup is a single
     /// indexed load.
     modules: [Option<Arc<dyn Module>>; 256],
+    /// The batch intake's dedicated rayon pool.
+    ///
+    /// Why a separate pool: the async execution lane executes
+    /// committed blocks on the GLOBAL pool in the background. With
+    /// one shared pool, the intake's parallel recovery queued
+    /// behind the lane's execution tasks — measured in the 100k-tx
+    /// EVM load test, the intake's recover phase collapsed from
+    /// ~10.6µs/tx (lane idle) to 39-60µs/tx (lane executing the
+    /// commit backlog), halving chain throughput exactly when the
+    /// pipeline reached steady state. Two pools time-share the
+    /// cores instead of queueing: intake tasks start immediately
+    /// on their own threads while the lane executes. `install`
+    /// also captures nested `par_iter`s (the EVM's preverify) onto
+    /// this pool. `None` = pool construction failed; the intake
+    /// falls back to the global pool (correctness never depends on
+    /// the split — it is a latency property).
+    intake_pool: Option<rayon::ThreadPool>,
     /// The mempool (owned, so the executor is the app's intake).
     /// Behind `Mutex` because `AppInterface` methods take `&self`.
     mempool: Mutex<mempool::Mempool>,
@@ -1588,7 +1750,10 @@ pub struct Executor {
     /// blocking callers that attest a height the lane never saw.
     exec_sync: std::sync::Arc<(Mutex<ExecSync>, std::sync::Condvar)>,
     /// Pending events from the current block (cleared each block).
-    events: Mutex<Vec<Event>>,
+    /// Each entry is the `Arc<[Event]>` of one tx (or one module's
+    /// `end_block` output) — shared with the tx's [`TxOutcome`] so
+    /// the block log never deep-copies event payloads (F-08).
+    events: Mutex<Vec<std::sync::Arc<[Event]>>>,
     /// Pre-recovered senders, keyed by tx hash. Populated at
     /// `ingest_tx` time via `Module::preverify_batch`. Consumed at
     /// `execute_block` time to skip secp256k1 recovery on the
@@ -1602,7 +1767,7 @@ pub struct Executor {
     /// Only the recovered `sender` is stored — the payload bytes are
     /// re-borrowed from the block's tx at execution time, so no
     /// per-tx `Vec<u8>` is ever cloned into or out of this cache.
-    preverify_cache: Mutex<HashMap<Hash, [u8; 20]>>,
+    preverify_cache: Mutex<primitives::digest_map::DigestMap<[u8; 20]>>,
     /// Minimum batch size to use the parallel speculative execution
     /// path. Configurable via [`Executor::with_config`]. Default:
     /// [`DEFAULT_PARALLEL_THRESHOLD`] (32 txs). Lowered from 100
@@ -1694,6 +1859,13 @@ pub struct Executor {
     /// `None` = in-memory only (tests, sims, and throwaway nodes);
     /// nodes configured with a data directory always install it.
     durability: Option<durability::Durability>,
+    /// Logical CPU the exec lane pins to (`hft-audit` F-02) — the
+    /// whole finalized-block → state-root path runs on one thread,
+    /// so keeping it resident on one core stops cache thrash from
+    /// migrations. `None` = unpinned (default; dev/test never set
+    /// it). Validation (core in the online set) happens at config
+    /// load, not here.
+    exec_lane_core: Option<u32>,
 }
 
 mod app_iface;
@@ -1720,9 +1892,22 @@ impl Executor {
     ///   parallel speculative execution path. Below this threshold,
     ///   serial execution is used.
     pub fn with_config(max_mempool_entries: usize, parallel_threshold: usize) -> Self {
-        let (intake_tx, intake_rx) = std::sync::mpsc::sync_channel(10_000);
+        // The intake ring is the mempool's staging buffer — bounded
+        // by the same admission budget. A fixed 10k slot ring
+        // thrashed at large blocks: a 10k-tx round filled it exactly,
+        // so every subsequent round's submission bounced off the
+        // full ring and retried (measured: submit phase doubled at
+        // 10k txs/round in the EVM load test). Ring capacity =
+        // mempool capacity keeps `submit_ahead` rounds of headroom
+        // honest: the ring can always hold what the pool can.
+        let (intake_tx, intake_rx) = std::sync::mpsc::sync_channel(max_mempool_entries);
+        let intake_pool = rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("oxide-intake-{i}"))
+            .build()
+            .ok();
         Self {
             modules: std::array::from_fn(|_| None),
+            intake_pool,
             mempool: Mutex::new(mempool::Mempool::new(max_mempool_entries)),
             finalized: Mutex::new(BTreeMap::new()),
             state_roots: Mutex::new(BTreeMap::new()),
@@ -1742,7 +1927,7 @@ impl Executor {
             )),
             events: Mutex::new(Vec::new()),
             tx_outcomes: Mutex::new(TxOutcomeStore::default()),
-            preverify_cache: Mutex::new(HashMap::new()),
+            preverify_cache: Mutex::new(primitives::digest_map::DigestMap::default()),
             parallel_threshold,
             recorder: None,
             mempool_intake_tx: intake_tx,
@@ -1758,6 +1943,7 @@ impl Executor {
             unsigned_tx_policy: UnsignedTxPolicy::Reject,
             history_retention: MAX_RETAINED_HISTORY,
             durability: None,
+            exec_lane_core: None,
         }
     }
 
@@ -1771,6 +1957,20 @@ impl Executor {
     #[must_use]
     pub fn with_chain_id(mut self, chain_id: u64) -> Self {
         self.chain_id = chain_id;
+        self
+    }
+
+    /// Pin the exec lane to logical CPU `core` (hft-audit F-02).
+    ///
+    /// The lane is the single writer for block execution → state
+    /// attestation; pinning stops the scheduler migrating it between
+    /// cores (cold L1/L2 on every hop). A failed pin logs and the
+    /// lane runs unpinned — locality is a latency property, never a
+    /// correctness one. Validate `core` against
+    /// `primitives::pin::online_cpus()` at config time.
+    #[must_use]
+    pub fn with_exec_lane_pin(mut self, core: Option<u32>) -> Self {
+        self.exec_lane_core = core;
         self
     }
 
@@ -2042,12 +2242,26 @@ struct AcceptedTx {
     /// a pool rejection must be written back to. `accepted_txs` is
     /// filtered, so its own position cannot stand in for this.
     result_idx: usize,
-    /// The preverified `(tx_hash, sender)` pair to cache once the
-    /// pool admits the tx — `None` for admitted-unsigned txs with
-    /// no authenticated sender.
-    cacheable: Option<(Hash, [u8; 20])>,
-    /// The transaction itself.
-    tx: TxBytes,
+    /// The tx's index into the caller's `Vec<TxBytes>` — the tx is
+    /// moved into the pool only after every borrow into the batch
+    /// (payload slices in the preverify results) is dead.
+    tx_idx: usize,
+    /// The tx's BLAKE3 hash — computed in the intake's parallel
+    /// phase; the mempool's dedup and the preverify cache reuse it
+    /// instead of re-hashing.
+    hash: Hash,
+    /// Envelope fields for the mempool's indices — parsed once at
+    /// routing, reused at insert (`submit_prepared`).
+    sender: Address,
+    nonce: u64,
+    fee: u64,
+    /// The target module's gas estimate — the proposal gas-cap loop
+    /// reads it from the pool entry instead of re-estimating.
+    gas: u64,
+    /// The authenticated sender to cache in the preverify map once
+    /// the pool admits the tx — `None` for admitted-unsigned txs
+    /// with no authenticated sender.
+    cache_sender: Option<[u8; 20]>,
 }
 
 #[cfg(test)]

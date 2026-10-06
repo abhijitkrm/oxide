@@ -42,6 +42,9 @@
 //!     block_budget: types::CHAIN_BLOCK_BUDGET,
 //!     base_timeout_ms: 2_000,
 //!     max_timeout_ms: 30_000,
+//!     consensus_core: None,
+//!     exec_lane_core: None,
+//!     numa_node: None,
 //! };
 //! let mut node = Node::assemble(&config);
 //! // Drive consensus, inspect state, etc.
@@ -187,6 +190,22 @@ pub struct NodeConfig {
     /// settlement entirely (fail-closed default — safe when no
     /// external matcher is attached to this node).
     pub settlement_operator: Option<primitives::Address>,
+    /// Logical CPU the consensus pump thread pins to (hft-audit
+    /// F-02). The pump serializes propose/vote/timeout handling —
+    /// pinning keeps its hot state on one core. `None` = unpinned.
+    /// Validated against the online-CPU set by
+    /// [`NodeConfig::validate_perf_pins`].
+    pub consensus_core: Option<u32>,
+    /// Logical CPU the executor commit lane pins to (hft-audit
+    /// F-02). Same rationale: block execution is one thread's hot
+    /// loop; migration costs a cold cache per hop. `None` = unpinned.
+    pub exec_lane_core: Option<u32>,
+    /// NUMA node the pinned threads are expected on (hft-audit
+    /// F-02). Validated against `/sys/devices/system/node/` at
+    /// startup; informational only — all pinned roles should sit on
+    /// this node's cores so shared state (book memory, chain
+    /// buffers) stays node-local. `None` disables the check.
+    pub numa_node: Option<u32>,
     /// Minimum transaction fee (`ctx.fee`) for native-module txs.
     /// Txs declaring less are skipped before execution — the fee
     /// field is sender-controlled, so without a floor every tx could
@@ -260,7 +279,44 @@ impl Default for NodeConfig {
             block_budget: types::CHAIN_BLOCK_BUDGET,
             base_timeout_ms: 2_000,
             max_timeout_ms: 30_000,
+            consensus_core: None,
+            exec_lane_core: None,
+            numa_node: None,
         }
+    }
+}
+
+impl NodeConfig {
+    /// Validate the pinning/NUMA surface against live topology
+    /// (hft-audit F-02): every configured core must be in the
+    /// online set and the NUMA node must exist under sysfs. A bad
+    /// pin is a deployment misconfiguration — it fails validation
+    /// loudly here rather than silently degrading locality after
+    /// startup. Returns the offending setting names + reasons.
+    pub fn perf_pin_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let online = primitives::pin::online_cpus();
+        for (name, core) in
+            [("consensus_core", self.consensus_core), ("exec_lane_core", self.exec_lane_core)]
+        {
+            if let Some(c) = core
+                && c >= online
+            {
+                errors.push(format!(
+                    "performance.{name} = {c} is outside the online CPU set \
+                     (online cores: {online})"
+                ));
+            }
+        }
+        if let Some(node) = self.numa_node
+            && !primitives::pin::numa_node_present(node)
+        {
+            errors.push(format!(
+                "performance.numa_node = {node} does not exist under \
+                 /sys/devices/system/node/"
+            ));
+        }
+        errors
     }
 }
 
@@ -554,8 +610,9 @@ impl framework::ParameterSink for ChainParamSink {
             b"chain.block_max_bytes" => &self.0.max_bytes,
             b"chain.min_fee" => &self.0.min_fee,
             _ => {
-                return Err(executor::ExecError::ModuleRejected(
-                    "chain: unknown governed parameter".to_string(),
+                return Err(executor::ExecError::rejected(
+                    executor::RejectCategory::NotFound,
+                    "chain: unknown governed parameter",
                 ));
             }
         };
@@ -564,10 +621,10 @@ impl framework::ParameterSink for ChainParamSink {
         };
         let v = u64::from_le_bytes(v);
         if key != b"chain.min_fee" && v == 0 {
-            return Err(executor::ExecError::ModuleRejected(format!(
-                "{}: block budget must be > 0",
-                String::from_utf8_lossy(key)
-            )));
+            return Err(executor::ExecError::rejected(
+                executor::RejectCategory::InvalidInput,
+                format!("{}: block budget must be > 0", String::from_utf8_lossy(key)),
+            ));
         }
         target.store(v, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -674,6 +731,7 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
         // hand-set `with_gas_limit` to compensate.
         .with_gas_limit(config.block_budget.max_gas)
         .with_chain_id(config.chain_id)
+        .with_exec_lane_pin(config.exec_lane_core)
         .with_unsigned_tx_policy(if config.require_signed_txs {
             executor::UnsignedTxPolicy::Reject
         } else {
@@ -1109,6 +1167,13 @@ pub fn node_config_from(
         },
         base_timeout_ms: config.consensus.base_timeout_ms,
         max_timeout_ms: config.consensus.max_timeout_ms,
+        // Pinning is deployment hygiene, not protocol config — it
+        // arrives through `[performance]` (TOML/env) rather than the
+        // assembly overrides. `None` = unpinned; topology errors are
+        // caught by `validate_effective_config` before this is used.
+        consensus_core: config.performance.consensus_core,
+        exec_lane_core: config.performance.exec_lane_core,
+        numa_node: config.performance.numa_node,
     })
 }
 
@@ -1234,6 +1299,12 @@ pub fn validate_effective_config(
                 .to_string(),
         );
     }
+
+    // Pinning/NUMA misconfiguration is a startup error, not a
+    // runtime surprise — check the online set and sysfs here so a
+    // bad core id fails at `validate` instead of degrading locality
+    // silently (hft-audit F-02).
+    errors.extend(node_config.perf_pin_errors());
 
     // `storage.archive` and `journal_retain_segments` have no
     // consumer in the node's storage stack — setting them would

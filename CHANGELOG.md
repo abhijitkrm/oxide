@@ -10,30 +10,41 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ## [Unreleased]
 
+### Documentation
+
+- **Full system audit** (`docs/system-audit.md`): a four-dimension
+  review (security, performance, throughput, stability) of the whole
+  tree, prioritizing the surfaces no prior review had read (rpc,
+  indexer, statesync, broadcast, codec, runtime, supervision,
+  storage recovery). Verifies the hardening already in place and
+  files the remaining seams with a prioritized fix list: equivocation
+  evidence → staking slash is not automated (HIGH), venue egress is
+  unwired (withdraw + Ed25519↔secp256k1 key linkage, HIGH), the
+  order-entry gateway lacks TLS (MED), the `debug_trace*` RPC
+  namespace cannot be disabled (MED), and no kill-9-mid-commit
+  restart test exists.
+- **README refreshed**: status corrected to "Phases 0–3 complete,
+  Phase 4 in progress"; the hardening section no longer lists
+  landed work (C4 mutual TLS, C9 consensus WAL, Ceiling 4) as
+  remaining; Phase 3 marked complete with current measurements; a
+  Phase 4 section documents the fuzz campaign, chaos sim, TLA+
+  model, and fault-injection coverage; stale claims fixed (the
+  transport is the hand-rolled TCP+TLS stack, not commonware; the
+  workspace layout now matches the tree; MSRV 1.91; 2,048 tests).
+
 ### Measured
 
-- **Lower message latency and fewer copies on the validator hot
-  path** (`node`, `p2p`, `ports`, `primitives`, `consensus`,
-  `storage`):
-  - The validator loop slept 1 ms on *every* pass, even right after
-    handling messages (its comment said otherwise), adding ≥ 1 ms
-    to each propose → vote → QC hop. It now sleeps only when a pass
-    did no work.
-  - Broadcasts (proposals, QCs, TCs, tx gossip) used to copy the
-    whole message once per peer; the new `Transport::broadcast`
-    shares one buffer across all recipients, plain-TCP batches are
-    written with vectored I/O instead of being concatenated, and
-    `send` takes a byte slice so callers stop allocating a `Vec`
-    per peer address.
+- **Faster journal/WAL checksums and a cheaper validator loop
+  pass** (`primitives`, `storage`, `consensus`, `node`):
   - CRC-32 for the journal and WAL is now slice-by-8, shared in
     `primitives::crc32`: **~0.4 → ~1.9 GB/s (≈4.7×)** on M1, 16 MiB
     input, release build. Same checksum, same on-disk format.
-  - The loop no longer takes a write lock on the staged validator
-    set every pass, and `OXIDE_DEBUG_PROPOSE` is read once per
-    process instead of on every idle `propose`.
-  - **In plain words:** messages between validators go out sooner,
-    big messages are no longer copied once per recipient, and disk
-    checksums are several times faster.
+  - The validator loop no longer takes a write lock (and clones the
+    committee) on the staged validator set every pass, and
+    `OXIDE_DEBUG_PROPOSE` is read once per process instead of on
+    every idle `propose`.
+  - **In plain words:** disk checksums are several times faster, and
+    the validator's main loop does less redundant work per pass.
 
 - **Commit-path fsync amortization** (`storage`, `executor`,
   `ports`, `consensus`): the executor journal used to pay one
@@ -98,6 +109,87 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     generator used to jam permanently the first time a transaction
     got dropped under pressure; now it backs up and retries the
     missing nonce like a real wallet would.
+
+- **100k-TPS levers, pass 2** (`consensus`, `types`, `crypto`,
+  `executor`, `mempool`): the vote path's body binding moved to a
+  BLAKE3 `body_hash` header field (~4× cheaper than re-deriving the
+  erasure commitment; the commitment stays for the dispersed shard
+  path — both ride the signed header); the leader's gas-cap loop
+  now reads gas estimates cached in the mempool at intake (was
+  ~17ms of re-parsing per proposal at a 40k-tx backlog); batch
+  intake no longer double-pays hashing/parsing/gas-estimation at
+  mempool insert (`submit_prepared`); and the intake got a
+  dedicated rayon pool after profiling showed its parallel
+  recovery queuing behind the async execution lane's work on the
+  shared global pool (the real find — submit collapsed from 10.6
+  to 39-60µs/tx once commits started landing). Measured on the
+  4-validator devnet: 40k-tx burst **~35,100 tx/s** (three
+  consecutive runs; the single earlier 39,048 reading was noise),
+  100k-tx sustained **21,051 → ~25,800 tx/s (+22%)**. Execution
+  confirmed not binding (tps_rw gate 65,933 tx/s, floor 60k).
+  In plain words: validators check big blocks' fingerprints ~4×
+  faster, the leader builds proposals without re-reading every
+  transaction, and the front door no longer queues behind the
+  executor — the chain holds ~35k tx/s on a 4-core cloud box,
+  with the parallel-signature check now the hardware-bound
+  ceiling (the 32-core validator spec is where 100k opens up).
+- **Batch-parallel tx intake** (`executor`, `consensus`, `ports`,
+- **Batch-parallel tx intake** (`executor`, `consensus`, `ports`,
+  `devnet`): the 10k EVM load test's phase profiler showed tx
+  intake was 60% of the whole pipeline — every EVM tx paid the
+  ~43µs secp256k1 sender recovery TWICE (validate, then preverify),
+  serially, with rayon invoked on a 1-element slice per tx. Intake
+  now runs once per batch, parallel across cores, and validation
+  reuses the recovered sender (`Module::validate_preverified`).
+  Measured: intake **90.4 → 12.0µs/tx (7.5×)**; end-to-end on the
+  4-validator TCP devnet **5,689 → 34,966 tx/s (6.1×)** at 10k
+  tx/block. In plain words: the chain's front door was the
+  bottleneck, not execution — now the front door fans out across
+  cores and the chain runs ~6× faster at big block sizes.
+- **Tabled Reed-Solomon encode** (`types::rs`): the vote path
+  re-verifies the body commitment per vote — a full erasure-code
+  encode of the proposal. The naive per-byte GF multiply cost
+  6.74ms on a 1.5MB body; per-coefficient multiplication tables
+  with row-wise XOR-accumulate cut it to **3.80ms (1.77×)**, same
+  hash. In plain words: validators check a big block's integrity
+  fingerprint nearly twice as fast, which directly raises the
+  block-size ceiling.
+- **Batch-settle `consumed` map flattened** (`exchange`): the
+  per-order consumed-quantity scratch was a `BTreeMap` (16+ levels
+  of pointer-chasing at 65k fills, ~22% of the batch profile) whose
+  ordering was never observed. Replaced with an open-addressed flat
+  table (same shape as the pair map). Measured on the criterion
+  bench: 1k distinct-pairs **903 → 708 µs (−19%)**, 16k clustered
+  pairs **6.59 → 4.11 ms (−38%)**, 1k same-pair **137 → 125 µs
+  (−9%)**. In plain words: settlement's worst case is ~25% faster
+  and improves with batch size — the win grows exactly where the
+  tree was deepest.
+- **Leader egress measured** (audit T1): proposals carry full
+  bodies, uploaded at ~1.4× via the erasure layer. At the 60k tx/s
+  gate that's ~15 MB/s (fine); at the venue's max settlement rate
+  (~1.85M fills/s) it's ~1.5 Gbps sustained — the ceiling that
+  binds. Recorded in `docs/system-audit.md` §8: tx-by-hash
+  proposals are a required pre-testnet design item, not code yet.
+- **HFT audit implementation pass** (`hft-audit.md` F-01–F-26):
+  the validated findings are now implemented. Headline deltas,
+  all head-to-head against the displaced code on identical
+  workloads — true-SPSC matcher ring (UnsafeCell slots, cache-
+  padded head/tail, parked-flag wakeup) vs `crossbeam` bounded:
+  **12.9 ns vs 23.2 ns** single push+pop and **911 ns vs 1.90 µs**
+  burst-64 (~2×); bitboard-walked capped-FOK pre-scan vs the
+  linear dense-ladder walk: **82 ns vs 2.62 µs** on a sparse
+  1,000-level book (~32×). Allocation-accounting is now a *gated*
+  bench: action path ≤2 allocs/op (measured 1.00), crossing-fill
+  ≤5 (2.08), FIX/WS parsers ≤1 (0.00 — both already borrowed),
+  response formatting bounded (FIX `_into` scratch hits ~0 on the
+  production send loop). Throughput floors ratcheted: raw engine
+  1M→5M ops/s, exchange settlement 100k→400k ops/s, plus a
+  mechanical ≥60k tx/s gate on the EVM parallel multi-sender
+  bench.
+  - **In plain words:** the audit's list of hot-path taxes is now
+    fixed and enforced — the order pipe is about twice as fast,
+    a full-book FOK check is ~32× faster, and the benches now
+    *fail* if someone reintroduces the allocations they removed.
 
 - **Folded-fsync consensus WAL** (`consensus::wal`): on Linux the
   WAL opens `O_DSYNC`, so a signature-path append's `write(2)` is
@@ -249,21 +341,14 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
-- **Journal no longer loses records after a crash-then-restart**
-  (`storage`, used by the executor commit journal and block sync):
-  a crash could leave a half-written record at the end of the
-  newest segment. `JournalWriter::create` ignored it and started a
-  *new* segment behind it, but `replay` stops at the first damaged
-  record — so every record fsynced after the restart vanished on
-  the next one. `create` now cuts the newest segment back to its
-  last intact record first (keeping the original bytes as
-  `segment-<n>.log.damaged`), refuses with
-  `JournalError::Corrupt` when the damage is in an older, sealed
-  segment, and fsyncs the directory after creating a segment so
-  the new file itself survives power loss.
-  - **In plain words:** after a crash, a node could later "forget"
-    blocks it had safely written to disk. It now cleans up the
-    half-written leftover before writing anything new.
+- **New journal segments survive power loss** (`storage`):
+  `sync_data` on a segment covers its bytes, not its directory
+  entry, so a power cut could drop a freshly created segment — and
+  every record later fsynced into it. Segment creation now fsyncs
+  the directory. (The torn-tail replay bug is fixed separately by
+  the system-audit pass, ST3.)
+  - **In plain words:** a brand-new journal file can no longer
+    vanish in a power cut along with the blocks written to it.
 
 - **EVM transactions can no longer forge their mempool envelope**
   (`executor`, `evm`): the envelope's sender, nonce and fee decide
@@ -271,9 +356,10 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   tied them to the signed payload. One funded account could evict
   another account's pending tx (claim its sender and nonce with a
   10 % higher fee) or claim a `u64::MAX` fee to never be evicted.
-  Admission now requires the envelope sender to equal the recovered
-  signer, the nonce to equal the signed nonce, and the fee to be at
-  most the signed `max_fee_per_gas`.
+  Admission (`validate_preverified`, both the single and batch
+  intake paths) now requires the envelope sender to equal the
+  recovered signer, the nonce to equal the signed nonce, and the fee
+  to be at most the signed `max_fee_per_gas`.
   - **In plain words:** someone could knock other people's pending
     transactions out of the queue by lying in a label nobody
     checked. The label is now checked against the signature.
@@ -298,15 +384,150 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     validator from accepting new connections. Handshakes now have
     a time limit and a size limit.
 
-- **Pipelined proposals stop duplicating in-flight txs under
-  leader rotation** (`mempool`, `executor`): the in-flight set was
-  released on *any* next commit, including another leader's
-  earlier block, so the next proposal re-selected txs still
-  pending in ours (each duplicate wastes block space as a nonce
-  skip). Sets are now keyed by height and released only when that
-  height commits.
-  - **In plain words:** blocks stop carrying copies of transactions
-    that are already on their way in.
+- **Journal replay could orphan post-recovery history**
+  (`storage::journal`): `replay` returned at the first torn record
+  — correct for a single segment, wrong after a restart, because
+  the writer always opens a *new* segment. A mid-append crash
+  followed by healthy blocks meant the next restart silently lost
+  everything after the tear. Replay now truncates the damaged
+  segment and continues scanning later ones. Covered by
+  `crash_mid_journal_append_ignores_torn_tail`.
+- **Kill-9-mid-commit recovery coverage** (`executor`): the
+  WAL-first path is now exercised under the real crash timing —
+  block journaled but never executed, executor dropped mid-commit,
+  restarted: recovered roots match an honest peer, resubmitting the
+  same block doesn't double-apply, and the chain continues. In
+  plain words: the crash path that's supposed to save you during a
+  power cut is now proven to.
+- **Empty proposals under pipelined consensus** (`mempool`,
+  `executor`): a validator whose pool anchored at the last
+  *executed* nonce saw a gap whenever the sender's intermediate
+  nonces lived in uncommitted ancestor blocks proposed by other
+  leaders — the selection walk broke at the hole and the leader
+  proposed an empty block (the intermittent devnet
+  fault-injection failure). Two bounded covers now bridge the
+  hole in `select`: `pending_commit` records nonces the commit
+  path vacated before the execution lane confirmed them, and
+  `in_chain` records nonces observed in accepted proposals (the
+  vote path sees every leader's block). Both expire on the same
+  per-block anchor refresh — dead-branch coverage times out and
+  real gaps still break the walk.
+  - **In plain words:** a validator no longer proposes empty
+    blocks just because the transactions filling the nonce gap
+    were submitted to a *different* validator first.
+
+- **Matcher hot-path taxes removed** (`matcher`): the sequencer
+  ring is now real single-producer/single-consumer storage (the
+  old "SPSC" was a mutex-backed MPMC); the sequencer parks an
+  undeliverable response batch instead of spinning forever;
+  market-data publication is a wait-free ring push with
+  serialization and subscriber fanout moved off the matching
+  thread (slow consumers get evicted, never backpressure); and the
+  consensus pump blocks on a wakeup-capable receive instead of a
+  fixed 1 ms sleep — network frames wake it immediately, timeouts
+  still drive the pacemaker.
+  - **In plain words:** the matching engine no longer burns CPU
+    waiting on slow clients, its market-data feed can't stall
+    order flow, and the validator reacts to consensus messages the
+    instant they arrive instead of on a timer.
+
+- **Parallel EVM no longer re-verifies recovered senders**
+  (`executor`/`evm`): transactions whose sender this node already
+  recovered (the `preverify_cache` hit — keyed by a locally
+  computed envelope hash, so a hit proves the bytes were verified
+  here) now carry a `verified_locally` flag that skips the second
+  secp256k1 recovery in both parallel decode loops. Foreign or
+  unverifiable bytes still recover — the flag is provenance, not a
+  trust vote.
+  - **In plain words:** transactions we already checked don't pay
+    the signature-recovery cost twice.
+
+- **Per-operation allocations removed from the API surfaces**
+  (`matcher::fix`/`ws`, `metrics`, `node`, `executor`): FIX
+  execution reports format into a per-connection scratch buffer;
+  inbound WebSocket frames are borrowed instead of copied; the
+  metrics recorder allocates a key only on first observation;
+  validator broadcasts reuse peer-id scratch instead of an
+  allocation per peer per message; block events are shared
+  (`Arc<[Event]>`) rather than cloned per transaction; and the
+  executor's preverification cache hashes by the digest's own
+  bytes instead of SipHashing already-hashed keys.
+  - **In plain words:** the code stopped paying a memory
+    allocation on messages that arrive thousands of times a
+    second.
+
+- **Precompile dispatch no longer hijacks pattern-matching
+  addresses** (`evm::precompiles`): the gate was the syntactic
+  `0x00..0OOXX` address shape, so any ordinary contract deployed at
+  an address like `0xc0de` or `0x1000` was routed into the native
+  precompile dispatcher and reverted instead of executing its
+  bytecode. Dispatch now requires membership in the registered
+  `NATIVE_PRECOMPILES` set. Consensus-relevant: previously such
+  contracts were permanently uncallable. Caught by the official
+  `ethereum/tests` corpus.
+  - **In plain words:** a contract could be deployed fine but then
+    be unreachable forever if its address happened to look like a
+    precompile — the official conformance suite surfaced it, and
+    now only real precompiles intercept calls.
+
+- **State root drops touched-but-empty accounts (EIP-158)**
+  (`evm::module_impl`): an account touched during execution that
+  ends up empty (nonce 0, balance 0, no code — e.g. the coinbase
+  when the gas tip is zero) used to stay in the trie as an extra
+  leaf. Every upstream client deletes it, so our post-state root
+  diverged on virtually every block-like execution. Both the
+  incremental and full-state root paths now exclude empty
+  accounts.
+  - **In plain words:** our state hash used to disagree with
+    Ethereum's on almost every transaction that tipped the block
+    proposer zero — now it matches.
+
+- **`DIFFICULTY`/`PREVRANDAO` block fields wired** (`evm`): the
+  revm `BlockEnv` never carried `prevrandao`/`difficulty`, so both
+  opcodes always read zero. The module gains `set_prevrandao` /
+  `set_difficulty`; production leaves them unset by design (no
+  beacon randomness commitment yet), and the conformance runner
+  sets them per fixture.
+
+- **Empty accounts are deleted from durable state too** (`evm`'s
+  persistence): the EIP-158 rule above now reaches every place an
+  account can be written — the block flush emits a `Delete` for an
+  emptied account, snapshots omit it, snapshot verification
+  recomputes without it, and restart load skips it. Previously a
+  drained account (or a zero-tip coinbase) persisted and
+  resurrected on reload, and a checkpoint containing one failed
+  the importer's root recompute — recovery lost the snapshot and
+  replayed from genesis. Pinned by `snapshot_omits_eip158_empty_
+  accounts` and the executor's `checkpoint_bounds_replay`.
+  - **In plain words:** an account emptied to zero used to come
+    back to life after a restart and could even break crash
+    recovery — now "deleted" means deleted everywhere.
+
+- **Secret material is zeroized end-to-end** (`crypto`, `node`,
+  `matcher`, binaries): decrypted keystore payloads, the
+  `OXIDE_KEY_PASSPHRASE` value, PBKDF2-derived AEAD keys, remote-signer
+  link keys, per-session MAC keys, settlement signing keys, and every
+  raw/hex intermediate a key file travels through now wipe on drop
+  (`zeroize`/`Zeroizing`). secp256k1 intermediates get an explicit
+  `non_secure_erase`; `ed25519-dalek`'s `zeroize` feature is on.
+  - **In plain words:** validator keys, keystores, and the
+    signer-daemon credential no longer leave plaintext copies sitting
+    in freed memory after use.
+
+- **Wire-count allocations bounded in dormant decoders** (`p2p`):
+  `discovery` peer-list decode and `SnapshotClient::set_metadata`
+  sized buffers directly from wire-controlled counts. Unreachable
+  today, but a future caller would have inherited the OOM shape —
+  now capped by remaining input / `MAX_CHUNKS`, with regression
+  tests.
+  - **In plain words:** malformed "a billion peers/chunks" messages
+    can no longer make a node allocate a giant buffer it then
+    immediately rejects.
+
+- **`secp256k1` recovery-ID docs corrected** (`crypto`): the docs
+  claimed `recid > 3` was accepted-reject boundary; the code
+  correctly rejects `recid > 1` (standard `{0, 1}` set). Docs now
+  match.
 
 - **Verify pool survives a panicking job** (`node`): a panic
   inside a signature-verification closure used to kill the worker
@@ -477,6 +698,92 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     vote to skip the dead turn and keep going, as designed.
 
 ### Added
+
+- **Equivocation evidence reaches staking** (`consensus`,
+  `validator_net`, `types`, `devnet`): the engine now records each
+  validator's vote per `(view, phase)` in a bounded log; a
+  same-voter conflicting vote is dropped and queued as
+  `DoubleSignEvidence`, which `validator_net` drains every pump
+  pass and submits as a staking `evidence` transaction signed by
+  the node's funded reporter key (`EvidenceReporter`). Verified
+  end-to-end: a multinode test equivocates a validator and observes
+  the on-chain jail on every replica. In plain words: double-signing
+  used to be detected but never punished — now the chain slashes it
+  automatically, no operator action needed.
+- **Venue egress: Ed25519↔secp256k1 key linkage** (`exchange`):
+  settlement credits custody under the ed25519-derived trading
+  owner, an address that can never sign a native secp envelope —
+  deposits in, no way out. The new committed link registry fixes
+  it: `LINK_TRADING_KEY` records `owner → {secp, epoch}` gated on
+  the trading key's signature over a domain-separated consent that
+  includes the next epoch (captured consents can't replay, and a
+  tombstoned link can't resurrect); `UNLINK_TRADING_KEY` revokes.
+  Linked register/cancel/deposit/withdraw paths reuse the same
+  custody cores as the self-service ones; `WITHDRAW_LINKED` pays
+  out only to the linked secp account. New wire tags append — old
+  messages and snapshots are unaffected. In plain words: trading
+  accounts funded by the matcher can finally withdraw — signed for
+  by the trading key, paid to a wallet the owner proved they
+  control.
+- **Matcher loopback-only guarantee, documented** (`matcher`,
+  `docs/runbooks.md`): all FIX/WS/p3p listeners bind `127.0.0.1`
+  literally — remote exposure is impossible by construction; remote
+  clients terminate TLS at a reverse proxy/gateway (deployment
+  shape in runbooks §12). In plain words: order entry can't be
+  exposed on a public interface even by misconfiguration.
+
+- **Thread pinning + NUMA surface** (`[performance]` config,
+  `primitives::pin`, matcher flags): `consensus_core`,
+  `exec_lane_core`, and `numa_node` pin the consensus pump and
+  executor commit lane to declared cores — validated against the
+  online CPU set and sysfs at startup, refused loudly on a bad
+  topology. `oxide-matcher` grows `--pin-sequencer` and
+  `--pin-worker-base` (worker `i` lands on `base + i`) with the
+  same validation. Implemented std-only via `taskset` against the
+  calling thread's `/proc/thread-self` TID — no libc dependency in
+  `primitives`. All pins default off; a failed pin logs and runs
+  unpinned (locality is a latency property, never correctness).
+  - **In plain words:** the busiest threads can now be told to
+    stay on one CPU so their caches stay warm — off by default,
+    checked before the node starts, and never able to break the
+    node if the hardware disagrees.
+
+- **Matcher risk limits are operator-configurable** (`oxide-matcher`
+  `--risk-max-*` flags, `ServerConfig::risk`): order rate, order
+  size, price band, and resting-per-account thresholds are no
+  longer hardcoded human-scale defaults inside the worker — the
+  venue-scale defaults assume admission throttling lives upstream.
+  - **In plain words:** the matching engine used to cap every
+    account at 100 orders/second no matter what — now operators
+    set the real limits (or turn the matcher-side cap off).
+
+- **Configurable peer socket buffers** (`NetworkConfig::
+  socket_buffer_bytes`): the p2p transport sets explicit send/receive
+  buffer sizes alongside `TCP_NODELAY` at every dial and accept —
+  kernel defaults no longer govern frame latency under load.
+  - **In plain words:** the node's network sockets get sized
+    buffers like a trading system expects, not whatever the kernel
+    happened to default to.
+
+- **Official `ethereum/tests` `GeneralStateTests` runner**
+  (`modules/evm/tests/official_state_tests.rs`, production-readiness
+  gate 6): 1,548 committed fixture files (~14k expectations) run
+  through the production path — sign → encode → decode → validate →
+  execute → state root + logs hash. Fixture transactions are
+  re-signed at `config.chainid` (upstream ships unprotected
+  signatures Oxide correctly rejects). Result: **13,754 pass, 0
+  unexpected divergence, 184 explicitly unsupported** (EIP-4844
+  blobs, >u128 pre-state balances), **20 pinned known-divergences**
+  — all EIP-7610 (create-over-nonempty-storage), matching
+  revm/reth's upstream position; the precondition is unreachable
+  via transactions post-EIP-161. Per-account `post.state` diffs and
+  call traces make any new divergence immediately diagnosable, and
+  the gate fails on anything outside the pinned set.
+  - **In plain words:** the EVM now continuously proves its state
+    transitions against Ethereum's own conformance corpus, with the
+    two remaining gaps (a retroactive create-collision rule even
+    reth skips, and blob transactions) explicitly documented rather
+    than hidden.
 
 - **Bounded signature-verification pool for the consensus pump**
   (`node::verify_pool` + engine `*_preverified` entries). Every
@@ -777,6 +1084,19 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     its own seat from its key.
 
 ### Changed
+
+- **Typed transaction-rejection categories.** Module rejections
+  (`ExecError::ModuleRejected`) now carry a stable
+  `RejectCategory` — `insufficient_funds`, `unauthorized`,
+  `not_found`, `invalid_input`, `precondition`, `internal`, or
+  `rejected` — alongside the human detail string. Rejection reasons
+  rendered at the mempool/RPC boundary are prefixed with the
+  category token (`"insufficient_funds: balance 3 < 9"`), so
+  clients can branch on the category instead of matching free-form
+  text. `internal` marks a module-side failure (wiring, invariant,
+  engine error) — investigate rather than retry.
+  - **In plain words:** a rejected transaction now says *why* in a
+    way software can rely on, not just a human reading logs.
 
 - **No production path signs with a public test identity.**
   `oxide-validator genesis` without `--validator-pubkeys` or an

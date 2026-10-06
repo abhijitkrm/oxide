@@ -8,7 +8,9 @@
 //! reads the set only through `Committee`, so every mutation path
 //! lives here.
 
-use super::{Address, Event, ExecError, StakingModule, TxContext, UnbondingEntry, msg_type};
+use super::{
+    Address, Event, ExecError, RejectCategory, StakingModule, TxContext, UnbondingEntry, msg_type,
+};
 
 impl StakingModule {
     /// Handle a key-change message: record a new BLS consensus key
@@ -35,22 +37,29 @@ impl StakingModule {
     ) -> Result<Vec<Event>, ExecError> {
         // The sender must be the validator changing its own key.
         if ctx.sender != validator {
-            return Err(ExecError::ModuleRejected(
-                "key_change: sender must be the validator".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "key_change: sender must be the validator",
             ));
         }
         // The validator must exist (have non-zero stake).
         let validators = framework::lock_state(&self.validators);
         if !validators.contains_key(&validator) {
-            return Err(ExecError::ModuleRejected("key_change: validator not found".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                "key_change: validator not found",
+            ));
         }
         // The new key is a 48-byte BLS12-381 compressed public key,
         // followed by its 96-byte proof-of-possession.
         if msg.len() != 21 + 48 + 96 {
-            return Err(ExecError::ModuleRejected(format!(
-                "key_change: expected 144-byte key+pop, got {} bytes",
-                msg.len().saturating_sub(21)
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!(
+                    "key_change: expected 144-byte key+pop, got {} bytes",
+                    msg.len().saturating_sub(21)
+                ),
+            ));
         }
         // PoP verification mints the validated-key token — the
         // pending queue and `bls_keys` store the proof, so the key
@@ -65,8 +74,9 @@ impl StakingModule {
             .iter()
             .any(|(a, k)| *a != validator && *k == new_key)
         {
-            return Err(ExecError::ModuleRejected(
-                "key_change: consensus key already in use".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                "key_change: consensus key already in use",
             ));
         }
         drop(validators); // release lock before acquiring pending_key_changes
@@ -101,18 +111,32 @@ impl StakingModule {
         pop: &[u8],
         op: &str,
     ) -> Result<crypto::bls_signer::ValidatedPublicKey, ExecError> {
-        let pk = crypto::bls::PublicKey::from_slice(key)
-            .map_err(|_| ExecError::ModuleRejected(format!("{op}: malformed BLS public key")))?;
-        let pop_sig = crypto::bls::Signature::from_slice(pop)
-            .map_err(|_| ExecError::ModuleRejected(format!("{op}: malformed PoP signature")))?;
+        let pk = crypto::bls::PublicKey::from_slice(key).map_err(|_| {
+            ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("{op}: malformed BLS public key"),
+            )
+        })?;
+        let pop_sig = crypto::bls::Signature::from_slice(pop).map_err(|_| {
+            ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("{op}: malformed PoP signature"),
+            )
+        })?;
         crypto::bls_signer::pop_verify(&pk, &pop_sig).map_err(|_| {
-            ExecError::ModuleRejected(format!("{op}: proof-of-possession verification failed"))
+            ExecError::rejected(
+                RejectCategory::Unauthorized,
+                format!("{op}: proof-of-possession verification failed"),
+            )
         })?;
         // `pop_verify` already decoded the point; `new` runs the
         // subgroup check so the token's contract does not depend on
         // what the verify path happened to cover.
         crypto::bls_signer::ValidatedPublicKey::new(pk).map_err(|_| {
-            ExecError::ModuleRejected(format!("{op}: BLS key is not a valid group element"))
+            ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("{op}: BLS key is not a valid group element"),
+            )
         })
     }
 
@@ -155,10 +179,10 @@ impl StakingModule {
         // must never reach the ValidatorSet (rogue-key
         // aggregate-forgery defense).
         if msg.len() != 21 + 48 + 96 {
-            return Err(ExecError::ModuleRejected(format!(
-                "validator_add: expected 165-byte message, got {} bytes",
-                msg.len()
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("validator_add: expected 165-byte message, got {} bytes", msg.len()),
+            ));
         }
         let bls_key = Self::verify_key_pop(&msg[21..69], &msg[69..165], "validator_add")?;
 
@@ -230,20 +254,23 @@ impl StakingModule {
     ) -> Result<(), ExecError> {
         let validators = framework::lock_state(&self.validators);
         if validators.contains_key(candidate) {
-            return Err(ExecError::ModuleRejected(
-                "validator_add: validator already exists".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                "validator_add: validator already exists",
             ));
         }
         let pending_adds = framework::lock_state(&self.pending_validator_adds);
         if pending_adds.iter().any(|(a, _)| a == candidate) {
-            return Err(ExecError::ModuleRejected(
-                "validator_add: validator already pending".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                "validator_add: validator already pending",
             ));
         }
         let bls_keys = framework::lock_state(&self.bls_keys);
         if bls_keys.iter().any(|(a, k)| a != candidate && k == key) {
-            return Err(ExecError::ModuleRejected(
-                "validator_add: consensus key already in use".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                "validator_add: consensus key already in use",
             ));
         }
         Ok(())
@@ -306,14 +333,16 @@ impl StakingModule {
     pub(crate) fn validate_remove_action(&self, validator: &Address) -> Result<(), ExecError> {
         let validators = framework::lock_state(&self.validators);
         if !validators.contains_key(validator) {
-            return Err(ExecError::ModuleRejected(
-                "validator_remove: validator not found".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                "validator_remove: validator not found",
             ));
         }
         let pending_removes = framework::lock_state(&self.pending_validator_removes);
         if pending_removes.contains(validator) {
-            return Err(ExecError::ModuleRejected(
-                "validator_remove: validator already pending removal".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                "validator_remove: validator already pending removal",
             ));
         }
         // A pending-add candidate is removable — the remove cancels
@@ -331,8 +360,9 @@ impl StakingModule {
                 .iter()
                 .all(|(a, _)| a != validator)
         {
-            return Err(ExecError::ModuleRejected(
-                "validator_remove: cannot remove last powered validator".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                "validator_remove: cannot remove last powered validator",
             ));
         }
         Ok(())

@@ -166,8 +166,16 @@ pub fn parse_fix_cancel_replace(body: &str) -> Option<ActionRequest> {
     })
 }
 
-/// Format an order response as a FIX `ExecutionReport` (MsgType=8).
-pub fn format_fix_execution_report(resp: &OrderResponse, cl_ord_id: &str) -> String {
+/// Format an order response as a FIX `ExecutionReport` (MsgType=8)
+/// into a reusable scratch buffer.
+///
+/// `buf` is cleared, not freed: a per-connection scratch String
+/// reaches steady-state capacity after the first report, so the
+/// per-message heap allocation the allocation-accounting bench
+/// (hft-audit F-16) measures drops to zero on the send loop. Call
+/// [`format_fix_execution_report`] for the owned convenience form
+/// (one-shots, tests).
+pub fn format_fix_execution_report_into(resp: &OrderResponse, cl_ord_id: &str, buf: &mut String) {
     let exec_type = if resp.rejected {
         "8"
     } else if resp.order_id > 0 {
@@ -183,21 +191,32 @@ pub fn format_fix_execution_report(resp: &OrderResponse, cl_ord_id: &str) -> Str
         "2" // Filled.
     };
 
-    let mut msg = String::with_capacity(256);
-    msg.push_str("35=8\x01"); // MsgType=ExecutionReport.
-    let _ = write!(msg, "11={cl_ord_id}\x01"); // ClOrdID.
-    let _ = write!(msg, "150={exec_type}\x01"); // ExecType.
-    let _ = write!(msg, "39={ord_status}\x01"); // OrdStatus.
+    buf.clear();
+    buf.push_str("35=8\x01"); // MsgType=ExecutionReport.
+    let _ = write!(buf, "11={cl_ord_id}\x01"); // ClOrdID.
+    let _ = write!(buf, "150={exec_type}\x01"); // ExecType.
+    let _ = write!(buf, "39={ord_status}\x01"); // OrdStatus.
 
     if resp.rejected {
         let reason = resp.reject_reason.map_or("99", fix_reject_code);
-        let _ = write!(msg, "103={reason}\x01"); // OrdRejReason.
+        let _ = write!(buf, "103={reason}\x01"); // OrdRejReason.
     } else {
-        let _ = write!(msg, "151={}\x01", resp.fills_count); // LeavesQty (simplified).
-        let _ = write!(msg, "14={}\x01", resp.fills_count); // CumQty.
+        let _ = write!(buf, "151={}\x01", resp.fills_count); // LeavesQty (simplified).
+        let _ = write!(buf, "14={}\x01", resp.fills_count); // CumQty.
     }
+}
 
-    msg
+/// Format an order response as a FIX `ExecutionReport` (MsgType=8).
+///
+/// Convenience wrapper over [`format_fix_execution_report_into`]
+/// for callers without a scratch buffer — allocates once per call.
+/// Per-connection send loops should prefer the `_into` form so the
+/// steady-state path is allocation-free (hft-audit F-16).
+#[must_use]
+pub fn format_fix_execution_report(resp: &OrderResponse, cl_ord_id: &str) -> String {
+    let mut buf = String::with_capacity(256);
+    format_fix_execution_report_into(resp, cl_ord_id, &mut buf);
+    buf
 }
 
 /// Borrowed-slice tag lookup — replaces the per-message

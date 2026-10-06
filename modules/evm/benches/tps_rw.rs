@@ -401,6 +401,44 @@ fn bench_batch_parallel_multi_sender(c: &mut Criterion) {
         });
     }
 
+    // Mechanical gate (hft-audit F-12): the parallel multi-sender
+    // path must sustain ≥60k tx/s on 10k transfers / 100 senders —
+    // 2×+ over the serial `handle` floor (~28k tx/s), ~2× under the
+    // reference measurement (~128k tx/s on the dev rig) so shared CI
+    // runners have headroom but a serial-path regression cannot
+    // pass. Criterion tracks time; this row measures throughput
+    // directly and panics below the floor.
+    {
+        const GATE_TXS: usize = 10_000;
+        let module = EvmModule::new(1, 7_000_000_000);
+        for key in &keys {
+            fund(&module, &key.addr);
+        }
+        let txs_per_sender = (GATE_TXS / N_SENDERS) as u64;
+        let mut txs: Vec<Vec<u8>> = Vec::with_capacity(GATE_TXS);
+        for (i, key) in keys.iter().enumerate() {
+            for j in 0..txs_per_sender {
+                txs.push(signed_transfer(&key.privkey, j, recipients[i], 1_000_000_000));
+            }
+        }
+        module.begin_block(Height::new(1));
+        let t = std::time::Instant::now();
+        let results = module.handle_batch_parallel(&dummy_ctx(), &txs);
+        let elapsed = t.elapsed();
+        module.end_block(Height::new(1));
+        black_box(results);
+        // usize→f64 is exact at this count; the lint guards the
+        // general case, not a bounded benchmark constant.
+        #[allow(clippy::cast_precision_loss)]
+        let tps = txs.len() as f64 / elapsed.as_secs_f64();
+        eprintln!("batch_parallel_multi_sender gate: {tps:.0} tx/s (floor 60k)");
+        assert!(
+            tps >= 60_000.0,
+            "parallel EVM throughput gate failed: {tps:.0} tx/s < 60k tx/s — \
+             the multi-version parallel path regressed to serial territory"
+        );
+    }
+
     group.finish();
 }
 
@@ -798,7 +836,11 @@ fn bench_preverified_vs_recovery(c: &mut Criterion) {
                     let preverified: Vec<PreverifiedTx<'_>> = txs
                         .iter()
                         .zip(&senders)
-                        .map(|(raw, &sender)| PreverifiedTx { raw: raw.as_slice(), sender })
+                        .map(|(raw, &sender)| PreverifiedTx {
+                            raw: raw.as_slice(),
+                            sender,
+                            verified_locally: true,
+                        })
                         .collect();
                     let results = module.handle_batch_preverified(&dummy_ctx(), &preverified);
                     module.end_block(Height::new(1));
@@ -906,7 +948,11 @@ fn bench_preverified_parallel_vs_recovery(c: &mut Criterion) {
                     let preverified: Vec<PreverifiedTx<'_>> = txs
                         .iter()
                         .zip(&senders)
-                        .map(|(raw, &sender)| PreverifiedTx { raw: raw.as_slice(), sender })
+                        .map(|(raw, &sender)| PreverifiedTx {
+                            raw: raw.as_slice(),
+                            sender,
+                            verified_locally: true,
+                        })
                         .collect();
                     let results =
                         module.handle_batch_parallel_preverified(&dummy_ctx(), &preverified);

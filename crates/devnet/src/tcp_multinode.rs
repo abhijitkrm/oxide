@@ -2088,7 +2088,7 @@ impl TcpMultiNodeDevnet {
         let Some(to_addr) = validator_set.validator_addresses().get(to_seat) else {
             return;
         };
-        if transport.send(&to_addr.0, bytes).is_err()
+        if transport.send(&to_addr.0.to_vec(), bytes).is_err()
             && let Some(inbox) = inboxes.get(to_seat)
         {
             primitives::sync::lock_state(inbox).push_back((my_id.to_vec(), bytes.to_vec()));
@@ -2121,6 +2121,13 @@ impl TcpMultiNodeDevnet {
     /// Submit one round's worth of txs to the leader's intake,
     /// draining the intake via pipelined ticks when it's full.
     ///
+    /// Submits in BATCHES through `submit_txs` — the executor's
+    /// parallel intake path (secp256k1 recovery fanned across cores,
+    /// ~43µs/tx serial → ~12µs/tx effective). The old per-tx
+    /// `submit_tx` loop was 60% of the whole pipelined run's wall
+    /// clock in the 10k EVM load test; this is the harness matching
+    /// the deployment shape (RPC clients batch).
+    ///
     /// Returns the next tx index after the submitted round.
     fn submit_round_txs(
         &mut self,
@@ -2141,20 +2148,27 @@ impl TcpMultiNodeDevnet {
         let Some(leader_pos) = self.engine_pos(leader_idx) else {
             return txs_per_round;
         };
+        // Batch size: the whole remaining round in one call — the
+        // intake ring bounds admission, so an oversized batch
+        // back-pressures via `Rejected` acks and the retry loop
+        // below drains it. `try_send` fails only once the ring is
+        // full, so within one batch the accepted acks are a PREFIX
+        // and the rejected acks a contiguous suffix — advancing by
+        // the accepted count and retrying the tail is exact.
         while tx_idx < txs_per_round {
-            let ack = self.engines[leader_pos].submit_tx(txs[tx_idx].clone());
-            match ack {
-                types::MempoolAck::Accepted => {
-                    tx_idx += 1;
-                }
-                types::MempoolAck::Rejected { .. } => {
-                    // Intake channel is full — run the pipeline for
-                    // multiple ticks to drain it, then retry.
-                    for _ in 0..64 {
-                        self.pipelined_tick(state, view_cap);
-                        if std::time::Instant::now() > deadline {
-                            break;
-                        }
+            let remaining = txs_per_round - tx_idx;
+            let batch: Vec<TxBytes> = txs[tx_idx..tx_idx + remaining].to_vec();
+            let acks = self.engines[leader_pos].submit_txs(batch);
+            let accepted =
+                acks.iter().take_while(|a| matches!(a, types::MempoolAck::Accepted)).count();
+            tx_idx += accepted;
+            if accepted < remaining {
+                // Intake ring full — run the pipeline for multiple
+                // ticks to drain it, then retry the rejected tail.
+                for _ in 0..64 {
+                    self.pipelined_tick(state, view_cap);
+                    if std::time::Instant::now() > deadline {
+                        break;
                     }
                 }
             }
@@ -2279,7 +2293,7 @@ impl TcpMultiNodeDevnet {
                     if let Some(leader_addr) =
                         self.validator_set.validator_addresses().get(leader_idx)
                     {
-                        let _ = self.transports[i].send(&leader_addr.0, &buf);
+                        let _ = self.transports[i].send(&leader_addr.0.to_vec(), &buf);
                     }
                     // In-process vote delivery: collect the vote
                     // directly on the leader's engine. This ensures
@@ -2386,7 +2400,7 @@ impl TcpMultiNodeDevnet {
                         // Best-effort TCP broadcast. Failures are
                         // tolerated — the in-process delivery below
                         // is the authoritative path.
-                        let _ = self.transports[i].send(&addr.0, &qc_buf);
+                        let _ = self.transports[i].send(&addr.0.to_vec(), &qc_buf);
                     }
                 }
                 // Self-deliver: the leader that formed the QC must
@@ -2556,7 +2570,7 @@ impl TcpMultiNodeDevnet {
         for addr in self.validator_set.validator_addresses() {
             if addr.0.as_slice() != leader_own.as_slice() {
                 // Tolerate transient send failure (peer mid-reconnect).
-                let _ = self.transports[leader_pos].send(&addr.0, &qc_buf);
+                let _ = self.transports[leader_pos].send(&addr.0.to_vec(), &qc_buf);
             }
         }
 

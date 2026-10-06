@@ -925,6 +925,7 @@ impl Wal {
     /// time rather than mid-view is the point. Unsupported
     /// filesystems disable the hint and keep writing.
     #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)] // reviewed syscall wrapper — SAFETY note at the call site
     fn ensure_room(&mut self, need: u64) -> Result<(), WalError> {
         if !self.prealloc_ok || self.appended_end.saturating_add(need) <= self.allocated_end {
             return Ok(());
@@ -934,12 +935,16 @@ impl Wal {
             // or memory-safety contract; `offset`/`len` are plain
             // integers. The fd is valid: `self.writer` owns an open
             // `File` for the life of `self`.
+            // The chunk is an 8 MiB constant — `try_from` (not a
+            // wrapping cast) keeps the u64→off_t conversion checked.
+            let len: libc::off_t =
+                i64::try_from(PREALLOC_CHUNK_BYTES).unwrap_or(i64::MAX) as libc::off_t;
             let ret = unsafe {
                 libc::fallocate(
                     self.writer.get_ref().as_raw_fd(),
                     libc::FALLOC_FL_KEEP_SIZE,
                     i64::try_from(self.allocated_end).unwrap_or(i64::MAX) as libc::off_t,
-                    PREALLOC_CHUNK_BYTES as libc::off_t,
+                    len,
                 )
             };
             if ret == 0 {
@@ -948,7 +953,7 @@ impl Wal {
             }
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
-                Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) => {
+                Some(libc::EOPNOTSUPP | libc::ENOSYS) => {
                     self.prealloc_ok = false;
                     return Ok(());
                 }
@@ -1511,6 +1516,7 @@ mod tests {
             proposer_signature: None,
             exec_cert: None,
             body_commitment: Hash::ZERO,
+            body_hash: Hash::ZERO,
         }
     }
 

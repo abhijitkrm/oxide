@@ -14,8 +14,8 @@
 
 use super::{
     AggregateSignature, AttestVerifyTask, BlockBody, BlockHeader, ConsensusError, Encode,
-    ExecCertificate, Hash, Height, OxideBft, Proposal, QuorumCertificate, Signature,
-    StateAttestation, ValidatorIndex, Verdict, View, Vote, VotePhase, proposer_hash,
+    ExecCertificate, Hash, Height, MAX_PENDING_EVIDENCE, OxideBft, Proposal, QuorumCertificate,
+    Signature, StateAttestation, ValidatorIndex, Verdict, View, Vote, VotePhase, proposer_hash,
 };
 use crate::verify::VerifiedTc;
 use types::ExecDivergence;
@@ -189,11 +189,23 @@ impl OxideBft {
         if self.verify_signatures {
             let commit_ok = if let Some((_, commit_ok)) = verdict {
                 commit_ok
-            } else {
+            } else if header.body_hash == Hash::ZERO {
+                // Synthetic/legacy headers (body_hash absent) fall
+                // back to the erasure commitment.
                 let mut buf = Vec::new();
                 proposal.encode(&mut buf);
                 types::shard::commitment(&buf, self.validator_set.n(), self.erasure_k())
                     == header.body_commitment
+            } else {
+                // Fast path: the header carries the body's BLAKE3
+                // integrity hash — one hash pass over the canonical
+                // encoding instead of a Reed-Solomon encode (measured
+                // ~4× cheaper on a 1.5MB body). Same binding strength:
+                // both fields are signed in the header.
+                let mut buf = Vec::new();
+                proposal.encode(&mut buf);
+                crypto::hash::Hasher::hash_one(crypto::hash::Domain::BodyHash, &buf)
+                    == header.body_hash
             };
             if !commit_ok {
                 return false;
@@ -1228,6 +1240,67 @@ impl OxideBft {
         if vote.view != self.current_view {
             return (Ok(()), None);
         }
+        // Equivocation detection (system-audit S1): this voter has
+        // already signed a vote at this `(view, phase)` naming a
+        // *different* block — two signatures for conflicting blocks
+        // at one position is the exact slashable offense the staking
+        // module's `evidence` message consumes. The check reads the
+        // per-validator history (`vote_history`), which unlike the
+        // QC buffer survives QC formation and view-scoped clears —
+        // an equivocating pair straddling a buffer clear is still
+        // caught. The conflicting vote never enters the collection
+        // bucket: it cannot pollute the QC, and the preserved pair
+        // self-authenticates downstream (the module re-verifies both
+        // signatures before slashing, so an unverified signature
+        // slipping in under `verify_per_vote = false` is harmless).
+        // Dropping returns `Ok`: the relaying peer is not the
+        // offender — the slash, not a transport penalty, is the
+        // correct consequence.
+        // A vote is recorded below only after it clears every
+        // admissibility gate (idempotent slot, signature, phantom
+        // guard, conflict check), so `seen_*` always names a vote
+        // this node actually counted — a dropped phantom or forged
+        // message can never masquerade as the voter's first
+        // signature.
+        if let Some((seen_view, seen_hash, seen_sig)) = self.vote_history.get(&(voter, vote.phase))
+            && *seen_view == vote.view
+            && *seen_hash != vote.block_hash
+        {
+            if self.evidence_out.len() < MAX_PENDING_EVIDENCE {
+                // `idx` was bounds-checked against `votes.len()`
+                // (= committee size) above, and
+                // `validator_addresses` is index-parallel — `ZERO`
+                // is the unreachable fallback for a broken-set
+                // invariant, and an evidence record naming it
+                // simply fails module verification ("no consensus
+                // key on record") rather than accusing the wrong
+                // account.
+                let offender = self
+                    .validator_set
+                    .validator_addresses()
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(primitives::Address::ZERO);
+                self.evidence_out.push_back(types::DoubleSignEvidence {
+                    validator: offender,
+                    view: vote.view,
+                    phase: vote.phase,
+                    epoch: self.epoch,
+                    first_block_hash: *seen_hash,
+                    first_signature: *seen_sig,
+                    second_block_hash: vote.block_hash,
+                    second_signature: vote.signature,
+                });
+            } else {
+                self.evidence_dropped = self.evidence_dropped.saturating_add(1);
+            }
+            return (Ok(()), None);
+        }
+        // Otherwise: no entry, a stale one from a prior view, or a
+        // re-delivered copy of the recorded vote — all fall through
+        // to the collection slot, which is idempotent. The insert
+        // happens at the storage point below so only votes that
+        // clear admissibility anchor the history.
         // Already collected — idempotent (not an error, just a no-op).
         if self.votes[idx].is_some() {
             return (Ok(()), None);
@@ -1328,6 +1401,14 @@ impl OxideBft {
             None
         };
 
+        // The vote cleared every admissibility gate — record it as
+        // the voter's position at `(view, phase)` for equivocation
+        // detection. Unlike the QC buffer (`votes`), this history
+        // survives QC formation and view-scoped clears, so an
+        // equivocating pair straddling a buffer clear is still
+        // caught; the `seen_view` tag makes entries from prior
+        // views inert rather than blocking.
+        self.vote_history.insert((voter, vote.phase), (vote.view, vote.block_hash, vote.signature));
         self.votes[idx] = Some(vote);
         self.vote_count += 1;
         // `voter` is in-range (checked against `votes.len()` above),

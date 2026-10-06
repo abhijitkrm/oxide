@@ -11,8 +11,8 @@
 
 use super::{
     Address, Arc, CacheDB, CoinbaseObs, DatabaseRef, EvmModule, ExecError, ExecuteCommitEvm,
-    ExecutionResult, InspectEvm, ObservedReads, Output, ResultGas, SpecId, SpecTx, SuccessReason,
-    TX_GAS_TRANSFER, TxEnv, TxKind, alloy_primitives_address, trace, tx, versioned,
+    ExecutionResult, InspectEvm, ObservedReads, Output, RejectCategory, ResultGas, SpecId, SpecTx,
+    SuccessReason, TX_GAS_TRANSFER, TxEnv, TxKind, alloy_primitives_address, trace, tx, versioned,
 };
 
 impl EvmModule {
@@ -93,9 +93,9 @@ impl EvmModule {
         // native journal inspector replays precompile side-effect
         // undos when a frame reverts. Result/state semantics are
         // identical.
-        let result_and_state = evm
-            .inspect_tx(tx)
-            .map_err(|e| ExecError::ModuleRejected(format!("evm transact failed: {e:?}")))?;
+        let result_and_state = evm.inspect_tx(tx).map_err(|e| {
+            ExecError::rejected(RejectCategory::Other, format!("evm transact failed: {e:?}"))
+        })?;
         evm.precompiles.clear_native_journal();
         // Drain the call-tree recorder before the Evm is dropped —
         // the trace lands in `history` beside this tx's receipt for

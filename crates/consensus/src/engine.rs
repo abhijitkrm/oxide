@@ -144,6 +144,21 @@ pub const PROPOSAL_VERIFY_BUDGET_PER_SEC: u32 = 50;
 /// re-verification, never a wrong verdict.
 const MAX_REJECTED_HEADERS: usize = 4096;
 
+/// Maximum pending [`types::DoubleSignEvidence`] records awaiting
+/// the node pump's drain.
+///
+/// Unit: records (~180 bytes each — address + context + two
+/// hash/signature pairs). Origin: system-audit S1 — the queue
+/// exists so detection never has to choose between memory safety
+/// and preserving evidence; a full view of a 1024-seat committee
+/// can equivocate at most once per member per phase bout, so the
+/// bound covers a worst-case fully-byzantine view twice over.
+/// Tradeoff: on overflow the *newest* record is dropped — earlier
+/// evidence keeps FIFO fairness, and the fleet-level redundancy
+/// (every honest node detects the same pair) means a single
+/// node's drop does not lose the offense.
+const MAX_PENDING_EVIDENCE: usize = 2048;
+
 /// Heights between a validator-set transition being committed and
 /// its activation.
 ///
@@ -741,6 +756,39 @@ pub struct OxideBft {
     /// Collected votes for the current view (leader only). `None` =
     /// no vote from that validator. Indexed by `ValidatorIndex`.
     votes: Vec<Option<Vote>>,
+    /// The first vote this engine observed from each validator at
+    /// each pipeline position, keyed by `(ValidatorIndex,
+    /// VotePhase)`. Unlike `votes` (the QC-collection buffer,
+    /// cleared at every QC formation), this log spans the whole
+    /// engine lifetime and is the equivocation detector: an
+    /// incoming vote whose `(view, phase)` matches a recorded
+    /// entry but whose `block_hash` differs is a double-sign — two
+    /// signatures for conflicting blocks at one position — and
+    /// both are preserved as [`types::DoubleSignEvidence`].
+    /// Per-position keys mean a phase transition never overwrites
+    /// the record a later same-phase equivocation is checked
+    /// against; entries carry their `view`, so a stale record from
+    /// an old view simply never matches a new vote — no per-view
+    /// clearing is needed and the map stays bounded by 3×committee
+    /// size. The first-seen vote wins: every later conflicting
+    /// vote compares against it, so an equivocator can emit many
+    /// records per view (the queue bound absorbs that).
+    ///
+    /// Cost: one hash-map lookup per incoming vote (~50 ns) —
+    /// negligible against the millisecond-scale BLS verification
+    /// the same message already pays downstream.
+    vote_history: std::collections::HashMap<(ValidatorIndex, VotePhase), (View, Hash, Signature)>,
+    /// Detected equivocation evidence awaiting the node pump's
+    /// drain ([`OxideBft::take_evidence`]). Bounded by
+    /// [`MAX_PENDING_EVIDENCE`]; on overflow the newest record is
+    /// dropped and counted in `evidence_dropped` — the offense is
+    /// still likely to land via another honest node's identical
+    /// detection.
+    evidence_out: std::collections::VecDeque<types::DoubleSignEvidence>,
+    /// Records dropped because `evidence_out` hit
+    /// [`MAX_PENDING_EVIDENCE`]. A nonzero value means the pump is
+    /// not draining — operator signal, not a correctness issue.
+    evidence_dropped: u64,
     /// Number of votes collected in the current view (diagnostics).
     /// The quorum decision uses `vote_stake` — signer *count* is not
     /// voting *power* under unequal stake.
@@ -997,6 +1045,9 @@ impl OxideBft {
             epoch,
             timeout_signed_view: None,
             votes: vec![None; n],
+            vote_history: std::collections::HashMap::new(),
+            evidence_out: std::collections::VecDeque::new(),
+            evidence_dropped: 0,
             vote_count: 0,
             vote_stake: 0,
             exec_attest_pool: std::collections::BTreeMap::new(),
@@ -1747,6 +1798,26 @@ impl OxideBft {
         self.blocks.len()
     }
 
+    /// Diagnostic dump of `(height, view, kind, tx_count)` per stored
+    /// block — used by simulation harnesses to attribute a missing
+    /// proposal to the engine's actual stored state (e.g. an empty
+    /// block where the tx should have been). `#[doc(hidden)]`: not a
+    /// consensus-semantics API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn debug_stored_blocks(&self) -> Vec<(u64, u64, &'static str, usize)> {
+        self.blocks
+            .values()
+            .map(|(h, b)| {
+                let (kind, txs) = match b {
+                    BlockBody::Complete(p) => ("complete", p.txs.len()),
+                    BlockBody::Awaiting => ("awaiting", 0),
+                };
+                (h.height.value(), h.view.value(), kind, txs)
+            })
+            .collect()
+    }
+
     /// Whether `block_hash` resolves to a stored, *authenticated*
     /// proposal — `Awaiting` (header verified, body pending) or
     /// `Complete` (header + body verified). Entries enter `blocks`
@@ -2031,6 +2102,12 @@ impl OxideBft {
         proposal.encode(&mut body_bytes);
         let body_commitment =
             types::shard::commitment(&body_bytes, self.validator_set.n(), self.erasure_k());
+        // The direct path's body binding: one BLAKE3 pass over the
+        // same canonical encoding the commitment covers. Both fields
+        // ride the signed header — a validator holding the full body
+        // verifies with the cheap hash; the dispersed path keeps the
+        // commitment its shard proofs root into.
+        let body_hash = crypto::hash::Hasher::hash_one(crypto::hash::Domain::BodyHash, &body_bytes);
         let mut header = BlockHeader {
             height,
             view: self.current_view,
@@ -2038,6 +2115,7 @@ impl OxideBft {
             prev_block,
             tx_root,
             body_commitment,
+            body_hash,
             high_qc: self.high_qc.as_ref().map(|v| v.qc().clone()),
             // Embed the TC that brought us into this view, if any
             // (spec §view-changes: "the next leader embeds the TC in
@@ -2201,7 +2279,14 @@ impl OxideBft {
         }
         let mut buf = Vec::new();
         proposal.encode(&mut buf);
-        if types::shard::commitment(&buf, n, k) != header.body_commitment {
+        // Same split as the direct path: the BLAKE3 body hash when
+        // the header carries it, the erasure commitment otherwise.
+        let body_ok = if header.body_hash == Hash::ZERO {
+            types::shard::commitment(&buf, n, k) == header.body_commitment
+        } else {
+            crypto::hash::Hasher::hash_one(crypto::hash::Domain::BodyHash, &buf) == header.body_hash
+        };
+        if !body_ok {
             return Err(ConsensusError::BodyRejected { block_hash });
         }
         match self.app.process_proposal(proposal) {
@@ -2509,6 +2594,24 @@ impl OxideBft {
     /// drops oldest when never drained.
     pub fn take_certified(&mut self) -> Vec<CertifiedBlock> {
         Vec::from(std::mem::take(&mut self.certified_out))
+    }
+
+    /// Drain the equivocation evidence detected since the last call
+    /// (system-audit S1). Each record is a pair of conflicting signed
+    /// votes preserved verbatim — the node pump encodes them into a
+    /// staking `evidence` transaction and submits it; the staking
+    /// module re-verifies both signatures before slashing, so
+    /// submitting a malformed record wastes a tx but cannot slash
+    /// an honest validator. Returns the records in detection order.
+    pub fn take_evidence(&mut self) -> Vec<types::DoubleSignEvidence> {
+        self.evidence_out.drain(..).collect()
+    }
+
+    /// Pending evidence count plus the number of records dropped for
+    /// queue overflow — the operator observability pair for the S1
+    /// pipeline. `dropped > 0` means the drain is not keeping up.
+    pub fn evidence_stats(&self) -> (usize, u64) {
+        (self.evidence_out.len(), self.evidence_dropped)
     }
 
     /// The committed tip — hash and height of the last block this
@@ -2829,6 +2932,10 @@ impl OxideBft {
 impl ConsensusEngine for OxideBft {
     fn submit_tx(&mut self, tx: TxBytes) -> MempoolAck {
         self.app.ingest_tx(tx)
+    }
+
+    fn submit_txs(&mut self, txs: Vec<TxBytes>) -> Vec<MempoolAck> {
+        self.app.ingest_tx_batch(txs)
     }
 
     fn run_until_idle(&mut self) {

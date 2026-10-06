@@ -1097,7 +1097,7 @@ fn m4_oracle_rate_limit_rejects_second_update_same_block() {
     match result {
         Err(ExecError::ModuleRejected(reason)) => {
             assert!(
-                reason.contains("oracle update limit"),
+                reason.detail.contains("oracle update limit"),
                 "expected rate limit rejection, got: {reason}"
             );
         }
@@ -2006,7 +2006,7 @@ fn stale_mark_rejects_new_exposure_allows_reduce_only() {
     let err = perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap_err();
     match err {
         ExecError::ModuleRejected(reason) => {
-            assert!(reason.contains("stale"), "expected stale rejection, got: {reason}");
+            assert!(reason.detail.contains("stale"), "expected stale rejection, got: {reason}");
         }
         _ => panic!("expected ModuleRejected, got {err:?}"),
     }
@@ -2713,7 +2713,7 @@ fn oracle_outage_and_recovery_through_real_pipeline() {
     let err = perps.handle(&ctx(5), &msg::place(mid, limit(Side::Buy, 500, 1, 5))).unwrap_err();
     match err {
         ExecError::ModuleRejected(reason) => {
-            assert!(reason.contains("stale"), "expected stale rejection, got: {reason}");
+            assert!(reason.detail.contains("stale"), "expected stale rejection, got: {reason}");
         }
         _ => panic!("expected ModuleRejected, got {err:?}"),
     }

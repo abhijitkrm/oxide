@@ -62,6 +62,33 @@ struct PoolEntry {
     fee: u64,
     /// The serialized size in bytes (precomputed).
     size: u64,
+    /// The module's gas estimate, precomputed at insert time. The
+    /// proposal gas-cap loop reads this instead of re-parsing the
+    /// envelope and re-estimating per candidate — at a 40k-tx
+    /// backlog that loop was ~17ms per proposal (parse 0.3µs +
+    /// estimate 0.12µs per tx), the largest single term in the
+    /// leader's propose path.
+    gas: u64,
+}
+
+/// A transaction with everything the pool's indices need, computed
+/// once by the intake's parallel phase instead of re-derived per
+/// insert. `submit_prepared` skips the hash, the envelope re-parse,
+/// and the gas estimate — the batch intake already paid for all
+/// three.
+pub struct PreparedTx {
+    /// The transaction bytes, as submitted.
+    pub tx: TxBytes,
+    /// BLAKE3 [`Domain::Transaction`] hash of `tx` — the dedup key.
+    pub hash: Hash,
+    /// The envelope sender.
+    pub sender: Address,
+    /// The envelope nonce.
+    pub nonce: u64,
+    /// The envelope fee.
+    pub fee: u64,
+    /// The target module's gas estimate.
+    pub gas: u64,
 }
 
 /// The mempool: a fee-priority transaction pool with per-account nonce
@@ -97,11 +124,11 @@ pub struct Mempool {
     /// every other account. The cap bounds any sender's block
     /// share regardless of fee.
     max_per_sender: usize,
-    /// Pool-level per-sender bound, checked at `submit`: at most
-    /// this many pending txs per sender, and no nonce more than
-    /// this far past the sender's last executed nonce (when known).
-    /// Distinct from `max_per_sender` (a per-*block* share): the
-    /// pool deliberately holds several blocks' worth per sender so
+    /// Pool-level per-sender bound, checked on insert: at most this
+    /// many pending txs per sender, and no nonce more than this far
+    /// past the sender's last executed nonce (when known). Distinct
+    /// from `max_per_sender` (a per-*block* share): the pool
+    /// deliberately holds several blocks' worth per sender so
     /// pipelined proposals can continue a nonce chain.
     max_pending_per_sender: usize,
     /// Per-sender last executed nonce (HIGH fix). The mempool
@@ -112,6 +139,38 @@ pub struct Mempool {
     /// which could be a mid-chain nonce after earlier txs executed,
     /// creating a nonce gap in the block.
     executed_nonces: HashMap<Address, u64>,
+    /// Per-sender committed-but-unexecuted nonces: `(nonce ->
+    /// committed height)`. `remove_committed` vacates a committed tx
+    /// from the queue immediately, but the lane-side
+    /// `refresh_anchors` only rebuilds `executed_nonces` after the
+    /// block *executes* — under execution-lane lag the two clocks
+    /// diverge and the sender's queue shows a phantom gap between
+    /// `executed + 1` and the next live entry. `select` bridges
+    /// exactly the nonces recorded here (all of which are decided —
+    /// consumed or deterministically skipped — never free), and
+    /// `refresh_anchors` expires every entry at or below the just-
+    /// executed height: a consumed entry is covered by the refreshed
+    /// anchor, a skipped one un-bridges so the sender's refilled
+    /// nonce becomes selectable again.
+    pending_commit: HashMap<Address, BTreeMap<u64, u64>>,
+    /// Per-sender nonces carried by observed uncommitted chain
+    /// blocks: `(nonce -> proposal height)`. Under pipelined
+    /// consensus the sender's nonce chain is contiguous across the
+    /// *chain*, not across any one validator's pool: block h4 can
+    /// legitimately carry nonce 4 while uncommitted ancestors h2/h3
+    /// carry nonces 2 and 3 — all proposed to (and pooled by)
+    /// different leaders. The `executed_nonces` anchor alone sees
+    /// that as a gap and breaks the walk, producing empty proposals.
+    ///
+    /// `process_proposal` — which runs on every vote-path proposal,
+    /// not just this node's own — records the observed coverage via
+    /// `note_in_chain`, and `select` bridges a local queue miss
+    /// whose nonce a live ancestor carries. Entries expire in
+    /// `refresh_anchors` two ways: the rebuilt anchor passing the
+    /// nonce (resolved by execution), or the covering height falling
+    /// `CHAIN_COVER_TTL` behind the executed tip (the branch died —
+    /// the gap is real again and the walk stops bridging it).
+    in_chain: HashMap<Address, BTreeMap<u64, u64>>,
     /// Tx hashes already carried by an uncommitted proposal — one
     /// set per outstanding proposal position, oldest first.
     ///
@@ -121,18 +180,14 @@ pub struct Mempool {
     /// nonce chain — the duplicate then commits as a deterministic
     /// nonce skip and wastes the block space. `select` skips
     /// in-flight hashes, `note_proposed` records each built
-    /// proposal's set tagged with the height it proposed for, and
-    /// `remove_committed(h)` resolves every set at height ≤ h. If
-    /// the committed block carried these txs they are already gone
-    /// from the pool; if a different block won the height, the txs
-    /// become selectable again.
-    ///
-    /// Keyed by height, not by deque position: with rotating
-    /// leaders this node proposes only some heights, so "pop one
-    /// set per commit" released our in-flight set on the commit of
-    /// *another* leader's earlier block — while ours was still
-    /// pending — and the next proposal duplicated its txs.
-    proposed: VecDeque<(u64, HashSet<Hash>)>,
+    /// proposal's set, and `remove_committed` resolves the oldest
+    /// position per commit: positions commit strictly in order and
+    /// a descendant can only commit if its parent did, so the
+    /// front of the deque is always the next position to resolve.
+    /// If the committed block carried these txs they are already
+    /// gone from the pool; if a different branch won the position,
+    /// the txs become selectable again.
+    proposed: VecDeque<HashSet<Hash>>,
 }
 
 /// Maximum outstanding proposal positions tracked for in-flight
@@ -144,6 +199,15 @@ pub struct Mempool {
 /// without bound (early release can only re-select — it can never
 /// censor a tx).
 const MAX_IN_FLIGHT_PROPOSALS: usize = 16;
+
+/// Heights an `in_chain` nonce-cover stays valid (unit: blocks).
+///
+/// A proposed block resolves — commits or dies with its branch —
+/// inside the pipeline's in-flight window; twice that bound covers
+/// any honest resolution path while still expiring dead-branch
+/// coverage promptly (a lingering cover would falsely bridge a real
+/// gap and burn a proposal slot on a deterministically-skipped tx).
+const CHAIN_COVER_TTL: u64 = 2 * MAX_IN_FLIGHT_PROPOSALS as u64;
 
 /// Default per-sender selection cap: 1000 txs per block.
 ///
@@ -253,10 +317,11 @@ pub enum MempoolError {
     /// replacement's fee is below the required bump (≥110% of the
     /// displaced fee — geth legacypool `ErrReplaceUnderpriced`).
     ReplacementUnderpriced,
-    /// The sender already holds `max_pending_per_sender` pending txs, or the
-    /// nonce sits further than that past its last executed nonce.
-    /// Without this bound one account could fill the whole pool with
-    /// far-future nonces that never execute and are never pruned.
+    /// The sender already holds `max_pending_per_sender` pending
+    /// txs, or the nonce sits further than that past its last
+    /// executed nonce. Without this bound one account could fill the
+    /// whole pool with far-future nonces that never execute and are
+    /// never pruned.
     SenderLimit,
 }
 
@@ -292,6 +357,8 @@ impl Mempool {
             max_per_sender: DEFAULT_MAX_PER_SENDER,
             max_pending_per_sender: DEFAULT_MAX_PENDING_PER_SENDER,
             executed_nonces: HashMap::new(),
+            pending_commit: HashMap::new(),
+            in_chain: HashMap::new(),
             proposed: VecDeque::new(),
         }
     }
@@ -336,26 +403,42 @@ impl Mempool {
     pub fn submit(&mut self, tx: TxBytes) -> Result<(), MempoolError> {
         let bytes = tx.as_bytes();
         let hash = Hasher::hash_one(Domain::Transaction, bytes);
+        let (sender, nonce, fee) = parse_tx(bytes).ok_or(MempoolError::Malformed)?;
+        // The standalone path has no module context — the gas
+        // estimate is not available, so the entry carries 0 and the
+        // proposal gas-cap loop falls back to per-candidate
+        // estimation for it (see `select_with_gas`).
+        self.insert_prepared(PreparedTx { tx, hash, sender, nonce, fee, gas: 0 })
+    }
+
+    /// Submit a transaction whose hash, envelope fields, and gas
+    /// estimate the caller already computed — the batch intake's
+    /// parallel phase produces exactly this. Skips the per-tx
+    /// re-hash (~0.22µs), re-parse (~0.1µs), and gas re-estimate
+    /// (~0.12µs) that [`submit`](Self::submit) would redo.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`submit`](Self::submit).
+    pub fn submit_prepared(&mut self, prepared: PreparedTx) -> Result<(), MempoolError> {
+        self.insert_prepared(prepared)
+    }
+
+    /// The shared insert body behind [`submit`](Self::submit) and
+    /// [`submit_prepared`](Self::submit_prepared): dedup, same-nonce
+    /// replacement, capacity eviction, then the three-index insert.
+    fn insert_prepared(&mut self, prepared: PreparedTx) -> Result<(), MempoolError> {
+        let PreparedTx { tx, hash, sender, nonce, fee, gas } = prepared;
+        let bytes = tx.as_bytes();
 
         // Dedup: if we've seen this hash, it's a duplicate.
         if self.by_hash.contains_key(&hash) {
             return Err(MempoolError::Duplicate);
         }
 
-        // Parse sender, nonce, fee.
-        let (sender, nonce, fee) = parse_tx(bytes).ok_or(MempoolError::Malformed)?;
         let size = bytes.len() as u64;
         let density = FeeDensity { fee, size };
 
-        // Same-nonce replacement (geth legacypool semantics): if this
-        // sender already has a pending tx at this nonce, the new tx
-        // may replace it only if its fee is at least 110% of the old
-        // one. The displaced tx is removed from every index — the
-        // previous implementation just overwrote the `by_sender` slot,
-        // leaking the old entry in `by_hash`/`by_fee` forever (it kept
-        // counting toward `max_entries` and could be "evicted" as a
-        // ghost) and letting a *lower*-fee resubmit shadow a
-        // higher-fee tx.
         // Per-sender admission bound (replacements reuse their slot,
         // so they are exempt from the count): at most
         // `max_pending_per_sender` pending txs, within that many
@@ -372,6 +455,15 @@ impl Mempool {
             return Err(MempoolError::SenderLimit);
         }
 
+        // Same-nonce replacement (geth legacypool semantics): if this
+        // sender already has a pending tx at this nonce, the new tx
+        // may replace it only if its fee is at least 110% of the old
+        // one. The displaced tx is removed from every index — the
+        // previous implementation just overwrote the `by_sender` slot,
+        // leaking the old entry in `by_hash`/`by_fee` forever (it kept
+        // counting toward `max_entries` and could be "evicted" as a
+        // ghost) and letting a *lower*-fee resubmit shadow a
+        // higher-fee tx.
         if let Some(&old_hash) = self.by_sender.get(&sender).and_then(|q| q.get(&nonce))
             && let Some(old) = self.by_hash.get(&old_hash)
         {
@@ -415,7 +507,7 @@ impl Mempool {
         }
 
         // Insert into all indices.
-        let entry = PoolEntry { tx, hash, sender, nonce, fee, size };
+        let entry = PoolEntry { tx, hash, sender, nonce, fee, size, gas };
         self.by_hash.insert(hash, entry);
         self.by_sender.entry(sender).or_default().insert(nonce, hash);
         self.by_fee.entry(density).or_default().insert(hash);
@@ -535,6 +627,20 @@ impl Mempool {
     /// `by_sender` queues drop the selected nonces in one pass each;
     /// `by_fee` buckets are filtered once via `BTreeMap::retain`.
     pub fn select(&mut self, max_bytes: u64) -> Vec<TxBytes> {
+        self.select_with_gas(max_bytes).into_iter().map(|(tx, _gas)| tx).collect()
+    }
+
+    /// [`select`](Self::select) with each candidate's precomputed gas
+    /// estimate — the proposal gas-cap loop reads `gas` instead of
+    /// re-parsing the envelope and calling `estimate_gas` per
+    /// candidate (~0.42µs/tx saved; ~17ms per proposal at a 40k-tx
+    /// backlog). Entries inserted via [`submit`](Self::submit) carry
+    /// `gas = 0` (no module context at that site) — the caller falls
+    /// back to per-candidate estimation for those.
+    ///
+    /// The walk is identical to `select`'s; only the projection
+    /// differs, so the two can never diverge on ORDER.
+    pub fn select_with_gas(&mut self, max_bytes: u64) -> Vec<(TxBytes, u64)> {
         let mut total_bytes = 0u64;
         // Sender-fair fee-priority selection: a max-heap of
         // (head fee density, sender) — the density of each sender's
@@ -599,6 +705,28 @@ impl Mempool {
             // may still fit, so keep popping the heap).
             while count < per_sender_cap {
                 let Some(&hash) = queue.get(&nonce) else {
+                    // A miss is not necessarily a gap. Two covers let
+                    // the walk step over it: `pending_commit` — the
+                    // commit path vacated the nonce but the execution
+                    // lane hasn't confirmed — and `in_chain` — an
+                    // uncommitted ancestor block carries the nonce, so
+                    // it executes before this position and the chain
+                    // stays contiguous (the pipelined-consensus case
+                    // where each leader only pools its own round's
+                    // txs). A nonce in neither place is a real gap:
+                    // stop the chain.
+                    if self
+                        .pending_commit
+                        .get(&sender)
+                        .is_some_and(|pending| pending.contains_key(&nonce))
+                        || self
+                            .in_chain
+                            .get(&sender)
+                            .is_some_and(|cover| cover.contains_key(&nonce))
+                    {
+                        nonce = nonce.saturating_add(1);
+                        continue;
+                    }
                     break;
                 };
                 // In-flight: an earlier uncommitted proposal
@@ -612,7 +740,7 @@ impl Mempool {
                 // position can only commit after its parent, so
                 // this tx's position always resolves before any
                 // proposal carrying the later nonces commits.
-                if self.proposed.iter().any(|(_, set)| set.contains(&hash)) {
+                if self.proposed.iter().any(|set| set.contains(&hash)) {
                     nonce = nonce.saturating_add(1);
                     continue;
                 }
@@ -640,7 +768,7 @@ impl Mempool {
         let mut selected = Vec::with_capacity(selected_order.len());
         for hash in selected_order {
             if let Some(entry) = self.by_hash.get(&hash) {
-                selected.push(entry.tx.clone());
+                selected.push((entry.tx.clone(), entry.gas));
             }
         }
 
@@ -658,28 +786,52 @@ impl Mempool {
     /// so a lost proposal's work re-selects once its position
     /// resolves on commit (see `proposed`).
     ///
-    /// `height` is a lower bound on the height the proposal will
-    /// occupy; the set is tagged with `max(height, previous tag + 1)`
-    /// (so pipelined proposals never share a tag) and resolves when
-    /// that height — or a later one — commits. Callers that cannot
-    /// know the exact height should over-estimate: a late release
-    /// only delays a lost proposal's txs, an early one duplicates
-    /// them.
+    /// The set is pushed unconditionally — even for an empty
+    /// proposal — because `remove_committed` resolves exactly one
+    /// position per call and the deque's order must stay aligned
+    /// with the chain's position order. A missed push would release
+    /// a later set early (re-admitting its txs for one position —
+    /// the duplicate-skip this exists to prevent); an extra push
+    /// only delays a release past its position, which is the safe
+    /// direction.
     ///
     /// Hashes are recomputed here because `Proposal` carries only
     /// `TxBytes`: O(proposal txs) hashing on the proposal path —
     /// the same price `remove_committed` pays at finalization.
-    pub fn note_proposed(&mut self, height: u64, txs: &[TxBytes]) {
-        if txs.is_empty() {
-            return;
-        }
+    pub fn note_proposed(&mut self, txs: &[TxBytes]) {
         let set: HashSet<Hash> =
             txs.iter().map(|tx| Hasher::hash_one(Domain::Transaction, tx.as_bytes())).collect();
-        let tag =
-            self.proposed.back().map_or(height, |(last, _)| height.max(last.saturating_add(1)));
-        self.proposed.push_back((tag, set));
+        self.proposed.push_back(set);
         while self.proposed.len() > MAX_IN_FLIGHT_PROPOSALS {
             self.proposed.pop_front();
+        }
+    }
+
+    /// Record the nonce coverage of an *observed* chain proposal —
+    /// called from the app's `process_proposal` for every accepted
+    /// proposal, this node's own and foreign leaders' alike.
+    ///
+    /// This is the information [`select`](Self::select) needs that
+    /// the local queue structurally lacks: which sender nonces are
+    /// already carried by uncommitted ancestor blocks. A re-
+    /// proposal at a later height refreshes the entry's TTL (`max`
+    /// keeps the newest cover — the dead-height can't out-live the
+    /// live one). Entries with an unparseable tx are skipped — a
+    /// malformed proposal is rejected before this runs, so the loop
+    /// sees only statically valid txs.
+    ///
+    /// O(txs) parse + `BTreeMap` insert on the vote path — cold
+    /// relative to per-tx signature checks already paid there.
+    pub fn note_in_chain(&mut self, txs: &[TxBytes], height: u64) {
+        for tx in txs {
+            if let Some((sender, nonce, _fee)) = parse_tx(tx.as_bytes()) {
+                self.in_chain
+                    .entry(sender)
+                    .or_default()
+                    .entry(nonce)
+                    .and_modify(|h| *h = (*h).max(height))
+                    .or_insert(height);
+            }
         }
     }
 
@@ -699,15 +851,32 @@ impl Mempool {
     /// Hashes are recomputed here because `FinalizedBlock` carries
     /// only `TxBytes`: O(block txs) hashing on the commit path.
     ///
-    /// Also resolves every in-flight proposal at height ≤ `height`:
-    /// the commit answers whether those txs committed (they are
-    /// already gone via `remove` below) or must re-select (a
-    /// different block won the height — the released set is
+    /// Also resolves the oldest outstanding proposal position: the
+    /// commit answers whether that proposal's txs committed (they
+    /// are already gone via `remove` below) or must re-select (a
+    /// different branch won the position — the released set is
     /// eligible again on the next `select`).
-    pub fn remove_committed(&mut self, height: u64, txs: &[TxBytes]) {
-        self.proposed.retain(|(h, _)| *h > height);
+    /// `height` is the committing block's height: `pending_commit`
+    /// entries are expired by *executed* height in
+    /// [`refresh_anchors`](Self::refresh_anchors), which needs the
+    /// commit height to tell "still in the lane" from "resolved".
+    pub fn remove_committed(&mut self, txs: &[TxBytes], height: u64) {
+        self.proposed.pop_front();
         for tx in txs {
             let hash = Hasher::hash_one(Domain::Transaction, tx.as_bytes());
+            // Record the vacated nonce as committed-but-unexecuted so
+            // `select` can bridge the phantom gap an execution-lane
+            // lag would otherwise leave between the stale anchor and
+            // the next queued nonce (empty proposals under load —
+            // the devnet fault-injection flake). Recorded from the
+            // committed *bytes*, not pool membership: a validator
+            // that never held the tx (it was proposed by another
+            // leader) still needs the bridge. A nonce committed twice
+            // keeps the later height — either copy executing first
+            // resolves the slot identically.
+            if let Some((sender, nonce, _fee)) = parse_tx(tx.as_bytes()) {
+                self.pending_commit.entry(sender).or_default().insert(nonce, height);
+            }
             self.remove(&hash);
         }
     }
@@ -746,7 +915,16 @@ impl Mempool {
     /// it — e.g. a same-nonce replacement that won in a competing
     /// block), so they can never execute and would otherwise occupy
     /// pool space until a size-cap eviction reached them.
-    pub fn refresh_anchors(&mut self, next_expected: impl Fn(&Address) -> Option<u64>) {
+    /// `executed_height` is the height this refresh executed: every
+    /// `pending_commit` entry at or below it has been resolved by
+    /// execution — consumed (covered by the rebuilt anchor) or
+    /// skipped (dead slot: un-bridging it lets a nonce refill
+    /// become selectable again). Entries above it remain in flight.
+    pub fn refresh_anchors(
+        &mut self,
+        executed_height: u64,
+        next_expected: impl Fn(&Address) -> Option<u64>,
+    ) {
         self.executed_nonces = self
             .by_sender
             .keys()
@@ -759,6 +937,26 @@ impl Mempool {
                     .map(|last| (*sender, last))
             })
             .collect();
+        // Expire resolved bridges — `<= executed_height` covers both
+        // outcomes: consumed slots are inside the refreshed anchor,
+        // skipped ones must stop shadowing the sender's nonce floor.
+        self.pending_commit.retain(|_, pending| {
+            pending.retain(|_, committed_height| *committed_height > executed_height);
+            !pending.is_empty()
+        });
+        // Same for observed chain coverage: a cover dies when the
+        // rebuilt anchor passes its nonce (execution resolved the
+        // slot — the pool no longer needs the bridge) or when its
+        // proposal height falls CHAIN_COVER_TTL behind the executed
+        // tip (the covering block never committed — its branch is
+        // dead and the gap is real). A sender whose queue emptied is
+        // absent from the rebuilt anchor; its entries ride the TTL
+        // until expiry.
+        self.in_chain.retain(|sender, cover| {
+            let anchor = self.executed_nonces.get(sender).copied().unwrap_or(0);
+            cover.retain(|nonce, h| *nonce > anchor && *h + CHAIN_COVER_TTL > executed_height);
+            !cover.is_empty()
+        });
         // Collect stale hashes first — `by_sender` can't be mutated
         // while its queues are borrowed for the range scan.
         let mut stale: Vec<Hash> = Vec::new();
@@ -943,7 +1141,7 @@ mod tests {
         // Selection is a peek — the tx stays pooled until the block
         // finalizes, so a losing proposal can't lose it.
         assert_eq!(pool.len(), 1, "peek select leaves entries pooled");
-        pool.remove_committed(1, &selected);
+        pool.remove_committed(&selected, 1);
         assert_eq!(pool.len(), 0, "finalization removes committed txs");
     }
 
@@ -1046,7 +1244,7 @@ mod tests {
         let (_, nonce1, _) = parse_tx(selected[1].as_bytes()).unwrap();
         assert_eq!(nonce1, 1);
         // Both txs stay pooled until finalization removes them.
-        pool.remove_committed(1, &selected);
+        pool.remove_committed(&selected, 1);
         assert_eq!(pool.len(), 0);
     }
 
@@ -1061,7 +1259,7 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(pool.len(), 2, "peek: both txs stay pooled");
         // After the selected tx commits, one remains for next block.
-        pool.remove_committed(1, &selected);
+        pool.remove_committed(&selected, 1);
         assert_eq!(pool.len(), 1, "one tx remains after commit");
     }
 
@@ -1189,7 +1387,7 @@ mod tests {
         assert_eq!(pool.len(), 10);
         let selected = pool.select(1 << 20);
         assert_eq!(selected.len(), 10, "all 10 txs should be selected");
-        pool.remove_committed(1, &selected);
+        pool.remove_committed(&selected, 1);
         assert_eq!(pool.len(), 0, "pool should be empty after commit");
         // Committing drained every index — a `by_fee` tombstone
         // would leave a non-empty bucket behind.
@@ -1209,7 +1407,7 @@ mod tests {
         // Commit all — removal should clean up the sender queue.
         let selected = pool.select(1 << 20);
         assert_eq!(selected.len(), 3);
-        pool.remove_committed(1, &selected);
+        pool.remove_committed(&selected, 1);
         assert_eq!(pool.len(), 0);
         // The sender's queue should be gone (no orphaned entries).
         // Verify by submitting a new tx from the same sender — it
@@ -1247,7 +1445,7 @@ mod tests {
         assert_eq!(pool.len(), 6, "peek keeps all entries pooled");
         // Commit the selected txs, then the next select takes the
         // spammer's next two capped nonces.
-        pool.remove_committed(1, &selected);
+        pool.remove_committed(&selected, 1);
         let selected2 = pool.select(1 << 20);
         assert_eq!(selected2.len(), 2, "next block takes the next 2 capped txs");
     }
@@ -1347,7 +1545,7 @@ mod tests {
         assert_eq!(selected.len(), 3, "chain stops at cap even with more nonces");
         // Peek: nonces `0..2` selected, all 6 stay pooled; commit
         // removes the selected three.
-        pool.remove_committed(1, &selected);
+        pool.remove_committed(&selected, 1);
         assert_eq!(pool.len(), 3);
     }
 
@@ -1387,7 +1585,7 @@ mod tests {
         let second = pool.select(1 << 20);
         assert_eq!(second, first, "uncommitted txs stay re-proposable");
         // And when a block DOES commit it, it leaves for good.
-        pool.remove_committed(1, &second);
+        pool.remove_committed(&second, 1);
         assert!(pool.select(1 << 20).is_empty());
     }
 
@@ -1402,7 +1600,7 @@ mod tests {
                 pool.submit(build_tx(addr(i), round, 100 + round, &[0])).unwrap();
             }
             let selected = pool.select(1 << 20);
-            pool.remove_committed(1, &selected);
+            pool.remove_committed(&selected, 1);
         }
         assert_eq!(pool.len(), 0);
         assert!(
@@ -1446,7 +1644,7 @@ mod tests {
         // A block consumed addr(1) nonces 0 and 1 — the executor's
         // map reports the *next* expected nonce (2).
         let next_expected = HashMap::from([(addr(1), 2u64)]);
-        pool.refresh_anchors(|a| next_expected.get(a).copied());
+        pool.refresh_anchors(1, |a| next_expected.get(a).copied());
         assert_eq!(pool.len(), 2, "nonces 0 and 1 are pruned");
         // The next selection starts at nonce 2 — the consumed
         // entries can't be re-proposed.
@@ -1468,13 +1666,99 @@ mod tests {
         pool.set_executed_nonce(addr(1), 4);
         pool.set_executed_nonce(addr(9), 10); // not pooled
         let next_expected = HashMap::from([(addr(1), 4u64), (addr(9), 10u64)]);
-        pool.refresh_anchors(|a| next_expected.get(a).copied());
+        pool.refresh_anchors(1, |a| next_expected.get(a).copied());
         assert_eq!(pool.executed_nonces.len(), 1, "only pooled senders keep an anchor");
         assert!(pool.executed_nonces.contains_key(&addr(1)));
     }
 
     fn nonces_of(selected: &[TxBytes]) -> Vec<u64> {
         selected.iter().map(|tx| parse_tx(tx.as_bytes()).unwrap().1).collect()
+    }
+
+    /// Execution-lane lag must not starve selection: commit vacates
+    /// a tx from the queue immediately, but `refresh_anchors` only
+    /// rebuilds the executed anchor when the lane finishes the block.
+    /// Between the two the sender's queue has a phantom gap —
+    /// `select` must bridge it through `pending_commit` instead of
+    /// emitting an empty proposal (the devnet fault-injection flake:
+    /// "leader should propose" with `work_outstanding=false`).
+    #[test]
+    fn select_bridges_committed_unexecuted_gap() {
+        let mut pool = Mempool::new(100);
+        // Sender 1's executed anchor is stale (lane still owes the
+        // blocks) while commits already vacated nonces 1 and 2.
+        pool.set_executed_nonce(addr(1), 0);
+        pool.remove_committed(&[build_tx(addr(1), 1, 100, &[0])], 1);
+        pool.remove_committed(&[build_tx(addr(1), 2, 100, &[0])], 2);
+        // The live tx queues at nonce 3 — the phantom gap at 1..3.
+        pool.submit(build_tx(addr(1), 3, 100, &[0])).unwrap();
+        let selected = pool.select(1 << 20);
+        assert_eq!(nonces_of(&selected), vec![3], "the bridge covers the vacated nonces");
+
+        // Once the lane executes through the committing heights the
+        // bridges expire: the refreshed anchor (nonces ≤ 2 consumed)
+        // carries the chain and `pending_commit` empties. The live
+        // nonce-3 tx is still queued and stays selectable.
+        let next_expected = HashMap::from([(addr(1), 3u64)]);
+        pool.refresh_anchors(2, |a| next_expected.get(a).copied());
+        assert!(!pool.pending_commit.contains_key(&addr(1)));
+        assert_eq!(nonces_of(&pool.select(1 << 20)), vec![3]);
+    }
+
+    /// A committed nonce that *skips* at execution (its nonce never
+    /// consumed) must un-bridge once that height executes — keeping
+    /// it would dead-lock the sender's refilled nonce forever.
+    #[test]
+    fn skipped_committed_nonce_unbridges_on_execution() {
+        let mut pool = Mempool::new(100);
+        pool.set_executed_nonce(addr(1), 0);
+        // Nonce 1 commits but skips at execution (next_expected
+        // stays 1) — its bridge must not outlive the executed height.
+        pool.remove_committed(&[build_tx(addr(1), 1, 100, &[0])], 1);
+        // The user refills nonce 1 — the bridge must not hide it.
+        pool.submit(build_tx(addr(1), 1, 200, &[1])).unwrap();
+        let next_expected = HashMap::from([(addr(1), 1u64)]);
+        pool.refresh_anchors(1, |a| next_expected.get(a).copied());
+        assert_eq!(
+            nonces_of(&pool.select(1 << 20)),
+            vec![1],
+            "refill at the skipped nonce is selectable again"
+        );
+    }
+
+    /// The pipelined-consensus gap: each leader only pools its own
+    /// submissions, so a validator whose mempool anchors at the
+    /// executed nonce sees a hole where uncommitted ancestor blocks
+    /// (proposed by other leaders) carry the missing nonces. Without
+    /// `in_chain` coverage the walk broke at the hole and the leader
+    /// proposed an empty block — the devnet fault-injection flake
+    /// ("leader should propose" at the flush round with
+    /// `work_outstanding=false`).
+    #[test]
+    fn select_bridges_in_flight_ancestor_gap() {
+        let mut pool = Mempool::new(100);
+        pool.set_executed_nonce(addr(1), 0);
+        // Nonces 1 and 2 were observed in accepted proposals at
+        // heights 1 and 2 — foreign leaders' blocks this validator
+        // voted on but never pooled.
+        pool.note_in_chain(&[build_tx(addr(1), 1, 100, &[0])], 1);
+        pool.note_in_chain(&[build_tx(addr(1), 2, 100, &[0])], 2);
+        // The validator holds only nonce 3, submitted to it directly.
+        pool.submit(build_tx(addr(1), 3, 100, &[0])).unwrap();
+        assert_eq!(
+            nonces_of(&pool.select(1 << 20)),
+            vec![3],
+            "the ancestor cover bridges nonces 1 and 2"
+        );
+
+        // The covers expire once the covering heights fall behind
+        // the executed tip: if those ancestor blocks never committed
+        // (dead branch), the gap is real again and selection must
+        // stop bridging it.
+        let next_expected = HashMap::from([(addr(1), 1u64)]);
+        pool.refresh_anchors(CHAIN_COVER_TTL + 2, |a| next_expected.get(a).copied());
+        assert!(!pool.in_chain.contains_key(&addr(1)), "dead-branch covers expire");
+        assert_eq!(pool.select(1 << 20).len(), 0, "a real gap breaks the walk");
     }
 
     /// The defect this guards: `select` is a peek, so a pipelined
@@ -1493,7 +1777,7 @@ mod tests {
         pool.submit(build_tx(addr(2), 0, 100, &[9])).unwrap();
 
         let first = pool.select(1 << 20);
-        pool.note_proposed(1, &first);
+        pool.note_proposed(&first);
         // cap=2 → the first proposal carries addr(1) nonces 0,1 and
         // addr(2) nonce 0 (fee ties order across senders; collect
         // nonces per sender instead of asserting an interleave).
@@ -1521,7 +1805,7 @@ mod tests {
                 .unwrap();
         }
         let first = pool.select(1 << 20);
-        pool.note_proposed(1, &first);
+        pool.note_proposed(&first);
         assert!(
             pool.select(1 << 20).is_empty(),
             "in-flight head is excluded while its position is open"
@@ -1529,7 +1813,7 @@ mod tests {
 
         // A different branch won the position: the commit carries
         // none of the proposed txs. The set releases.
-        pool.remove_committed(1, &[]);
+        pool.remove_committed(&[], 1);
         let reselected = pool.select(1 << 20);
         assert_eq!(
             nonces_of(&reselected),
@@ -1550,18 +1834,18 @@ mod tests {
                 .unwrap();
         }
         let first = pool.select(1 << 20);
-        pool.note_proposed(1, &first);
+        pool.note_proposed(&first);
         let second = pool.select(1 << 20);
-        pool.note_proposed(2, &second);
+        pool.note_proposed(&second);
 
         // Position 1 commits its proposal: those txs leave the
         // pool, and the position resolves.
-        pool.remove_committed(1, &first);
+        pool.remove_committed(&first, 1);
         assert_eq!(pool.len(), 2);
         // Position 2 still open: nonces 2,3 stay in-flight.
         assert!(pool.select(1 << 20).is_empty());
         // Position 2 resolves the same way.
-        pool.remove_committed(2, &second);
+        pool.remove_committed(&second, 1);
         assert_eq!(pool.len(), 0);
     }
 
@@ -1576,43 +1860,25 @@ mod tests {
         pool.submit(build_tx(addr(1), 1, 100, &[1])).unwrap();
 
         let first = pool.select(1 << 20); // carries nonce 0
-        pool.note_proposed(1, &first);
+        pool.note_proposed(&first);
         let second = pool.select(1 << 20); // continues past it: nonce 1
-        pool.note_proposed(2, &second);
+        pool.note_proposed(&second);
         assert_eq!(nonces_of(&second), vec![1]);
 
         // An alien block won position 1: the first set releases,
         // the second stays in-flight.
-        pool.remove_committed(1, &[]);
+        pool.remove_committed(&[], 1);
         let third = pool.select(1 << 20);
         assert_eq!(
             nonces_of(&third),
             vec![0],
             "released position-1 tx re-selects while position 2 is open"
         );
-        pool.note_proposed(3, &third);
+        pool.note_proposed(&third);
 
         // Position 2 resolves on the next commit — its tx releases.
-        pool.remove_committed(2, &[]);
+        pool.remove_committed(&[], 1);
         let fourth = pool.select(1 << 20);
         assert_eq!(nonces_of(&fourth), vec![1], "position 2 resolves on its own commit");
-    }
-
-    /// Regression: with rotating leaders this node proposes only
-    /// some heights. The commit of another leader's *earlier* block
-    /// must not release our still-pending proposal's set — the old
-    /// pop-one-per-commit bookkeeping did, so the next proposal
-    /// re-selected (and duplicated) our in-flight txs.
-    #[test]
-    fn foreign_commit_below_our_height_keeps_in_flight() {
-        let mut pool = Mempool::new(100);
-        pool.submit(build_tx(addr(1), 0, 100, &[0])).unwrap();
-        let ours = pool.select(1 << 20);
-        pool.note_proposed(5, &ours);
-        pool.remove_committed(3, &[]);
-        pool.remove_committed(4, &[]);
-        assert!(pool.select(1 << 20).is_empty(), "height 5 is still pending");
-        pool.remove_committed(5, &[]);
-        assert_eq!(nonces_of(&pool.select(1 << 20)), vec![0], "released once height 5 resolves");
     }
 }

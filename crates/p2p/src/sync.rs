@@ -551,8 +551,14 @@ impl SnapshotClient {
     }
 
     /// Store metadata received from the server.
+    ///
+    /// `num_chunks` is wire-controlled: cap the backing `Vec` at
+    /// [`MAX_CHUNKS`] — the snapshot encoder rejects anything larger,
+    /// so a server claiming more is provably hostile/malformed. The
+    /// stored metadata keeps the true value, and `add_chunk` rejects
+    /// chunk indices past the capped buffer as `ChunkOutOfRange`.
     pub fn set_metadata(&mut self, response: SyncResponse) {
-        let num_chunks = response.num_chunks as usize;
+        let num_chunks = (response.num_chunks as usize).min(MAX_CHUNKS as usize);
         self.metadata = Some(response);
         self.chunks.clear();
         self.chunks.resize_with(num_chunks, Vec::new);
@@ -795,6 +801,32 @@ mod tests {
             is_last: true,
         };
         assert_eq!(client.add_chunk(bad_chunk), Err(SyncError::InvalidResponse));
+    }
+
+    /// A hostile `num_chunks` (far beyond `MAX_CHUNKS`) must not
+    /// drive the client's chunk-table allocation — the table caps at
+    /// `MAX_CHUNKS` and any chunk index past it reports
+    /// `ChunkOutOfRange`.
+    #[test]
+    fn snapshot_client_caps_hostile_chunk_count() {
+        let mut client = SnapshotClient::new(vec![0u8]);
+        client.set_metadata(SyncResponse {
+            height: 7,
+            num_chunks: u32::MAX,
+            state_root: [0u8; 32],
+            num_entries: 0,
+        });
+        // The table is capped at MAX_CHUNKS, so a chunk at index
+        // MAX_CHUNKS is out of range — reported against the claimed
+        // u32::MAX count, not the cap.
+        let chunk = ChunkResponse {
+            height: 7,
+            index: MAX_CHUNKS,
+            entries: vec![(vec![0x01], vec![0x02])],
+            is_last: false,
+        };
+        assert_eq!(client.add_chunk(chunk), Err(SyncError::ChunkOutOfRange(MAX_CHUNKS, u32::MAX)));
+        assert!(!client.is_complete());
     }
 
     #[test]

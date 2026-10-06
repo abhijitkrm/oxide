@@ -46,7 +46,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use executor::{Event, ExecError, Module, TxContext};
+use executor::{Event, ExecError, Module, RejectCategory, TxContext};
 use framework::{CommittedStore, module_id};
 use primitives::fixed::{Price, Qty, SignedQty};
 use primitives::{Address, Hash, Height};
@@ -873,20 +873,20 @@ impl PerpsModule {
     /// Panics if the inner mutex is poisoned.
     pub fn list_market(&self, cfg: PerpsMarketConfig) -> Result<u8, ExecError> {
         let mut inner = framework::lock_state(&self.inner);
-        let id =
-            inner.markets.iter().position(Option::is_none).ok_or_else(|| {
-                ExecError::ModuleRejected("all 256 market slots taken".to_string())
-            })?;
+        let id = inner.markets.iter().position(Option::is_none).ok_or_else(|| {
+            ExecError::rejected(RejectCategory::Precondition, "all 256 market slots taken")
+        })?;
         #[allow(clippy::cast_possible_truncation)]
         let id_u8 = id as u8;
-        let vbase = cfg
-            .base
-            .validated()
-            .map_err(|e| ExecError::ModuleRejected(format!("market config: {e}")))?;
-        let book = DenseBook::new(vbase)
-            .map_err(|e| ExecError::ModuleRejected(format!("book init: {e}")))?;
-        let mut engine = MatchingEngine::new(vbase, book)
-            .map_err(|e| ExecError::ModuleRejected(format!("engine init: {e}")))?;
+        let vbase = cfg.base.validated().map_err(|e| {
+            ExecError::rejected(RejectCategory::Internal, format!("market config: {e}"))
+        })?;
+        let book = DenseBook::new(vbase).map_err(|e| {
+            ExecError::rejected(RejectCategory::Internal, format!("book init: {e}"))
+        })?;
+        let mut engine = MatchingEngine::new(vbase, book).map_err(|e| {
+            ExecError::rejected(RejectCategory::Internal, format!("engine init: {e}"))
+        })?;
         // Committed engines carry the resting fold — `state_root`
         // reads `resting_fold()` instead of re-walking the book.
         engine.enable_resting_fold(perps_book_leaf);
@@ -938,7 +938,7 @@ impl PerpsModule {
     pub fn set_mark_price(&self, market: u8, mark: u64) -> Result<(), ExecError> {
         let mut inner = framework::lock_state(&self.inner);
         if !inner.configs.contains_key(&market) {
-            return Err(ExecError::ModuleRejected("market does not exist".to_string()));
+            return Err(ExecError::rejected(RejectCategory::NotFound, "market does not exist"));
         }
         // M4 fix: per-block oracle rate limit. Each market can have
         // at most `MAX_ORACLE_UPDATES_PER_BLOCK` oracle updates per
@@ -947,17 +947,23 @@ impl PerpsModule {
         // block.
         let current_updates = inner.oracle_updates_this_block.get(&market).copied().unwrap_or(0);
         if current_updates >= MAX_ORACLE_UPDATES_PER_BLOCK {
-            return Err(ExecError::ModuleRejected(format!(
-                "oracle update limit reached: {current_updates}/{MAX_ORACLE_UPDATES_PER_BLOCK} per block per market"
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                format!(
+                    "oracle update limit reached: {current_updates}/{MAX_ORACLE_UPDATES_PER_BLOCK} per block per market"
+                ),
+            ));
         }
         // Oracle robustness: reject extreme price changes.
         if let Some(old_mark) = inner.marks.get(&market) {
             let deviation = mark_price_deviation_bps(mark, *old_mark);
             if deviation > MAX_MARK_CHANGE_BPS {
-                return Err(ExecError::ModuleRejected(format!(
-                    "mark price deviation {deviation} bps exceeds max {MAX_MARK_CHANGE_BPS} bps"
-                )));
+                return Err(ExecError::rejected(
+                    RejectCategory::InvalidInput,
+                    format!(
+                        "mark price deviation {deviation} bps exceeds max {MAX_MARK_CHANGE_BPS} bps"
+                    ),
+                ));
             }
         }
         inner.marks.insert(market, mark);
@@ -987,7 +993,7 @@ impl PerpsModule {
     pub fn set_mark_price_unchecked(&self, market: u8, mark: u64) -> Result<(), ExecError> {
         let mut inner = framework::lock_state(&self.inner);
         if !inner.configs.contains_key(&market) {
-            return Err(ExecError::ModuleRejected("market does not exist".to_string()));
+            return Err(ExecError::rejected(RejectCategory::NotFound, "market does not exist"));
         }
         inner.marks.insert(market, mark);
         let h = inner.current_height;
@@ -1101,10 +1107,9 @@ impl PerpsModule {
     /// Panics if the inner mutex is poisoned.
     pub fn apply_funding(&self, market: u8, rate_i64: i64) -> Result<Vec<Event>, ExecError> {
         let mut inner = framework::lock_state(&self.inner);
-        let mark = *inner
-            .marks
-            .get(&market)
-            .ok_or_else(|| ExecError::ModuleRejected("market does not exist".to_string()))?;
+        let mark = *inner.marks.get(&market).ok_or_else(|| {
+            ExecError::rejected(RejectCategory::NotFound, "market does not exist")
+        })?;
 
         // Bound the applied rate: the quorum gate authenticates the
         // rate but cannot bound its magnitude — an out-of-range rate
@@ -1114,9 +1119,10 @@ impl PerpsModule {
         // `i64::MIN` has no positive abs — checked_abs maps it to
         // out-of-range rather than panicking.
         if rate_i64.checked_abs().is_none_or(|a| a > MAX_FUNDING_RATE_BPS) {
-            return Err(ExecError::ModuleRejected(format!(
-                "funding rate {rate_i64} bps exceeds bound ±{MAX_FUNDING_RATE_BPS} bps"
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                format!("funding rate {rate_i64} bps exceeds bound ±{MAX_FUNDING_RATE_BPS} bps"),
+            ));
         }
 
         let mut events = Vec::new();
@@ -1285,10 +1291,9 @@ impl PerpsModule {
         // before even knowing whether liquidation was needed. The
         // equity read only needs shared borrows of disjoint fields.
         let (equity, maintenance) = {
-            let acct = inner
-                .accounts
-                .get(account)
-                .ok_or_else(|| ExecError::ModuleRejected("account not found".to_string()))?;
+            let acct = inner.accounts.get(account).ok_or_else(|| {
+                ExecError::rejected(RejectCategory::NotFound, "account not found")
+            })?;
             (
                 acct.equity(&inner.marks, &inner.configs),
                 acct.total_maintenance(&inner.marks, &inner.configs),
@@ -1353,7 +1358,7 @@ impl PerpsModule {
         {
             let Inner { marks, accounts, .. } = &mut *inner;
             let Some(mut acct_mut) = accounts.get(account).cloned() else {
-                return Err(ExecError::ModuleRejected("account not found".to_string()));
+                return Err(ExecError::rejected(RejectCategory::NotFound, "account not found"));
             };
             cross_margin = acct_mut.cross_margin;
             for (market, pos) in &mut acct_mut.positions {

@@ -215,6 +215,20 @@ pub trait ConsensusEngine: Send {
     /// may handle it directly.
     fn submit_tx(&mut self, tx: TxBytes) -> MempoolAck;
 
+    /// Feed a batch of transactions into the pipeline, returning one
+    /// ack per input in order.
+    ///
+    /// Why a trait method: batch intake is the throughput path — the
+    /// executor's `ingest_tx_batch` parallelizes secp256k1 recovery
+    /// across the batch (~43µs/tx serial → ~12µs/tx effective on the
+    /// dev rig), and per-tx `submit_tx` loops cannot reach it. The
+    /// default loops [`submit_tx`](Self::submit_tx) so engines
+    /// without a batch path keep working; `OxideBft` overrides to
+    /// forward to `ingest_tx_batch`.
+    fn submit_txs(&mut self, txs: Vec<TxBytes>) -> Vec<MempoolAck> {
+        txs.into_iter().map(|tx| self.submit_tx(tx)).collect()
+    }
+
     /// Drive the engine until it has no immediately-executable work.
     /// Deterministic-runtime-friendly: the real engine's I/O is
     /// event-driven in Phase 1; this step function lets conformance

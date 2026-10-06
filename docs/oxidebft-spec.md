@@ -186,6 +186,26 @@ counterexample the TLA+ model produced. The recursive rule also makes
 the future block-import/catch-up seam safe by construction: imported
 ancestors commit with the chain that certifies them.
 
+### Body binding (direct vs dispersed)
+
+A proposal's body is bound to the signed header two ways, and a
+validator uses whichever matches how the body reached it:
+
+- **Direct path** (full proposal in hand): the header carries
+  `body_hash` — `H(BodyHash ‖ canonical proposal encoding)`. One
+  BLAKE3 pass verifies it (~4× cheaper than re-deriving the erasure
+  commitment; measured 3.8ms → ~0.9ms on a 1.5MB body).
+- **Dispersed path** (shards only, `DispersedSimplex`): the header
+  carries `body_commitment` — the Merkle root over the
+  Reed-Solomon-encoded shards. Each validator verifies its shard's
+  inclusion proof against this root *before* voting, and
+  reconstructs + certifies the full body (via `body_hash` when
+  present, else the commitment) before finalize.
+
+Both fields ride the signed header, so either binding is exactly as
+trustworthy as the other; `body_hash = 0` (synthetic test headers)
+selects the commitment check on both paths.
+
 ### Why two-chain, not three-chain or one-chain
 
 - **One-chain (basic HotStuff)** finalizes in one round but requires

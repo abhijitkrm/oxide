@@ -678,7 +678,7 @@ fn send_range_request(transport: &mut p2p::tcp::TcpTransport, peer_id: &[u8], fr
     buf.extend_from_slice(&crate::block_sync::encode_request(
         &crate::block_sync::FetchRequest::ByRange { from, count: crate::block_sync::SYNC_PAGE_CAP },
     ));
-    transport.send(peer_id, &buf).is_ok()
+    transport.send(&peer_id.to_vec(), &buf).is_ok()
 }
 
 #[cfg(test)]
@@ -812,6 +812,10 @@ mod tests {
             repair_peers: Vec::new(),
             observer_peers: vec![observer],
             tx_inject,
+            // Test-cluster validators detect equivocation but do
+            // not submit — no funded secp256k1 identity exists in
+            // this harness, and the drain keeps detection warm.
+            evidence_reporter: None,
         };
         std::thread::spawn(move || crate::validator_net::run(spec));
     }

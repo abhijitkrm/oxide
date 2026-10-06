@@ -23,6 +23,7 @@ consensus = { workspace = true }
 staking = { workspace = true }
 evm = { workspace = true }
 alloy-primitives = { workspace = true }
+zeroize = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

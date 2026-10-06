@@ -1346,6 +1346,7 @@ dependencies = [
  "primitives",
  "secp256k1",
  "sha3",
+ "zeroize",
 ]
 
 [[package]]
@@ -1756,6 +1757,8 @@ dependencies = [
  "proptest",
  "rayon",
  "revm",
+ "serde",
+ "serde_json",
  "staking",
  "storage",
  "types",
@@ -1792,6 +1795,7 @@ dependencies = [
  "metrics",
  "ports",
  "primitives",
+ "rayon",
  "redb",
  "staking",
  "storage",
@@ -2539,6 +2543,7 @@ dependencies = [
  "tokio-tungstenite 0.27.0",
  "trading",
  "types",
+ "zeroize",
 ]
 
 [[package]]
@@ -2655,6 +2660,7 @@ dependencies = [
  "tracing",
  "trading",
  "types",
+ "zeroize",
 ]
 
 [[package]]
@@ -2859,6 +2865,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -2905,6 +2912,7 @@ dependencies = [
  "tokio",
  "trading",
  "types",
+ "zeroize",
 ]
 
 [[package]]
@@ -2973,6 +2981,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "types",
+ "zeroize",
 ]
 
 [[package]]
@@ -2997,6 +3006,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "socket2",
  "thiserror",
 ]
 

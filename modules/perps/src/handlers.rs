@@ -11,8 +11,9 @@ use super::{
     AccountState, Address, BACKSTOP_UNWIND_SLIPPAGE_BPS, BTreeMap, CLEARING_ACCOUNT,
     CROSS_MARGIN_MARKET, Event, ExecError, FLAG_REDUCE_ONLY, FillEvent, Inner,
     MAX_FUNDING_RATE_BPS, MAX_MARK_STALENESS_BLOCKS, NewOrder, OpenOrderResv, OrderId,
-    OrderOutcome, OrderType, PRICE_SCALE, PerpsModule, Price, Qty, ReduceOnlyCap, Side, SignedQty,
-    StpMode, TimeInForce, TradingError, TxContext, cancel_event, fill_event, outcome_event,
+    OrderOutcome, OrderType, PRICE_SCALE, PerpsModule, Price, Qty, ReduceOnlyCap, RejectCategory,
+    Side, SignedQty, StpMode, TimeInForce, TradingError, TxContext, cancel_event, fill_event,
+    outcome_event,
 };
 
 impl PerpsModule {
@@ -31,7 +32,9 @@ impl PerpsModule {
         // a slot. `base.validate` also caps `max_resting`
         // at `MAX_RESTING_LIMIT`, bounding the arenas
         // `list_market` allocates at quorum.
-        cfg.validate().map_err(|e| ExecError::ModuleRejected(format!("list_market: {e}")))?;
+        cfg.validate().map_err(|e| {
+            ExecError::rejected(RejectCategory::Internal, format!("list_market: {e}"))
+        })?;
         // Same quorum gate as `TAG_SET_MARK`: a listing
         // eagerly allocates the market's order-pool and
         // id-map arenas, so an unauthenticated listing is a
@@ -39,7 +42,10 @@ impl PerpsModule {
         // exact tagged message; the market lists only once
         // endorsing power strictly exceeds two-thirds.
         let Some(committee) = self.committee.clone() else {
-            return Err(ExecError::ModuleRejected("list_market: no committee wired".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "list_market: no committee wired",
+            ));
         };
         match self.endorsements.record(msg, &ctx.sender, committee.as_ref())? {
             framework::EndorsementOutcome::Pending { .. } => Ok(vec![Event {
@@ -79,14 +85,17 @@ impl PerpsModule {
         // the bounded pending set must never carry an action that
         // cannot apply.
         if !framework::lock_state(&self.inner).marks.contains_key(&market) {
-            return Err(ExecError::ModuleRejected("market does not exist".to_string()));
+            return Err(ExecError::rejected(RejectCategory::NotFound, "market does not exist"));
         }
         // Same quorum gate as `TAG_SET_MARK` — an unauthenticated
         // funding rate is an unauthenticated balance transfer
         // between every long and short on the market, so it takes
         // the same two-thirds endorsement to schedule.
         let Some(committee) = self.committee.clone() else {
-            return Err(ExecError::ModuleRejected("apply_funding: no committee wired".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "apply_funding: no committee wired",
+            ));
         };
         match self.endorsements.record(msg, &ctx.sender, committee.as_ref())? {
             framework::EndorsementOutcome::Pending { .. } => Ok(vec![Event {
@@ -100,9 +109,12 @@ impl PerpsModule {
                 // decode path enforces the same bound as a
                 // canonicity rule).
                 if rate.unsigned_abs() > u64::try_from(MAX_FUNDING_RATE_BPS).unwrap_or(0) {
-                    return Err(ExecError::ModuleRejected(format!(
-                        "funding rate {rate} bps exceeds bound ±{MAX_FUNDING_RATE_BPS} bps"
-                    )));
+                    return Err(ExecError::rejected(
+                        RejectCategory::InvalidInput,
+                        format!(
+                            "funding rate {rate} bps exceeds bound ±{MAX_FUNDING_RATE_BPS} bps"
+                        ),
+                    ));
                 }
                 // Scheduled, not immediate: the rate waits in
                 // `pending_funding` for the next
@@ -115,6 +127,40 @@ impl PerpsModule {
                 Ok(vec![Event { module: "perps", kind: "funding_scheduled", data: vec![market] }])
             }
         }
+    }
+
+    /// The market gate for new orders: the market must exist, and a
+    /// market whose mark is older than [`MAX_MARK_STALENESS_BLOCKS`]
+    /// is in reduce-only mode (live-pipeline risk control). New
+    /// exposure against a price nobody has vouched for recently
+    /// cannot be margined honestly, so only reduce-only orders pass:
+    /// closing exposure must never be blocked by a feed outage.
+    /// Liquidations similarly keep running at the last mark —
+    /// freezing risk-reduction during an outage would strand
+    /// underwater accounts exactly when they need closing.
+    fn check_market_accepts_order(
+        inner: &Inner,
+        market: u8,
+        reduce_only: bool,
+    ) -> Result<(), ExecError> {
+        if !inner.configs.contains_key(&market) {
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                format!("market {market} does not exist"),
+            ));
+        }
+        let stale = inner.mark_updated_at.get(&market).is_none_or(|&updated| {
+            inner.current_height.saturating_sub(updated) > MAX_MARK_STALENESS_BLOCKS
+        });
+        if stale && !reduce_only {
+            return Err(ExecError::rejected(
+                RejectCategory::Precondition,
+                format!(
+                    "market {market} mark is stale (no update in {MAX_MARK_STALENESS_BLOCKS}+ blocks); reduce-only orders only"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Handle a place-order message (extracted from `handle` to keep
@@ -144,27 +190,7 @@ impl PerpsModule {
         // orders are potential exposure and must be margined as if
         // filled — otherwise an account could stack unbacked orders
         // that all later fill (C7).
-        if !inner.configs.contains_key(&market) {
-            return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
-        }
-        // Oracle-staleness gate (live-pipeline risk control): a
-        // market whose mark is older than
-        // [`MAX_MARK_STALENESS_BLOCKS`] is in reduce-only mode — new
-        // exposure against a price nobody has vouched for recently
-        // cannot be margined honestly. Only reduce-only orders
-        // pass: closing exposure must never be blocked by a feed
-        // outage. Liquidations similarly keep running at the last
-        // mark — freezing risk-reduction during an outage would
-        // strand underwater accounts exactly when they need
-        // closing.
-        let stale = inner.mark_updated_at.get(&market).is_none_or(|&updated| {
-            inner.current_height.saturating_sub(updated) > MAX_MARK_STALENESS_BLOCKS
-        });
-        if stale && !reduce_only {
-            return Err(ExecError::ModuleRejected(format!(
-                "market {market} mark is stale (no update in {MAX_MARK_STALENESS_BLOCKS}+ blocks); reduce-only orders only"
-            )));
-        }
+        Self::check_market_accepts_order(&inner, market, reduce_only)?;
         {
             let acct = inner.accounts.get(&ctx.sender);
             let pos = acct.and_then(|a| a.positions.get(&market));
@@ -188,8 +214,9 @@ impl PerpsModule {
             // reducible size would add exposure, which the flag
             // forbids — reject at admission.
             if reduce_only && u128::from(order.qty.0) > reducible {
-                return Err(ExecError::ModuleRejected(
-                    "reduce-only order exceeds reducible position".to_string(),
+                return Err(ExecError::rejected(
+                    RejectCategory::Precondition,
+                    "reduce-only order exceeds reducible position",
                 ));
             }
             // Marginal IM of this order = the reservation-set IM
@@ -214,8 +241,9 @@ impl PerpsModule {
                 let existing_im = a.total_initial_margin(&inner.marks, &inner.configs);
                 let required = existing_im.saturating_add(order_set_im);
                 if equity < i128::try_from(required).unwrap_or(i128::MAX) {
-                    return Err(ExecError::ModuleRejected(
-                        "insufficient initial margin".to_string(),
+                    return Err(ExecError::rejected(
+                        RejectCategory::InsufficientFunds,
+                        "insufficient initial margin",
                     ));
                 }
             }
@@ -223,7 +251,10 @@ impl PerpsModule {
 
         let Inner { markets, fills, accounts, .. } = &mut *inner;
         let Some(engine) = markets[usize::from(market)].as_mut() else {
-            return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                format!("market {market} does not exist"),
+            ));
         };
 
         fills.clear();
@@ -231,7 +262,7 @@ impl PerpsModule {
             ReduceOnlyCap { accounts, market, spent: BTreeMap::new(), removed: Vec::new() };
         let outcome = engine
             .place_with_cap(order, fills, &mut cap)
-            .map_err(|e| ExecError::ModuleRejected(format!("engine: {e}")))?;
+            .map_err(|e| ExecError::rejected(RejectCategory::Internal, format!("engine: {e}")))?;
         let ReduceOnlyCap { removed, .. } = cap;
 
         // Move fills out of the scratch buffer (no clone). The
@@ -382,11 +413,17 @@ impl PerpsModule {
         let mut inner = framework::lock_state(&self.inner);
         let Inner { markets, .. } = &mut *inner;
         let Some(engine) = markets[usize::from(market)].as_mut() else {
-            return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                format!("market {market} does not exist"),
+            ));
         };
         if let Some(owner) = engine.order_owner(order_id) {
             if owner != ctx.sender {
-                return Err(ExecError::ModuleRejected("cancel: not the order owner".to_string()));
+                return Err(ExecError::rejected(
+                    RejectCategory::Unauthorized,
+                    "cancel: not the order owner",
+                ));
             }
         } else {
             // Order not on the book: if a reservation entry survives
@@ -397,7 +434,7 @@ impl PerpsModule {
                 acct.open_orders.remove(&(market, order_id.0));
                 inner.accounts.insert(ctx.sender, acct);
             }
-            return Err(ExecError::ModuleRejected("cancel: order not found".to_string()));
+            return Err(ExecError::rejected(RejectCategory::NotFound, "cancel: order not found"));
         }
         match engine.cancel(order_id) {
             Ok(canceled) => {
@@ -411,9 +448,9 @@ impl PerpsModule {
                 Ok(vec![cancel_event(market, canceled)])
             }
             Err(TradingError::OrderNotFound) => {
-                Err(ExecError::ModuleRejected("cancel: order not found".to_string()))
+                Err(ExecError::rejected(RejectCategory::NotFound, "cancel: order not found"))
             }
-            Err(e) => Err(ExecError::ModuleRejected(format!("cancel: {e}"))),
+            Err(e) => Err(ExecError::rejected(RejectCategory::Internal, format!("cancel: {e}"))),
         }
     }
 
@@ -443,9 +480,9 @@ impl PerpsModule {
         };
         // Overflow check first: never debit the ledger for margin we
         // cannot represent.
-        let new_balance = balance
-            .checked_add(amount)
-            .ok_or_else(|| ExecError::ModuleRejected("margin balance overflow".to_string()))?;
+        let new_balance = balance.checked_add(amount).ok_or_else(|| {
+            ExecError::rejected(RejectCategory::Precondition, "margin balance overflow")
+        })?;
         if let Some(ledger) = &self.ledger {
             ledger.debit(&ctx.sender, amount)?;
         }
@@ -490,18 +527,25 @@ impl PerpsModule {
         // requires.
         if market == CROSS_MARGIN_MARKET {
             let Some(acct) = inner.accounts.get(&ctx.sender) else {
-                return Err(ExecError::ModuleRejected("insufficient margin".to_string()));
+                return Err(ExecError::rejected(
+                    RejectCategory::InsufficientFunds,
+                    "insufficient margin",
+                ));
             };
             if acct.cross_margin < amount {
-                return Err(ExecError::ModuleRejected("insufficient margin".to_string()));
+                return Err(ExecError::rejected(
+                    RejectCategory::InsufficientFunds,
+                    "insufficient margin",
+                ));
             }
             let equity_after = acct.equity(&inner.marks, &inner.configs) - i128::from(amount);
             let required = acct
                 .total_initial_margin(&inner.marks, &inner.configs)
                 .saturating_add(acct.total_open_order_im(&inner.configs));
             if equity_after < i128::try_from(required).unwrap_or(i128::MAX) {
-                return Err(ExecError::ModuleRejected(
-                    "withdrawal would breach initial margin".to_string(),
+                return Err(ExecError::rejected(
+                    RejectCategory::InsufficientFunds,
+                    "withdrawal would breach initial margin",
                 ));
             }
         } else {
@@ -509,7 +553,10 @@ impl PerpsModule {
             let pos = acct.and_then(|a| a.positions.get(&market));
             let iso = pos.map_or(0u64, |p| p.isolated_margin);
             if iso < amount {
-                return Err(ExecError::ModuleRejected("insufficient margin".to_string()));
+                return Err(ExecError::rejected(
+                    RejectCategory::InsufficientFunds,
+                    "insufficient margin",
+                ));
             }
             if let Some(p) = pos.filter(|p| p.is_open()) {
                 let mark = inner.marks.get(&market).copied().unwrap_or(p.entry_price);
@@ -525,8 +572,9 @@ impl PerpsModule {
                     let leverage = u128::from(cfg.max_leverage.max(1));
                     let pos_im = p.notional(mark) / leverage / PRICE_SCALE;
                     if equity_after < i128::try_from(pos_im).unwrap_or(i128::MAX) {
-                        return Err(ExecError::ModuleRejected(
-                            "withdrawal would breach position margin".to_string(),
+                        return Err(ExecError::rejected(
+                            RejectCategory::InsufficientFunds,
+                            "withdrawal would breach position margin",
                         ));
                     }
                 }
@@ -588,7 +636,10 @@ impl PerpsModule {
     /// touch the account.
     pub(crate) fn reject_clearing_sender(ctx: &TxContext) -> Result<(), ExecError> {
         if ctx.sender == CLEARING_ACCOUNT {
-            return Err(ExecError::ModuleRejected("clearing account cannot transact".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "clearing account cannot transact",
+            ));
         }
         Ok(())
     }

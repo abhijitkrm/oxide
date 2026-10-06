@@ -604,3 +604,53 @@ done; echo
 # debug_trace* returns "method not found" unless debug_api = true.
 curl -s -X POST http://localhost:9000 \
   -d '{"jsonrpc":"2.0","id":1,"method":"debug_traceTransaction","params":["0x..."]}'
+
+## 12. Matcher gateway exposure
+
+### When to use
+
+The off-chain matching server (`oxide-matcher`) accepts order flow
+over four protocols — binary TCP, WebSocket, JSON-RPC, FIX 4.4 —
+and a deployment needs remote clients to reach it.
+
+### Guidance
+
+- **Every matcher listener binds `127.0.0.1` by construction.** The
+  bind host is a hardcoded literal in `crates/matcher/src/server.rs`,
+  not a config value — there is deliberately no flag that can widen
+  it. Order-entry transport is plaintext; the loopback literal is
+  the security boundary, so do not patch it to take a `--listen`
+  flag (system-audit S3).
+- **Remote clients terminate TLS at an on-host proxy.** The supported
+  deployment shape is a TLS-terminating reverse proxy (nginx,
+  haproxy, stunnel) on the same host forwarding to the matcher
+  ports. Orders are signature-authenticated end-to-end, so spoofing
+  is not the risk the proxy covers — what TLS buys is *intent
+  confidentiality*: without it a passive observer on the path sees
+  order flow before it matches. FIX clients in particular expect
+  TLS at the boundary.
+- Example nginx stanza for the FIX port:
+
+  ```nginx
+  stream {
+      server {
+          listen 9878 ssl;
+          ssl_certificate     /etc/oxide/fix.pem;
+          ssl_certificate_key /etc/oxide/fix.key;
+          proxy_pass 127.0.0.1:9878;
+      }
+  }
+  ```
+
+- Keep the proxy on the **same host**: forwarding plaintext order
+  flow across even a private network re-opens the sniffing surface
+  the loopback bind exists to close.
+
+### Verification
+
+```sh
+# No non-loopback bind should exist — only 127.0.0.1 listeners.
+ss -ltnp | grep -E '987[0-9]|988[0-9]'
+# → 127.0.0.1:<port> entries only; a 0.0.0.0 entry means a proxy
+#   config error or a forbidden code change.
+```

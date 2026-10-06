@@ -909,6 +909,45 @@ impl<'a> Decode<'a> for Vote {
     }
 }
 
+/// Slashable equivocation evidence: two *conflicting* votes observed
+/// from the same validator at the same `(view, phase, epoch)` but
+/// naming different block hashes.
+///
+/// Emitted by the consensus engine when its per-view vote history
+/// sees a second signed vote that disagrees with the first it
+/// recorded for a voter. Both signatures are carried verbatim —
+/// the pair is self-authenticating: the staking module re-derives
+/// the exact vote signing messages and re-verifies each signature
+/// against the offender's current and retired BLS keys, so a
+/// malformed or forged pair cannot produce a slash. The record is
+/// a Rust-only hand-off (engine → node pump → staking evidence
+/// transaction); it has no wire form of its own.
+///
+/// `first`/`second` are ordered by observation time. The staking
+/// module treats the pair symmetrically — order carries no
+/// protocol meaning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoubleSignEvidence {
+    /// The equivocating validator's staking address — the account
+    /// the slash and jail apply to.
+    pub validator: Address,
+    /// The view both votes were cast in.
+    pub view: View,
+    /// The pipeline phase both votes were cast in.
+    pub phase: VotePhase,
+    /// The epoch both votes belong to — the signing messages the
+    /// module reconstructs bind the epoch.
+    pub epoch: Epoch,
+    /// The block hash of the first observed vote.
+    pub first_block_hash: Hash,
+    /// The BLS signature on the first observed vote.
+    pub first_signature: Signature,
+    /// The block hash of the second, conflicting vote.
+    pub second_block_hash: Hash,
+    /// The BLS signature on the second, conflicting vote.
+    pub second_signature: Signature,
+}
+
 /// A quorum certificate: the aggregate of votes for a single
 /// `(view, phase, block_hash)` whose signers hold a strict
 /// two-thirds supermajority of voting power
@@ -1177,6 +1216,18 @@ pub struct BlockHeader {
     /// information, certify (reconstruct + verify) before finalize.
     /// `Hash::ZERO` only for synthetic headers in tests.
     pub body_commitment: Hash,
+    /// BLAKE3 integrity hash over the canonical `Proposal` encoding
+    /// ([`Domain::BodyHash`]) — the direct-proposal path's body
+    /// binding. The erasure commitment above stays the dispersed
+    /// path's binding (its per-shard proofs root into it); this
+    /// field lets a validator holding the full body verify it with
+    /// one hash pass instead of a Reed-Solomon encode — measured
+    /// 3.8ms → ~0.9ms on a 1.5MB body, the vote path's largest
+    /// body-linear cost. `Hash::ZERO` (synthetic test headers)
+    /// means "absent": verifiers fall back to the commitment
+    /// check, so old test fixtures and conformance headers keep
+    /// working unchanged.
+    pub body_hash: Hash,
 }
 
 impl Encode for BlockHeader {
@@ -1219,6 +1270,8 @@ impl Encode for BlockHeader {
         // Appended last so earlier protocol revisions' encodings are a
         // strict prefix — decoders that stop here see the old format.
         self.body_commitment.encode(buf);
+        // Appended after `body_commitment` (same strict-prefix rule).
+        self.body_hash.encode(buf);
     }
 }
 
@@ -1240,6 +1293,7 @@ impl<'a> Decode<'a> for BlockHeader {
         let exec_cert =
             if reader.read_bool()? { Some(ExecCertificate::decode(reader)?) } else { None };
         let body_commitment = Hash::decode(reader)?;
+        let body_hash = Hash::decode(reader)?;
         Ok(Self {
             height,
             view,
@@ -1253,6 +1307,7 @@ impl<'a> Decode<'a> for BlockHeader {
             proposer_signature,
             exec_cert,
             body_commitment,
+            body_hash,
         })
     }
 }
@@ -1601,6 +1656,7 @@ mod tests {
             proposer_signature: None,
             exec_cert: None,
             body_commitment: Hash::ZERO,
+            body_hash: Hash::ZERO,
         };
         let mut expected = Vec::new();
         expected.extend_from_slice(&0u64.to_le_bytes()); // height
@@ -1615,6 +1671,7 @@ mod tests {
         expected.push(0); // no proposer_signature
         expected.push(0); // no exec_cert
         expected.extend_from_slice(&[0; 32]); // body_commitment
+        expected.extend_from_slice(&[0; 32]); // body_hash (appended field)
         roundtrip(&header, &expected);
     }
 
@@ -1642,14 +1699,19 @@ mod tests {
             proposer_signature: None,
             exec_cert: None,
             body_commitment: Hash::ZERO,
+            body_hash: Hash([0xCC; 32]),
         };
         // Encode + round-trip (the QC makes the full wire form long;
-        // roundtrip checks both encode-match and decode-match).
+        // roundtrip checks both encode-match and decode-match). The
+        // non-ZERO `body_hash` proves the appended field survives the
+        // round-trip — a decode that dropped it would silently
+        // disable the fast body-binding path.
         let mut buf = Vec::new();
         header.encode(&mut buf);
         let mut r = Reader::new(&buf);
         let decoded = BlockHeader::decode(&mut r).expect("decode");
         assert_eq!(decoded, header);
+        assert_eq!(decoded.body_hash, Hash([0xCC; 32]), "body_hash must round-trip");
         assert!(r.is_empty());
     }
 
@@ -1678,6 +1740,7 @@ mod tests {
             proposer_signature: None,
             exec_cert: None,
             body_commitment: Hash::ZERO,
+            body_hash: Hash::ZERO,
         };
         let mut buf = Vec::new();
         header.encode(&mut buf);

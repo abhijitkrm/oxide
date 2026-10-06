@@ -77,21 +77,7 @@ pub trait Transport: Send {
     /// the transport's peer table, [`TransportError::MessageTooLarge`]
     /// if the message exceeds `max_message_bytes`, or
     /// [`TransportError::ChannelClosed`] if the transport is shut down.
-    fn send(&mut self, peer: &[u8], bytes: &[u8]) -> Result<(), TransportError>;
-
-    /// Send the same `bytes` to every peer in `peers` — the consensus
-    /// fan-out shape (proposals, QCs, TCs). Per-peer failures are
-    /// dropped, exactly as callers of a `send` loop ignore them: a
-    /// slow or departed peer must not stop delivery to the rest.
-    ///
-    /// The default is one [`send`](Self::send) per peer. Transports
-    /// that queue outbound bytes override it to share one buffer
-    /// across all peers instead of copying the message per peer.
-    fn broadcast(&mut self, peers: &[&[u8]], bytes: &[u8]) {
-        for peer in peers {
-            let _ = self.send(peer, bytes);
-        }
-    }
+    fn send(&mut self, peer: &PeerId, bytes: &[u8]) -> Result<(), TransportError>;
 
     /// Receive the next inbound message, blocking until one arrives.
     /// Returns `None` if the transport is shut down. The deterministic

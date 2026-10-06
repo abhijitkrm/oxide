@@ -82,7 +82,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use executor::{Event, ExecError, Module, TxContext};
+use executor::{Event, ExecError, Module, RejectCategory, TxContext};
 use framework::module_id;
 use primitives::fixed::{Price, Qty, qty_add, qty_sub};
 use primitives::{Address, Hash, Height};
@@ -174,6 +174,27 @@ struct RegisteredOrder {
     /// side`), so the escrow's unit can never disagree with the
     /// direction it secures.
     reserved: Reserved,
+}
+
+/// A trading-key linkage entry: the committed record binding an
+/// Ed25519-derived trading `owner` to the secp256k1 ledger account
+/// authorized to operate it. Written only by `TAG_LINK_TRADING_KEY`
+/// (consent-verified) and `TAG_UNLINK_TRADING_KEY` (tombstones the
+/// link by zeroing `secp` while preserving `epoch` for replay
+/// protection — the entry is never removed so a captured consent
+/// can never re-bind a revoked epoch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinkedEntry {
+    /// The secp256k1 ledger address the trading key consented to —
+    /// the only envelope sender the link-gated handlers accept for
+    /// this owner. `Address::ZERO` marks a revoked link.
+    secp: Address,
+    /// Monotonic per-owner counter: the epoch of the last applied
+    /// link/unlink. Signatures bind `stored + 1`, so every applied
+    /// message advances it and no captured signature can replay —
+    /// relinking after a revocation needs a fresh consent at the
+    /// next epoch.
+    epoch: u64,
 }
 
 /// The escrowed obligation of a [`RegisteredOrder`], denominated in
@@ -268,6 +289,73 @@ const TAG_DEPOSIT_BASE: u8 = 6;
 /// Body: `[market:1][amount:8]` = 9 bytes.
 const TAG_WITHDRAW_BASE: u8 = 7;
 
+// ── Trading-key linkage (venue egress, system-audit S2) ──────────────
+//
+// The off-chain matcher's trading credential is Ed25519; the chain's
+// ledger credential is secp256k1. The two share the 20-byte address
+// namespace but are cryptographically unrelated — byte equality proves
+// nothing (a crafted Ed25519 key cannot produce a secp256k1 signature
+// for the same bytes and vice versa). Settlement therefore books
+// custody under Ed25519-derived owners that no tx envelope can ever
+// sign for. The linkage registry closes that: a secp256k1 sender binds
+// itself to a trading key via an Ed25519-signed consent, and
+// link-gated messages then let the linked ledger account operate —
+// and withdraw from — the trading owner's committed state.
+
+/// Link-trading-key message tag: the secp256k1 sender registers
+/// itself as the ledger operator of an Ed25519 trading owner.
+/// Body: `[pubkey:32][consent_sig:64]` = 96 bytes; `consent_sig`
+/// covers `LINK_CONSENT_DOMAIN || sender || pubkey || epoch` where
+/// `epoch` is the owner's next link epoch. Latest wins — a relink
+/// to a different ledger account only needs the trading key's
+/// consent for the new epoch.
+const TAG_LINK_TRADING_KEY: u8 = 8;
+
+/// Unlink-trading-key message tag: sever the link so no ledger
+/// account may act for the trading owner. Any sender may relay it —
+/// the Ed25519 signature inside is the authorization.
+/// Body: `[pubkey:32][sig:64]` = 96 bytes; `sig` covers
+/// `UNLINK_CONSENT_DOMAIN || pubkey || epoch`.
+const TAG_UNLINK_TRADING_KEY: u8 = 9;
+
+/// Deposit-base-for message tag: like `TAG_DEPOSIT_BASE` but the
+/// custody beneficiary is an explicit `owner` (a linked trading
+/// account). Permissionless — funding someone else's custody can
+/// only increase what their link can withdraw.
+/// Body: `[owner:20][market:1][amount:8]` = 29 bytes.
+const TAG_DEPOSIT_BASE_FOR: u8 = 10;
+
+/// Withdraw-linked message tag: the sender pulls free base custody
+/// out of a trading `owner`'s `(owner, market)` entry into the
+/// sender's own ledger balance. Requires `linked[owner] == sender`.
+/// Body: `[owner:20][market:1][amount:8]` = 29 bytes.
+const TAG_WITHDRAW_LINKED: u8 = 11;
+
+/// Sweep-linked message tag: the sender moves `amount` of the
+/// trading `owner`'s *ledger* balance (buy-escrow refunds and
+/// settlement rebates credit it) into the sender's own balance.
+/// Requires `linked[owner] == sender`. Without this, quote
+/// returning to a linked owner would be stranded — an Ed25519
+/// address can never submit a signed tx itself.
+/// Body: `[owner:20][amount:8]` = 28 bytes.
+const TAG_SWEEP_LINKED: u8 = 12;
+
+/// Register-linked message tag: register an off-chain-matched
+/// order under a linked `owner` — the registered-order settlement
+/// path is otherwise unreachable for Ed25519 identities, since
+/// `TAG_REGISTER_ORDER` keys the sender. Escrows draw on the
+/// *owner's* ledger (buys) and base custody (sells), identically
+/// to self-registration.
+/// Body: `[owner:20][market:2][side:1][price:8][qty:8]
+/// [client_id:8]` = 47 bytes.
+const TAG_REGISTER_LINKED: u8 = 13;
+
+/// Cancel-linked message tag: cancel a linked owner's registered
+/// order, refunding its escrow to the owner. Without it, escrow
+/// under a linked account could only ever be consumed by fills.
+/// Body: `[owner:20][client_id:8]` = 28 bytes.
+const TAG_CANCEL_LINKED: u8 = 14;
+
 /// Size of a single fill entry in a batch-settle message:
 /// 2 + 8 + 8 + 20 + 8 + 20 + 8 = 74 bytes.
 const FILL_ENTRY_LEN: usize = 74;
@@ -304,6 +392,18 @@ const CANCEL_REGISTERED_BODY_LEN: usize = 8;
 /// `[market:1][amount:8]` = 9 (deposit-base and withdraw-base
 /// share the same body shape).
 const CUSTODY_BODY_LEN: usize = 9;
+/// `[pubkey:32][signature:64]` = 96 (link and unlink share the
+/// same body shape).
+const LINK_BODY_LEN: usize = 96;
+/// `[owner:20][market:1][amount:8]` = 29 (deposit-for and
+/// withdraw-linked share the same body shape).
+const LINKED_CUSTODY_BODY_LEN: usize = 29;
+/// `[owner:20][amount:8]` = 28 (sweep-linked).
+const SWEEP_LINKED_BODY_LEN: usize = 28;
+/// `[owner:20][market:2][side:1][price:8][qty:8][client_id:8]` = 47.
+const REGISTER_LINKED_BODY_LEN: usize = 47;
+/// `[owner:20][client_id:8]` = 28.
+const CANCEL_LINKED_BODY_LEN: usize = 28;
 
 /// Quote-currency scale: the ledger stores native `u64` base units.
 /// The notional from a fill is scale-14 (`qty_scale_6 × price_scale_8`);
@@ -390,6 +490,16 @@ const MAP_TAG_BASE_BALANCES: u64 = 3;
 const MAP_TAG_BASE_HOLDS: u64 = 4;
 const MAP_TAG_FEE_VAULT: u64 = 5;
 const MAP_TAG_BOOK: u64 = 6;
+const MAP_TAG_LINKED: u64 = 7;
+
+/// Signing domain for the trading key's link consent — separates
+/// these signatures from order signatures (`oxide-order-v2`) and
+/// every other Ed25519 message in the system so a consent can never
+/// be transplanted into a different context.
+const LINK_CONSENT_DOMAIN: &[u8] = b"oxide-link-key-v1";
+
+/// Signing domain for the trading key's unlink authorization.
+const UNLINK_CONSENT_DOMAIN: &[u8] = b"oxide-unlink-key-v1";
 
 /// The committed KV-subtree leaf — the same record shape
 /// `subtree_root_map` folds sequentially.
@@ -440,6 +550,14 @@ fn fee_vault_leaf(k: &u8, v: &u64) -> Hash {
     let mut w = framework::CanonicalState::new();
     w.put_u8(*k).put_u64(*v);
     framework::committed_leaf(MAP_TAG_FEE_VAULT, w.as_bytes())
+}
+
+/// `(owner ‖ secp ‖ epoch)` — mirrors `linked`'s record.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn linked_leaf(k: &Address, v: &LinkedEntry) -> Hash {
+    let mut w = framework::CanonicalState::new();
+    w.put_addr(k).put_addr(&v.secp).put_u64(v.epoch);
+    framework::committed_leaf(MAP_TAG_LINKED, w.as_bytes())
 }
 
 /// `(id ‖ side ‖ price ‖ qty ‖ owner)` — the same record shape
@@ -495,11 +613,19 @@ struct Inner {
     /// `checked_add` guards are honored rather than assumed).
     /// Committed state.
     fee_vault: framework::CommittedMap<u8, u64>,
+    /// Trading-key linkage: Ed25519-derived trading owner → the
+    /// secp256k1 ledger account authorized to operate it (system-
+    /// audit S2). Gated writes only — `TAG_LINK_TRADING_KEY` /
+    /// `TAG_UNLINK_TRADING_KEY` — and read by every `*_LINKED`
+    /// authorization check. Committed state: replicas disagreeing
+    /// on links would authorize different withdrawals.
+    linked: framework::CommittedMap<Address, LinkedEntry>,
 }
 
 /// The committed state a snapshot decodes into — the per-market
 /// engines, pending governance endorsements, the registered-order
-/// map, and the base-asset custody maps, in canonical layout order.
+/// map, the base-asset custody maps, and the linkage registry, in
+/// canonical layout order.
 type CommittedState = (
     Vec<Option<MatchingEngine>>,
     framework::Endorsements,
@@ -507,6 +633,7 @@ type CommittedState = (
     BTreeMap<(Address, u8), Qty>,
     BTreeMap<(Address, u8), Qty>,
     BTreeMap<u8, u64>,
+    BTreeMap<Address, LinkedEntry>,
 );
 
 mod codec;
@@ -531,6 +658,7 @@ impl ExchangeModule {
                 base_balances: framework::CommittedMap::new(base_balances_leaf),
                 base_holds: framework::CommittedMap::new(base_holds_leaf),
                 fee_vault: framework::CommittedMap::new(fee_vault_leaf),
+                linked: framework::CommittedMap::new(linked_leaf),
             }),
             store: Mutex::new(framework::CommittedStore::new(store_leaf)),
             ledger: None,
@@ -611,10 +739,9 @@ impl ExchangeModule {
     pub fn list_market(&self, cfg: MarketConfig) -> Result<u8, ExecError> {
         let mut inner = framework::lock_state(&self.inner);
         // Find the first empty slot.
-        let id =
-            inner.markets.iter().position(Option::is_none).ok_or_else(|| {
-                ExecError::ModuleRejected("all 256 market slots taken".to_string())
-            })?;
+        let id = inner.markets.iter().position(Option::is_none).ok_or_else(|| {
+            ExecError::rejected(RejectCategory::Precondition, "all 256 market slots taken")
+        })?;
         // u8 market id space: position is 0..=255, fits u8.
         #[allow(clippy::cast_possible_truncation)]
         let id_u8 = id as u8;
@@ -622,13 +749,15 @@ impl ExchangeModule {
         // invalid configs, but the decoded bytes are checked again so
         // a corrupted store cannot pair an unchecked config with an
         // engine — the proof type makes the check structural.
-        let vcfg = cfg
-            .validated()
-            .map_err(|e| ExecError::ModuleRejected(format!("market config: {e}")))?;
-        let book = DenseBook::new(vcfg)
-            .map_err(|e| ExecError::ModuleRejected(format!("book init: {e}")))?;
-        let mut engine = MatchingEngine::new(vcfg, book)
-            .map_err(|e| ExecError::ModuleRejected(format!("engine init: {e}")))?;
+        let vcfg = cfg.validated().map_err(|e| {
+            ExecError::rejected(RejectCategory::Internal, format!("market config: {e}"))
+        })?;
+        let book = DenseBook::new(vcfg).map_err(|e| {
+            ExecError::rejected(RejectCategory::Internal, format!("book init: {e}"))
+        })?;
+        let mut engine = MatchingEngine::new(vcfg, book).map_err(|e| {
+            ExecError::rejected(RejectCategory::Internal, format!("engine init: {e}"))
+        })?;
         // Committed engines always carry the incremental book fold —
         // `state_root` reads `resting_fold()` instead of re-walking
         // the book. Enabled before any orders rest, so the fold is
@@ -907,6 +1036,124 @@ pub mod msg {
             msg.extend_from_slice(&f.sell.owner.0);
             msg.extend_from_slice(&f.sell.client_id.to_le_bytes());
         }
+        msg
+    }
+
+    /// Build the exact bytes an Ed25519 trading key signs to consent
+    /// to a link: `LINK_CONSENT_DOMAIN ‖ secp ‖ pubkey ‖ epoch`.
+    /// `epoch` must equal the owner's next epoch — `1` for a first
+    /// link, otherwise the stored epoch `+ 1` (query the module's
+    /// committed `linked` map). Shared by the signer and the module
+    /// so the verification preimage can never drift.
+    #[must_use]
+    pub fn link_consent_message(secp: &super::Address, pubkey: &[u8; 32], epoch: u64) -> Vec<u8> {
+        let mut m = Vec::with_capacity(super::LINK_CONSENT_DOMAIN.len() + 20 + 32 + 8);
+        m.extend_from_slice(super::LINK_CONSENT_DOMAIN);
+        m.extend_from_slice(&secp.0);
+        m.extend_from_slice(pubkey);
+        m.extend_from_slice(&epoch.to_le_bytes());
+        m
+    }
+
+    /// Build the exact bytes an Ed25519 trading key signs to revoke
+    /// a link: `UNLINK_CONSENT_DOMAIN ‖ pubkey ‖ epoch` with the
+    /// same epoch rule as [`link_consent_message`].
+    #[must_use]
+    pub fn unlink_consent_message(pubkey: &[u8; 32], epoch: u64) -> Vec<u8> {
+        let mut m = Vec::with_capacity(super::UNLINK_CONSENT_DOMAIN.len() + 32 + 8);
+        m.extend_from_slice(super::UNLINK_CONSENT_DOMAIN);
+        m.extend_from_slice(pubkey);
+        m.extend_from_slice(&epoch.to_le_bytes());
+        m
+    }
+
+    /// Build a link-trading-key message: the envelope sender
+    /// registers itself as the ledger operator of the trading owner
+    /// `crypto::ed25519::owner_address(pubkey)`. `consent_sig` is
+    /// the Ed25519 signature over [`link_consent_message`].
+    pub fn link_trading_key(pubkey: &[u8; 32], consent_sig: &[u8; 64]) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(1 + super::LINK_BODY_LEN);
+        msg.push(super::TAG_LINK_TRADING_KEY);
+        msg.extend_from_slice(pubkey);
+        msg.extend_from_slice(consent_sig);
+        msg
+    }
+
+    /// Build an unlink-trading-key message. Permissionless — any
+    /// sender can relay it; the Ed25519 signature inside authorizes.
+    pub fn unlink_trading_key(pubkey: &[u8; 32], sig: &[u8; 64]) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(1 + super::LINK_BODY_LEN);
+        msg.push(super::TAG_UNLINK_TRADING_KEY);
+        msg.extend_from_slice(pubkey);
+        msg.extend_from_slice(sig);
+        msg
+    }
+
+    /// Build a deposit-base-for message: the sender's ledger is
+    /// debited and `owner` receives the base custody on `market` —
+    /// how a linked trading account's custody is funded.
+    pub fn deposit_base_for(owner: super::Address, market: u8, amount: u64) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(1 + super::LINKED_CUSTODY_BODY_LEN);
+        msg.push(super::TAG_DEPOSIT_BASE_FOR);
+        msg.extend_from_slice(&owner.0);
+        msg.push(market);
+        msg.extend_from_slice(&amount.to_le_bytes());
+        msg
+    }
+
+    /// Build a withdraw-linked message: the sender (the owner's
+    /// linked ledger account) pulls `amount` of `owner`'s free base
+    /// custody on `market` into its own ledger balance.
+    pub fn withdraw_linked(owner: super::Address, market: u8, amount: u64) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(1 + super::LINKED_CUSTODY_BODY_LEN);
+        msg.push(super::TAG_WITHDRAW_LINKED);
+        msg.extend_from_slice(&owner.0);
+        msg.push(market);
+        msg.extend_from_slice(&amount.to_le_bytes());
+        msg
+    }
+
+    /// Build a sweep-linked message: the sender moves `amount` of
+    /// `owner`'s native ledger balance into its own — the egress
+    /// path for quote that settlement credits a linked owner.
+    pub fn sweep_linked(owner: super::Address, amount: u64) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(1 + super::SWEEP_LINKED_BODY_LEN);
+        msg.push(super::TAG_SWEEP_LINKED);
+        msg.extend_from_slice(&owner.0);
+        msg.extend_from_slice(&amount.to_le_bytes());
+        msg
+    }
+
+    /// Build a register-linked message: register an off-chain-
+    /// matched order under the linked `owner`, escrowing the
+    /// owner's funds exactly as a self-registration would.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_linked(
+        owner: super::Address,
+        market: u16,
+        side: trading::Side,
+        price: u64,
+        qty: u64,
+        client_id: u64,
+    ) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(1 + super::REGISTER_LINKED_BODY_LEN);
+        msg.push(super::TAG_REGISTER_LINKED);
+        msg.extend_from_slice(&owner.0);
+        msg.extend_from_slice(&market.to_le_bytes());
+        msg.push(encode_side(side));
+        msg.extend_from_slice(&price.to_le_bytes());
+        msg.extend_from_slice(&qty.to_le_bytes());
+        msg.extend_from_slice(&client_id.to_le_bytes());
+        msg
+    }
+
+    /// Build a cancel-linked message: cancel `owner`'s registered
+    /// order, refunding its escrow to the owner.
+    pub fn cancel_linked(owner: super::Address, client_id: u64) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(1 + super::CANCEL_LINKED_BODY_LEN);
+        msg.push(super::TAG_CANCEL_LINKED);
+        msg.extend_from_slice(&owner.0);
+        msg.extend_from_slice(&client_id.to_le_bytes());
         msg
     }
 }

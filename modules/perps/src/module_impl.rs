@@ -8,7 +8,7 @@
 
 use super::{
     Address, Event, ExecError, FUNDING_PERIOD_BLOCKS, Hash, Height, LIQUIDATION_SWEEP_BUDGET,
-    Module, PerpsModule, TAG_APPLY_FUNDING, TAG_CANCEL, TAG_DEPOSIT, TAG_LIQUIDATE,
+    Module, PerpsModule, RejectCategory, TAG_APPLY_FUNDING, TAG_CANCEL, TAG_DEPOSIT, TAG_LIQUIDATE,
     TAG_LIST_MARKET, TAG_PLACE, TAG_SET_MARK, TAG_WITHDRAW, TxContext, module_id,
 };
 use crate::decode;
@@ -73,7 +73,10 @@ impl Module for PerpsModule {
                 // are only ever listed, never removed, so the
                 // check cannot go stale mid-endorsement.
                 if !inner.configs.contains_key(&market) {
-                    return Err(ExecError::ModuleRejected("market does not exist".to_string()));
+                    return Err(ExecError::rejected(
+                        RejectCategory::NotFound,
+                        "market does not exist",
+                    ));
                 }
                 drop(inner);
                 // C9: committee-quorum emergency override. The
@@ -88,8 +91,9 @@ impl Module for PerpsModule {
                 // command. Without a wired committee the path is
                 // closed entirely.
                 let Some(committee) = self.committee.clone() else {
-                    return Err(ExecError::ModuleRejected(
-                        "set_mark: no committee wired".to_string(),
+                    return Err(ExecError::rejected(
+                        RejectCategory::Unauthorized,
+                        "set_mark: no committee wired",
                     ));
                 };
                 match self.endorsements.record(msg, &ctx.sender, committee.as_ref())? {
@@ -384,8 +388,9 @@ impl framework::ParameterSink for PerpsModule {
             b"perps.max_leverage" => Field::MaxLeverage,
             b"perps.mmr_base_bps" => Field::MmrBaseBps,
             _ => {
-                return Err(ExecError::ModuleRejected(
-                    "perps: unknown governed parameter".to_string(),
+                return Err(ExecError::rejected(
+                    RejectCategory::NotFound,
+                    "perps: unknown governed parameter",
                 ));
             }
         };
@@ -396,15 +401,18 @@ impl framework::ParameterSink for PerpsModule {
         let v = u16::from_le_bytes([value[1], value[2]]);
         let mut inner = framework::lock_state(&self.inner);
         let Some(mut cfg) = inner.configs.get(&market).copied() else {
-            return Err(ExecError::ModuleRejected(format!(
-                "perps param: market {market} not listed"
-            )));
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                format!("perps param: market {market} not listed"),
+            ));
         };
         match field {
             Field::MaxLeverage => cfg.max_leverage = v,
             Field::MmrBaseBps => cfg.mmr_base_bps = v,
         }
-        cfg.validate().map_err(|e| ExecError::ModuleRejected(format!("perps param: {e}")))?;
+        cfg.validate().map_err(|e| {
+            ExecError::rejected(RejectCategory::InvalidInput, format!("perps param: {e}"))
+        })?;
         inner.configs.insert(market, cfg);
         drop(inner);
         // Committed half: the store record is what `state_root` and

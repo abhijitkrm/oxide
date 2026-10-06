@@ -347,6 +347,50 @@ fn supply_body_rejects_commitment_mismatch() {
     follower.supply_body(hash, &proposal).expect("duplicate supply is a no-op");
 }
 
+/// The direct path's body binding uses the header's BLAKE3
+/// `body_hash` when present (the fast path — one hash pass instead
+/// of a Reed-Solomon encode) and the erasure commitment otherwise
+/// (synthetic headers). Both bindings must reject a tampered body.
+#[test]
+fn body_hash_binding_rejects_tampered_body_and_falls_back() {
+    let mut leader = make_multi_engine(0);
+    let mut follower = make_multi_engine(1);
+    leader.submit_tx(TxBytes::new(vec![7]));
+    let (header, proposal) = leader.propose().expect("leader proposes");
+    // The propose path stamps the fast-path hash — non-ZERO.
+    assert!(
+        header.body_hash != primitives::Hash::ZERO,
+        "propose must stamp body_hash for the direct-path fast binding"
+    );
+    let hash = OxideBft::block_hash(&header);
+    // Park the body slot — `supply_body` needs the header to have
+    // arrived (the existing commitment-mismatch test does the same).
+    assert!(follower.vote_header(&header).is_some(), "header notarizes");
+
+    // Tampered body rejected under the fast binding.
+    let mut wrong = proposal.clone();
+    wrong.txs = vec![TxBytes::new(vec![8])];
+    assert!(matches!(follower.supply_body(hash, &wrong), Err(ConsensusError::BodyRejected { .. })));
+
+    // A synthetic header with NO body_hash falls back to the
+    // erasure commitment — the same tamper must still reject.
+    let mut legacy = header.clone();
+    legacy.body_hash = primitives::Hash::ZERO;
+    let legacy_hash = OxideBft::block_hash(&legacy);
+    let mut legacy_follower = make_multi_engine(2);
+    assert!(legacy_follower.vote_header(&legacy).is_some(), "legacy header notarizes");
+    assert!(matches!(
+        legacy_follower.supply_body(legacy_hash, &wrong),
+        Err(ConsensusError::BodyRejected { .. })
+    ));
+
+    // The genuine body is accepted on both paths.
+    follower.supply_body(hash, &proposal).expect("genuine body accepted (fast path)");
+    legacy_follower
+        .supply_body(legacy_hash, &proposal)
+        .expect("genuine body accepted (commitment fallback)");
+}
+
 /// A notarized header keeps the block eligible for all
 /// header-level rules while its body propagates: with bodies
 /// supplied every round, the dispersed path commits identically
@@ -1167,6 +1211,7 @@ fn leapfrog_qc_commits_full_ancestor_chain() {
             proposer_signature: None,
             exec_cert: None,
             body_commitment: Hash::ZERO,
+            body_hash: Hash::ZERO,
         };
         let proposal = Proposal {
             height: header.height,
@@ -1603,6 +1648,7 @@ fn vote_rejects_proposal_from_wrong_proposer() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     // Even with a valid signature from key 2, the proposer field
     // doesn't match the expected leader (0), so vote() rejects.
@@ -1644,6 +1690,7 @@ fn vote_rejects_proposal_with_missing_signature() {
         proposer_signature: None, // missing
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     assert!(
         follower.vote(&header, &proposal).is_none(),
@@ -1678,6 +1725,7 @@ fn vote_rejects_proposal_with_forged_signature() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let forged_sk = bls_key(3);
     let signing_hash = OxideBft::proposal_signing_hash(&header);
@@ -1724,6 +1772,7 @@ fn vote_memoises_rejected_proposal() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let forged_sk = bls_key(3);
     let signing_hash = OxideBft::proposal_signing_hash(&header);
@@ -1865,6 +1914,7 @@ fn proposal_known_distinguishes_authentic_from_forged() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let signing_hash = OxideBft::proposal_signing_hash(&forged);
     forged.proposer_signature =
@@ -1909,6 +1959,7 @@ fn proposal_admissible_gates_window_and_leader() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
 
     // In-window edges: [50−10, 50+32] = [40, 82] with the correct
@@ -1955,6 +2006,7 @@ fn vote_header_memoises_rejected_proposal() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let signing_hash = OxideBft::proposal_signing_hash(&header);
     header.proposer_signature =
@@ -2855,6 +2907,7 @@ fn tail_fork_rejects_proposal_without_high_qc() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let vote = engine.vote(&header, &proposal);
     assert!(vote.is_none(), "fork proposal without high_qc must be rejected");
@@ -2894,6 +2947,7 @@ fn tail_fork_rejects_proposal_with_wrong_high_qc() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let vote = engine.vote(&header, &proposal);
     assert!(
@@ -2939,6 +2993,7 @@ fn tail_fork_accepts_proposal_extending_high_qc() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let vote = engine.vote(&header, &proposal);
     assert!(vote.is_some(), "proposal extending high_qc must be accepted");
@@ -2993,6 +3048,7 @@ fn tail_fork_accepts_proposal_with_newer_high_qc() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     engine
         .blocks
@@ -3017,6 +3073,7 @@ fn tail_fork_accepts_proposal_with_newer_high_qc() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let vote = engine.vote(&header, &proposal);
     assert!(
@@ -3062,6 +3119,7 @@ fn tail_fork_rejects_proposal_with_older_high_qc() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let vote = engine.vote(&header, &proposal);
     assert!(
@@ -3089,6 +3147,7 @@ fn tail_fork_accepts_genesis_proposal() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: Hash::ZERO,
+        body_hash: Hash::ZERO,
     };
     let vote = engine.vote(&header, &proposal);
     assert!(vote.is_some(), "genesis proposal must be accepted");
@@ -3543,6 +3602,7 @@ fn divergence_detection_accepts_matching_exec_cert() {
         prev_block: Hash::ZERO,
         tx_root: OxideBft::tx_root(&proposal.txs),
         body_commitment: types::shard::commitment(&body, 1, 1),
+        body_hash: Hash::ZERO,
         high_qc: None,
         timeout_cert: None,
         proposer: proposer_hash(0),
@@ -3592,6 +3652,7 @@ fn genesis_proposal_with_cert(
         prev_block: Hash::ZERO,
         tx_root: OxideBft::tx_root(&proposal.txs),
         body_commitment: types::shard::commitment(&body, 1, 1),
+        body_hash: Hash::ZERO,
         high_qc: None,
         timeout_cert: None,
         proposer: proposer_hash(0),
@@ -4028,6 +4089,7 @@ fn vote_carries_execution_attestation() {
         prev_block: Hash::ZERO,
         tx_root: OxideBft::tx_root(&proposal.txs),
         body_commitment: types::shard::commitment(&body, 4, 3),
+        body_hash: Hash::ZERO,
         high_qc: None,
         timeout_cert: None,
         proposer: proposer_hash(0),
@@ -4271,6 +4333,7 @@ fn forged_exec_cert_is_rejected_on_root_mismatch() {
         prev_block: Hash::ZERO,
         tx_root: OxideBft::tx_root(&proposal.txs),
         body_commitment: types::shard::commitment(&body, 4, 3),
+        body_hash: Hash::ZERO,
         high_qc: None,
         timeout_cert: None,
         proposer: proposer_hash(0),
@@ -4425,6 +4488,7 @@ fn subquorum_embedded_qc_is_rejected() {
         prev_block: parent_hash,
         tx_root: OxideBft::tx_root(&proposal.txs),
         body_commitment: types::shard::commitment(&body, 4, 3),
+        body_hash: Hash::ZERO,
         high_qc: Some(thin_qc),
         timeout_cert: None,
         proposer: proposer_hash(0),
@@ -4878,6 +4942,203 @@ fn collect_vote_future_view_does_not_block_current_view_votes() {
     };
     leader.collect_vote(2, real_vote).expect("current-view vote accepted after future-view drop");
     assert!(leader.votes[2].is_some(), "current-view vote must be stored");
+}
+
+/// System-audit S1: a validator that signs two different blocks at
+/// the same `(view, phase)` has equivocated — the engine must
+/// preserve BOTH signed votes as `DoubleSignEvidence` instead of
+/// silently dropping the second as an idempotent duplicate. The
+/// evidence record is what the node pump turns into a staking
+/// `evidence` transaction; losing it here made the slash
+/// impossible.
+#[test]
+fn collect_vote_emits_evidence_on_same_voter_conflict() {
+    let mut leader = make_multi_engine(0);
+    leader.submit_tx(TxBytes::new(vec![1]));
+    let (header, _proposal) = leader.propose().expect("leader proposes");
+    let block_a = OxideBft::block_hash(&header);
+
+    let sig_a = Signature([0xAA; 96]);
+    let sig_b = Signature([0xBB; 96]);
+    let vote_a = Vote {
+        view: header.view,
+        phase: VotePhase::Prepare,
+        block_hash: block_a,
+        signature: sig_a,
+        attestation: None,
+        attestation_sig: None,
+    };
+    leader.collect_vote(1, vote_a).expect("first vote collects");
+    assert!(leader.take_evidence().is_empty(), "no evidence from one vote");
+
+    // Same voter, same view + phase, DIFFERENT block — the
+    // equivocation. It returns Ok (the relaying peer is not the
+    // offender) and never enters the collection bucket.
+    let vote_b = Vote {
+        view: header.view,
+        phase: VotePhase::Prepare,
+        block_hash: Hash([0xCC; 32]),
+        signature: sig_b,
+        attestation: None,
+        attestation_sig: None,
+    };
+    leader.collect_vote(1, vote_b).expect("conflicting vote drops without error");
+
+    let evidence = leader.take_evidence();
+    assert_eq!(evidence.len(), 1, "exactly one evidence record emitted");
+    let ev = &evidence[0];
+    assert_eq!(ev.validator, leader.validator_set().validator_addresses()[1]);
+    assert_eq!(ev.view, header.view);
+    assert_eq!(ev.phase, VotePhase::Prepare);
+    assert_eq!(ev.epoch, leader.epoch);
+    assert_eq!((ev.first_block_hash, ev.first_signature), (block_a, sig_a));
+    assert_eq!(
+        (ev.second_block_hash, ev.second_signature),
+        (Hash([0xCC; 32]), sig_b),
+        "the second, conflicting signed vote must be preserved verbatim"
+    );
+    // The queue drains fully — a second take returns empty.
+    assert!(leader.take_evidence().is_empty());
+    // The conflicting vote never displaced the recorded one in the
+    // collection slot.
+    assert_eq!(leader.votes[1].as_ref().map(|v| v.block_hash), Some(block_a));
+}
+
+/// A re-delivered copy of the recorded vote is idempotent, not
+/// equivocation — same `(view, phase, block_hash)` produces no
+/// evidence.
+#[test]
+fn collect_vote_duplicate_same_block_emits_no_evidence() {
+    let mut leader = make_multi_engine(0);
+    leader.submit_tx(TxBytes::new(vec![1]));
+    let (header, _proposal) = leader.propose().expect("leader proposes");
+    let block_hash = OxideBft::block_hash(&header);
+
+    let vote = Vote {
+        view: header.view,
+        phase: VotePhase::Prepare,
+        block_hash,
+        signature: Signature::ZERO,
+        attestation: None,
+        attestation_sig: None,
+    };
+    leader.collect_vote(1, vote.clone()).expect("first collects");
+    leader.collect_vote(1, vote).expect("duplicate is idempotent");
+    assert!(leader.take_evidence().is_empty(), "identical re-delivery is not an offense");
+}
+
+/// Equivocation straddling a QC formation must still be caught:
+/// the collection buffer clears when the QC forms, so a detector
+/// that only reads the live slot would miss a conflicting vote
+/// delivered late. `vote_history` spans the whole view.
+#[test]
+fn collect_vote_catches_equivocation_after_qc_clear() {
+    let mut leader = make_multi_engine(0);
+    leader.submit_tx(TxBytes::new(vec![1]));
+    let (header, _proposal) = leader.propose().expect("leader proposes");
+    let block_a = OxideBft::block_hash(&header);
+
+    // Voter 1 votes for block A; enough same-block votes collect
+    // to form the QC (buffer clears on formation).
+    let vote = |sig: Signature| Vote {
+        view: header.view,
+        phase: VotePhase::Prepare,
+        block_hash: block_a,
+        signature: sig,
+        attestation: None,
+        attestation_sig: None,
+    };
+    leader.collect_vote(1, vote(Signature([0x01; 96]))).expect("v1 collects");
+    leader.collect_vote(2, vote(Signature([0x02; 96]))).expect("v2 collects");
+    leader.collect_vote(3, vote(Signature([0x03; 96]))).expect("v3 collects");
+    assert!(leader.try_form_qc().is_some() || leader.vote_count() >= 3);
+    // The conflicting vote arrives only AFTER the buffer cleared —
+    // history still holds voter 1's first vote.
+    let conflicting = Vote {
+        view: header.view,
+        phase: VotePhase::Prepare,
+        block_hash: Hash([0xDD; 32]),
+        signature: Signature([0xEE; 96]),
+        attestation: None,
+        attestation_sig: None,
+    };
+    leader.collect_vote(1, conflicting).expect("late conflict drops without error");
+    let evidence = leader.take_evidence();
+    assert_eq!(evidence.len(), 1, "post-clear equivocation must still emit evidence");
+    assert_eq!(evidence[0].validator, leader.validator_set().validator_addresses()[1]);
+}
+
+/// Two votes in different *phases* are different signing contexts —
+/// voting at `Prepare` and again at `PreCommit` is the protocol, not
+/// an offense. History is keyed per `(validator, phase)` position.
+#[test]
+fn collect_vote_different_phase_is_not_equivocation() {
+    let mut leader = make_multi_engine(0);
+    leader.submit_tx(TxBytes::new(vec![1]));
+    let (header, _proposal) = leader.propose().expect("leader proposes");
+    let block_hash = OxideBft::block_hash(&header);
+
+    for phase in [VotePhase::Prepare, VotePhase::PreCommit, VotePhase::Commit] {
+        let vote = Vote {
+            view: header.view,
+            phase,
+            block_hash,
+            signature: Signature::ZERO,
+            attestation: None,
+            attestation_sig: None,
+        };
+        leader.collect_vote(1, vote).expect("per-phase vote collects");
+    }
+    assert!(leader.take_evidence().is_empty(), "phase progression is not an offense");
+}
+
+/// The pending-evidence queue is bounded — a byzantine spam of
+/// distinct offenses must not grow memory without limit. Overflow
+/// drops the newest record and counts the drop.
+#[test]
+fn evidence_queue_is_bounded() {
+    let mut leader = make_multi_engine(0);
+    // Fill the queue directly — simulating a backlog of distinct
+    // offenses the pump has not drained.
+    for i in 0..MAX_PENDING_EVIDENCE {
+        leader.evidence_out.push_back(types::DoubleSignEvidence {
+            validator: Address::ZERO,
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            epoch: Epoch::new(0),
+            first_block_hash: Hash([u8::try_from(i % 256).unwrap_or(0); 32]),
+            first_signature: Signature::ZERO,
+            second_block_hash: Hash([0xFF; 32]),
+            second_signature: Signature::ZERO,
+        });
+    }
+    assert_eq!(leader.evidence_stats(), (MAX_PENDING_EVIDENCE, 0));
+
+    leader.submit_tx(TxBytes::new(vec![1]));
+    let (header, _proposal) = leader.propose().expect("leader proposes");
+    let vote_a = Vote {
+        view: header.view,
+        phase: VotePhase::Prepare,
+        block_hash: OxideBft::block_hash(&header),
+        signature: Signature([0x01; 96]),
+        attestation: None,
+        attestation_sig: None,
+    };
+    leader.collect_vote(1, vote_a).expect("first collects");
+    let vote_b = Vote {
+        view: header.view,
+        phase: VotePhase::Prepare,
+        block_hash: Hash([0xAB; 32]),
+        signature: Signature([0x02; 96]),
+        attestation: None,
+        attestation_sig: None,
+    };
+    leader.collect_vote(1, vote_b).expect("conflict drops without error");
+    assert_eq!(
+        leader.evidence_stats(),
+        (MAX_PENDING_EVIDENCE, 1),
+        "overflow drops the newest record and counts the drop"
+    );
 }
 
 /// A vote naming a block the collector never stored must not
@@ -7094,6 +7355,7 @@ fn hidden_qc_timeout_release_cannot_fork() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: types::shard::commitment(&body_bytes, 4, k),
+        body_hash: Hash::ZERO,
     };
     h_child1.proposer_signature = Some(byz.sign(
         crypto::hash::Domain::Proposal,
@@ -7127,6 +7389,7 @@ fn hidden_qc_timeout_release_cannot_fork() {
         proposer_signature: None,
         exec_cert: None,
         body_commitment: types::shard::commitment(&body_bytes, 4, k),
+        body_hash: Hash::ZERO,
     };
     h_child2.proposer_signature = Some(byz.sign(
         crypto::hash::Domain::Proposal,

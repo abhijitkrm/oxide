@@ -313,7 +313,7 @@ fn ring_matcher_seals_from_the_one_book() {
     let mut server = MatchingServer::new(cfg(), 100);
     server.fund_account(&seller, 1_000_000_000);
     server.fund_account(&buyer, 1_000_000_000);
-    let ring = RingMatcher::new(server, 4, 1024);
+    let ring = RingMatcher::new(server, 4, 1024, None);
 
     // Push a maker sell + taker buy as one batch through ring 0.
     // The ring only accepts `VerifiedOrder` proofs — transport
@@ -372,7 +372,7 @@ fn ring_matcher_seals_from_the_one_book() {
 #[test]
 fn ring_lease_grants_exclusive_ownership() {
     let server = MatchingServer::new(cfg(), 100);
-    let ring = RingMatcher::new(server, 2, 64);
+    let ring = RingMatcher::new(server, 2, 64, None);
 
     let lease = ring.try_acquire_ring(0).expect("a free ring leases");
     let held_idx = lease.ring_idx();
@@ -400,7 +400,7 @@ fn ring_lease_grants_exclusive_ownership() {
 #[test]
 fn ring_lease_exhaustion_waits() {
     let server = MatchingServer::new(cfg(), 100);
-    let ring = RingMatcher::new(server, 1, 64);
+    let ring = RingMatcher::new(server, 1, 64, None);
     let lease = ring.try_acquire_ring(0).expect("first lease");
     assert!(ring.try_acquire_ring(0).is_none(), "held ring cannot re-lease");
     drop(lease);
@@ -946,11 +946,24 @@ fn worker_releases_filled_maker_resting_count() {
     balances.set(&seller, 1_000_000_000);
     balances.set(&buyer, u64::MAX / 2);
     let (now, clock) = test_clock();
-    let matcher = MultiMarketMatcher::with_clock(vec![cfg_for(0)], balances, clock);
+    // The cap under test is the resting-order ceiling — set it
+    // explicitly rather than relying on a default (the production
+    // default moved to venue-scale 10k in F-23, which this many
+    // orders can't reach).
+    let risk = RiskConfig { max_resting_per_account: 1_000, ..RiskConfig::default() };
+    let matcher = MultiMarketMatcher::with_options(
+        vec![cfg_for(0)],
+        balances,
+        clock,
+        protocol::CHAIN_ID,
+        None,
+        risk,
+        None,
+    );
 
-    // 1_000 resting sells = the default per-account cap. Ten
+    // 1_000 resting sells = the configured per-account cap. Ten
     // batches of 100 with a full window slide between them stay
-    // under the 100/sec rate limit.
+    // under any rate limit (the default is unlimited anyway).
     let mut nonce = 0u64;
     for _ in 0..10 {
         let batch: Vec<OrderRequest> = (0..100)
@@ -1032,6 +1045,8 @@ fn worker_verifies_configured_chain_id() {
         balances,
         Arc::new(wall_clock_ms),
         42,
+        None,
+        RiskConfig::default(),
         None,
     );
 

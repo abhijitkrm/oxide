@@ -141,7 +141,17 @@ alloy-primitives = { version = "1.7.2", features = ["std"] }
 # (GPL-3.0-compatible). This is the native signature scheme for
 # Oxide's non-EVM modules (staking, trading) — faster
 # verification than secp256k1 and no malleability.
-ed25519-dalek = { version = "3.0.0", features = ["rand_core", "batch"] }
+# `zeroize` makes `SigningKey` `ZeroizeOnDrop` — signing secrets
+# must not linger in freed memory (heap reuse, core dumps).
+ed25519-dalek = { version = "3.0.0", features = ["rand_core", "batch", "zeroize"] }
+
+# zeroize: explicit memory hygiene for secret material — key files,
+# passphrases, derived AEAD/session keys, and the hex-decoded
+# intermediate buffers key loaders briefly hold. Already a
+# transitive dep via blst (its SecretKey is #[zeroize(drop)]);
+# making it direct lets our own buffers carry the same guarantee.
+# MIT/Apache-2.0 (GPL-3.0-compatible).
+zeroize = "1.9.0"
 # rayon: data-parallelism for batch secp256k1 sender recovery.
 # The EVM tx hot path spends 88% of its time on secp256k1 ECDSA
 # recovery. Recovering N senders in parallel across cores turns

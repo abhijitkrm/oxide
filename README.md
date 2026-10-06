@@ -9,11 +9,12 @@ on-chain CLOB + perps venue where the order book *is* the blockchain, secured by
 HFT standards (zero-allocation hot paths, sub-microsecond matching, ~50–100ms
 blocks, sub-250ms full finality).
 
-> **Status: pre-alpha / Phase 2 complete.** Oxide is under active
-> development. Nothing here is production-ready yet, APIs will change
-> without notice, and no releases have been cut. Protocol specs are
-> landing in `docs/` as each phase progresses; the roadmap table below
-> tracks the current phase. **Do not run with real funds.**
+> **Status: pre-alpha / Phases 0–3 complete, Phase 4 (hardening &
+> testnet) in progress.** Oxide is under active development. Nothing
+> here is production-ready yet, APIs will change without notice, and
+> no releases have been cut. Protocol specs are landing in `docs/` as
+> each phase progresses; the roadmap table below tracks the current
+> phase. **Do not run with real funds.**
 
 ---
 
@@ -63,14 +64,13 @@ Users / HFT ──gRPC/WS──▶ Gateway (sig verify, risk pre-check, rate lim
                     │ NATIVE TRACK      │ EVM TRACK              │
                     │ module router:    │ revm host + optimistic │
                     │ core / staking /  │ parallel execution     │
-                    │ staking /         │ (Block-STM-style OCC)  │
-                    │ exchange / perps /│ native precompiles →   │
-                    │ oracle / gov      │ trading core           │
+                    │ exchange / perps /│ (Block-STM-style OCC)  │
+                    │ oracle / gov      │ native precompiles →   │
                     └────────┬─────────┴───────────┬────────────┘
-                             ▼   unified state      ▼
+                             ▼   unified state      ▼   trading core
               RAM hot state (huge pages, NUMA-pinned)
               + StorageBackend [PORT: default = authenticated journal
-                (MMR-over-log, group commit, io_uring)]
+                (MMR-over-log, group commit)]
               + async write-behind → ColdStore [PORT: MDBX/RocksDB/redb]
               + signed post-execution state attestations
                 fed back into consensus headers
@@ -107,9 +107,9 @@ swap them — the Rust-native answer to Cosmos's ABCI composability:
 | `ConsensusEngine` | **oxideBFT** (2-chain HotStuff) | `MockEngine` (sims/tests), `SequencerEngine` (dev mode) — shipped; hotstuff_rs wrapper — planned |
 | `AppInterface` (OAI) | oxide app: mempool + executor + state | the boundary every engine programs against (`docs/oai-spec.md`) |
 | `StorageBackend` | authenticated journal (MMR-over-log) | `Volatile` (in-memory), `RedbBackend` (pure Rust), `RocksDbBackend` (LSM), `MdbxBackend` (B-tree) — all shipped, conformance-tested, benchmarked |
-| `ColdStore` | MDBX (pending Phase 0 bench-off) | RocksDB, redb |
+| `ColdStore` | MDBX (won the Phase 0 bench-off) | RocksDB, redb |
 | `BroadcastEngine` | erasure-coded + f+1 availability votes | `PlainGossip` (tiny devnets), external DA (planned) |
-| `Transport` | commonware-p2p (authenticated) | libp2p/QUIC adapter (planned) |
+| `Transport` | hand-rolled TCP + TLS (signed-greeting peer auth, admission control) | libp2p/QUIC adapter (planned) |
 | `VmModule` | `evm` (revm) | SVM/MoveVM modules (post-testnet) |
 | `BookBackend` (internal) | dense flat tick ladder | sparse B-tree (wide-range markets) |
 
@@ -135,23 +135,26 @@ oxide/
 │   │                          #   + MockEngine + conformance suites
 │   ├── consensus/       # ★ oxideBFT engine + mock/sequencer engines + epochs
 │   ├── broadcast/       # erasure-coded dissemination + backfill
-│   ├── p2p/             # Transport impl over commonware-p2p
+│   ├── p2p/             # Transport impl: TCP + TLS, admission control
 │   ├── mempool/         # fee-priority pool, nonce queues, dedup
 │   ├── storage/         # ★ journal + MMR-over-log + StorageBackend adapters
-│   ├── state/           # in-memory authenticated state overlay
 │   ├── executor/        # block executor: module router + parallel EVM scheduler
 │   ├── trading/         # ★ matching engine, risk engine (HFT-grade)
-│   ├── rpc/             # JSON-RPC + WebSocket (eth_* + oxide_*)
+│   ├── matcher/         # ★ order-entry gateway: SPSC rings, FIX/WS/TCP/JSON-RPC
+│   ├── rpc/             # JSON-RPC + WebSocket (eth_* + web3_* + txpool_* + debug_*)
+│   ├── indexer/         # finalized-block index for explorer queries
+│   ├── statesync/       # certificate-verified snapshot bootstrap
+│   ├── metrics/ devnet/ config/ types/
 │   ├── node/            # node assembly: config-driven wiring of all ports
-│   └── types/           # shared chain types (Tx, Header, QC, BlockRecord…)
 ├── modules/                   # Cosmos-SDK-style module framework + modules
 │   ├── framework/  core/  staking/
 │   ├── evm/        # revm host + native precompiles; its account
 │   │               # store is also the chain's single native-token ledger
 │   └── exchange/  perps/  oracle/  governance/
-├── bin/                       # oxide-validator, oxide-fullnode, oxide-spammer,
+├── bin/                       # oxide-validator, oxide-fullnode, oxide-matcher,
+│                              # oxide-devnet, oxide-loadgen, oxide-spammer,
 │                              # oxide-deploy, oxide-bench
-├── sim/                       # deterministic swarm simulations (echo sim now; Phase 4: byzantine strategies)
+├── sim/                       # deterministic swarm simulations (chaos injection)
 ├── fuzz/                      # cargo-fuzz targets
 └── .devin/skills/             # coding/testing/performance standards (see below)
 ```
@@ -190,7 +193,7 @@ Read them before contributing. They are short, and they are the contract.
 
 ### Prerequisites
 
-- **Rust** 1.85+ (edition 2024) — <https://rustup.rs>
+- **Rust** 1.91+ (edition 2024) — <https://rustup.rs>
 - Linux is the production target; macOS works for development.
   (Some perf features — huge pages, io_uring tweaks, NUMA pinning — are
   Linux-only and degrade gracefully elsewhere.)
@@ -233,8 +236,8 @@ cargo run --bin oxide-deploy -- generate --validators 4 local
 | **0 — Foundation** | workspace, primitives, codec, runtime, ports/OAI, storage journal + MMR | journal ≥1M appends/s single-thread; MMR over 1M leaves <20ms; deterministic 4-node echo sim; mock engine drives app via OAI | ✅ Complete |
 | **1 — Consensus + chain skeleton** | oxideBFT, broadcast, mempool, executor v0, core/bank/staking, devnet tooling | 50–100ms blocks; 200k tx/s sim (n=32); devnet runs on SequencerEngine via config swap with **zero app-code changes**; bit-exact journal replay | ✅ Complete |
 | **2 — EVM + storage** | revm module, parallel OCC scheduler, JSON-RPC, adapters, snapshots | ≥1 GG/s on 16-core rig; MetaMask/Foundry/Blockscout green; storage conformance for every adapter | ✅ Complete |
-| **3 — Trading core** | matching engine, risk, spot + perps, oracle, market data | ≥5M ops/s single-core; ≥1M orders/s chain-wide sim; p50 <200ns order ops; perps property tests (no negative equity, ADL correctness) | 🚧 In progress |
-| **4 — Hardening & testnet** | fuzz, chaos sims, TLA+ model, external review, 20–50 validator testnet | 7-day soak ≥50% load; zero safety violations in 10k randomized sims | 📋 Planned |
+| **3 — Trading core** | matching engine, risk, spot + perps, oracle, market data | ≥5M ops/s single-core; ≥1M orders/s chain-wide sim; p50 <200ns order ops; perps property tests (no negative equity, ADL correctness) | ✅ Complete |
+| **4 — Hardening & testnet** | fuzz, chaos sims, TLA+ model, external review, 20–50 validator testnet | 7-day soak ≥50% load; zero safety violations in 10k randomized sims | 🚧 In progress |
 
 Post-testnet: mainnet + tokenomics, slashing, encrypted mempool, BAL access
 lists, revmc JIT, DPDK/AF_XDP gateway lane, bridges, SVM/MoveVM modules.
@@ -243,7 +246,7 @@ lists, revmc JIT, DPDK/AF_XDP gateway lane, bridges, SVM/MoveVM modules.
 
 ## What's built so far
 
-Phases 0–2 are complete, Phase 3 (trading core) is in progress. Here's what's in the repo today:
+Phases 0–3 are complete; Phase 4 (hardening & testnet) is in progress. Here's what's in the repo today:
 
 ### Phase 0 — Foundation ✅
 
@@ -313,42 +316,69 @@ identified critical consensus-safety findings, HIGH-severity
 security issues, and four execution-path ceilings for the 10 GG/block
 target. Remediation is in progress:
 
-**Critical fixes (C1–C10):**
+**Critical fixes (C1–C10):** all landed.
 - C1: consensus height overflow (`u64::MAX` wrap) — saturating arithmetic
 - C2: future-view vote acceptance — view-range filtering
 - C3: unsigned proposals — leader signature verification
+- C4: mutual TLS bound to validator keys — client-cert check against the peer-id map + signed-greeting `PeerAuth`
 - C5: precompile no-ops — executor-side settlement
 - C6: Reed-Solomon reconstruct panic on unequal shards — checked lengths
 - C7: matcher ignores protocol nonce — replay protection
 - C8: fills before bank settlement — settlement ordering
+- C9: consensus WAL — durable vote/lock journal with torn-tail repair (`crates/consensus/src/wal.rs`)
 - C10: `executed_nonce` in-memory only — persisted to storage backend
-- **Remaining:** C4 (mutual TLS bound to validator keys), C9 (consensus WAL)
 
-**Execution-path ceilings (10 GG/block):**
+**Execution-path ceilings (10 GG/block):** all landed.
 - Ceiling 1: unified block gas limit at 10 GG ✅
-- Ceiling 2: parallel executor with tx-granular conflict tracking ✅
+- Ceiling 2: parallel executor with slot-granular conflict tracking ✅
 - Ceiling 3: sparse retained-trie for O(touched·log N) state root ✅
-- Ceiling 4: O(n) receipts root + free-gas stuffing gates — remaining
+- Ceiling 4: O(n) receipts root + free-gas stuffing gates ✅
 
-**HIGH-severity fixes (partial):**
-- RPC rate limiting, per-vote BLS verify drop, EIP-2718 receipts
-  encoding, perps funding clamp, trading money-math clamps — done.
-- RLP trailing bytes, signature malleability, unbounded channels,
-  admission leak, mempool nonce anchoring, snapshot auth — in progress.
+**HIGH-severity fixes:** landed (RPC cost-weighted rate limiting,
+per-vote BLS verify, EIP-2718 receipts, perps funding clamp, trading
+money-math clamps, RLP trailing bytes, signature malleability,
+bounded channels, admission control, mempool nonce anchoring,
+certificate-verified snapshots).
 
-### Phase 3 — Trading core (in progress)
+**HFT audit (F-01…F-26):** resolved — see `hft-audit.md` (SPSC ring
+rewrite, bitboard FOK pre-scan, wait-free market-data publish, scratch
+discipline on every write path, CPU pinning, ratcheted throughput
+gates) and `docs/system-audit.md` for the follow-up system audit.
+
+### Phase 3 — Trading core ✅
 
 - **Matching engine** (`crates/trading`): multi-market parallel
   matcher (one worker per market), shared `ShardedBalanceCache`
   (64 shards), 4 protocols (TCP, JSON-RPC, FIX, WebSocket).
-  15.15M orders/s single-market, 11.68M orders/s across 128 markets.
+  24.5M orders/s raw engine; true-SPSC ring transport (~14.7 ns
+  push+pop); bitboard FOK pre-scan (~82 ns).
 - **Exchange module** (`modules/exchange`): spot CLOB with
-  limit/market orders, settlement via the EVM account ledger.
+  limit/market orders, settlement via the EVM account ledger;
+  chain-path settlement 400–550k orders/s (gated).
 - **Perps module** (`modules/perps`): perpetuals with margin,
   funding, liquidations, insurance fund, ADL.
+- **Oracle module** (`modules/oracle`): median-of-feeds mark price,
+  EMA smoothing, quorum gating, staleness tracking.
 - **EVM load test**: 100K EVM txs at 6,410 tx/s (4 validators),
   throughput stable as state grows (sparse state root).
 - **Trading load test**: 2M trading txs at 72,556 tx/s (4 validators).
+
+### Phase 4 — Hardening & testnet (in progress)
+
+- **Fuzz campaign**: 11 targets (`codec_decode`, `consensus_msg`,
+  `evm_execute`, `evm_parallel_differential`, `exchange_settlement`,
+  `journal_replay`, `mmr_proof_verify`, `sync_decode`,
+  `trading_engine`, `trading_order_validate`, `types_decode`) with
+  committed corpus, 10-min nightly budget each.
+- **Chaos sim**: 10k randomized scenarios, zero safety violations.
+- **TLA+ model** of oxideBFT: 3 counterexamples found and fixed;
+  TLC seeded simulation in CI, deep config nightly.
+- **Deterministic multinode fault injection**: leader kills, view
+  advances, mempool nonce-bridge liveness (green across repeated
+  parallel runs).
+- **Open gates**: 7-day soak at ≥50% load, external security review,
+  20–50 validator public testnet. Current audit state:
+  `docs/system-audit.md`.
 
 ### Benchmark results (8-core Apple M1)
 
@@ -365,12 +395,14 @@ target. Remediation is in progress:
 | State root incremental (100k accts, 10 touched) | 110 µs | <10ms ✅ |
 | State root incremental (100k accts, 100 touched) | 1.0 ms | <10ms ✅ |
 | State root incremental (1M accts, 100 touched) | 1.27 ms | <10ms ✅ |
-| Matching engine (1 market, ring) | 15.15M orders/s | ≥5M ops/s ✅ |
+| Matching engine (1 market, ring) | 24.5M orders/s raw; ~14.7 ns SPSC push+pop | ≥5M ops/s ✅ |
 | Matching engine (128 markets, multi) | 11.68M orders/s | ≥1M orders/s ✅ |
+| FOK pre-scan (sparse 1k-level book, bitboard) | ~82 ns (linear oracle: 2.61 µs) | ~32× vs linear ✅ |
+| Exchange settlement (chain path) | 538k orders/s (1M-trade gate run) | ≥400k ops/s ✅ |
 | EVM load test (4 validators, 100k txs) | 6,410 tx/s | — |
 | Trading load test (4 validators, 2M txs) | 72,556 tx/s | — |
 
-**1,138 tests pass.** `cargo fmt --check`, `cargo clippy -D warnings`,
+**2,048 tests pass.** `cargo fmt --check`, `cargo clippy -D warnings`,
 `cargo deny check` all clean.
 
 ---
@@ -404,7 +436,8 @@ these systems, whose public designs informed ours:
 
 - **commonware** (p2p/crypto/codec/coding primitives, buffered-signature
   amortization, threshold-simplex, QMDB, deterministic runtime pattern) —
-  used as *libraries* where non-differentiating
+  studied as a design reference; the shipped transport/codec are
+  first-principles implementations
 - **Monad** (MonadBFT: pipelined Jolteon + tail-fork resistance; async
   execution; optimistic parallel EVM)
 - **Hyperliquid** (HyperBFT; HyperCore/HyperEVM dual-engine; on-chain signed

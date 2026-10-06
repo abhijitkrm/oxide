@@ -10,8 +10,9 @@
 use super::{
     Arc, CacheDB, CoinbaseObs, DecodedTx, Event, EvmModule, ExecError, ExecuteCommitEvm, InfoKey,
     InspectEvm, IntoParallelIterator, IntoParallelRefIterator, MvDb, MvState, ParallelIterator,
-    PreverifiedTx, SharedCacheDB, SpecTx, TracedResult, TxContext, alloy_primitives_address,
-    destructive_accounts, history, info_key, receipts, trace, tx, versioned,
+    PreverifiedTx, RejectCategory, SharedCacheDB, SpecTx, TracedResult, TxContext,
+    alloy_primitives_address, destructive_accounts, history, info_key, receipts, trace, tx,
+    versioned,
 };
 use revm::database_interface::DatabaseRef;
 use revm::state::EvmState;
@@ -166,8 +167,8 @@ impl EvmModule {
     ) -> Vec<Result<PreverifiedTx<'a>, ExecError>> {
         // A lone tx has no parallelism to buy — the rayon bridge's
         // split/join overhead (~µs) is pure cost on the caller's
-        // thread, and the mempool admission path calls this with a
-        // single-element slice per tx.
+        // thread, and the single-tx admission path calls this with a
+        // one-element slice.
         if msgs.len() == 1 {
             return msgs.iter().map(|raw| self.preverify_one(raw.as_ref())).collect();
         }
@@ -183,7 +184,9 @@ impl EvmModule {
         }
         let sender = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
         let caller = alloy_primitives_address(sender.0);
-        Ok(PreverifiedTx { raw, sender: caller })
+        // This function IS this node's ingest-time recovery — the
+        // flag's exact provenance meaning.
+        Ok(PreverifiedTx { raw, sender: caller, verified_locally: true })
     }
 
     /// Execute a batch of transactions with **pre-verified senders**.
@@ -240,11 +243,20 @@ impl EvmModule {
         ctx: &TxContext,
         txs: &[PreverifiedTx<'_>],
     ) -> Vec<Result<Vec<Event>, ExecError>> {
-        // Phase 1: decode and re-recover the sender. RLP decode is
-        // ~79 ns/tx; secp256k1 recovery is ~30 µs/tx. We re-recover
-        // the sender and check it matches the pre-recovered value.
-        // A byzantine proposer cannot forge a sender — any mismatch
-        // is rejected before state transition.
+        // Phase 1: decode and resolve the caller. RLP decode is
+        // ~79 ns/tx; secp256k1 recovery is ~30 µs/tx. Provenance
+        // splits the work (hft-audit F-06):
+        //
+        // - `verified_locally` — the sender came from this node's
+        //   own ingest-time recovery (executor preverify cache, keyed
+        //   by a locally-computed tx hash over these exact bytes).
+        //   Re-recovery would only re-derive what was already proven;
+        //   skip it. Decode + chain-id still run — a tx must parse
+        //   and match this chain regardless of who verified it.
+        // - Otherwise — `pv.sender` is an unproven claim; recover
+        //   from the signature and compare. A byzantine proposer
+        //   cannot forge a sender: any mismatch is rejected before
+        //   state transition.
         let decoded: Vec<DecodedTx> = txs
             .par_iter()
             .map(|pv| {
@@ -252,18 +264,20 @@ impl EvmModule {
                 if signed.chain_id() != self.chain_id {
                     return Err(ExecError::Malformed);
                 }
-                // Re-recover the sender from the signature. This is
-                // the security gate: we do NOT trust `pv.sender`.
-                let recovered = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
-                let recovered_addr = alloy_primitives_address(recovered.0);
-                // Check the pre-recovered sender matches the
-                // signature-recovered sender. A mismatch means the
-                // proposer supplied a wrong sender — reject it.
-                if recovered_addr != pv.sender {
-                    return Err(ExecError::Malformed);
-                }
+                let caller = if pv.verified_locally {
+                    pv.sender
+                } else {
+                    // Unproven sender — the security gate: recover
+                    // and compare, reject any mismatch.
+                    let recovered = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
+                    let recovered_addr = alloy_primitives_address(recovered.0);
+                    if recovered_addr != pv.sender {
+                        return Err(ExecError::Malformed);
+                    }
+                    recovered_addr
+                };
                 let tx_hash = alloy_primitives::keccak256(pv.raw);
-                Ok((signed, recovered_addr, tx_hash, pv.raw.to_vec()))
+                Ok((signed, caller, tx_hash, pv.raw.to_vec()))
             })
             .collect();
 
@@ -418,9 +432,10 @@ impl EvmModule {
                     Ok(rs) => rs,
                     Err(e) => {
                         evm.precompiles.clear_native_journal();
-                        results.push(Err(ExecError::ModuleRejected(format!(
-                            "evm transact failed: {e:?}"
-                        ))));
+                        results.push(Err(ExecError::rejected(
+                            RejectCategory::Other,
+                            format!("evm transact failed: {e:?}"),
+                        )));
                         continue;
                     }
                 };
@@ -659,8 +674,12 @@ impl EvmModule {
             return Vec::new();
         }
 
-        // Phase 1: decode and re-recover the sender. We do NOT
-        // trust `pv.sender` — a byzantine proposer could forge it.
+        // Phase 1: decode and resolve the caller — same provenance
+        // split as `handle_batch_preverified` (hft-audit F-06):
+        // `verified_locally` means this node already recovered the
+        // sender at ingest, so the ~30 µs/tx recovery inside
+        // `par_iter` is skipped; any other `pv.sender` is an
+        // unproven claim and is recovered-and-compared as before.
         let decoded: Vec<DecodedTx> = txs
             .par_iter()
             .map(|pv| {
@@ -668,15 +687,18 @@ impl EvmModule {
                 if signed.chain_id() != self.chain_id {
                     return Err(ExecError::Malformed);
                 }
-                // Re-recover the sender from the signature and
-                // check it matches the pre-recovered value.
-                let recovered = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
-                let recovered_addr = alloy_primitives_address(recovered.0);
-                if recovered_addr != pv.sender {
-                    return Err(ExecError::Malformed);
-                }
+                let caller = if pv.verified_locally {
+                    pv.sender
+                } else {
+                    let recovered = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
+                    let recovered_addr = alloy_primitives_address(recovered.0);
+                    if recovered_addr != pv.sender {
+                        return Err(ExecError::Malformed);
+                    }
+                    recovered_addr
+                };
                 let tx_hash = alloy_primitives::keccak256(pv.raw);
-                Ok((signed, recovered_addr, tx_hash, pv.raw.to_vec()))
+                Ok((signed, caller, tx_hash, pv.raw.to_vec()))
             })
             .collect();
 
@@ -900,9 +922,10 @@ impl EvmModule {
                     Err(e) => Some(SpecTx {
                         idx: i,
                         sender: caller,
-                        result: Err(ExecError::ModuleRejected(format!(
-                            "evm transact failed: {e:?}"
-                        ))),
+                        result: Err(ExecError::rejected(
+                            RejectCategory::Other,
+                            format!("evm transact failed: {e:?}"),
+                        )),
                         // Whatever the journal read before rejecting
                         // is the observation record — a real subset,
                         // not just the sender.
@@ -1220,9 +1243,10 @@ impl EvmModule {
                             final_results[i] = Some(Ok((r, call_trace)));
                         }
                         Err(e) => {
-                            final_results[i] = Some(Err(ExecError::ModuleRejected(format!(
-                                "evm transact failed: {e:?}"
-                            ))));
+                            final_results[i] = Some(Err(ExecError::rejected(
+                                RejectCategory::Other,
+                                format!("evm transact failed: {e:?}"),
+                            )));
                         }
                     }
                 }
@@ -1323,8 +1347,9 @@ impl EvmModule {
                     results.push(self.exec_result_to_events(res, meta));
                 }
                 None => {
-                    results.push(Err(ExecError::ModuleRejected(
-                        "parallel execution: missing result".to_string(),
+                    results.push(Err(ExecError::rejected(
+                        RejectCategory::NotFound,
+                        "parallel execution: missing result",
                     )));
                 }
             }

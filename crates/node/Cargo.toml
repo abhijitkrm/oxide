@@ -69,6 +69,10 @@ alloy-primitives = { workspace = true }
 # tracing: structured diagnostic logging for node lifecycle events
 # (startup, shutdown, block finalization). Not on the hot path.
 tracing = { workspace = true }
+# zeroize: every secret this crate holds — loaded key bytes, remote-
+# signer link keys, derived session MAC keys — is wiped on drop
+# rather than left in freed heap memory.
+zeroize = { workspace = true }
 metrics.workspace = true
 
 [dev-dependencies]

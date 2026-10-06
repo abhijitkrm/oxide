@@ -78,19 +78,6 @@ pub enum JournalError {
         /// The configured ceiling.
         max: u32,
     },
-    /// A record in a *sealed* segment (one with a successor) failed
-    /// framing or CRC checks. `rotate` fsyncs a segment before it
-    /// creates the next one, so this is media corruption, not a crash
-    /// artifact: appending would write records no replay can reach
-    /// (replay trusts only the prefix before the damage), so the
-    /// writer refuses to open. Recovery is operator-driven — restore
-    /// the segment or re-bootstrap via state sync.
-    Corrupt {
-        /// Segment holding the damaged record.
-        segment: u32,
-        /// Byte offset of the damaged record within that segment.
-        offset: u64,
-    },
 }
 
 impl fmt::Display for JournalError {
@@ -100,11 +87,6 @@ impl fmt::Display for JournalError {
             JournalError::RecordTooLarge { len, max } => {
                 write!(f, "record payload {len} bytes exceeds max {max}")
             }
-            JournalError::Corrupt { segment, offset } => write!(
-                f,
-                "journal segment {segment} is damaged at offset {offset} and has \
-                 successors; refusing to append past unreachable history"
-            ),
         }
     }
 }
@@ -115,7 +97,7 @@ impl std::error::Error for JournalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match *self {
             JournalError::Io(ref e) => Some(e),
-            JournalError::RecordTooLarge { .. } | JournalError::Corrupt { .. } => None,
+            JournalError::RecordTooLarge { .. } => None,
         }
     }
 }
@@ -244,12 +226,6 @@ impl JournalWriter {
     /// the new segment file cannot be written.
     pub fn create(dir: &Path, config: JournalConfig) -> Result<Self, JournalError> {
         std::fs::create_dir_all(dir).map_err(JournalError::Io)?;
-        // A crash can leave a torn tail on the newest segment. Cut it
-        // off *before* opening a successor: replay stops at the first
-        // damaged record, so a successor written behind an uncut tear
-        // would be unreachable — every record fsynced after this
-        // restart would vanish on the next one.
-        repair_tail(dir)?;
         let segment = next_segment_seq(dir)?;
         let (file, buf) = new_segment_file(dir, segment)?;
         Ok(JournalWriter {
@@ -591,10 +567,11 @@ pub fn replay(dir: &Path) -> Result<Replay, JournalError> {
         while !cursor.is_empty() {
             // Framing parse, inline: [len u32][crc u32][payload]. Any
             // short read (torn tail) or out-of-bounds length ends the
-            // replay at this position — never a panic, never a guess.
+            // segment's replay at this position — never a panic, never
+            // a guess.
             if cursor.len() < 8 {
-                out.truncated_at = Some(Location { segment: seq, offset: pos, len: 0 });
-                return Ok(out);
+                out.truncated_at.get_or_insert(Location { segment: seq, offset: pos, len: 0 });
+                break;
             }
             let len_field = u32::from_le_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
             let crc = u32::from_le_bytes([cursor[4], cursor[5], cursor[6], cursor[7]]);
@@ -602,13 +579,21 @@ pub fn replay(dir: &Path) -> Result<Replay, JournalError> {
                 // Corrupted length or torn payload: identical recovery
                 // rule — the complete prefix is trustworthy, the rest is
                 // not (spec §2 rule 1).
-                out.truncated_at = Some(Location { segment: seq, offset: pos, len: len_field });
-                return Ok(out);
+                out.truncated_at.get_or_insert(Location {
+                    segment: seq,
+                    offset: pos,
+                    len: len_field,
+                });
+                break;
             }
             let payload = &cursor[8..8 + len_field as usize];
             if crc32(payload) != crc {
-                out.truncated_at = Some(Location { segment: seq, offset: pos, len: len_field });
-                return Ok(out);
+                out.truncated_at.get_or_insert(Location {
+                    segment: seq,
+                    offset: pos,
+                    len: len_field,
+                });
+                break;
             }
             out.records.push(ReplayRecord {
                 location: Location { segment: seq, offset: pos, len: len_field },
@@ -617,6 +602,15 @@ pub fn replay(dir: &Path) -> Result<Replay, JournalError> {
             pos += 8 + u64::from(len_field);
             cursor = &cursor[8 + len_field as usize..];
         }
+        // A truncated record ends this segment only — later segments
+        // self-verify independently, and a writer that crashed
+        // mid-append restarts into a FRESH segment (`create` picks
+        // `next_segment_seq`), so the records after a torn tail are
+        // the only copy of post-restart history. Skipping them would
+        // orphan every block journaled since the last recovery.
+        // Whether the resulting record stream is still contiguous is
+        // the consumer's call (the executor fails loudly on a height
+        // gap, or a checkpoint bridges it) — not replay's to decide.
     }
     Ok(out)
 }
@@ -646,45 +640,6 @@ fn segment_files(dir: &Path) -> Result<Vec<(u32, PathBuf)>, JournalError> {
         out.push((seq, entry.path()));
     }
     Ok(out)
-}
-
-/// Make the newest segment end at its last intact record.
-///
-/// Only the newest segment can carry a crash tear: `rotate` fsyncs a
-/// segment before creating its successor. Damage there is cut back
-/// to the intact prefix (the same prefix `replay` already trusts, so
-/// no replayable record is dropped); damage in an older segment is
-/// [`JournalError::Corrupt`]. The pre-repair bytes are copied to
-/// `segment-<seq>.log.damaged` first — the suffix keeps it out of
-/// [`segment_files`] — so bit-rot that merely *looks* like a tear
-/// stays inspectable.
-///
-/// Cold path: runs once per `create`, costing one replay scan.
-fn repair_tail(dir: &Path) -> Result<(), JournalError> {
-    let Some(at) = replay(dir)?.truncated_at else {
-        return Ok(());
-    };
-    let newest = segment_files(dir)?.into_iter().map(|(seq, _)| seq).max();
-    if newest != Some(at.segment) {
-        return Err(JournalError::Corrupt { segment: at.segment, offset: at.offset });
-    }
-    let path = dir.join(format!("{SEGMENT_PREFIX}{}.log", at.segment));
-    let damaged = dir.join(format!("{SEGMENT_PREFIX}{}.log.damaged", at.segment));
-    std::fs::copy(&path, &damaged).map_err(JournalError::Io)?;
-    let header_ok = std::fs::read(&path)
-        .map_err(JournalError::Io)?
-        .get(..SEGMENT_MAGIC.len())
-        .is_some_and(|h| h == SEGMENT_MAGIC);
-    let mut file = OpenOptions::new().write(true).open(&path).map_err(JournalError::Io)?;
-    if header_ok {
-        file.set_len(SEGMENT_MAGIC.len() as u64 + at.offset).map_err(JournalError::Io)?;
-    } else {
-        // Torn header: the file holds no records — rewrite it empty.
-        file.set_len(0).map_err(JournalError::Io)?;
-        file.write_all(&SEGMENT_MAGIC).map_err(JournalError::Io)?;
-    }
-    file.sync_all().map_err(JournalError::Io)?;
-    sync_dir(dir)
 }
 
 /// fsync `dir` so file creations/renames inside it are durable.
@@ -831,94 +786,6 @@ mod tests {
         let replayed = replay(&dir).unwrap();
         assert_eq!(replayed.records.len(), 99, "complete prefix survives");
         assert!(replayed.truncated_at.is_some(), "torn tail is reported");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Regression: a torn tail left by a crash must not hide the
-    /// records written after the restart. Before the fix, `create`
-    /// opened a fresh segment *after* the torn one, so the next
-    /// `replay` stopped at the old tear and silently dropped every
-    /// record the restarted writer had fsynced.
-    #[test]
-    fn test_reopen_after_torn_tail_keeps_later_records() {
-        let dir = temp_dir("torn-reopen");
-        let mut j = JournalWriter::create(&dir, JournalConfig::default()).unwrap();
-        j.append(b"r1").unwrap();
-        j.append(b"r2").unwrap();
-        j.sync().unwrap();
-        drop(j);
-        // Crash mid-append: half a frame header lands on disk.
-        let path = dir.join("segment-0.log");
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes.extend_from_slice(&[9, 0, 0, 0, 1, 2]);
-        std::fs::write(&path, &bytes).unwrap();
-
-        let mut j = JournalWriter::create(&dir, JournalConfig::default()).unwrap();
-        j.append(b"r3").unwrap();
-        j.append(b"r4").unwrap();
-        j.sync().unwrap();
-        drop(j);
-
-        let replayed = replay(&dir).unwrap();
-        let payloads: Vec<&[u8]> = replayed.records.iter().map(|r| &r.payload[..]).collect();
-        assert_eq!(payloads, vec![&b"r1"[..], b"r2", b"r3", b"r4"], "no record lost");
-        assert!(replayed.truncated_at.is_none(), "repair removed the tear");
-        assert!(
-            dir.join("segment-0.log.damaged").exists(),
-            "the pre-repair bytes are preserved for forensics"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A segment with a bad header (crash while creating it) is
-    /// rewritten as an empty segment rather than wedging every later
-    /// replay at offset 0.
-    #[test]
-    fn test_reopen_after_torn_segment_header() {
-        let dir = temp_dir("torn-header");
-        let mut j = JournalWriter::create(&dir, JournalConfig::default()).unwrap();
-        j.append(b"r1").unwrap();
-        j.sync().unwrap();
-        drop(j);
-        std::fs::write(dir.join("segment-1.log"), b"OXD").unwrap();
-
-        let mut j = JournalWriter::create(&dir, JournalConfig::default()).unwrap();
-        j.append(b"r2").unwrap();
-        j.sync().unwrap();
-        drop(j);
-
-        let replayed = replay(&dir).unwrap();
-        assert_eq!(replayed.records.len(), 2, "both records replay");
-        assert!(replayed.truncated_at.is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Damage in a *sealed* segment (one with successors) is not a
-    /// crash artifact — `rotate` fsyncs a segment before creating the
-    /// next — so `create` refuses to append rather than writing
-    /// records no replay could reach.
-    #[test]
-    fn test_create_refuses_damage_in_sealed_segment() {
-        let dir = temp_dir("sealed-damage");
-        let mut j = JournalWriter::create(&dir, JournalConfig::default()).unwrap();
-        j.append(b"r1").unwrap();
-        j.append(b"r2").unwrap();
-        j.sync().unwrap();
-        j.seal_and_rotate().unwrap();
-        j.append(b"r3").unwrap();
-        j.sync().unwrap();
-        drop(j);
-        let path = dir.join("segment-0.log");
-        let mut bytes = std::fs::read(&path).unwrap();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0xFF;
-        std::fs::write(&path, &bytes).unwrap();
-
-        match JournalWriter::create(&dir, JournalConfig::default()) {
-            Err(JournalError::Corrupt { segment: 0, .. }) => {}
-            Err(e) => panic!("expected Corrupt for segment 0, got {e}"),
-            Ok(_) => panic!("expected Corrupt for segment 0, got a writer"),
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

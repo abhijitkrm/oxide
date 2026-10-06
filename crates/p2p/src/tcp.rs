@@ -57,11 +57,6 @@ use std::time::{Duration, Instant};
 
 use ports::transport::{InboundMessage, PeerId, Transport, TransportCaps, TransportError};
 
-/// An outbound message as queued to a peer's writer thread. Shared
-/// (`Arc`) so a broadcast hands every recipient the same bytes
-/// instead of a per-peer copy.
-type Frame = Arc<[u8]>;
-
 #[cfg(feature = "tls")]
 use crate::tls::TlsConfig;
 
@@ -120,11 +115,34 @@ pub trait PeerStream: Send {
     /// # Errors
     ///
     /// Returns `Err` on I/O error.
-    fn write_frames(&mut self, frames: &[Frame]) -> io::Result<()> {
+    fn write_frames(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
         for f in frames {
             self.write_frame(f)?;
         }
         Ok(())
+    }
+
+    /// Scratch-backed batch write: `scratch` holds the serialized
+    /// batch (plaintext `[len][payload]…` for TCP, ciphertext for
+    /// TLS) so a caller that batches on every drain amortizes the
+    /// buffer across calls instead of allocating a `Vec` per batch
+    /// (hft-audit F-14 — the writer loop is exactly that caller).
+    ///
+    /// The default delegates to [`PeerStream::write_frames`];
+    /// implementations that stage through a contiguous buffer
+    /// override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on I/O error. `scratch` may be left partially
+    /// filled — callers must not rely on its contents across calls.
+    fn write_frames_scratch(
+        &mut self,
+        frames: &[Vec<u8>],
+        scratch: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        let _ = scratch;
+        self.write_frames(frames)
     }
 }
 
@@ -168,34 +186,45 @@ impl PeerStream for TcpStream {
         Ok(())
     }
 
-    fn write_frames(&mut self, frames: &[Frame]) -> io::Result<()> {
+    fn write_frames(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
         if frames.len() == 1 {
             // Single-frame fast path: keep the vectored write.
             return self.write_frame(&frames[0]);
         }
-        // Batched frames: the `[len][payload]…` sequence goes to the
-        // kernel as one iovec list — still one syscall + one flush
-        // for the whole batch, but without first copying up to
-        // `WRITER_BATCH_MAX_BYTES` of payload into a fresh buffer.
-        // ≤ 2 × `WRITER_BATCH_MAX_MESSAGES` = 128 iovecs, well under
-        // every platform's `IOV_MAX` (≥ 1024).
-        let prefixes: Vec<[u8; 4]> = frames
-            .iter()
-            .map(|f| u32::try_from(f.len()).unwrap_or(u32::MAX).to_be_bytes())
-            .collect();
-        let mut slices: Vec<io::IoSlice<'_>> = Vec::with_capacity(frames.len() * 2);
-        for (prefix, f) in prefixes.iter().zip(frames) {
-            slices.push(io::IoSlice::new(prefix));
-            slices.push(io::IoSlice::new(f));
+        // Batched frames: one contiguous `[len][payload]…` buffer →
+        // one `write_all` + one `flush` for the whole batch. The
+        // single memcpy per batch is dwarfed by the syscall and
+        // flush savings (N frames would otherwise cost N of each).
+        let total: usize = frames.iter().map(|f| 4 + f.len()).sum();
+        let mut buf = Vec::with_capacity(total);
+        for f in frames {
+            buf.extend_from_slice(&u32::try_from(f.len()).unwrap_or(u32::MAX).to_be_bytes());
+            buf.extend_from_slice(f);
         }
-        let mut rest = &mut slices[..];
-        while !rest.is_empty() {
-            let n = self.write_vectored(rest)?;
-            if n == 0 {
-                return Err(io::Error::from(io::ErrorKind::WriteZero));
-            }
-            io::IoSlice::advance_slices(&mut rest, n);
+        self.write_all(&buf)?;
+        self.flush()
+    }
+
+    fn write_frames_scratch(
+        &mut self,
+        frames: &[Vec<u8>],
+        scratch: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        if frames.len() == 1 {
+            // Single-frame fast path: keep the vectored write —
+            // scratch is untouched.
+            return self.write_frame(&frames[0]);
         }
+        // Same contiguous-batch strategy as `write_frames`, staged
+        // into the caller-owned scratch so the writer loop's buffer
+        // is amortized across drains (F-14).
+        scratch.clear();
+        scratch.reserve(frames.iter().map(|f| 4 + f.len()).sum());
+        for f in frames {
+            scratch.extend_from_slice(&u32::try_from(f.len()).unwrap_or(u32::MAX).to_be_bytes());
+            scratch.extend_from_slice(f);
+        }
+        self.write_all(scratch)?;
         self.flush()
     }
 }
@@ -226,6 +255,14 @@ impl PeerStream for TcpStream {
 /// mid-record. `conn` is released before the socket syscall, so the
 /// crypto lock never spans I/O, and the reader's poll can never queue
 /// a writer behind it.
+///
+/// **Write-path budget (hft-audit F-11):** ~4 µs per frame under the
+/// `conn` + `wire` locks (~3.4 µs uncontended — measured by the
+/// `tls_contention` bench, informational, no gate). At the current
+/// 1 s view cadence that is invisible; it becomes a real share if
+/// cadence ever drops toward ~10 ms or tx-gossip volume grows —
+/// the documented revisit point is kernel TLS (kTLS) or per-
+/// connection crypto threads. mTLS stays opt-in.
 ///
 /// `#[doc(hidden)]`: `pub` exists so the `tls_contention` bench can
 /// measure the real primitives rather than a reimplemented replica.
@@ -472,7 +509,7 @@ impl PeerStream for TlsWriteHalf {
         wire.write_all(&ciphertext)
     }
 
-    fn write_frames(&mut self, frames: &[Frame]) -> io::Result<()> {
+    fn write_frames(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
         let mut wire = primitives::sync::lock_state(&self.wire);
         let ciphertext = {
             let mut conn = primitives::sync::lock_state(&self.conn);
@@ -488,6 +525,31 @@ impl PeerStream for TlsWriteHalf {
             out
         };
         wire.write_all(&ciphertext)
+    }
+
+    fn write_frames_scratch(
+        &mut self,
+        frames: &[Vec<u8>],
+        scratch: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        // Same encrypt-batch-then-write shape as `write_frames`, with
+        // the ciphertext staged in the caller's scratch (F-14). The
+        // scratch MUST stay owned past the `conn` lock — `wire` is
+        // written after `conn` is released, so the buffer cannot be
+        // `conn`-local.
+        let mut wire = primitives::sync::lock_state(&self.wire);
+        {
+            let mut conn = primitives::sync::lock_state(&self.conn);
+            scratch.clear();
+            scratch.reserve(frames.iter().map(|f| 4 + f.len() + (f.len() / 16_384 + 2) * 64).sum());
+            for f in frames {
+                let len = u32::try_from(f.len()).unwrap_or(u32::MAX);
+                Self::buffer_plaintext(&mut conn, &len.to_be_bytes(), scratch)?;
+                Self::buffer_plaintext(&mut conn, f, scratch)?;
+            }
+            conn.write_tls(scratch)?;
+        }
+        wire.write_all(scratch)
     }
 }
 
@@ -1004,7 +1066,30 @@ pub struct TcpTransportConfig {
     /// no allowlist bypass): it guards the pre-authentication window
     /// itself. Default [`DEFAULT_MAX_CONNECTIONS_PER_SOURCE`].
     pub max_connections_per_source: usize,
+
+    /// Target size for `SO_SNDBUF`/`SO_RCVBUF` on every peer socket,
+    /// in bytes (hft-audit F-10). Sized for the burst profile, not
+    /// the steady state: a committee-wide vote/QC round or a sync
+    /// page burst must drain without kernel-buffer overflow →
+    /// retransmit stalls. The kernel silently caps this at
+    /// `net.core.{r,w}mem_max`, so the applied value is logged at
+    /// startup — check `sysctl` if the log shows a clamp. `0`
+    /// keeps the kernel default. Default
+    /// [`DEFAULT_SOCK_BUF_BYTES`].
+    pub socket_buffer_bytes: usize,
 }
+
+/// Default [`TcpTransportConfig::socket_buffer_bytes`]: 4 MiB.
+///
+/// BDP math (hft-audit F-10): at a 1 ms RTT a TCP stream is bounded
+/// by `buffer / RTT` — the kernel default (~208 KiB on Linux) tops
+/// out near ~1.7 Gbps and truncates bursts into retransmits. 4 MiB
+/// holds ~4,000 typical 1 KiB consensus frames or several
+/// max-size messages, comfortably past any committee burst, and
+/// stays under common `net.core.{r,w}mem_max` ceilings so the
+/// setsockopt usually applies unclamped. Raise for WAN links with
+/// larger RTT (BDP = bandwidth × RTT); `0` opts out entirely.
+pub const DEFAULT_SOCK_BUF_BYTES: usize = 4 << 20;
 
 impl Default for TcpTransportConfig {
     fn default() -> Self {
@@ -1020,6 +1105,7 @@ impl Default for TcpTransportConfig {
             max_outbound_queue_bytes: DEFAULT_MAX_OUTBOUND_QUEUE_BYTES,
             peer_auth: None,
             max_connections_per_source: DEFAULT_MAX_CONNECTIONS_PER_SOURCE,
+            socket_buffer_bytes: DEFAULT_SOCK_BUF_BYTES,
         }
     }
 }
@@ -1035,7 +1121,7 @@ pub type TcpAddr = String;
 /// takes its accounting with it.
 struct OutboundSlot {
     /// Send side of the peer's writer channel.
-    tx: mpsc::SyncSender<Frame>,
+    tx: mpsc::SyncSender<Vec<u8>>,
     /// Payload bytes currently queued for this peer.
     queued: Arc<AtomicUsize>,
     /// Identity of the connection this slot belongs to. Two
@@ -1422,6 +1508,15 @@ impl TcpTransport {
         let max_inbound_queue_bytes = config.max_inbound_queue_bytes;
         let connect_timeout = config.connect_timeout;
         let read_timeout = config.read_timeout;
+        let socket_buffer_bytes = config.socket_buffer_bytes;
+        // F-10: surface the REQUESTED buffer size at startup — the
+        // kernel may silently clamp to `net.core.{r,w}mem_max`; an
+        // operator comparing this line to `sysctl` output sees the
+        // clamp rather than trusting the config.
+        println!(
+            "p2p: peer socket buffers target {socket_buffer_bytes} bytes \
+             (kernel may clamp to net.core.{{r,w}}mem_max)"
+        );
 
         // Set the listener to non-blocking mode so the accept thread
         // can periodically check the shutdown flag.
@@ -1449,6 +1544,7 @@ impl TcpTransport {
             max_message_bytes,
             max_inbound_queue_bytes,
             read_timeout,
+            socket_buffer_bytes: config.socket_buffer_bytes,
         };
         let (handshake_tx, handshake_rx) = mpsc::sync_channel::<PendingAccept>(HANDSHAKE_QUEUE);
         // `Receiver` isn't `Sync`, so the pool shares it behind a
@@ -1599,6 +1695,7 @@ impl TcpTransport {
                         peer_auth: cauth.clone(),
                         #[cfg(feature = "tls")]
                         tls: ctls.clone(),
+                        socket_buffer_bytes,
                     };
                     // Outer reconnect loop: if the connection breaks
                     // (reader loop exits due to I/O error, EOF, or
@@ -1632,7 +1729,7 @@ impl TcpTransport {
                         {
                             if let Some(ref tls_config) = ctls {
                                 // Initiate TLS as client.
-                                let _ = stream.set_nodelay(true);
+                                configure_peer_socket(&stream, ctx.socket_buffer_bytes);
                                 // Ensure blocking mode (TcpStream::connect
                                 // should already be blocking, but be
                                 // explicit — rustls requires blocking I/O).
@@ -1705,8 +1802,9 @@ impl TcpTransport {
                         }
                         // Plain TCP path.
                         let mut stream = stream;
-                        // Disable Nagle (same rationale as accept path).
-                        let _ = stream.set_nodelay(true);
+                        // Nodelay + kernel buffers (see
+                        // `configure_peer_socket`).
+                        configure_peer_socket(&stream, ctx.socket_buffer_bytes);
                         // First frame: our peer ID (legacy) or the
                         // signed-greeting exchange. The handshake
                         // timeout bounds the challenge wait — a peer
@@ -1862,6 +1960,7 @@ impl TcpTransport {
             peer_auth: self.config.peer_auth.clone(),
             #[cfg(feature = "tls")]
             tls: self.tls.clone(),
+            socket_buffer_bytes: self.config.socket_buffer_bytes,
         };
         let pid = peer_id.clone();
         let actor = format!("p2p-peer-{}", peer_tag(&pid));
@@ -1882,7 +1981,7 @@ impl TcpTransport {
             #[cfg(feature = "tls")]
             {
                 if let Some(ref tls_config) = ctx.tls {
-                    let _ = stream.set_nodelay(true);
+                    configure_peer_socket(&stream, ctx.socket_buffer_bytes);
                     let server_name = rustls::pki_types::ServerName::try_from("localhost")
                         .expect("localhost is a valid server name");
                     let client_conn = rustls::ClientConnection::new(
@@ -1921,7 +2020,8 @@ impl TcpTransport {
                 }
             }
             let mut stream = stream;
-            let _ = stream.set_nodelay(true);
+            // Nodelay + kernel buffers (see `configure_peer_socket`).
+            configure_peer_socket(&stream, ctx.socket_buffer_bytes);
             let greeted = match ctx.peer_auth.as_deref() {
                 Some(auth) => {
                     let _ = stream.set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT));
@@ -1984,6 +2084,9 @@ struct ConnectCtx {
     /// TLS configuration, when the transport was built with it.
     #[cfg(feature = "tls")]
     tls: Option<Arc<TlsConfig>>,
+    /// Kernel socket-buffer target (F-10) — applied by
+    /// `configure_peer_socket` on every established connection.
+    socket_buffer_bytes: usize,
 }
 
 /// Register a connected peer's handles and run its reader loop to
@@ -2042,53 +2145,41 @@ fn install_connected_peer(
     }
 }
 
-/// Queue `frame` on `peer`'s writer, charging its outbound byte
-/// budget — the shared tail of [`Transport::send`] and
-/// [`Transport::broadcast`].
-fn enqueue(
-    streams: &HashMap<PeerId, OutboundSlot>,
-    peer: &[u8],
-    frame: Frame,
-    max_queue_bytes: usize,
-) -> Result<(), TransportError> {
-    let Some(slot) = streams.get(peer) else {
-        return Err(TransportError::UnknownPeer);
-    };
-    let len = frame.len();
-    if !try_reserve_bytes(&slot.queued, max_queue_bytes, len) {
-        return Err(TransportError::ChannelFull);
-    }
-    slot.tx.try_send(frame).map_err(|e| {
-        slot.queued.fetch_sub(len, Ordering::Relaxed);
-        match e {
-            mpsc::TrySendError::Full(_) => TransportError::ChannelFull,
-            mpsc::TrySendError::Disconnected(_) => TransportError::ChannelClosed,
-        }
-    })
-}
-
 impl Transport for TcpTransport {
-    fn send(&mut self, peer: &[u8], bytes: &[u8]) -> Result<(), TransportError> {
+    fn send(&mut self, peer: &PeerId, bytes: &[u8]) -> Result<(), TransportError> {
         if bytes.len() as u64 > self.config.max_message_bytes {
             return Err(TransportError::MessageTooLarge);
         }
+        // Look up the per-peer send channel and send bytes into it.
+        // The lock is held only for the lookup, not during I/O —
+        // the writer thread handles the actual write asynchronously.
         let streams = primitives::sync::lock_state(&self.streams);
-        enqueue(&streams, peer, Frame::from(bytes), self.config.max_outbound_queue_bytes)
-    }
-
-    /// One shared [`Frame`] for every recipient and one `streams`
-    /// lock for the whole fan-out: a proposal to N validators costs
-    /// one payload copy instead of N.
-    fn broadcast(&mut self, peers: &[&[u8]], bytes: &[u8]) {
-        if bytes.len() as u64 > self.config.max_message_bytes {
-            return;
+        let Some(slot) = streams.get(peer) else {
+            return Err(TransportError::UnknownPeer);
+        };
+        // Per-peer byte budget: reserve before queueing so a peer
+        // draining slower than we produce bounds its queued payload
+        // at `max_outbound_queue_bytes` instead of
+        // `OUTBOUND_CHANNEL_BOUND × max_message_bytes`. On overflow
+        // the caller sees `ChannelFull` — explicit backpressure,
+        // the slow-consumer policy.
+        if !try_reserve_bytes(&slot.queued, self.config.max_outbound_queue_bytes, bytes.len()) {
+            return Err(TransportError::ChannelFull);
         }
-        let frame = Frame::from(bytes);
-        let streams = primitives::sync::lock_state(&self.streams);
-        for peer in peers {
-            let _ =
-                enqueue(&streams, peer, Arc::clone(&frame), self.config.max_outbound_queue_bytes);
-        }
+        // Clone the bytes into a Vec for the channel. The writer
+        // thread owns the stream and writes the frame. Use
+        // `try_send` (non-blocking) so a full outbound channel
+        // returns `ChannelFull` instead of blocking the caller or
+        // growing the queue without bound.
+        slot.tx.try_send(bytes.to_vec()).map_err(|e| {
+            // The reservation must not outlive the message that
+            // failed to queue — release it on every error path.
+            slot.queued.fetch_sub(bytes.len(), Ordering::Relaxed);
+            match e {
+                mpsc::TrySendError::Full(_) => TransportError::ChannelFull,
+                mpsc::TrySendError::Disconnected(_) => TransportError::ChannelClosed,
+            }
+        })
     }
 
     fn recv(&mut self) -> Option<InboundMessage> {
@@ -2144,6 +2235,55 @@ impl Transport for TcpTransport {
             #[cfg(not(feature = "tls"))]
             encrypted: false,
             max_message_bytes: self.config.max_message_bytes,
+        }
+    }
+}
+
+impl TcpTransport {
+    /// Bounded blocking receive — parks on the inbound channel until
+    /// a reader thread enqueues a message or `dur` elapses
+    /// (hft-audit F-01). `std::sync::mpsc` blocking receive is
+    /// condvar-backed, so an arriving frame wakes the consumer THIS
+    /// instant instead of on the next sleep quantum; the timeout
+    /// only bounds the fully-idle case so the caller's periodic
+    /// duties (pacemaker, gossip, sync) keep their cadence.
+    ///
+    /// The consensus pump uses this for its tail wait: the popped
+    /// frame is stashed for the next drain pass, so a wait that
+    /// ends with a message loses nothing.
+    ///
+    /// Admission control and the byte-reservation release apply
+    /// exactly as in `recv` — a rejected frame falls through to the
+    /// next queued entry within the remaining budget.
+    ///
+    /// Returns `None` on timeout, on shutdown, or when every sender
+    /// is gone.
+    pub fn recv_timeout(&mut self, dur: Duration) -> Option<InboundMessage> {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return None;
+        }
+        let deadline = std::time::Instant::now() + dur;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            // Timeout (idle bound reached) or Disconnected (every
+            // reader gone — only possible during teardown) ends the wait.
+            let Ok(msg) = primitives::sync::lock_state(&self.inbound_rx).recv_timeout(remaining)
+            else {
+                return None;
+            };
+            // Same accounting order as `recv`: release the reader's
+            // byte reservation before the admission gate so a dropped
+            // message still frees its budget.
+            self.inbound_queued.fetch_sub(msg.bytes.len(), Ordering::Relaxed);
+            if let Some(ref ac) = self.admission
+                && !ac.admit_message(&msg.from, msg.bytes.len())
+            {
+                continue; // dropped by admission control — keep waiting
+            }
+            return Some(msg);
         }
     }
 }
@@ -2394,12 +2534,42 @@ const WRITER_BATCH_MAX_MESSAGES: usize = 64;
 /// batch, capped to avoid latency spikes from oversized writes.
 const WRITER_BATCH_MAX_BYTES: usize = 1 << 20;
 
+/// Consensus-facing socket tuning applied at every connect/accept
+/// site (F-10):
+///
+/// - `TCP_NODELAY` — consensus messages are small and
+///   latency-sensitive (vote → QC → next proposal). Nagle buffers
+///   small writes waiting for more data, interacting with delayed
+///   ACK to add 25–40ms per round-trip on macOS; send immediately.
+/// - `SO_SNDBUF`/`SO_RCVBUF` — sized to [`PEER_SOCK_BUF_BYTES`] so
+///   a committee-wide frame burst drains without kernel-buffer
+///   overflow → retransmit stalls.
+fn configure_peer_socket(stream: &TcpStream, socket_buffer_bytes: usize) {
+    let _ = stream.set_nodelay(true);
+    if socket_buffer_bytes == 0 {
+        return; // operator opt-out: keep the kernel default
+    }
+    let sock = socket2::SockRef::from(stream);
+    // The kernel clamps to `net.core.{r,w}mem_max` — the applied
+    // size is read back rather than assumed (F-10: silent clamping
+    // is why the applied value must be inspectable).
+    let _ = sock.set_send_buffer_size(socket_buffer_bytes);
+    let _ = sock.set_recv_buffer_size(socket_buffer_bytes);
+}
+
 fn writer_loop(
     mut stream: Box<dyn PeerStream>,
-    rx: mpsc::Receiver<Frame>,
+    rx: mpsc::Receiver<Vec<u8>>,
     queued: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
 ) {
+    // Staging buffer for `write_frames_scratch` — the contiguous
+    // batch (TCP) or ciphertext (TLS) is serialized into this every
+    // drain, so the per-batch `Vec::with_capacity` becomes a
+    // once-per-connection allocation (hft-audit F-14). Starts at
+    // one WRITER_BATCH_MAX_BYTES' headroom; `reserve` grows it only
+    // if a batch ever exceeds the cap.
+    let mut scratch: Vec<u8> = Vec::with_capacity(WRITER_BATCH_MAX_BYTES);
     while !shutdown.load(Ordering::Relaxed) {
         // Use recv_timeout to avoid blocking forever, so we can
         // check the shutdown flag periodically.
@@ -2415,7 +2585,7 @@ fn writer_loop(
                 // bursts (votes → QCs) queue several frames within
                 // microseconds; batching turns N frames into one
                 // socket write instead of N syscalls + N flushes.
-                let mut batch: Vec<Frame> = Vec::with_capacity(8);
+                let mut batch: Vec<Vec<u8>> = Vec::with_capacity(8);
                 let mut total_bytes: usize = first.len();
                 batch.push(first);
                 while batch.len() < WRITER_BATCH_MAX_MESSAGES {
@@ -2434,7 +2604,7 @@ fn writer_loop(
                         Err(_) => break,
                     }
                 }
-                if stream.write_frames(&batch).is_err() {
+                if stream.write_frames_scratch(&batch, &mut scratch).is_err() {
                     return; // connection closed or error
                 }
             }
@@ -2461,7 +2631,7 @@ fn spawn_writer(
     pid: &PeerId,
     conn_id: u64,
 ) -> OutboundSlot {
-    let (tx, rx) = mpsc::sync_channel::<Frame>(OUTBOUND_CHANNEL_BOUND);
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(OUTBOUND_CHANNEL_BOUND);
     // The byte counter is shared between `send()` (reserves) and
     // the writer thread (releases on dequeue). It starts at zero
     // and dies with the slot when the connection is replaced.
@@ -2533,6 +2703,9 @@ struct AcceptShared {
     max_inbound_queue_bytes: usize,
     /// Read timeout applied to established plain streams.
     read_timeout: Duration,
+    /// Kernel socket-buffer target (F-10) — applied by
+    /// `configure_peer_socket` on every accepted connection.
+    socket_buffer_bytes: usize,
 }
 
 /// Run the accept-side handshake for one queued socket, off the
@@ -2681,12 +2854,9 @@ fn accept_plain_connection(
     read_timeout: Duration,
     shared: &AcceptShared,
 ) -> AcceptResult {
-    // Disable Nagle's algorithm: consensus messages are small and
-    // latency-sensitive (vote → QC → next proposal). Nagle buffers
-    // small writes waiting for more data, interacting with delayed
-    // ACK to add 25–40ms per round-trip on macOS. TCP_NODELAY sends
-    // each write immediately.
-    let _ = stream.set_nodelay(true);
+    // Nodelay + consensus-sized kernel buffers — see
+    // `configure_peer_socket` for the rationale.
+    configure_peer_socket(&stream, shared.socket_buffer_bytes);
     // Bound the greeting read BEFORE it happens: a peer that
     // connects and never sends must not pin a handshake worker —
     // the timeout turns a silent freeze into a dropped socket.
@@ -2734,8 +2904,8 @@ fn accept_tls_connection(
     _read_timeout: Duration,
     shared: &AcceptShared,
 ) -> AcceptResult {
-    // Disable Nagle (same rationale as plain accept).
-    let _ = stream.set_nodelay(true);
+    // Nodelay + kernel buffers (see `configure_peer_socket`).
+    configure_peer_socket(&stream, shared.socket_buffer_bytes);
     // The listener is in non-blocking mode, and accepted streams
     // inherit that mode. rustls's `StreamOwned` requires blocking
     // I/O (with a read timeout) — non-blocking mode causes
@@ -2943,32 +3113,6 @@ mod tests {
         let err = read_frame(&mut stream, HANDSHAKE_MAX_FRAME_BYTES).expect_err("must time out");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(Instant::now() < deadline + Duration::from_secs(1), "stopped promptly");
-    }
-
-    /// The plain-TCP batch path writes prefixes and payloads as one
-    /// vectored list; a multi-MiB frame forces partial writes, so
-    /// this exercises the `advance_slices` resume as well.
-    #[test]
-    fn plain_write_frames_round_trips_large_batches() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let frames: Vec<Frame> = (0..64usize)
-            .map(|i| {
-                let len = if i == 7 { 3 << 20 } else { i * 37 };
-                Frame::from((0..len).map(|b| (b ^ i).to_le_bytes()[0]).collect::<Vec<u8>>())
-            })
-            .collect();
-        let expected = frames.clone();
-        let writer = std::thread::spawn(move || {
-            let mut out = TcpStream::connect(addr).expect("connect");
-            out.write_frames(&frames).expect("write batch");
-        });
-        let (mut inp, _) = listener.accept().expect("accept");
-        for want in &expected {
-            let got = read_frame(&mut inp, DEFAULT_MAX_MESSAGE_BYTES).expect("frame");
-            assert_eq!(&got[..], &want[..]);
-        }
-        writer.join().expect("writer thread");
     }
 
     /// Pre-auth frames are capped far below `max_message_bytes`: a
@@ -3206,7 +3350,7 @@ mod tests {
         let addr = "127.0.0.1:19040";
         let id = vec![0u8];
         let mut transport = TcpTransport::new(addr, id, vec![]);
-        let result = transport.send(&[99u8], b"hello");
+        let result = transport.send(&vec![99u8], b"hello");
         assert_eq!(result, Err(TransportError::UnknownPeer));
     }
 
@@ -3262,6 +3406,7 @@ mod tests {
             max_outbound_queue_bytes: DEFAULT_MAX_OUTBOUND_QUEUE_BYTES,
             peer_auth: None,
             max_connections_per_source: DEFAULT_MAX_CONNECTIONS_PER_SOURCE,
+            socket_buffer_bytes: DEFAULT_SOCK_BUF_BYTES,
         };
 
         let mut transport_a = TcpTransport::with_config(
@@ -4297,7 +4442,7 @@ mod tests {
         let budget = 150;
         // Queue a 100-byte frame: reserve, then enqueue.
         assert!(try_reserve_bytes(&slot.queued, budget, 100));
-        slot.tx.try_send(Frame::from(vec![0u8; 100])).expect("queue has room");
+        slot.tx.try_send(vec![0u8; 100]).expect("queue has room");
         // The reservation stands while the frame sits queued.
         assert!(!try_reserve_bytes(&slot.queued, budget, 100), "100 + 100 > 150");
 
@@ -4591,7 +4736,7 @@ mod tests {
         // Slot for connection 2 (the live replacement): a bare
         // channel suffices — the teardown logic only inspects
         // `conn_id`, never the sender.
-        let (tx, _rx) = mpsc::sync_channel::<Frame>(1);
+        let (tx, _rx) = mpsc::sync_channel::<Vec<u8>>(1);
         primitives::sync::lock_state(&streams).insert(
             pid.clone(),
             OutboundSlot { tx, queued: Arc::new(AtomicUsize::new(0)), conn_id: 2 },

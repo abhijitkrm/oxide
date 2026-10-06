@@ -11,28 +11,35 @@
 //!   every order add/cancel/fill.
 //! - **Trades**: executed trades. Published on every fill.
 //!
-//! # Design
+//! # Design — sequencer-safe by construction (hft-audit F-05)
 //!
-//! The publisher is a separate module from the order-entry WebSocket
-//! server (`ws.rs`). Order entry and market data have different
-//! scaling characteristics: order entry is low-volume, high-integrity
-//! (authenticated, risk-checked); market data is high-volume,
-//! read-only (no auth, no risk checks).
+//! The publisher is split in two:
 //!
-//! The publisher maintains a list of subscriber handles (WebSocket
-//! senders). When the matching engine produces a fill or a resting
-//! order, the matching server calls `publish_l1`, `publish_trades`,
-//! etc. Each publish call broadcasts the update to all subscribers
-//! on the relevant feed.
+//! - [`MarketDataPublisher`] is the PRODUCER handle the matching
+//!   path calls. `publish_*` builds one small typed message and
+//!   pushes it onto a bounded SPSC ring — ~20ns, no serialization,
+//!   no lock, no per-subscriber work on the match path. A full ring
+//!   drops the update and counts it: market data is a lossy feed by
+//!   design — the book must never back-pressure on subscribers.
+//! - [`MarketDataFanout`] is the CONSUMER: a dedicated task (spawned
+//!   on the node runtime) that owns the subscriber list, serializes
+//!   each update ONCE to an `Arc<str>`, and broadcasts the shared
+//!   string — every subscriber clone is a refcount bump, not a
+//!   `String` copy.
+//!
+//! Before this split, `publish_*` serialized JSON and iterated the
+//! whole subscriber list under a mutex on the caller's thread — on
+//! the matching sequencer that is ~µs of serde plus N channel sends
+//! inside the order hot path. Now everything past the ring push is
+//! the fanout task's problem.
 //!
 //! # Serialization
 //!
-//! Messages are serialized as JSON (via `serde_json`). This is the
-//! universal wire format for WebSocket market data — every exchange
-//! (Binance, Coinbase, Hyperliquid) uses JSON for WS market data.
-//! In a future optimization, a binary format (e.g., `MessagePack` or
-//! a custom flatbuffer) can be added for high-throughput L2/L3
-//! feeds.
+//! Messages are serialized as JSON (via `serde_json`) on the fanout
+//! task. This is the universal wire format for WebSocket market
+//! data — every exchange (Binance, Coinbase, Hyperliquid) uses JSON
+//! for WS market data. A binary format (`MessagePack`, flatbuffers)
+//! can slot into the fanout without touching the producer path.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,6 +47,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use primitives::fixed::{Price, Qty};
 use serde::Serialize;
 use tokio::sync::mpsc;
+
+use crate::ring::{SpscReceiver, SpscSender, spsc_ring_with_notify};
 
 /// Market data feed type — clients subscribe to one or more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -118,7 +127,9 @@ pub struct TradeMessage {
     pub seq: u64,
 }
 
-/// A market data message — one of the feed types.
+/// A market data message — one of the feed types. The unit the
+/// handoff ring carries: small, owned, and cheap to move (the L2
+/// level vectors move by pointer — no payload copy on the ring).
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum MarketDataMessage {
@@ -135,80 +146,154 @@ pub enum MarketDataMessage {
 /// Market-data messages are a few hundred bytes of JSON, so 256
 /// queued messages bound a subscriber at ~128 KiB — and a client
 /// that is 256 updates behind is already too stale to be useful.
-/// The matching engine must never back-pressure on a slow socket,
-/// so the queue is the only place a slow consumer can accumulate
-/// cost; over this depth the subscriber is evicted (its send side
+/// The fanout must never back-pressure on a slow socket, so the
+/// queue is the only place a slow consumer can accumulate cost;
+/// over this depth the subscriber is evicted (its send side
 /// dropped), which closes the WebSocket task's `recv()` and ends
 /// the connection — the standard exchange slow-consumer policy.
 /// Raising it tolerates more client lag at more memory per lagging
 /// subscriber; lowering it disconnects mildly slow clients.
 const SUB_QUEUE_DEPTH: usize = 256;
 
+/// Depth of the sequencer→fanout handoff ring, in updates.
+///
+/// 1,024 updates ≈ a few hundred µs of fanout lag at serialization
+/// cost (~µs per update worst case). Tradeoff: deeper tolerates
+/// longer fanout stalls (WS stalls, eviction bursts) at more
+/// buffered memory; shallower sheds updates sooner — safe either
+/// way because market data is explicitly lossy.
+const OUTBOUND_RING_DEPTH: usize = 1024;
+
 /// A subscriber's subscription: which feeds and markets they want.
-#[derive(Debug, Clone)]
+/// Sent to the fanout over a cold-path mpsc — subscribe rate is
+/// human-scale, so an unbounded channel is acceptable here (unlike
+/// the per-message data path, which is strictly bounded).
+#[derive(Debug)]
 struct Subscription {
     /// The feeds this subscriber wants (L1, L2, L3, Trades).
     feeds: Vec<FeedType>,
     /// The markets this subscriber wants (empty = all).
     markets: Vec<u8>,
     /// The bounded channel to send messages on — capacity
-    /// [`SUB_QUEUE_DEPTH`].
-    tx: mpsc::Sender<String>,
+    /// [`SUB_QUEUE_DEPTH`], payload `Arc<str>` so N subscribers
+    /// share one serialization (refcount bump, not a string copy).
+    tx: mpsc::Sender<Arc<str>>,
 }
 
-/// The market data publisher — owns subscriber list and per-market
-/// sequence numbers.
+/// The producer half of the market data pipeline — the handle the
+/// matching path publishes through.
 ///
-/// Thread-safe via `std::sync::Mutex`. The publish path is called
-/// from the matching server thread after each order; the subscribe
-/// path is called from the WebSocket accept loop. Contention is low
-/// (subscribers rarely change; publishes are frequent but hold the
-/// lock only for the broadcast iteration).
+/// Everything on this type is wait-free: `publish_*` assigns a
+/// sequence number (atomic fetch-add — the SPSC ring then preserves
+/// publication order), builds the typed update, and pushes it to
+/// the fanout ring. Serialization, subscriber iteration, and every
+/// eviction decision happen on the fanout task — never here.
+///
+/// Observability: `dropped_update_count` counts updates shed when
+/// the ring was full; `evicted_subscriber_count` counts slow
+/// consumers the fanout disconnected — the two numbers an operator
+/// watches for feed health.
 pub struct MarketDataPublisher {
-    /// Subscriber list (protected by a mutex).
-    subscribers: std::sync::Mutex<Vec<Subscription>>,
+    /// Handoff ring to the fanout task.
+    tx: SpscSender<MarketDataMessage>,
+    /// Subscription commands to the fanout (cold path).
+    sub_tx: mpsc::UnboundedSender<Subscription>,
     /// Per-market L1 sequence counter.
-    l1_seq: Arc<AtomicU64>,
+    l1_seq: AtomicU64,
     /// Per-market L2 sequence counter.
-    l2_seq: Arc<AtomicU64>,
+    l2_seq: AtomicU64,
     /// Per-market trades sequence counter.
-    trades_seq: Arc<AtomicU64>,
+    trades_seq: AtomicU64,
+    /// Updates shed because the fanout fell `OUTBOUND_RING_DEPTH`
+    /// behind — the lossy-feed backpressure valve.
+    dropped_updates: Arc<AtomicU64>,
     /// Subscribers evicted for a full queue or a closed receiver —
-    /// the slow-consumer signal an operator watches to detect
-    /// clients that cannot keep up with the feed rate.
+    /// owned by the fanout, shared here for monitoring.
     evicted_subscribers: Arc<AtomicU64>,
+    /// Live subscription count — owned by the fanout, shared here.
+    subscriber_count: Arc<AtomicU64>,
+}
+
+/// The consumer half: owns the subscriber list and does all
+/// serialization. Runs as a dedicated task — `run()` pops updates
+/// off the handoff ring (awaiting its `Notify` between empties) and
+/// services subscription commands between updates.
+pub struct MarketDataFanout {
+    /// Handoff ring from producers.
+    rx: SpscReceiver<MarketDataMessage>,
+    /// Subscription commands (cold path).
+    sub_rx: mpsc::UnboundedReceiver<Subscription>,
+    /// Live subscribers — fanout-local, never locked.
+    subscribers: Vec<Subscription>,
+    /// Eviction count shared back to the publisher handle.
+    evicted_subscribers: Arc<AtomicU64>,
+    /// Live count shared back for monitoring.
+    subscriber_count: Arc<AtomicU64>,
+}
+
+/// Build the (publisher, fanout) pair. The publisher is what the
+/// matching path holds; the fanout is spawned once on the runtime
+/// (`tokio::spawn(fanout.run())`).
+#[must_use]
+pub fn market_data_channel() -> (MarketDataPublisher, MarketDataFanout) {
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let (tx, rx) = spsc_ring_with_notify(OUTBOUND_RING_DEPTH, notify);
+    let (sub_tx, sub_rx) = mpsc::unbounded_channel();
+    let evicted_subscribers = Arc::new(AtomicU64::new(0));
+    let subscriber_count = Arc::new(AtomicU64::new(0));
+    (
+        MarketDataPublisher {
+            tx,
+            sub_tx,
+            l1_seq: AtomicU64::new(0),
+            l2_seq: AtomicU64::new(0),
+            trades_seq: AtomicU64::new(0),
+            dropped_updates: Arc::new(AtomicU64::new(0)),
+            evicted_subscribers: Arc::clone(&evicted_subscribers),
+            subscriber_count: Arc::clone(&subscriber_count),
+        },
+        MarketDataFanout {
+            rx,
+            sub_rx,
+            subscribers: Vec::new(),
+            evicted_subscribers,
+            subscriber_count,
+        },
+    )
 }
 
 impl MarketDataPublisher {
-    /// Create a new publisher with no subscribers.
+    /// Create a publisher + fanout pair; see [`market_data_channel`].
     #[must_use]
-    pub fn new() -> Self {
-        Self {
-            subscribers: std::sync::Mutex::new(Vec::new()),
-            l1_seq: Arc::new(AtomicU64::new(0)),
-            l2_seq: Arc::new(AtomicU64::new(0)),
-            trades_seq: Arc::new(AtomicU64::new(0)),
-            evicted_subscribers: Arc::new(AtomicU64::new(0)),
-        }
+    pub fn new() -> (Self, MarketDataFanout) {
+        market_data_channel()
     }
 
     /// Subscribe a new client. Returns a bounded [`mpsc::Receiver`]
-    /// (capacity [`SUB_QUEUE_DEPTH`]) that the caller polls for
-    /// messages to send over the WebSocket. When the queue stays
-    /// full the publisher evicts the subscription — the receiver's
+    /// (capacity [`SUB_QUEUE_DEPTH`]) of shared-serialized messages
+    /// the caller forwards over the WebSocket. When the queue stays
+    /// full the fanout evicts the subscription — the receiver's
     /// `recv()` then returns `None` and the connection task ends.
     ///
     /// The `feeds` parameter specifies which feeds the client wants.
     /// The `markets` parameter specifies which markets (empty = all).
+    ///
+    /// The subscription itself is delivered to the fanout over a
+    /// cold-path channel; it takes effect as the fanout drains —
+    /// an update published concurrently may (correctly) miss a
+    /// not-yet-installed subscriber.
     #[must_use]
-    pub fn subscribe(&self, feeds: Vec<FeedType>, markets: Vec<u8>) -> mpsc::Receiver<String> {
+    pub fn subscribe(&self, feeds: Vec<FeedType>, markets: Vec<u8>) -> mpsc::Receiver<Arc<str>> {
         let (tx, rx) = mpsc::channel(SUB_QUEUE_DEPTH);
-        let sub = Subscription { feeds, markets, tx };
-        primitives::sync::lock_state(&self.subscribers).push(sub);
+        // Cold path: a failed send means the fanout task is gone —
+        // the returned receiver then reports disconnection, which
+        // ends the client task exactly like an eviction.
+        let _ = self.sub_tx.send(Subscription { feeds, markets, tx });
         rx
     }
 
     /// Publish an L1 update (top-of-book) to all L1 subscribers.
+    /// Wait-free: sequence bump + struct build + one ring push.
     pub fn publish_l1(
         &self,
         market: u8,
@@ -216,7 +301,7 @@ impl MarketDataPublisher {
         best_ask: Option<(Price, Qty)>,
     ) {
         let seq = self.l1_seq.fetch_add(1, Ordering::Relaxed);
-        let msg = L1Update {
+        let msg = MarketDataMessage::L1(L1Update {
             feed: "l1",
             market,
             best_bid_price: best_bid.map(|(p, _)| p.0),
@@ -224,67 +309,47 @@ impl MarketDataPublisher {
             best_ask_price: best_ask.map(|(p, _)| p.0),
             best_ask_qty: best_ask.map(|(_, q)| q.0),
             seq,
-        };
-        self.broadcast(market, FeedType::L1, &msg);
+        });
+        self.dispatch(msg);
     }
 
     /// Publish an L2 update (full depth) to all L2 subscribers.
+    /// The `bids`/`asks` vectors move onto the ring by pointer —
+    /// no payload copy on the producer path.
     pub fn publish_l2(&self, market: u8, bids: Vec<(u64, u64)>, asks: Vec<(u64, u64)>) {
         let seq = self.l2_seq.fetch_add(1, Ordering::Relaxed);
-        let msg = L2Update { feed: "l2", market, bids, asks, seq };
-        self.broadcast(market, FeedType::L2, &msg);
+        self.dispatch(MarketDataMessage::L2(L2Update { feed: "l2", market, bids, asks, seq }));
     }
 
     /// Publish a trade (execution) to all Trades subscribers.
     pub fn publish_trade(&self, market: u8, price: Price, qty: Qty, taker_side_buy: bool) {
         let seq = self.trades_seq.fetch_add(1, Ordering::Relaxed);
-        let msg = TradeMessage {
+        self.dispatch(MarketDataMessage::Trade(TradeMessage {
             feed: "trades",
             market,
             price: price.0,
             qty: qty.0,
             taker_side: if taker_side_buy { "buy" } else { "sell" },
             seq,
-        };
-        self.broadcast(market, FeedType::Trades, &msg);
+        }));
     }
 
-    /// Broadcast a message to all subscribers matching the feed and
-    /// market. Serializes once, sends the same string to all.
-    fn broadcast<T: Serialize>(&self, market: u8, feed: FeedType, msg: &T) {
-        let json = serde_json::to_string(msg).unwrap_or_default();
-        let mut subs = primitives::sync::lock_state(&self.subscribers);
-        let mut evict = 0usize;
-        // `retain` walks the list once; `true` keeps the slot. The
-        // eviction count doubles as an index-shift-free way to count
-        // removals for the observability counter below.
-        subs.retain(|sub| {
-            // Check if this subscriber wants this feed.
-            if !sub.feeds.contains(&feed) {
-                return true;
-            }
-            // Check if this subscriber wants this market (empty = all).
-            if !sub.markets.is_empty() && !sub.markets.contains(&market) {
-                return true;
-            }
-            // `try_send` never blocks the matching engine on a slow
-            // socket. A full queue means the client has fallen
-            // [`SUB_QUEUE_DEPTH`] updates behind — stale beyond
-            // usefulness — and a closed receiver means the WS task
-            // is gone; either way the subscription is dead weight.
-            // Evicting it (dropping the send side) ends the client
-            // task and frees the slot: the explicit slow-consumer
-            // policy is disconnect, not silent accumulation.
-            if sub.tx.try_send(json.clone()).is_ok() {
-                true
-            } else {
-                evict += 1;
-                false
-            }
-        });
-        if evict > 0 {
-            self.evicted_subscribers.fetch_add(evict as u64, Ordering::Relaxed);
+    /// One ring push; on a full ring the update is dropped and
+    /// counted — the documented lossy-feed policy (the match path
+    /// never slows for market data). A dead fanout likewise drops:
+    /// no subscribers can exist without it.
+    #[inline]
+    fn dispatch(&self, msg: MarketDataMessage) {
+        if self.tx.push(msg).is_err() {
+            self.dropped_updates.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Updates dropped because the fanout fell behind — nonzero
+    /// means the feed is shedding load faster than clients see.
+    #[must_use]
+    pub fn dropped_update_count(&self) -> u64 {
+        self.dropped_updates.load(Ordering::Relaxed)
     }
 
     /// Total subscribers evicted for full queues or closed
@@ -295,22 +360,120 @@ impl MarketDataPublisher {
         self.evicted_subscribers.load(Ordering::Relaxed)
     }
 
-    /// Get the current subscriber count (for monitoring).
+    /// Get the current subscriber count (for monitoring). Lagging
+    /// by the fanout's command drain — subscribe/unsubscribe is not
+    /// latency-critical.
     #[must_use]
     pub fn subscriber_count(&self) -> usize {
-        primitives::sync::lock_state(&self.subscribers).len()
+        // `usize` is at least u32 on every supported target — the
+        // u64 counter can't hold more subscribers than exist.
+        usize::try_from(self.subscriber_count.load(Ordering::Relaxed)).unwrap_or(usize::MAX)
     }
 }
 
-impl Default for MarketDataPublisher {
-    fn default() -> Self {
-        Self::new()
+impl MarketDataFanout {
+    /// The fanout loop: pop every queued update, broadcast it, then
+    /// park on the ring's data `Notify` (with the register-then-
+    /// recheck pattern so a push between the empty check and the
+    /// await is not missed). Subscription commands are serviced
+    /// between updates and between waits.
+    ///
+    /// Runs until every publisher handle is dropped — the ring then
+    /// reports `producer_gone` and the task exits cleanly.
+    pub async fn run(mut self) {
+        let data = Arc::clone(self.rx.data_notify());
+        loop {
+            // Drain pending subscription commands first — installs
+            // are cheap and cold.
+            while let Ok(sub) = self.sub_rx.try_recv() {
+                self.subscribers.push(sub);
+                self.subscriber_count.store(self.subscribers.len() as u64, Ordering::Relaxed);
+            }
+            if self.rx.producer_gone() {
+                return;
+            }
+            // Drain the ring completely, then wait.
+            let mut drained = false;
+            while let Some(msg) = self.rx.pop() {
+                self.broadcast(&msg);
+                drained = true;
+            }
+            let notified = data.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            // Re-check both channels after arming — a command or a
+            // push racing the arm must not sleep through.
+            while let Ok(sub) = self.sub_rx.try_recv() {
+                self.subscribers.push(sub);
+                self.subscriber_count.store(self.subscribers.len() as u64, Ordering::Relaxed);
+            }
+            if self.rx.pop().is_some() || drained {
+                continue;
+            }
+            if self.rx.producer_gone() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Serialize once into `Arc<str>` and broadcast to every
+    /// matching subscriber. All the work that used to sit on the
+    /// match thread lives here (F-05): serde, the subscriber scan,
+    /// eviction.
+    fn broadcast(&mut self, msg: &MarketDataMessage) {
+        let (market, feed): (u8, FeedType) = match msg {
+            MarketDataMessage::L1(u) => (u.market, FeedType::L1),
+            MarketDataMessage::L2(u) => (u.market, FeedType::L2),
+            MarketDataMessage::Trade(u) => (u.market, FeedType::Trades),
+        };
+        let json: Arc<str> = match serde_json::to_string(msg) {
+            Ok(s) => Arc::from(s.as_str()),
+            Err(_) => return, // serialization of these types cannot fail in practice
+        };
+        let mut evict = 0usize;
+        // `retain` walks the list once; `true` keeps the slot.
+        self.subscribers.retain(|sub| {
+            // Check if this subscriber wants this feed.
+            if !sub.feeds.contains(&feed) {
+                return true;
+            }
+            // Check if this subscriber wants this market (empty = all).
+            if !sub.markets.is_empty() && !sub.markets.contains(&market) {
+                return true;
+            }
+            // `try_send` never blocks on a slow socket. A full queue
+            // means the client is [`SUB_QUEUE_DEPTH`] updates behind —
+            // stale beyond usefulness — and a closed receiver means
+            // the WS task is gone; either way the subscription is
+            // dead weight. Evicting it (dropping the send side) ends
+            // the client task: slow-consumer policy is disconnect,
+            // not silent accumulation.
+            if sub.tx.try_send(Arc::clone(&json)).is_ok() {
+                true
+            } else {
+                evict += 1;
+                false
+            }
+        });
+        if evict > 0 {
+            self.evicted_subscribers.fetch_add(evict as u64, Ordering::Relaxed);
+            self.subscriber_count.store(self.subscribers.len() as u64, Ordering::Relaxed);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Start a publisher + fanout pair; the fanout runs on the
+    /// tokio runtime the test is already on.
+    fn start() -> (MarketDataPublisher, tokio::task::JoinHandle<()>) {
+        let (pub_, fanout) = market_data_channel();
+        let handle = tokio::spawn(fanout.run());
+        (pub_, handle)
+    }
 
     #[test]
     fn l1_update_serializes_correctly() {
@@ -378,8 +541,11 @@ mod tests {
 
     #[tokio::test]
     async fn publish_l1_reaches_subscriber() {
-        let publisher = MarketDataPublisher::new();
+        let (publisher, _fanout) = start();
         let mut rx = publisher.subscribe(vec![FeedType::L1], vec![]);
+        // Give the fanout a scheduler slot to install the
+        // subscription, then publish.
+        tokio::task::yield_now().await;
         publisher.publish_l1(0, Some((Price(1_500_000_000), Qty(1_000))), None);
         let msg = rx.recv().await.expect("should receive message");
         assert!(msg.contains("\"feed\":\"l1\""));
@@ -389,8 +555,9 @@ mod tests {
 
     #[tokio::test]
     async fn publish_trade_reaches_subscriber() {
-        let publisher = MarketDataPublisher::new();
+        let (publisher, _fanout) = start();
         let mut rx = publisher.subscribe(vec![FeedType::Trades], vec![]);
+        tokio::task::yield_now().await;
         publisher.publish_trade(0, Price(1_500_000_000), Qty(1_000), true);
         let msg = rx.recv().await.expect("should receive trade");
         assert!(msg.contains("\"feed\":\"trades\""));
@@ -399,9 +566,10 @@ mod tests {
 
     #[tokio::test]
     async fn subscriber_filters_by_market() {
-        let publisher = MarketDataPublisher::new();
+        let (publisher, _fanout) = start();
         // Subscribe to market 1 only.
         let mut rx = publisher.subscribe(vec![FeedType::L1], vec![1]);
+        tokio::task::yield_now().await;
         // Publish on market 0 — should NOT reach this subscriber.
         publisher.publish_l1(0, Some((Price(1_500_000_000), Qty(1_000))), None);
         // Publish on market 1 — SHOULD reach this subscriber.
@@ -413,9 +581,10 @@ mod tests {
 
     #[tokio::test]
     async fn subscriber_filters_by_feed() {
-        let publisher = MarketDataPublisher::new();
+        let (publisher, _fanout) = start();
         // Subscribe to Trades only.
         let mut rx = publisher.subscribe(vec![FeedType::Trades], vec![]);
+        tokio::task::yield_now().await;
         // Publish L1 — should NOT reach this subscriber.
         publisher.publish_l1(0, Some((Price(1_500_000_000), Qty(1_000))), None);
         // Publish a trade — SHOULD reach this subscriber.
@@ -426,23 +595,31 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_subscribers_all_receive() {
-        let publisher = MarketDataPublisher::new();
+        let (publisher, _fanout) = start();
         let mut rx1 = publisher.subscribe(vec![FeedType::L1], vec![]);
         let mut rx2 = publisher.subscribe(vec![FeedType::L1], vec![]);
+        tokio::task::yield_now().await;
         publisher.publish_l1(0, Some((Price(1_500_000_000), Qty(1_000))), None);
         let msg1 = rx1.recv().await.expect("subscriber 1 should receive");
         let msg2 = rx2.recv().await.expect("subscriber 2 should receive");
         assert_eq!(msg1, msg2, "both subscribers receive the same message");
     }
 
-    #[test]
-    fn subscriber_count_tracks_subscriptions() {
-        let publisher = MarketDataPublisher::new();
+    #[tokio::test]
+    async fn subscriber_count_tracks_subscriptions() {
+        let (publisher, _fanout) = start();
         assert_eq!(publisher.subscriber_count(), 0);
         let _rx1 = publisher.subscribe(vec![FeedType::L1], vec![]);
-        assert_eq!(publisher.subscriber_count(), 1);
         let _rx2 = publisher.subscribe(vec![FeedType::Trades], vec![]);
-        assert_eq!(publisher.subscriber_count(), 2);
+        // The count lives on the fanout task — drain its command
+        // queue by yielding until the fanout runs.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if publisher.subscriber_count() == 2 {
+                return;
+            }
+        }
+        panic!("fanout never installed the subscriptions");
     }
 
     #[test]
@@ -454,25 +631,35 @@ mod tests {
     }
 
     /// A subscriber that stops reading fills its bounded queue and
-    /// is evicted: the publisher must never back-pressure the
-    /// matching engine on a slow socket, so the documented
-    /// slow-consumer policy is disconnect. The queue is the only
-    /// place a slow consumer can accumulate memory — the unbounded
-    /// channel this replaced let it grow without limit.
-    #[test]
-    fn slow_consumer_is_evicted_at_queue_depth() {
-        let publisher = MarketDataPublisher::new();
+    /// is evicted: the fanout must never back-pressure on a slow
+    /// socket, so the documented slow-consumer policy is disconnect.
+    /// The queue is the only place a slow consumer can accumulate
+    /// memory.
+    #[tokio::test]
+    async fn slow_consumer_is_evicted_at_queue_depth() {
+        let (publisher, _fanout) = start();
         let mut rx = publisher.subscribe(vec![FeedType::L1], vec![]);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if publisher.subscriber_count() == 1 {
+                break;
+            }
+        }
         // Fill exactly to capacity: every send must succeed — a full
         // queue alone is not yet an eviction.
         for _ in 0..SUB_QUEUE_DEPTH {
             publisher.publish_l1(0, Some((Price(1), Qty(1))), None);
+            tokio::task::yield_now().await;
         }
-        assert_eq!(publisher.subscriber_count(), 1);
         assert_eq!(publisher.evicted_subscriber_count(), 0);
         // One more update than the queue holds → evict.
         publisher.publish_l1(0, Some((Price(1), Qty(1))), None);
-        assert_eq!(publisher.subscriber_count(), 0);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if publisher.evicted_subscriber_count() == 1 {
+                break;
+            }
+        }
         assert_eq!(publisher.evicted_subscriber_count(), 1);
         // Buffered messages stay receivable; once drained the
         // channel reports disconnection so the client task exits.
@@ -486,47 +673,67 @@ mod tests {
     }
 
     /// A subscriber whose receiver is gone is dead weight — the
-    /// first publish that finds the closed channel evicts it, and
-    /// the eviction counter records it for the operator.
-    #[test]
-    fn closed_receiver_is_evicted() {
-        let publisher = MarketDataPublisher::new();
+    /// first publish that finds the closed channel evicts it.
+    #[tokio::test]
+    async fn closed_receiver_is_evicted() {
+        let (publisher, _fanout) = start();
         let rx = publisher.subscribe(vec![FeedType::L1], vec![]);
         drop(rx);
         publisher.publish_l1(0, Some((Price(1), Qty(1))), None);
-        assert_eq!(publisher.subscriber_count(), 0);
-        assert_eq!(publisher.evicted_subscriber_count(), 1);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if publisher.evicted_subscriber_count() == 1 {
+                return;
+            }
+        }
+        panic!("fanout never evicted the closed receiver");
     }
 
     /// Eviction is per-subscriber: a lagging L1 client is dropped
     /// while a healthy subscriber on another feed keeps receiving —
     /// feed and market filters must not turn one client's failure
     /// into everyone's disconnect.
-    #[test]
-    fn eviction_is_per_subscriber() {
-        let publisher = MarketDataPublisher::new();
+    #[tokio::test]
+    async fn eviction_is_per_subscriber() {
+        let (publisher, _fanout) = start();
         let _lagging = publisher.subscribe(vec![FeedType::L1], vec![]);
         let mut healthy = publisher.subscribe(vec![FeedType::Trades], vec![]);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if publisher.subscriber_count() == 2 {
+                break;
+            }
+        }
         for _ in 0..=SUB_QUEUE_DEPTH {
             publisher.publish_l1(0, Some((Price(1), Qty(1))), None);
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if publisher.evicted_subscriber_count() == 1 {
+                break;
+            }
         }
         assert_eq!(publisher.subscriber_count(), 1, "only the lagging subscriber is evicted");
         assert_eq!(publisher.evicted_subscriber_count(), 1);
-        publisher.publish_trade(0, Price(1), Qty(1), true);
-        assert!(healthy.try_recv().is_ok(), "healthy subscriber still receives its feed");
+        publisher.publish_trade(0, Price(1_500_000_000), Qty(1_000), true);
+        let msg = healthy.recv().await.expect("healthy subscriber still receives");
+        assert!(msg.contains("\"feed\":\"trades\""));
     }
 
-    /// Market filtering still applies under the bounded queue: a
-    /// subscriber whose market filter excludes the update is never
-    /// sent it — and so is never evicted by traffic it doesn't want.
+    /// F-05 regression: publishing while the fanout stalls must
+    /// never block or panic — the ring fills to depth, then updates
+    /// shed and the drop counter records them. The match path's
+    /// worst case is a wait-free push, always. (The fanout is held
+    /// alive but never polled: a dropped consumer would instead
+    /// report `Disconnected` on every push.)
     #[test]
-    fn filtered_out_traffic_cannot_evict() {
-        let publisher = MarketDataPublisher::new();
-        let _rx = publisher.subscribe(vec![FeedType::L1], vec![1]);
-        for _ in 0..=SUB_QUEUE_DEPTH {
+    fn publish_with_stalled_fanout_sheds_and_counts() {
+        let (publisher, fanout) = market_data_channel();
+        let _fanout_kept_alive = fanout; // never spawned — ring fills
+        for _ in 0..(OUTBOUND_RING_DEPTH + 10) {
             publisher.publish_l1(0, Some((Price(1), Qty(1))), None);
         }
-        assert_eq!(publisher.subscriber_count(), 1, "no send attempt → no eviction");
-        assert_eq!(publisher.evicted_subscriber_count(), 0);
+        assert_eq!(publisher.dropped_update_count(), 10);
     }
 }

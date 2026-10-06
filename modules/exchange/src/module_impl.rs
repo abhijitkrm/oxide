@@ -7,10 +7,12 @@
 //! ordering auditable end-to-end.
 
 use super::{
-    Address, Event, ExchangeModule, ExecError, Hash, Height, Module, TAG_BATCH_SETTLE, TAG_CANCEL,
-    TAG_CANCEL_REGISTERED, TAG_DEPOSIT_BASE, TAG_LIST_MARKET, TAG_PLACE, TAG_REGISTER_ORDER,
-    TAG_WITHDRAW_BASE, TxContext, base_balances_leaf, base_holds_leaf, decode, fee_vault_leaf,
-    module_id, registered_leaf, store_leaf,
+    Address, Event, ExchangeModule, ExecError, Hash, Height, Module, RejectCategory,
+    TAG_BATCH_SETTLE, TAG_CANCEL, TAG_CANCEL_LINKED, TAG_CANCEL_REGISTERED, TAG_DEPOSIT_BASE,
+    TAG_DEPOSIT_BASE_FOR, TAG_LINK_TRADING_KEY, TAG_LIST_MARKET, TAG_PLACE, TAG_REGISTER_LINKED,
+    TAG_REGISTER_ORDER, TAG_SWEEP_LINKED, TAG_UNLINK_TRADING_KEY, TAG_WITHDRAW_BASE,
+    TAG_WITHDRAW_LINKED, TxContext, base_balances_leaf, base_holds_leaf, decode, fee_vault_leaf,
+    linked_leaf, module_id, registered_leaf, store_leaf,
 };
 
 impl Module for ExchangeModule {
@@ -46,8 +48,9 @@ impl Module for ExchangeModule {
                 // slot. This also bounds the allocation `list_market`
                 // performs at quorum: `validate` caps `max_resting`
                 // at `MAX_RESTING_LIMIT`.
-                cfg.validate()
-                    .map_err(|e| ExecError::ModuleRejected(format!("list_market: {e}")))?;
+                cfg.validate().map_err(|e| {
+                    ExecError::rejected(RejectCategory::Internal, format!("list_market: {e}"))
+                })?;
                 drop(inner);
                 // Committee-quorum gate: a listing eagerly allocates
                 // the market's order-pool and id-map arenas, so an
@@ -56,8 +59,9 @@ impl Module for ExchangeModule {
                 // message; the market lists only once endorsing power
                 // strictly exceeds two-thirds of the committee.
                 let Some(committee) = self.committee.clone() else {
-                    return Err(ExecError::ModuleRejected(
-                        "list_market: no committee wired".to_string(),
+                    return Err(ExecError::rejected(
+                        RejectCategory::Unauthorized,
+                        "list_market: no committee wired",
                     ));
                 };
                 match self.endorsements.record(msg, &ctx.sender, committee.as_ref())? {
@@ -94,6 +98,20 @@ impl Module for ExchangeModule {
 
             TAG_WITHDRAW_BASE => self.handle_withdraw_base(ctx, body, &mut inner),
 
+            TAG_LINK_TRADING_KEY => Self::handle_link(ctx, body, &mut inner),
+
+            TAG_UNLINK_TRADING_KEY => Self::handle_unlink(ctx, body, &mut inner),
+
+            TAG_DEPOSIT_BASE_FOR => self.handle_deposit_base_for(ctx, body, &mut inner),
+
+            TAG_WITHDRAW_LINKED => self.handle_withdraw_linked(ctx, body, &mut inner),
+
+            TAG_SWEEP_LINKED => self.handle_sweep_linked(ctx, body, &mut inner),
+
+            TAG_REGISTER_LINKED => self.handle_register_linked(ctx, body, &mut inner),
+
+            TAG_CANCEL_LINKED => self.handle_cancel_linked(ctx, body, &mut inner),
+
             _ => Err(ExecError::Malformed),
         }
     }
@@ -129,6 +147,7 @@ impl Module for ExchangeModule {
             base_balances_fold: inner.base_balances.root(),
             base_holds_fold: inner.base_holds.root(),
             fee_vault_fold: inner.fee_vault.root(),
+            linked_fold: inner.linked.root(),
         };
         let mut w = framework::CanonicalState::new();
         decode::write_root_preimage(&view, &mut w);
@@ -164,7 +183,7 @@ impl Module for ExchangeModule {
     /// once installed.
     fn inspect_state(&self, snapshot: &storage::Snapshot) -> Result<Hash, storage::SnapshotError> {
         let slots = framework::lock_state(&self.inner).markets.len();
-        let (_canon, (markets, endorsements, registered, balances, holds, fees), store) =
+        let (_canon, (markets, endorsements, registered, balances, holds, fees, linked), store) =
             framework::stage_blob_snapshot(snapshot, |r, s| Self::decode_committed(r, s, slots))?;
         let view = decode::RootView {
             store_fold: framework::CommittedStore::fold_map(&store, store_leaf),
@@ -174,6 +193,7 @@ impl Module for ExchangeModule {
             base_balances_fold: framework::CommittedMap::fold_map(&balances, base_balances_leaf),
             base_holds_fold: framework::CommittedMap::fold_map(&holds, base_holds_leaf),
             fee_vault_fold: framework::CommittedMap::fold_map(&fees, fee_vault_leaf),
+            linked_fold: framework::CommittedMap::fold_map(&linked, linked_leaf),
         };
         let mut w = framework::CanonicalState::new();
         decode::write_root_preimage(&view, &mut w);
@@ -185,7 +205,7 @@ impl Module for ExchangeModule {
     /// atomically (decode first, mutate second).
     fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
         let slots = framework::lock_state(&self.inner).markets.len();
-        let (_canon, (markets, endorsements, registered, balances, holds, fees), store) =
+        let (_canon, (markets, endorsements, registered, balances, holds, fees, linked), store) =
             framework::stage_blob_snapshot(snapshot, |r, s| Self::decode_committed(r, s, slots))?;
         *framework::lock_state(&self.store) =
             framework::CommittedStore::from_map(store, store_leaf);
@@ -195,6 +215,7 @@ impl Module for ExchangeModule {
         inner.base_balances = framework::CommittedMap::from_map(balances, base_balances_leaf);
         inner.base_holds = framework::CommittedMap::from_map(holds, base_holds_leaf);
         inner.fee_vault = framework::CommittedMap::from_map(fees, fee_vault_leaf);
+        inner.linked = framework::CommittedMap::from_map(linked, linked_leaf);
         // `fills` is per-call scratch — clear it so a buffer left
         // mid-transaction cannot leak across the import boundary.
         inner.fills.clear();
@@ -226,8 +247,9 @@ impl Module for ExchangeModule {
 impl framework::ParameterSink for ExchangeModule {
     fn apply_param(&self, key: &[u8], value: &[u8]) -> Result<(), ExecError> {
         if key != b"exchange.fee_vault.withdraw" {
-            return Err(ExecError::ModuleRejected(
-                "exchange: unknown governed parameter".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                "exchange: unknown governed parameter",
             ));
         }
         if value.len() != 29 {
@@ -243,16 +265,20 @@ impl framework::ParameterSink for ExchangeModule {
         let dest = Address(dest_bytes);
         let amount = u64::from_le_bytes(amount_bytes);
         if amount == 0 {
-            return Err(ExecError::ModuleRejected("fee_vault.withdraw: zero amount".to_string()));
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                "fee_vault.withdraw: zero amount",
+            ));
         }
         let ledger = self.ledger.as_ref().ok_or_else(|| {
-            ExecError::ModuleRejected("fee_vault.withdraw: no ledger wired".to_string())
+            ExecError::rejected(RejectCategory::Internal, "fee_vault.withdraw: no ledger wired")
         })?;
         let mut inner = framework::lock_state(&self.inner);
         let vault = inner.fee_vault.get(&market).copied().unwrap_or(0);
         if vault < amount {
-            return Err(ExecError::ModuleRejected(
-                "fee_vault.withdraw: insufficient vault balance".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::InsufficientFunds,
+                "fee_vault.withdraw: insufficient vault balance",
             ));
         }
         // Credit before decrementing custody — same ordering as
@@ -260,7 +286,7 @@ impl framework::ParameterSink for ExchangeModule {
         // untouched (the proposal then records ApplyFailed rather
         // than silently losing the funds).
         ledger.credit(&dest, amount).map_err(|_| {
-            ExecError::ModuleRejected("fee_vault.withdraw: credit failed".to_string())
+            ExecError::rejected(RejectCategory::Internal, "fee_vault.withdraw: credit failed")
         })?;
         // `vault >= amount` was just proven — saturating is the same
         // value and cannot panic under release `overflow-checks`.

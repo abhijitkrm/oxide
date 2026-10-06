@@ -821,3 +821,101 @@ fn resting_fold_tracks_every_mutation() {
     restored.enable_resting_fold(test_leaf);
     assert_eq!(restored.resting_fold(), e.resting_fold());
 }
+
+/// F-22 regression: the bitboard `capped_fillable` and the retained
+/// linear-scan baseline must agree on every book shape. The scan is
+/// the FOK pre-scan — a divergence here accepts an unfillable FOK or
+/// kills a fillable one, both all-or-nothing violations.
+#[test]
+fn capped_fillable_bitboard_matches_linear_oracle() {
+    let mut e = engine();
+    let mut fills = Vec::new();
+
+    // Sparse, non-contiguous book: asks at scattered ticks on both
+    // sides of the band, bids likewise, including self orders (owner
+    // 1) so every STP branch of the scan executes.
+    for (side, ticks, qty, owner) in [
+        (Side::Sell, 50, 5_000u64, 2u8),
+        (Side::Sell, 51, 3_000, 1), // self order for the owner-1 taker
+        (Side::Sell, 52, 4_000, 3),
+        (Side::Sell, 60, 2_000, 4),
+        (Side::Buy, 14, 6_000, 5),
+        (Side::Buy, 10, 2_000, 1), // self bid
+        (Side::Buy, 8, 3_000, 6),
+    ] {
+        let price = 1_000_000_000 + ticks * 1_000_000;
+        let out = e
+            .place(order(side, OrderType::Limit, TimeInForce::Gtc, price, qty, owner), &mut fills)
+            .unwrap();
+        assert!(matches!(out, OrderOutcome::Resting { .. }), "fixture order must rest");
+    }
+
+    for side in [Side::Buy, Side::Sell] {
+        for stp in [
+            StpMode::None,
+            StpMode::CancelNewest,
+            StpMode::CancelOldest,
+            StpMode::DecrementAndCancel,
+        ] {
+            for limit in [None, Some(1_050_000_000), Some(1_052_000_000), Some(1_010_000_000)] {
+                for qty in [1_000u64, 10_000, 60_000] {
+                    let req = NewOrder {
+                        side,
+                        order_type: OrderType::Limit,
+                        tif: TimeInForce::Fok,
+                        price: Price(limit.unwrap_or(if side == Side::Buy {
+                            1_064_000_000
+                        } else {
+                            1_000_000_000
+                        })),
+                        qty: Qty(qty),
+                        owner: Address([1; 20]),
+                        stp,
+                    };
+                    // The probes are read-only; both scans see the
+                    // identical book.
+                    let fast = e.capped_fillable_probe(&req, limit);
+                    let slow = e.capped_fillable_linear(&req, limit);
+                    assert_eq!(
+                        fast, slow,
+                        "side {side:?} stp {stp:?} limit {limit:?} qty {qty}: \
+                         bitboard scan must equal the displaced linear oracle"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// F-22 regression (behavioural): a FOK on a sparse book kills or
+/// fills exactly as the oracle says — the bitboard walk must not
+/// change the all-or-nothing verdict.
+#[test]
+fn fok_verdict_on_sparse_book_matches_oracle() {
+    let mut e = engine();
+    let mut fills = Vec::new();
+    for (ticks, qty) in [(50u64, 5_000u64), (60, 5_000)] {
+        e.place(
+            order(
+                Side::Sell,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                1_000_000_000 + ticks * 1_000_000,
+                qty,
+                2,
+            ),
+            &mut fills,
+        )
+        .unwrap();
+    }
+
+    // Fillable: 10.0 lots available within the limit.
+    let ok = order(Side::Buy, OrderType::Limit, TimeInForce::Fok, 1_060_000_000, 10_000, 3);
+    assert_eq!(e.place(ok, &mut fills).unwrap(), OrderOutcome::Filled);
+    assert_eq!(fills.len(), 2);
+
+    // Unfillable: one lot too many — killed, book untouched.
+    let bad = order(Side::Buy, OrderType::Limit, TimeInForce::Fok, 1_064_000_000, 11_000, 4);
+    assert_eq!(e.place(bad, &mut fills).unwrap(), OrderOutcome::Killed);
+    assert_eq!(e.resting_count(), 0);
+}

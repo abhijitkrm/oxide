@@ -37,6 +37,7 @@ use blst::min_pk::{
 
 use crate::bls::{AggregateSignature, PublicKey, Signature};
 use crate::hash::Domain;
+use zeroize::Zeroizing;
 
 /// The DST (domain separation tag) for a [`Domain`].
 ///
@@ -76,13 +77,19 @@ fn dst(domain: Domain) -> &'static [u8] {
         // link MACs, and the remote-signer daemon refuses requests
         // naming it. Present for exhaustiveness.
         Domain::SignerLink => b"oxide/signer-link",
+        // Never signed — the body hash is a plain BLAKE3 integrity
+        // digest, not a signature preimage. Present for
+        // exhaustiveness.
+        Domain::BodyHash => b"oxide/body-hash",
     }
 }
 
 /// A BLS12-381 secret key (32 bytes). Used to sign messages.
 ///
 /// This is a wrapper around `blst::min_pk::SecretKey` that produces
-/// signatures compatible with our wire [`Signature`] type.
+/// signatures compatible with our wire [`Signature`] type. The
+/// `blst` `SecretKey` itself is `#[zeroize(drop)]`, so the key
+/// material is wiped whenever this value is dropped.
 #[derive(Debug, Clone)]
 pub struct BlsSecretKey {
     inner: SecretKey,
@@ -142,9 +149,14 @@ impl BlsSecretKey {
     }
 
     /// Serialize the secret key to 32 bytes.
+    ///
+    /// The returned array is [`Zeroizing`]-wrapped so the plaintext
+    /// secret is wiped when the caller's binding drops — a raw
+    /// `[u8; 32]` copy of a consensus key must not linger in freed
+    /// stack/heap memory.
     #[must_use]
-    pub fn to_bytes(&self) -> [u8; 32] {
-        self.inner.to_bytes()
+    pub fn to_bytes(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.inner.to_bytes())
     }
 
     /// Deserialize a secret key from 32 bytes.
@@ -619,7 +631,7 @@ mod tests {
     fn secret_key_round_trip() {
         let key = sk(42);
         let bytes = key.to_bytes();
-        let restored = BlsSecretKey::from_bytes(&bytes).expect("deserialize");
+        let restored = BlsSecretKey::from_bytes(&bytes[..]).expect("deserialize");
         assert_eq!(key.public_key(), restored.public_key(), "key must round-trip");
     }
 

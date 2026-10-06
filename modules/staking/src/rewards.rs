@@ -8,7 +8,8 @@
 //! family is the only path that pays rewards out to accounts.
 
 use super::{
-    Address, Balances, Event, ExecError, FEE_POOL, REWARD_POOL, RPT_SCALE, StakingModule, TxContext,
+    Address, Balances, Event, ExecError, FEE_POOL, REWARD_POOL, RPT_SCALE, RejectCategory,
+    StakingModule, TxContext,
 };
 
 impl StakingModule {
@@ -34,12 +35,13 @@ impl StakingModule {
         // the key_change authorization model.) The `validator` field
         // is the *claimer* — delegators pass their own address.
         if ctx.sender != validator {
-            return Err(ExecError::ModuleRejected(
-                "claim_reward: only the account can claim its rewards".to_string(),
+            return Err(ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "claim_reward: only the account can claim its rewards",
             ));
         }
         let ledger = self.require_ledger().map_err(|_| {
-            ExecError::ModuleRejected("claim_reward: balance ledger not wired".to_string())
+            ExecError::rejected(RejectCategory::Internal, "claim_reward: balance ledger not wired")
         })?;
 
         // Lazy accrual: settle every position the claimer holds so
@@ -53,8 +55,9 @@ impl StakingModule {
             let accumulated = pending.get(&validator).copied().unwrap_or(0);
             let claim_amount = if amount == 0 { accumulated } else { amount.min(accumulated) };
             if claim_amount == 0 {
-                return Err(ExecError::ModuleRejected(
-                    "claim_reward: no rewards to claim".to_string(),
+                return Err(ExecError::rejected(
+                    RejectCategory::Precondition,
+                    "claim_reward: no rewards to claim",
                 ));
             }
             pending.insert(validator, accumulated - claim_amount);
@@ -67,9 +70,9 @@ impl StakingModule {
         // acceptable because the pool-conservation invariant makes
         // it unreachable; a poisoned ledger would have failed the
         // block earlier.
-        ledger
-            .transfer(&REWARD_POOL, &validator, claim_amount)
-            .map_err(|_| ExecError::ModuleRejected("claim_reward: pool underfunded".to_string()))?;
+        ledger.transfer(&REWARD_POOL, &validator, claim_amount).map_err(|_| {
+            ExecError::rejected(RejectCategory::InsufficientFunds, "claim_reward: pool underfunded")
+        })?;
 
         Ok(vec![Event { module: "staking", kind: "claim_reward", data: msg.to_vec() }])
     }
