@@ -3591,6 +3591,55 @@ fn crash_mid_commit_recovers_journaled_block() {
     assert_eq!(*primitives::sync::lock_state(&counter2.count), count_at_2 + 2);
 }
 
+/// Media corruption is not a crash: a damaged record in the middle
+/// of a *sealed* segment, with history written after it in a later
+/// segment. Journal replay skips the damaged segment's remainder and
+/// continues (right for a crash tear), so recovery must notice the
+/// missing heights and refuse to start — replaying past the hole
+/// would build a state no peer shares.
+#[test]
+fn mid_history_corruption_fails_closed_with_journal_gap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let journal_dir = dir.path().join(crate::durability::JOURNAL_DIR_NAME);
+    let open = || {
+        let mut exec = test_executor(100)
+            .with_durability(DurabilityConfig::new(dir.path()).with_checkpoint_interval(4096))
+            .expect("durability config");
+        exec.register_module(Arc::new(CounterModule::new()));
+        exec
+    };
+
+    // Segment 0: heights 0..4. Segment 1 (the writer rolls over on
+    // restart): heights 4..7.
+    let exec = open();
+    for h in 0..4u64 {
+        exec.finalize_block(&repair_block(h, vec![make_tx_with_nonce(1, &[9], h)]));
+    }
+    exec.wait_exec_idle();
+    exec.journal_sync_pending();
+    drop(exec);
+    let exec = open();
+    exec.recover_durable_state().expect("clean recovery").expect("journal exists");
+    for h in 4..7u64 {
+        exec.finalize_block(&repair_block(h, vec![make_tx_with_nonce(1, &[9], h)]));
+    }
+    exec.wait_exec_idle();
+    exec.journal_sync_pending();
+    drop(exec);
+    assert!(journal_dir.join("segment-1.log").exists(), "history spans two segments");
+
+    // Bit rot inside segment 0's second record (not its tail).
+    let seg0 = journal_dir.join("segment-0.log");
+    let mut bytes = std::fs::read(&seg0).expect("segment 0");
+    let first_len = u32::from_le_bytes(bytes[8..12].try_into().expect("len")) as usize;
+    let second_payload = 8 + 8 + first_len + 8;
+    bytes[second_payload] ^= 0xFF;
+    std::fs::write(&seg0, &bytes).expect("corrupt segment 0");
+
+    let err = open().recover_durable_state().expect_err("a hole in history must fail closed");
+    assert!(matches!(err, DurabilityError::JournalGap { .. }), "expected JournalGap, got {err}");
+}
+
 /// The other mid-commit crash shape: SIGKILL lands during the
 /// journal *append itself* — the segment's tail is a torn record
 /// that fails CRC. Replay must keep the complete prefix, drop the

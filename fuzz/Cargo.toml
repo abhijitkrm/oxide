@@ -27,6 +27,7 @@ exchange = { path = "../modules/exchange" }
 framework = { path = "../modules/framework" }
 crypto = { path = "../crates/crypto", features = ["dev-identities"] }
 p2p = { path = "../crates/p2p" }
+mempool = { path = "../crates/mempool" }
 trading = { path = "../crates/trading" }
 # alloy-primitives: the same B256/Address/U256 types revm re-exports
 # (evm pins revm 42, whose primitives are alloy-primitives 1.x).
@@ -96,5 +97,17 @@ doc = false
 [[bin]]
 name = "exchange-settlement"
 path = "fuzz_targets/exchange_settlement.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "p2p-handshake"
+path = "fuzz_targets/p2p_handshake.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "mempool-ops"
+path = "fuzz_targets/mempool_ops.rs"
 test = false
 doc = false

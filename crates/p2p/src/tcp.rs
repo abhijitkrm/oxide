@@ -3102,6 +3102,59 @@ pub fn bench_tls_connect(
     (client, server)
 }
 
+/// `#[doc(hidden)]` fuzz seam: run the accept-side handshake
+/// (authenticated greeting + proof exchange) over `input` as the
+/// stranger's bytes. The handshake parsers are the first code to see
+/// an unauthenticated peer's bytes; this lets the `p2p-handshake`
+/// fuzz target drive them without a socket. The auth accepts no
+/// proof, so a run can only end in rejection — the property under
+/// test is "never panics, never admits".
+///
+/// Returns whether the stranger was admitted (always `false` for a
+/// correct implementation).
+#[doc(hidden)]
+#[must_use]
+pub fn fuzz_acceptor_handshake(input: &[u8]) -> bool {
+    #[derive(Debug)]
+    struct Never;
+    impl PeerAuth for Never {
+        fn challenge(&self) -> [u8; AUTH_NONCE_LEN] {
+            [7; AUTH_NONCE_LEN]
+        }
+        fn sign(&self, _transcript: &[u8]) -> Option<Vec<u8>> {
+            Some(vec![0; 96])
+        }
+        fn verify(&self, _peer: &PeerId, _transcript: &[u8], _signature: &[u8]) -> bool {
+            false
+        }
+    }
+    struct Duplex<'a> {
+        input: io::Cursor<&'a [u8]>,
+    }
+    impl Read for Duplex<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+    impl Write for Duplex<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut stream = Duplex { input: io::Cursor::new(input) };
+    acceptor_handshake(
+        &mut stream,
+        &Never,
+        &b"fuzz-acceptor".to_vec(),
+        None,
+        DEFAULT_MAX_MESSAGE_BYTES,
+    )
+    .is_some()
+}
+
 /// `#[doc(hidden)]` bench seam: an outbound peer table of `n` slots
 /// with live writer channels, so the `transport` bench can measure
 /// fan-out enqueue cost on the real [`enqueue`] path — a per-peer
@@ -4761,6 +4814,33 @@ mod tests {
     /// A proven-same-identity reconnect displaces the old slot —
     /// the displacement the audit flagged is only safe *because*
     /// the newcomer proved the same key.
+    /// A peer speaking the legacy greeting (its bare, self-claimed
+    /// ID — what an unauthenticated transport sends) must not be
+    /// admitted by an authenticated acceptor: no downgrade to the
+    /// unauthenticated path, and the acceptor never even issues its
+    /// signed challenge.
+    #[test]
+    fn authenticated_acceptor_rejects_legacy_greeting() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let claimed: PeerId = b"validator-1".to_vec();
+        let dialer = std::thread::spawn(move || {
+            let mut out = TcpStream::connect(addr).expect("connect");
+            write_frame(&mut out, b"validator-1").expect("legacy greeting");
+            // The acceptor must close without sending a challenge.
+            let mut buf = [0u8; 1];
+            out.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+            out.read(&mut buf).unwrap_or(0)
+        });
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream.set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT)).expect("timeout");
+        let auth = StaticAuth::new(1, [(claimed, 2u8)].into_iter().collect());
+        let admitted = acceptor_handshake(&mut stream, &auth, &b"acceptor".to_vec(), None, 1 << 20);
+        assert!(admitted.is_none(), "legacy greeting must not authenticate");
+        drop(stream);
+        assert_eq!(dialer.join().expect("dialer"), 0, "no challenge was sent to the dialer");
+    }
+
     #[test]
     fn tcp_auth_duplicate_same_identity_replaces_slot() {
         let addr_a = "127.0.0.1:19234";
