@@ -49,6 +49,27 @@ jobs:
         # land unnoticed (audit session 24 gap 4).
         run: cargo test --workspace --all-targets --locked --features storage/redb,storage/rocksdb,storage/mdbx
 
+  quality-macos:
+    name: clippy + test (macOS)
+    # The ubuntu job never compiles `cfg(not(target_os = "linux"))`
+    # code — the non-Linux CPU-pinning stub, the WAL's
+    # write+`sync_data` durability path, `F_FULLFSYNC`-backed fsyncs.
+    # A lint error in the pin stub reached main this way, and
+    # development happens on macOS. Default features only: the
+    # optional storage engines (RocksDB, MDBX) are Linux deployment
+    # targets and their native builds are covered by the ubuntu job.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked
+      - name: Test
+        run: cargo test --workspace --all-targets --locked
+
   msrv:
     name: msrv (rust-version floor)
     runs-on: ubuntu-latest
