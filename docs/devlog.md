@@ -23497,3 +23497,73 @@ Each item below: verdict, change (if any), and the evidence.
    plus the `mempool-ops` fuzz target (953k runs, 5 min, clean after
    correcting one over-strict invariant in the target itself:
    `txpool_snapshot` deliberately omits stale txs).
+
+## Session: HFT performance audit, pass 2 (`hft-audit-2.md`)
+
+First audit on the x86 target box (EPYC 7232P, 8c/16t, md RAID-1 of
+consumer NVMe). Six parallel source reviews (trading/exchange/perps,
+matcher, consensus/node/mempool, executor/EVM/framework,
+storage/codec/primitives/crypto, p2p/RPC/config/build) against
+`a5898cc`, every High finding re-verified line-by-line, plus the first
+pinned criterion run and OS floor probes on this machine. Report in
+`hft-audit-2.md`; nothing in `src/` changed.
+
+Headlines, in plain words:
+
+1. **The disk is on the critical path four times per view.** An
+   `fdatasync` here is 4 ms p50 / 13 ms p99 (RAID-1 of PLP-less NVMe,
+   measured mid-resync). Journal + WAL on the pump per vote and per
+   proposal, redb `Immediate` commit in `end_block` on the exec lane,
+   and the matcher's nonce checkpoint every 64 orders on the sequencer
+   all wait for it synchronously. Nothing else in the audit is within
+   an order of magnitude until a durability thread exists.
+2. **Two prior fixes regressed.** F-01: the pump's 1 ms idle quantum is
+   back — `1c9bc93`'s `progressed` flag was dropped in merge `7cbcbcd`
+   (`grep progressed validator_net.rs` → 0), and verify verdicts /
+   view advance / lane completion don't wake the pump (2–3 quanta per
+   view). F-26: the production resting leaf (`book_resting_leaf`)
+   grows a `CanonicalState` Vec 8→16→32→64 for a 45-byte preimage
+   (4 reallocs per leaf); the gated bench hashes a stack buffer, so the
+   gate never saw it.
+3. **F-05 is unwired** (no `publish_*` call site: production emits no
+   market data) and **F-06 is a cliff** (`all_cached` per run: one miss
+   re-recovers every tx in the run).
+4. **Per-item work on serial threads that was designed batched.**
+   Gossiped txs are recovered one at a time on the pump (~45 µs each,
+   ~20k tx/s cap); RPC recovers the sender twice; the venue calls
+   `verify_batch` with n = 1 per order (slower than `verify_strict`,
+   ~250k orders/s ceiling on 8 cores regardless of the engine); the WAL
+   re-writes every uncommitted block body on every vote (and a 2-block
+   tail at the 16 MiB block budget exceeds `MAX_WAL_ENTRY_BYTES` —
+   recovery would see a torn entry); three inline BLS pairings per view.
+5. **Structural tail cliffs:** `Arc::make_mut` on the live `CacheDB`
+   deep-copies the whole account cache on the first ledger write while
+   any RPC/history snapshot is alive; perps per-order cost is O(open
+   orders) (~0.4 ms for a 1k-order MM vs the 3 µs gate — the bench
+   uses ≤1 open order); production markets ship with `max_resting: 64`;
+   `TCP_NODELAY` is never set on matcher order-entry sockets.
+6. **This box specifically:** ~50 validator threads (two 16-thread rayon
+   pools, 8 verify workers, 2/peer, tokio) on 8 physical cores; no
+   `target-cpu` (bitboards compile to `bsf`/`bsr`); C2 exit latency
+   400 µs with `schedutil`. The report carries a core map, kernel/NIC
+   sysctls and config for it (§7).
+
+Measured on the box (criterion p50, one pinned core, `--measurement-time 3`):
+raw engine rest+cancel 64 ns (13.6 M mixed ops/s), but the *folded*
+pair is 485 ns — the fold tax is 421 ns, 6.6× the engine; exchange
+settlement 2.87 µs per fill vs 0.60 µs raw match; perps place 6.16 µs
+on a ≤1-order account (bench doc says 723 ns, gate "< 3 µs");
+secp256k1 recovery 51.8 µs (90% of an EVM transfer's `handle`); BLS
+`aggregate_verify/4` 1.46 ms (×3 inline per view); mempool select
+3.4 µs per selected tx; `uniswap_transfer/parallel_8` 13–26% *slower*
+than sequential; `deliver_qc_signed_wal` 13.8 ms against a "< 5 ms"
+gate — with the WAL on tmpfs. Two bench-apparatus facts fall out:
+criterion "gates" are doc comments (nothing asserts), and the storage
+and consensus durability benches write to `/tmp`, which is tmpfs here,
+so no fsync has ever been measured by the suite on Linux. The real
+`fdatasync` on this box is 4 ms p50 / 13 ms p99.
+
+Dead end worth recording: `pkill -f 'cargo build'` from inside a shell
+whose own command line contains that string kills the shell (exit 144).
+Toolchain + `build-essential` were installed on the box for the
+measurements (`rustup` 1.98.1 pinned, `cc` 15.2).
