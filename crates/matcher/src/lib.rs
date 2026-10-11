@@ -196,7 +196,7 @@ impl MatchingServer {
             balances: BalanceCache::with_capacity(balance_capacity),
             risk: RiskEngine::with_defaults(),
             fills: Vec::with_capacity(64),
-            settlement_batch: Vec::with_capacity(10_000),
+            settlement_batch: Vec::with_capacity(settlement::SETTLEMENT_BATCH_CAPACITY),
             cost_acc: LegCostAcc::default(),
             nonces: NonceTracker::new(),
             order_client_ids: HashMap::with_capacity(65_536),
@@ -233,7 +233,7 @@ impl MatchingServer {
             balances: BalanceCache::with_capacity(balance_capacity),
             risk: RiskEngine::new(risk_config),
             fills: Vec::with_capacity(64),
-            settlement_batch: Vec::with_capacity(10_000),
+            settlement_batch: Vec::with_capacity(settlement::SETTLEMENT_BATCH_CAPACITY),
             cost_acc: LegCostAcc::default(),
             nonces: NonceTracker::new(),
             order_client_ids: HashMap::with_capacity(65_536),
@@ -777,7 +777,7 @@ impl MatchingServer {
     pub fn seal_batch(&mut self) -> Vec<SettledFill> {
         self.nonces.flush();
         self.cost_acc.legs.clear();
-        std::mem::take(&mut self.settlement_batch)
+        settlement::take_presized_batch(&mut self.settlement_batch)
     }
 
     /// Total orders processed since creation.

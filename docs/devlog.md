@@ -23763,3 +23763,12 @@ unwritable store still refuses to start. A hard crash loses up to 63
 buffered nonces plus ~one fdatasync interval. Measured on ext4/md
 RAID-1: 11–17k → 2.7–3.9M orders/s; p99 3–4 ms → 0.39–0.66 µs; max
 36–121 ms → 20–90 µs.
+
+### M-12: settlement batches stay pre-sized
+
+`seal_batch` left a zero-capacity batch, so each 100 ms window regrew it
+through ~14 reallocations on the per-order path, and multi mode sealed
+its 128 workers one at a time. `take_presized_batch` leaves capacity
+≥ `SETTLEMENT_BATCH_CAPACITY` (10,000) or the drained batch's capacity;
+multi-market seal now sends to all workers before collecting replies in
+market order.

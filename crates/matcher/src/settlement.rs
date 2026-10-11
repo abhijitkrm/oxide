@@ -230,6 +230,32 @@ pub(crate) fn evict_gone_client_ids(
     }
 }
 
+/// Fills a settlement batch is sized for at creation and after
+/// every seal (hft-audit-2 M-12). It is the matcher's historical
+/// default: about 1 MB of `SettledFill`s, which covers a 100 ms
+/// settler window at ~100k fills/s. A batch that outgrows it keeps
+/// its larger capacity on the next window (see
+/// [`take_presized_batch`]), so the steady state never regrows on the
+/// order path. Raising it costs resident memory per market; lowering
+/// it brings regrowth back to busy windows.
+pub(crate) const SETTLEMENT_BATCH_CAPACITY: usize = 10_000;
+
+/// Drain `batch` for sealing and leave a pre-sized empty replacement
+/// in its place (hft-audit-2 M-12).
+///
+/// `mem::take` left a zero-capacity `Vec`, so the next window's fills
+/// regrew it 1 → 2 → 4 → … → 16k (about 14 reallocations, each
+/// copying the batch so far) on the sequencer's per-order path, in
+/// 100 ms-aligned bursts. The single allocation moves to the seal
+/// boundary instead, which is off the order path (settler cadence).
+/// The replacement keeps the drained batch's capacity, so a venue
+/// that runs above [`SETTLEMENT_BATCH_CAPACITY`] stops regrowing
+/// after one window.
+pub(crate) fn take_presized_batch(batch: &mut Vec<SettledFill>) -> Vec<SettledFill> {
+    let cap = batch.capacity().max(SETTLEMENT_BATCH_CAPACITY);
+    std::mem::replace(batch, Vec::with_capacity(cap))
+}
+
 /// A matched fill with settlement attribution.
 #[derive(Debug, Clone, Copy)]
 pub struct SettledFill {

@@ -1230,3 +1230,34 @@ fn seal_batch_resets_leg_cost_accumulator() {
     let _ = server.seal_batch();
     assert!(server.cost_acc.legs.is_empty(), "seal must reset the accumulator");
 }
+
+/// hft-audit-2 M-12: sealing must leave a pre-sized batch behind, so
+/// the next window's fills never regrow it on the order path, and a
+/// batch that outgrew the default keeps its larger capacity.
+#[test]
+fn seal_batch_leaves_a_presized_batch() {
+    let mut server = MatchingServer::new(cfg(), 100);
+    let sealed = server.seal_batch();
+    assert!(sealed.is_empty());
+    assert!(server.settlement_batch.capacity() >= settlement::SETTLEMENT_BATCH_CAPACITY);
+
+    let fill = SettledFill {
+        market: 0,
+        price: Price(1),
+        qty: Qty(1),
+        buyer: addr(1),
+        buyer_id: 1,
+        seller: addr(2),
+        seller_id: 2,
+        quote_amount: 0,
+    };
+    let big = 3 * settlement::SETTLEMENT_BATCH_CAPACITY;
+    server.settlement_batch = vec![fill; big];
+    let sealed = server.seal_batch();
+    assert_eq!(sealed.len(), big, "seal returns every fill");
+    assert!(server.settlement_batch.is_empty());
+    assert!(
+        server.settlement_batch.capacity() >= big,
+        "a busy window's capacity carries over to the next"
+    );
+}

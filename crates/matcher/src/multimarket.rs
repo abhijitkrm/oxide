@@ -530,12 +530,22 @@ impl MultiMarketMatcher {
         // running on a torn replay gate with a silently widening
         // restart-replay window.
         primitives::sync::lock_state(&self.nonces).flush();
+        // Fan out first, then collect (hft-audit-2 M-12). Sealing one
+        // worker at a time made the settler wait out N round trips
+        // back to back (128 by default), each queued behind that
+        // worker's backlog. Now all workers seal concurrently and the
+        // wait is the slowest one. Replies are collected in market
+        // order, so the concatenation order is unchanged.
+        let replies: Vec<_> = self
+            .market_senders
+            .iter()
+            .filter_map(|tx| {
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                tx.send(MarketMessage::Seal(reply_tx)).ok().map(|()| reply_rx)
+            })
+            .collect();
         let mut all_fills = Vec::new();
-        for tx in &self.market_senders {
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            if tx.send(MarketMessage::Seal(reply_tx)).is_err() {
-                continue;
-            }
+        for reply_rx in replies {
             if let Ok(fills) = reply_rx.recv() {
                 all_fills.extend(fills);
             }
@@ -665,7 +675,7 @@ impl MarketWorker {
             nonces,
             risk: RiskEngine::new(risk_config),
             fills: Vec::with_capacity(64),
-            settlement_batch: Vec::with_capacity(10_000),
+            settlement_batch: Vec::with_capacity(crate::settlement::SETTLEMENT_BATCH_CAPACITY),
             cost_acc: LegCostAcc::default(),
             clock,
             removed: Vec::with_capacity(64),
@@ -693,7 +703,8 @@ impl MarketWorker {
                     // legs re-form per batch, so the marginal-cost
                     // accumulator resets with the drain.
                     worker.cost_acc.legs.clear();
-                    let batch = std::mem::take(&mut worker.settlement_batch);
+                    let batch =
+                        crate::settlement::take_presized_batch(&mut worker.settlement_batch);
                     let _ = reply.send(batch);
                 }
                 Ok(MarketMessage::Stats(reply)) => {

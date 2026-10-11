@@ -48,6 +48,11 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Settlement batches no longer regrow after every seal**
+  (`matcher`, hft-audit-2 M-12); multi-market seals run concurrently.
+  - **In plain words:** removes a small stutter every settlement
+    window.
+
 - **`--nonce-state` persistence moved to a background write-ahead
   log** (`matcher`, hft-audit-2 M-1): `<path>.wal` next to the
   checkpoint, written and fsynced off the sequencer. With the store
