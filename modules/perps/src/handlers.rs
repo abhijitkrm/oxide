@@ -15,6 +15,7 @@ use super::{
     Side, SignedQty, StpMode, TimeInForce, TradingError, TxContext, cancel_event, fill_event,
     outcome_event,
 };
+use std::collections::BTreeSet;
 
 impl PerpsModule {
     /// Handle a list-market message (extracted from `handle` to keep
@@ -318,6 +319,13 @@ impl PerpsModule {
     /// maker under water (realized loss, or a flip into exposure
     /// it cannot cover); the check is uniform for every account
     /// the trade touched.
+    ///
+    /// Makers are checked once each, in first-fill order — the order
+    /// is consensus-visible (each check may emit events and
+    /// liquidate), so the dedupe must not reorder. A `BTreeSet` of
+    /// already-checked owners keeps that order at O(fills · log
+    /// makers); the previous `Vec::contains` scan was O(fills²) on a
+    /// deep sweep (hft-audit-2 T-14).
     fn margin_check_trade_parties(
         inner: &mut Inner,
         ctx: &TxContext,
@@ -326,11 +334,10 @@ impl PerpsModule {
         events: &mut Vec<Event>,
     ) {
         Self::margin_check(inner, &ctx.sender, market, events);
-        let mut checked: Vec<Address> = Vec::with_capacity(fills_owned.len());
+        let mut checked: BTreeSet<Address> = BTreeSet::new();
         for f in fills_owned {
             let maker = f.maker_owner;
-            if maker != ctx.sender && !checked.contains(&maker) {
-                checked.push(maker);
+            if maker != ctx.sender && checked.insert(maker) {
                 Self::margin_check(inner, &maker, market, events);
             }
         }

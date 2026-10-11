@@ -493,6 +493,11 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Deep perps sweeps no longer slow down quadratically in margin
+  checks** (`perps`, hft-audit-2 T-14).
+  - **In plain words:** an order that hits many resting orders no
+    longer gets disproportionately slower to settle.
+
 - **Market-data fanout no longer drops updates** (`matcher`): an
   update published while the fanout was going idle (typically the
   first one after a quiet period) was popped and discarded instead

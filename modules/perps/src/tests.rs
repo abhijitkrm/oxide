@@ -2917,3 +2917,23 @@ mod golden_roots {
         assert_eq!(got, "1774291ed638ce22d73506bf9ff825d70f061228d357a2de71360f9067d0f913");
     }
 }
+
+/// A sweep whose fills repeat a maker (A, B, A) margin-checks each
+/// maker once and settles every fill (hft-audit-2 T-14: the dedupe
+/// moved from `Vec::contains` to a `BTreeSet` without reordering).
+#[test]
+fn test_sweep_with_repeated_maker_settles_every_fill() {
+    let perps = PerpsModule::new();
+    let mid = perps.list_market(test_cfg()).unwrap();
+    for who in [1u8, 8, 9] {
+        perps.handle(&ctx(who), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000_000)).unwrap();
+    }
+    perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
+    perps.handle(&ctx(8), &msg::place(mid, limit(Side::Sell, 501, 1, 8))).unwrap();
+    perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 502, 1, 9))).unwrap();
+    let events = perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 502, 3, 1))).unwrap();
+    assert_eq!(events.iter().filter(|e| e.kind == "fill").count(), 3);
+    assert_eq!(perps.position(&addr(1), mid).size, 3_000);
+    assert_eq!(perps.position(&addr(9), mid).size, -2_000);
+    assert_eq!(perps.position(&addr(8), mid).size, -1_000);
+}

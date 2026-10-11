@@ -23866,3 +23866,12 @@ branch but set-mark before the handler re-locked: two lock/unlock pairs
 per order. Dispatch no longer locks; only set-mark takes the guard. The
 parsing moved outside the guard reads no state. Saving (~20–40 ns) is
 below bench noise; no number claimed.
+
+### T-14: post-trade margin dedup without `Vec::contains`
+
+Makers were deduplicated with `Vec::contains` — quadratic in fills on a
+deep sweep. Sort/dedup (the audit's suggestion) would reorder the
+checks, and order is consensus-visible (each check can emit events and
+liquidate), so a `BTreeSet` of checked owners keeps first-fill order at
+O(fills · log makers). New test for a repeating maker (A, B, A); the
+perps golden root is unchanged.
