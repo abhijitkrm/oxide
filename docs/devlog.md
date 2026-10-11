@@ -23605,3 +23605,14 @@ binding (sender/nonce/fee vs the signed payload), chain id, nonce,
 gas, balance — and the sender is cached `verified_locally` exactly as
 the preverify would have. The gossiping submitter also drops one of
 its two envelope copies on this path.
+
+### N-2: gossiped txs admitted per pass, not per frame
+
+Every `MSG_TX` frame went through `engine.submit_tx` → `ingest_tx`
+alone, running its secp256k1 recovery serially on the pump (~50 µs on
+the EPYC box) and taking the replay lock per tx; the pump saturated
+near 18k gossiped tx/s. The batched `ingest_tx_batch` (rayon recovery,
+one replay lock, one mempool insert) was only reachable from RPC/devnet
+paths. The pump now collects the drain's `MSG_TX` envelopes and admits
+them with one `submit_txs` at the end of Phase 3. Dedup, pending-tx
+notification and drop-on-reject behaviour are unchanged.

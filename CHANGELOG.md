@@ -48,6 +48,14 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Gossiped transactions are admitted in batches** (`node`,
+  hft-audit-2 N-2): the validator loop collects the transactions its
+  peers gossip during a pass and admits them together, verifying
+  their signatures in parallel instead of one after another on the
+  consensus thread (~50 µs each on the target box).
+  - **In plain words:** a busy network no longer makes the consensus
+    thread check every incoming transaction's signature by itself.
+
 - **RPC tx submission recovers the sender once** (`rpc`, `executor`,
   `node`, hft-audit-2 P-1): `eth_sendRawTransaction` hands the sender
   it already recovered to admission instead of admission recovering

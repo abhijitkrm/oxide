@@ -1097,6 +1097,10 @@ fn run_consensus_loop(
     // holds more than one frame and never across a shutdown break.
     let mut wake_msg: Option<ports::transport::InboundMessage> = None;
 
+    // Gossiped `MSG_TX` envelopes collected during Phase 3's drain
+    // and admitted together at its end (hft-audit-2 N-2).
+    let mut gossip_batch: Vec<TxBytes> = Vec::new();
+
     loop {
         // Set when this pass did work whose follow-up belongs to the
         // next pass — a consumed frame, verdict or gossiped tx, a
@@ -1369,7 +1373,9 @@ fn run_consensus_loop(
                         {
                             seen_txs.remove(&old);
                         }
-                        let _ = engine.submit_tx(TxBytes::new(payload.to_vec()));
+                        // Admitted in one batch after the drain
+                        // (hft-audit-2 N-2) — see `gossip_batch`.
+                        gossip_batch.push(TxBytes::new(payload.to_vec()));
                         // Feed pending-tx subscribers/filters — the
                         // Ethereum hash is keccak256 of the signed
                         // RLP inside the envelope, not the envelope
@@ -1684,6 +1690,18 @@ fn run_consensus_loop(
                 }
                 _ => {}
             }
+        }
+
+        // Phase 3 tail: admit this pass's gossiped txs as one batch
+        // (hft-audit-2 N-2). Admitting each frame alone ran its
+        // secp256k1 recovery serially on the pump (~50 µs/tx on the
+        // EPYC target, capping gossip ingest near 18k tx/s);
+        // `ingest_tx_batch` recovers the batch rayon-parallel and
+        // takes the mempool and replay locks once. Rejections are
+        // dropped exactly as the per-frame path dropped them — the
+        // originator already answered its client.
+        if !gossip_batch.is_empty() {
+            let _ = engine.submit_txs(std::mem::take(&mut gossip_batch));
         }
 
         // Phase 3a: apply verify-pool verdicts. Every BLS-bearing
