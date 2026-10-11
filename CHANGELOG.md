@@ -54,6 +54,11 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Digest-keyed map lookups skip a redundant hashing step**
+  (`primitives`, hft-audit-2 S-6), ~3% faster.
+  - **In plain words:** looking up a transaction by its hash does
+    slightly less work, with no change in safety.
+
 - **Perps account updates no longer copy the whole account per fill**
   (`perps`, `framework`, hft-audit-2 T-2, partial): about 9–13% faster
   perps settlement, identical state roots.

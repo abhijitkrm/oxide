@@ -23910,3 +23910,16 @@ fresh EPYC numbers and mark the three gates that fail here:
 17.2 µs vs 10 µs (both pending the rest of T-3 / T-7), and
 `perps_place_with_margin` 3.58 µs vs 3 µs (pending the rest of T-2).
 `state_root_vs_book` no longer claims the root re-serializes the book.
+
+### S-6: `Hash` keys hashed with one 32-byte write
+
+`#[derive(Hash)]` on `Hash([u8;32])` went through the slice impl, which
+writes a length prefix first, so `DigestHasher` ran 5 dependent multiply
+steps per lookup instead of 4. A hand-written impl does one
+`state.write(&self.0)` (consistent with byte-wise `Eq`; the prefix is
+redundant for a fixed-width type). All 32 bytes are kept rather than an
+8-byte prefix, so peer-nameable keys can't be used to build collision
+chains even in keyed SipHash maps. `DigestHasher` still folds every
+byte (executor `OccKey`s are structured, not uniform), now reading whole
+words without a zero-pad copy; its "one multiply" doc is corrected.
+`digest_map/get_hit` 9.07 → 8.82 ns.

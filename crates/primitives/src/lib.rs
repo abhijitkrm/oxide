@@ -37,8 +37,32 @@ use std::fmt;
 /// Oxide hashes with BLAKE3 (see `oxide-crypto`); this type is the
 /// transport form so that hashing-algorithm choice stays swappable
 /// without touching every struct.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Hash(pub [u8; Hash::LEN]);
+
+/// Hand-written (not derived) so the digest reaches the hasher as ONE
+/// 32-byte `write` (hft-audit-2 S-6).
+///
+/// `#[derive(Hash)]` on a `[u8; 32]` field goes through the slice impl,
+/// which first writes a `usize` length prefix and then the bytes — two
+/// `write` calls. For [`digest_map::DigestHasher`] that was five
+/// dependent multiply steps (prefix + four 8-byte chunks) instead of
+/// four; for `SipHash` an extra 8 bytes compressed per lookup.
+///
+/// Dropping the prefix is sound because the type is fixed-width: the
+/// prefix exists to keep variable-length slices prefix-free inside
+/// composite keys, and 32 bytes are always 32 bytes. All 32 bytes are
+/// still written — truncating to an 8-byte prefix would let anyone who
+/// can name arbitrary `Hash` values (a peer citing a block ID it never
+/// produced) build unbounded collision chains even in keyed `SipHash`
+/// maps. Consistency with `Eq` (derived, byte-wise) holds because the
+/// hash input is exactly the compared bytes.
+impl std::hash::Hash for Hash {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write(&self.0);
+    }
+}
 
 impl Hash {
     /// Length in bytes.
@@ -1295,8 +1319,8 @@ pub mod pin {
 /// re-derives uniformity the key already has: ~25–30 ns per lookup,
 /// twice per tx on the executor's preverify path and once per OCC
 /// read/write probe — pure waste. [`DigestHasher`] folds the key's
-/// first 8 bytes through one multiply-mix (~2 ns), which is all a
-/// uniform key needs.
+/// 8-byte words through a multiply-mix chain (four steps for a
+/// 32-byte digest, a few ns), which is all a uniform key needs.
 ///
 /// **This hasher is NOT DoS-resistant by itself** — the property
 /// doing the work is that the keys are cryptographic digests, so an
@@ -1313,15 +1337,18 @@ pub mod pin {
 pub mod digest_map {
     use std::hash::{BuildHasherDefault, Hasher};
 
-    /// `Hasher` for digest-typed keys: folds the first 8 written
-    /// bytes through a Fibonacci multiply (`0x9E37…` spreads entropy
+    /// `Hasher` for digest-typed keys: folds every written 8-byte
+    /// word through a Fibonacci multiply (`0x9E37…` spreads entropy
     /// into the high bits hashbrown uses for SIMD tag matching, and
-    /// the low bits it uses for bucket index). Later writes are
-    /// folded in too, so the hasher stays correct (not merely fast)
-    /// if a composite key is ever hashed.
+    /// the low bits it uses for bucket index). Every byte of every
+    /// write is folded (not just a prefix), so the hasher stays
+    /// correct for structured keys such as the executor's
+    /// zero-padded `OccKey`s, not only for uniform digests.
     ///
-    /// For a 32-byte `Hash` the derive calls `write` once — one
-    /// load + one multiply per lookup.
+    /// A 32-byte [`crate::Hash`] reaches this hasher as one `write`
+    /// (its hand-written `Hash` impl skips the slice length prefix —
+    /// hft-audit-2 S-6), i.e. four 8-byte loads folded by four
+    /// multiplies, with no length-prefix step and no zero-pad copy.
     #[derive(Default)]
     pub struct DigestHasher(u64);
 
@@ -1333,14 +1360,33 @@ pub mod digest_map {
 
         #[inline]
         fn write(&mut self, bytes: &[u8]) {
-            for chunk in bytes.chunks(8) {
-                let mut b = [0u8; 8];
-                b[..chunk.len()].copy_from_slice(chunk);
-                // Fibonacci hashing constant — a full-width odd
-                // multiplier, the standard avalanche step.
-                self.0 =
-                    self.0.wrapping_add(u64::from_le_bytes(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            // Whole words straight from the slice; only a ragged tail
+            // (never present for 32-byte digests) pays the zero-pad copy.
+            let (words, tail) = bytes.as_chunks::<8>();
+            for word in words {
+                self.mix(u64::from_le_bytes(*word));
             }
+            if !tail.is_empty() {
+                let mut b = [0u8; 8];
+                b[..tail.len()].copy_from_slice(tail);
+                self.mix(u64::from_le_bytes(b));
+            }
+        }
+
+        #[inline]
+        fn write_u64(&mut self, n: u64) {
+            self.mix(n);
+        }
+    }
+
+    impl DigestHasher {
+        /// One fold step: add the word, then multiply by the Fibonacci
+        /// hashing constant — a full-width odd multiplier, the standard
+        /// avalanche step. `write_u64(n)` and `write(&n.to_le_bytes())`
+        /// fold identically, so callers may use either form.
+        #[inline]
+        fn mix(&mut self, word: u64) {
+            self.0 = self.0.wrapping_add(word).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         }
     }
 
@@ -1361,6 +1407,70 @@ pub mod digest_map {
 mod tests {
     use super::fixed::{self, FixedError, PRICE_ONE, Price, QTY_ONE, Qty};
     use super::{Address, Epoch, Hash, Height, View, WrongSliceLength};
+
+    /// hft-audit-2 S-6: a `Hash` key reaches `DigestHasher` as one
+    /// 32-byte write — exactly four fold steps, no length-prefix step —
+    /// and every byte participates (a digest differing only in its last
+    /// byte must not collide by construction).
+    #[test]
+    fn test_hash_key_is_one_write_of_all_32_bytes() {
+        use super::digest_map::DigestHasher;
+        use std::hash::{Hash as _, Hasher as _};
+
+        let mut raw = [0u8; 32];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = u8::try_from(i).unwrap().wrapping_mul(37).wrapping_add(11);
+        }
+        let h = Hash(raw);
+
+        let mut via_impl = DigestHasher::default();
+        h.hash(&mut via_impl);
+        let mut via_write = DigestHasher::default();
+        via_write.write(&raw);
+        assert_eq!(via_impl.finish(), via_write.finish(), "Hash::hash must be one plain write");
+
+        // Manual four-step fold — what the hasher documents.
+        let mut acc = 0u64;
+        for w in raw.as_chunks::<8>().0 {
+            let word = u64::from_le_bytes(*w);
+            acc = acc.wrapping_add(word).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+        assert_eq!(via_impl.finish(), acc, "exactly four fold steps, no length prefix");
+
+        let mut tweaked = raw;
+        tweaked[31] ^= 1;
+        let mut other = DigestHasher::default();
+        Hash(tweaked).hash(&mut other);
+        assert_ne!(via_impl.finish(), other.finish(), "the last byte must be hashed too");
+
+        // write_u64 and write(le bytes) fold identically.
+        let mut a = DigestHasher::default();
+        a.write_u64(0xDEAD_BEEF_0123_4567);
+        let mut b = DigestHasher::default();
+        b.write(&0xDEAD_BEEF_0123_4567u64.to_le_bytes());
+        assert_eq!(a.finish(), b.finish());
+    }
+
+    /// Hash/Eq consistency for `Hash` under the default (`SipHash`)
+    /// hasher: equal digests hash equal, and a `HashMap` keyed by
+    /// `Hash` still finds every key.
+    #[test]
+    fn test_hash_impl_consistent_with_eq_in_std_map() {
+        let mut m = std::collections::HashMap::new();
+        for i in 0u8..=255 {
+            let mut raw = [0u8; 32];
+            raw[31] = i;
+            raw[0] = i.wrapping_mul(3);
+            m.insert(Hash(raw), i);
+        }
+        assert_eq!(m.len(), 256);
+        for i in 0u8..=255 {
+            let mut raw = [0u8; 32];
+            raw[31] = i;
+            raw[0] = i.wrapping_mul(3);
+            assert_eq!(m.get(&Hash(raw)), Some(&i));
+        }
+    }
 
     /// Hash/Address parse the right length and reject the wrong one.
     #[test]
