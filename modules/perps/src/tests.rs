@@ -2827,3 +2827,93 @@ fn perps_sink_rejects_unknown_market_and_invalid_values() {
     let cfg = framework::lock_state(&perps.inner).configs[&mid];
     assert_eq!(cfg, test_cfg(), "rejected applies leave the config untouched");
 }
+
+/// Golden-vector pins for the perps committed leaf encodings and a
+/// full module state root (hft-audit-2 T-2 / T-3 / T-6).
+///
+/// Captured from the pre-optimization code: the account leaf (whose
+/// preimage crosses any small inline buffer — three positions plus
+/// three open orders is ~200 bytes), the book leaf, and the root of a
+/// scenario that rests, partially fills, and places a reduce-only
+/// order. Serializer or settlement-path optimizations must reproduce
+/// these bit-for-bit; a mismatch is a state-root fork.
+mod golden_roots {
+    use super::*;
+    use crate::{AccountState, OpenOrderResv};
+
+    fn hex(b: &[u8; 32]) -> String {
+        use std::fmt::Write as _;
+        b.iter().fold(String::with_capacity(64), |mut out, x| {
+            let _ = write!(out, "{x:02x}");
+            out
+        })
+    }
+
+    #[test]
+    fn test_perps_leaf_encodings_are_pinned() {
+        let mut acct = AccountState { cross_margin: 123_456_789, ..AccountState::default() };
+        for m in 0..3u8 {
+            acct.positions.insert(
+                m,
+                Position {
+                    size: SignedQty(i64::from(m) * 1_000 - 1_500),
+                    entry_price: 1_500_000_000 + u64::from(m),
+                    isolated_margin: u64::from(m) * 7,
+                },
+            );
+            acct.open_orders.insert(
+                (m, 100 + u64::from(m)),
+                OpenOrderResv {
+                    qty: 2_000 + u64::from(m),
+                    price: 1_400_000_000,
+                    side: if m % 2 == 0 { Side::Buy } else { Side::Sell },
+                    reduce_only: m == 1,
+                },
+            );
+        }
+        let account = crate::accounts_leaf(&addr(0x33), &acct).0;
+        let book = crate::perps_book_leaf(&trading::RestingEntry {
+            id: OrderId(77),
+            side: Side::Buy,
+            price: Price(1_250_000_000),
+            qty: Qty(9_000),
+            owner: addr(0x44),
+        });
+        let got = [hex(&account), hex(&book)];
+        let want: [&str; 2] = [
+            "1bc5307aedddb0c33c7a5d4cb622636b4375c3787a324920f211b16cbcab6acb",
+            "b94b082c9ec60bac4f8906737d18bf541f2998db1a7db01b87e4ff231adfe9cb",
+        ];
+        assert_eq!(got, want.map(str::to_owned));
+    }
+
+    #[test]
+    fn test_perps_state_root_is_pinned() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        for who in [1u8, 5, 9] {
+            perps
+                .handle(&ctx(who), &msg::deposit(super::super::CROSS_MARGIN_MARKET, 500_000_000))
+                .unwrap();
+        }
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 5, 9))).unwrap();
+        perps.handle(&ctx(5), &msg::place(mid, limit(Side::Buy, 400, 2, 5))).unwrap();
+        // Partial fill of the resting sell: positions open on both sides.
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 3, 1))).unwrap();
+        // A reduce-only close resting above the book.
+        perps.handle(&ctx(1), &msg::place_reduce_only(mid, limit(Side::Sell, 600, 1, 1))).unwrap();
+        // A taker sweep that hits the bid and then trips over nothing
+        // reduce-only on the bid side.
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 400, 1, 9))).unwrap();
+        // A buy sweep: clears 9's remaining 2 lots at 500, then fills
+        // the reduce-only order as a maker at 600.
+        perps.handle(&ctx(5), &msg::place(mid, limit(Side::Buy, 600, 3, 5))).unwrap();
+        // The scenario really exercised partial fills and a maker-side
+        // reduce-only fill (otherwise the pin would cover less).
+        assert_eq!(perps.position(&addr(1), mid).size, 2_000);
+        assert_eq!(perps.position(&addr(5), mid).size, 4_000);
+        assert_eq!(perps.position(&addr(9), mid).size, -6_000);
+        let got = hex(&perps.state_root().0);
+        assert_eq!(got, "1774291ed638ce22d73506bf9ff825d70f061228d357a2de71360f9067d0f913");
+    }
+}

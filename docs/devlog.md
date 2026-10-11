@@ -23839,3 +23839,22 @@ itself off. Memory: ~6 MiB per market (4 MiB pool reserved virtually,
 state roots of new chains change, and replaying an existing chain's
 journal under this binary produces different roots — a hard fork for
 existing deployments; validators built from the same source agree.
+
+### T-3 + F-26: CanonicalState leaves built in an inline buffer
+
+`CanonicalState` started from `Vec::new()` and grew 8→16→32→64 for a
+45-byte leaf preimage — four reallocations per leaf, ~8 leaves per
+fill. The gated `_folded` benches hid it by hashing a stack-buffer copy
+of the leaf function instead of the production one (the F-26
+regression). It now keeps the first 128 bytes inline (std-only, no
+unsafe) and spills to a `Vec` only for whole-module encodings;
+`as_bytes()` is byte-identical, so hashes and roots are unchanged —
+pinned by golden vectors captured on the old code (every exchange leaf,
+two exchange roots, perps account/book leaves, a perps root with
+partial and reduce-only fills) plus a byte-for-byte check across the
+inline/heap boundary. `trading/benches/matching.rs` now benches the real
+`exchange::book_resting_leaf` (made `pub`; exchange is a dev-dependency
+of trading). p50 on a loaded box: `rest_cancel_pair_folded` 669 →
+390 ns, `mixed_workload_folded` 77.5 → 50.4 µs,
+`settlement_sweep/10_levels` 25.3 → 17.6 µs, `settlement_single_fill`
+2.72 → 2.52 µs.

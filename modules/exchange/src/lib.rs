@@ -567,7 +567,16 @@ fn linked_leaf(k: &Address, v: &LinkedEntry) -> Hash {
 /// engine's `fn(&RestingEntry) -> [u8; 32]` slot — `trading` is a
 /// dependency-free hot-path crate, so the hash itself stays in the
 /// module.
-fn book_resting_leaf(e: &trading::RestingEntry) -> [u8; 32] {
+///
+/// Public so the `trading` crate's `_folded` benches measure this
+/// exact function rather than a hand-maintained replica (hft-audit-2
+/// F-26) — it is not an extension point. Consensus-critical encoding:
+/// pinned by `tests::golden_roots`.
+///
+/// Budget (criterion `trading/rest_cancel_pair_folded`, two leaves per
+/// pair): see the bench doc; the leaf is one 45-byte BLAKE3 hash with
+/// zero heap allocation.
+pub fn book_resting_leaf(e: &trading::RestingEntry) -> [u8; 32] {
     let mut w = framework::CanonicalState::new();
     w.put_u64(e.id.0)
         .put_u8(codec::encode_side(e.side))

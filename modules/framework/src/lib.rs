@@ -864,74 +864,145 @@ pub fn committed_store_leaf(map_tag: u64, k: &[u8], v: &[u8]) -> Hash {
 ///   they hold the *current* block's deterministic values at
 ///   commit time.
 ///
-/// `state_root` is a cold path (once per block per module): a
-/// single allocation for the buffer is acceptable; the matching
-/// hot path never runs it.
-#[derive(Default)]
+/// Two very different callers share this serializer:
+///
+/// - **Leaf preimages** (`CommittedMap` leaves, engine resting-fold
+///   leaves) — *hot*: every custody move, resting mutation, and
+///   account update builds one, ~8 per exchange fill. These are
+///   20–100 bytes, so they live entirely in the inline buffer: zero
+///   heap allocation per leaf (hft-audit-2 T-3 / F-26 — the previous
+///   `Vec::new()` buffer grew 8→16→32→64 for a 45-byte preimage,
+///   four reallocations per leaf).
+/// - **Whole-module roots** (`state_root` sections) — cold (once per
+///   block per module): they overflow the inline buffer once and
+///   continue in a heap `Vec`.
+///
+/// The storage strategy is invisible to the encoding: [`Self::as_bytes`]
+/// is the same byte string either way, so leaf hashes and state
+/// roots are bit-identical to the plain-`Vec` serializer (pinned by
+/// the golden-root tests in `exchange` and `perps`).
 pub struct CanonicalState {
-    /// The accumulated canonical encoding.
-    buf: Vec<u8>,
+    /// Inline storage for the first [`CANONICAL_INLINE_CAP`] bytes.
+    /// Authoritative while `spill` is empty.
+    inline: [u8; CANONICAL_INLINE_CAP],
+    /// Bytes used in `inline` (≤ [`CANONICAL_INLINE_CAP`]). Frozen
+    /// once the encoding spills.
+    len: usize,
+    /// Heap continuation. Invariant: empty until the encoding first
+    /// exceeds the inline capacity; from then on it holds the *whole*
+    /// encoding (the inline prefix is copied in at spill time) and is
+    /// never empty again — so `spill.is_empty()` is the "still
+    /// inline" flag and needs no separate bool.
+    spill: Vec<u8>,
+}
+
+/// Inline capacity of [`CanonicalState`], in bytes.
+///
+/// Origin: the largest fixed-shape leaf preimage in the tree today is
+/// the exchange `registered` leaf (55 bytes); a perps account leaf
+/// with one position and one open order is 98 bytes. 128 covers both
+/// with headroom and keeps the struct at three cache lines on the
+/// stack. Raising it costs stack copies on every leaf build; lowering
+/// it below ~100 sends common perps account leaves to the heap again.
+/// Not consensus-relevant: the encoding is identical either way.
+pub const CANONICAL_INLINE_CAP: usize = 128;
+
+impl Default for CanonicalState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CanonicalState {
-    /// A fresh, empty serializer.
+    /// A fresh, empty serializer. Allocation-free: the buffer starts
+    /// inline and an empty `Vec` does not allocate.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self { inline: [0; CANONICAL_INLINE_CAP], len: 0, spill: Vec::new() }
+    }
+
+    /// Append raw bytes — the single write primitive every `put_*`
+    /// funnels through.
+    ///
+    /// Budget: a bounded `memcpy` while inline; the one-time spill
+    /// copies the ≤128-byte prefix into a `Vec` sized at twice the
+    /// needed length (amortized doubling thereafter, as before).
+    #[inline]
+    fn extend(&mut self, bytes: &[u8]) {
+        if self.spill.is_empty() {
+            let end = self.len + bytes.len();
+            if end <= CANONICAL_INLINE_CAP {
+                self.inline[self.len..end].copy_from_slice(bytes);
+                self.len = end;
+                return;
+            }
+            self.spill_to_heap(end);
+        }
+        self.spill.extend_from_slice(bytes);
+    }
+
+    /// Move the inline prefix to the heap — cold: only whole-module
+    /// encodings exceed [`CANONICAL_INLINE_CAP`].
+    #[cold]
+    #[inline(never)]
+    fn spill_to_heap(&mut self, needed: usize) {
+        let mut v = Vec::with_capacity(needed.saturating_mul(2));
+        v.extend_from_slice(&self.inline[..self.len]);
+        self.spill = v;
     }
 
     /// A section discriminator byte. Use distinct tags per logical
     /// section so two different schemas can never collide.
     pub fn put_tag(&mut self, tag: u8) -> &mut Self {
-        self.buf.push(tag);
+        self.extend(&[tag]);
         self
     }
 
     /// A `u8`.
     pub fn put_u8(&mut self, v: u8) -> &mut Self {
-        self.buf.push(v);
+        self.extend(&[v]);
         self
     }
 
     /// A `u16` little-endian.
     pub fn put_u16(&mut self, v: u16) -> &mut Self {
-        self.buf.extend_from_slice(&v.to_le_bytes());
+        self.extend(&v.to_le_bytes());
         self
     }
 
     /// A `u32` little-endian.
     pub fn put_u32(&mut self, v: u32) -> &mut Self {
-        self.buf.extend_from_slice(&v.to_le_bytes());
+        self.extend(&v.to_le_bytes());
         self
     }
 
     /// A `u64` little-endian.
     pub fn put_u64(&mut self, v: u64) -> &mut Self {
-        self.buf.extend_from_slice(&v.to_le_bytes());
+        self.extend(&v.to_le_bytes());
         self
     }
 
     /// A `u128` little-endian.
     pub fn put_u128(&mut self, v: u128) -> &mut Self {
-        self.buf.extend_from_slice(&v.to_le_bytes());
+        self.extend(&v.to_le_bytes());
         self
     }
 
     /// An `i64` little-endian (positions are signed).
     pub fn put_i64(&mut self, v: i64) -> &mut Self {
-        self.buf.extend_from_slice(&v.to_le_bytes());
+        self.extend(&v.to_le_bytes());
         self
     }
 
     /// A `bool` as one byte (`0`/`1`).
     pub fn put_bool(&mut self, v: bool) -> &mut Self {
-        self.buf.push(u8::from(v));
+        self.extend(&[u8::from(v)]);
         self
     }
 
     /// An `Address` as its raw 20 bytes.
     pub fn put_addr(&mut self, a: &Address) -> &mut Self {
-        self.buf.extend_from_slice(&a.0);
+        self.extend(&a.0);
         self
     }
 
@@ -939,35 +1010,35 @@ impl CanonicalState {
     /// elements so section boundaries are unambiguous.
     pub fn put_count(&mut self, n: usize) -> &mut Self {
         #[allow(clippy::cast_possible_truncation)]
-        self.buf.extend_from_slice(&(n as u64).to_le_bytes());
+        self.extend(&(n as u64).to_le_bytes());
         self
     }
 
     /// A length-prefixed byte string (`u64` length + raw bytes).
     pub fn put_bytes(&mut self, v: &[u8]) -> &mut Self {
         #[allow(clippy::cast_possible_truncation)]
-        self.buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
-        self.buf.extend_from_slice(v);
+        self.extend(&(v.len() as u64).to_le_bytes());
+        self.extend(v);
         self
     }
 
     /// A `Hash` as its raw 32 bytes (fixed-width, unambiguous).
     pub fn put_root(&mut self, h: &Hash) -> &mut Self {
-        self.buf.extend_from_slice(h.as_bytes());
+        self.extend(h.as_bytes());
         self
     }
 
     /// The canonical encoding accumulated so far.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.buf
+        if self.spill.is_empty() { &self.inline[..self.len] } else { &self.spill }
     }
 
     /// Hash the canonical encoding into the module's state root.
     #[must_use]
     pub fn root(&self) -> Hash {
         use crypto::hash::{Domain, Hasher};
-        Hasher::hash_one(Domain::Block, &self.buf)
+        Hasher::hash_one(Domain::Block, self.as_bytes())
     }
 }
 
@@ -1481,5 +1552,68 @@ mod tests {
         w2.put_count(0);
         let mut r2 = CanonicalReader::new(w2.as_bytes());
         assert!(Endorsements::read_canonical(&mut r2).is_none());
+    }
+
+    /// The inline-buffer `CanonicalState` (hft-audit-2 T-3) must emit
+    /// exactly the bytes a plain `Vec` serializer would, for every
+    /// length up to and across the inline→heap spill — the encoding is
+    /// consensus-critical, the storage is not.
+    #[test]
+    fn test_canonical_state_bytes_identical_across_inline_spill_boundary() {
+        for n in 0..(CANONICAL_INLINE_CAP * 3) {
+            let mut w = CanonicalState::new();
+            let mut reference: Vec<u8> = Vec::new();
+            for i in 0..n {
+                // Mix widths so the spill happens mid-field, not only
+                // on a field boundary.
+                #[allow(clippy::cast_possible_truncation)]
+                match i % 4 {
+                    0 => {
+                        w.put_u8(i as u8);
+                        reference.push(i as u8);
+                    }
+                    1 => {
+                        w.put_u64(i as u64 * 0x0101_0101);
+                        reference.extend_from_slice(&(i as u64 * 0x0101_0101).to_le_bytes());
+                    }
+                    2 => {
+                        w.put_bytes(&[0xAB; 3]);
+                        reference.extend_from_slice(&3u64.to_le_bytes());
+                        reference.extend_from_slice(&[0xAB; 3]);
+                    }
+                    _ => {
+                        w.put_addr(&Address([i as u8; 20]));
+                        reference.extend_from_slice(&[i as u8; 20]);
+                    }
+                }
+            }
+            assert_eq!(w.as_bytes(), reference.as_slice(), "n = {n}");
+            assert_eq!(
+                w.root(),
+                crypto::hash::Hasher::hash_one(crypto::hash::Domain::Block, &reference),
+                "root diverged at n = {n}"
+            );
+        }
+    }
+
+    /// Exactly-at-capacity stays inline; one more byte spills and the
+    /// prefix survives the move.
+    #[test]
+    fn test_canonical_state_spill_preserves_prefix_at_exact_capacity() {
+        let mut w = CanonicalState::new();
+        for i in 0..CANONICAL_INLINE_CAP {
+            #[allow(clippy::cast_possible_truncation)]
+            w.put_u8(i as u8);
+        }
+        assert!(w.spill.is_empty(), "exactly CAP bytes must stay inline");
+        w.put_u8(0xFF);
+        assert!(!w.spill.is_empty(), "CAP + 1 bytes must spill");
+        let bytes = w.as_bytes();
+        assert_eq!(bytes.len(), CANONICAL_INLINE_CAP + 1);
+        #[allow(clippy::cast_possible_truncation)]
+        let prefix_ok =
+            bytes[..CANONICAL_INLINE_CAP].iter().enumerate().all(|(i, b)| *b == i as u8);
+        assert!(prefix_ok);
+        assert_eq!(bytes[CANONICAL_INLINE_CAP], 0xFF);
     }
 }

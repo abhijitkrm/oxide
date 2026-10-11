@@ -64,30 +64,18 @@ fn engine() -> MatchingEngine {
     .unwrap()
 }
 
-/// The module's `book_resting_leaf` replicated exactly — the same
-/// `Domain::CommittedLeaf` hash over the same `(map_tag ‖ id ‖
-/// side ‖ price ‖ qty ‖ owner)` preimage the exchange folds — so
-/// the `_folded` rows measure the production leaf cost, not a toy
-/// mixer. `crypto` is dev-only; the engine takes the leaf as a
-/// function pointer and stays dependency-free.
-fn bench_leaf(e: &trading::RestingEntry) -> [u8; 32] {
-    let mut h = crypto::hash::Hasher::new(crypto::hash::Domain::CommittedLeaf);
-    h.update(&6u64.to_le_bytes()); // MAP_TAG_BOOK (exchange)
-    h.update(&e.id.0.to_le_bytes());
-    h.update(&[e.side as u8]);
-    h.update(&e.price.0.to_le_bytes());
-    h.update(&e.qty.0.to_le_bytes());
-    h.update(&e.owner.0);
-    h.finalize().0
-}
-
 /// An engine wired as the exchange wires it: the resting fold is
 /// what `state_root` reads per block, so every resting mutation
 /// pays one `committed_leaf` hash. This is the consensus-relevant
 /// engine configuration — the `_folded` rows are the honest gate.
 fn folded_engine() -> MatchingEngine {
     let mut e = engine();
-    e.enable_resting_fold(bench_leaf);
+    // The exchange module's own leaf function — not a replica — so
+    // the `_folded` rows price exactly what consensus pays per
+    // resting mutation, including the `CanonicalState` preimage
+    // build (hft-audit-2 F-26: a stack-buffer replica hid ~75 ns of
+    // per-leaf reallocations the production fn paid).
+    e.enable_resting_fold(exchange::book_resting_leaf);
     e
 }
 
@@ -327,6 +315,13 @@ fn mixed_workload(c: &mut Criterion) {
 /// p50 < 400ns) against the consensus engine shape. Every rest +
 /// cancel now pays one `committed_leaf` hash each, so this row
 /// prices the 7.4 fold on the two most common book mutations.
+///
+/// Measured (x86 audit box, Zen 2, loaded host, criterion p50, with
+/// the real `exchange::book_resting_leaf`): 669 ns with the old
+/// `Vec`-grown `CanonicalState` preimage → 390 ns with the inline
+/// buffer (hft-audit-2 T-3/F-26). The remaining fold tax over the raw
+/// pair is the two BLAKE3 leaf hashes. The 400 ns gate is met only
+/// narrowly on the consensus shape.
 fn rest_cancel_pair_folded(c: &mut Criterion) {
     let mut e = folded_engine();
     let mut fills = Vec::with_capacity(64);

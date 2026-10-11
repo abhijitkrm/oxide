@@ -2496,3 +2496,77 @@ fn state_snapshot_preserves_linkage() {
     let err = dst.handle(&ctx(9), &msg::withdraw_linked(owner, 0, 1)).unwrap_err();
     assert!(format!("{err:?}").contains("Unauthorized"), "imported link must still gate");
 }
+
+/// Golden-vector pins for every committed leaf encoding and for a
+/// full module state root (hft-audit-2 T-3 / F-26).
+///
+/// The leaf preimages are consensus-critical: the incremental folds
+/// they feed are part of every block's state root. These vectors were
+/// captured from the pre-T-3 `Vec`-backed `CanonicalState`; any change
+/// to the serializer's storage (inline buffer, pre-sizing, direct
+/// hashing) must reproduce them bit-for-bit. A mismatch here is a
+/// state-root fork, not a test to re-baseline.
+mod golden_roots {
+    use super::*;
+
+    fn hex(b: &[u8; 32]) -> String {
+        use std::fmt::Write as _;
+        b.iter().fold(String::with_capacity(64), |mut out, x| {
+            let _ = write!(out, "{x:02x}");
+            out
+        })
+    }
+
+    #[test]
+    fn test_exchange_leaf_encodings_are_pinned() {
+        let e = trading::RestingEntry {
+            id: OrderId(0x0102_0304_0506_0708),
+            side: Side::Sell,
+            price: Price(1_234_000_000),
+            qty: Qty(56_000),
+            owner: addr(0x5A),
+        };
+        let book = crate::book_resting_leaf(&e);
+        let bal = crate::base_balances_leaf(&(addr(7), 3), &Qty(987_654_321)).0;
+        let hold = crate::base_holds_leaf(&(addr(7), 3), &Qty(987_654_321)).0;
+        let fee = crate::fee_vault_leaf(&4, &u64::MAX).0;
+        let link =
+            crate::linked_leaf(&addr(1), &crate::LinkedEntry { secp: addr(2), epoch: 0xDEAD_BEEF })
+                .0;
+        let got = [hex(&book), hex(&bal), hex(&hold), hex(&fee), hex(&link)];
+        let want: [&str; 5] = [
+            "6efb7073ebc210011bec6c984a47ea9ad52c80b54e6c1bd889916f15da16a2fb",
+            "436f3db2c96b8c3e127a16827046e6e5e3c017caa78cd033f9c5b295226073c5",
+            "8656151e31e50229b6c6e3fadf0985e30ec1c6e15a39d5bef1b3c87aba82da8c",
+            "e94f647968d51531d41b1d0ae5274d6b4148947b09567efe931ce9019be07580",
+            "748304f5dcacd5bc7d5a21bc4c6c9a925a1ac3f7a15a7c024e80c7448c4cf7b2",
+        ];
+        assert_eq!(got, want.map(str::to_owned));
+    }
+
+    #[test]
+    fn test_exchange_state_root_is_pinned() {
+        // Book path: three resting orders, one partially filled.
+        let ex = ExchangeModule::new();
+        let mid = ex.list_market(test_cfg()).unwrap();
+        ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 5, 9))).unwrap();
+        ex.handle(&ctx(8), &msg::place(mid, limit(Side::Sell, 510, 2, 8))).unwrap();
+        ex.handle(&ctx(7), &msg::place(mid, limit(Side::Buy, 400, 4, 7))).unwrap();
+        ex.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 3, 1))).unwrap();
+        let book_root = ex.state_root();
+
+        // Custody + registration path.
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let ex2 = ExchangeModule::with_ledger(ledger.clone());
+        ex2.list_market(test_cfg()).unwrap();
+        registered_pair(&ledger, &ex2, 1_500_000_000, 1_000_000_000, 100_000);
+        let custody_root = ex2.state_root();
+
+        let got = [hex(&book_root.0), hex(&custody_root.0)];
+        let want: [&str; 2] = [
+            "75b275e02b59b8dcc25e29ac7a380054e909e5dcb0cf60d02ca5215788bef3b0",
+            "ab80c2c49b0c8da929a8951071812e89450dc626b271c0c2ca2d0a3f2889fcec",
+        ];
+        assert_eq!(got, want.map(str::to_owned));
+    }
+}

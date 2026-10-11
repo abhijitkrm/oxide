@@ -4771,7 +4771,7 @@ name = "trading"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "crypto",
+ "exchange",
  "primitives",
  "proptest",
 ]

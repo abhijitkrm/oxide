@@ -48,6 +48,15 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **State-commitment leaves are built without heap allocation**
+  (`framework`, `exchange`, `trading`, hft-audit-2 T-3/F-26); roots
+  unchanged. Folded mixed workload 77.5 → 50.4 µs per 256 ops;
+  10-level settlement sweep 25.3 → 17.6 µs. The folded benches now
+  measure the production leaf function.
+  - **In plain words:** every on-chain trade does less memory
+    housekeeping, so the on-chain order book handles about 40% more
+    operations per second.
+
 - **Committed blocks are copied once, not twice, on the consensus
   thread** (`executor`, hft-audit-2 X-7): the block log and the
   execution queue share one copy of each finalized block.
