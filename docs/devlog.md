@@ -23858,3 +23858,11 @@ of trading). p50 on a loaded box: `rest_cancel_pair_folded` 669 →
 390 ns, `mixed_workload_folded` 77.5 → 50.4 µs,
 `settlement_sweep/10_levels` 25.3 → 17.6 µs, `settlement_single_fill`
 2.72 → 2.52 µs.
+
+### T-12: perps `handle` takes its state lock once
+
+`PerpsModule::handle` locked the state, then dropped the guard in every
+branch but set-mark before the handler re-locked: two lock/unlock pairs
+per order. Dispatch no longer locks; only set-mark takes the guard. The
+parsing moved outside the guard reads no state. Saving (~20–40 ns) is
+below bench noise; no number claimed.

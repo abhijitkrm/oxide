@@ -42,31 +42,19 @@ impl Module for PerpsModule {
         let tag = msg[0];
         let body = &msg[1..];
 
-        let inner = framework::lock_state(&self.inner);
-
+        // No lock here: every arm except `TAG_SET_MARK` takes the
+        // state lock inside its own handler, so locking up front only
+        // to drop it again cost an extra uncontended lock/unlock pair
+        // on every order (hft-audit-2 T-12).
         match tag {
-            TAG_PLACE => {
-                drop(inner);
-                self.handle_place(ctx, body)
-            }
-            TAG_CANCEL => {
-                drop(inner);
-                self.handle_cancel(ctx, body)
-            }
-            TAG_LIST_MARKET => {
-                drop(inner);
-                self.handle_list_market(ctx, msg, body)
-            }
-            TAG_DEPOSIT => {
-                drop(inner);
-                self.handle_deposit(ctx, body)
-            }
-            TAG_WITHDRAW => {
-                drop(inner);
-                self.handle_withdraw(ctx, body)
-            }
+            TAG_PLACE => self.handle_place(ctx, body),
+            TAG_CANCEL => self.handle_cancel(ctx, body),
+            TAG_LIST_MARKET => self.handle_list_market(ctx, msg, body),
+            TAG_DEPOSIT => self.handle_deposit(ctx, body),
+            TAG_WITHDRAW => self.handle_withdraw(ctx, body),
             TAG_SET_MARK => {
                 let (market, mark) = Self::parse_set_mark(body).ok_or(ExecError::Malformed)?;
+                let inner = framework::lock_state(&self.inner);
                 // Reject a nonexistent market before recording an
                 // endorsement — pending actions are a bounded set,
                 // so junk targets must never occupy a slot. Markets
@@ -122,10 +110,7 @@ impl Module for PerpsModule {
                     }
                 }
             }
-            TAG_APPLY_FUNDING => {
-                drop(inner);
-                self.handle_apply_funding(ctx, msg, body)
-            }
+            TAG_APPLY_FUNDING => self.handle_apply_funding(ctx, msg, body),
             TAG_LIQUIDATE => {
                 // `[account: 20B]` — permissionless trigger: the
                 // sender pays the tx fee, which prices the spam
@@ -134,7 +119,6 @@ impl Module for PerpsModule {
                 let Ok(account) = <[u8; 20]>::try_from(body) else {
                     return Err(ExecError::Malformed);
                 };
-                drop(inner);
                 self.liquidation_check(&primitives::Address(account))
             }
             _ => Err(ExecError::Malformed),

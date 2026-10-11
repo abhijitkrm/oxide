@@ -48,6 +48,11 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Perps order handling takes its state lock once instead of twice**
+  (`perps`, hft-audit-2 T-12).
+  - **In plain words:** one redundant step removed from every perps
+    order.
+
 - **State-commitment leaves are built without heap allocation**
   (`framework`, `exchange`, `trading`, hft-audit-2 T-3/F-26); roots
   unchanged. Folded mixed workload 77.5 → 50.4 µs per 256 ops;
