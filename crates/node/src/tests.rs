@@ -1257,3 +1257,18 @@ fn physical_cores_is_within_logical_count() {
     assert!(physical >= 1);
     assert!(physical <= logical, "{physical} physical > {logical} logical");
 }
+
+/// hft-audit-2 S-7: two hot threads pinned to one CPU is a config
+/// error, reported by the same validation as an offline core.
+#[test]
+fn perf_pins_on_one_cpu_are_rejected() {
+    let config =
+        NodeConfig { consensus_core: Some(0), exec_lane_core: Some(0), ..NodeConfig::default() };
+    let errors = config.perf_pin_errors();
+    assert!(
+        errors.iter().any(|e| e.contains("both pinned to CPU 0")),
+        "expected a shared-core error, got {errors:?}"
+    );
+    let single = NodeConfig { consensus_core: Some(0), ..NodeConfig::default() };
+    assert!(single.perf_pin_errors().is_empty(), "CPU 0 is always online");
+}

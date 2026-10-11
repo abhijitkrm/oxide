@@ -534,6 +534,13 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Pin validation rejects two hot threads on one physical core**
+  (`node`, hft-audit-2 S-7): `consensus_core` and `exec_lane_core` on
+  the same CPU or on SMT siblings now fail config validation, and
+  online-CPU checks handle sparse CPU lists correctly.
+  - **In plain words:** the node refuses a pinning setup that would
+    quietly make its two busiest threads share one core.
+
 - **An invalid order-pool index fails loudly instead of reading
   another order** (`trading`, hft-audit-2 T-13).
   - **In plain words:** a potential silent mix-up between orders is

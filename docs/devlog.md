@@ -24016,3 +24016,15 @@ each) and allocates two Vecs. New `PreparedPublicKey` (decoded once) and
 does internally minus decompression and Vecs; a test checks identical
 verdicts over 6 cases. p50: n=32 2.06 → 1.86 ms; n=128 3.53 → 1.93 ms;
 n=4 within noise. Not yet adopted by consensus.
+
+### S-7 follow-up: pin validation uses the SMT report and the online set
+
+`NodeConfig::perf_pin_errors` now rejects two pinned roles on one
+physical core (same CPU or SMT siblings) via the new
+`primitives::pin::smt_pin_report` — on the EPYC box `consensus_core = 1`
+with `exec_lane_core = 9` used to validate and silently halve both. It
+also checks membership in the online CPU *set* rather than
+`core < online_cpus()`, which rejected valid CPUs and accepted offline
+ones on a sparse online list (`0-3,8-11`); the count remains the
+non-Linux fallback. Sibling-not-isolated findings are advisory and not
+surfaced yet.

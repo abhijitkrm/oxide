@@ -369,19 +369,39 @@ impl NodeConfig {
     /// startup. Returns the offending setting names + reasons.
     pub fn perf_pin_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
+        // Membership in the online *set*, not `core < count`: a host
+        // whose online list is sparse (`0-3,8-11`) has 8 online CPUs
+        // and CPU 9 among them — the count test rejected CPU 9 and
+        // accepted offline CPU 5. The count stays the fallback where
+        // the online list can't be read (non-Linux).
+        let online_set = std::fs::read_to_string("/sys/devices/system/cpu/online")
+            .map(|s| primitives::pin::parse_cpu_list(&s))
+            .unwrap_or_default();
         let online = primitives::pin::online_cpus();
-        for (name, core) in
+        let pins: Vec<(&str, u32)> =
             [("consensus_core", self.consensus_core), ("exec_lane_core", self.exec_lane_core)]
-        {
-            if let Some(c) = core
-                && c >= online
-            {
+                .into_iter()
+                .filter_map(|(name, core)| core.map(|c| (name, c)))
+                .collect();
+        for &(name, c) in &pins {
+            let is_online =
+                if online_set.is_empty() { c < online } else { online_set.contains(&c) };
+            if !is_online {
                 errors.push(format!(
                     "performance.{name} = {c} is outside the online CPU set \
                      (online cores: {online})"
                 ));
             }
         }
+        // Two pinned hot threads on one physical core (the same CPU or
+        // SMT siblings) each run at roughly half speed (hft-audit-2
+        // S-7) — a deployment error, rejected like an offline core.
+        errors.extend(
+            primitives::pin::smt_pin_report(&pins)
+                .errors
+                .into_iter()
+                .map(|e| format!("performance: {e}")),
+        );
         if let Some(node) = self.numa_node
             && !primitives::pin::numa_node_present(node)
         {
