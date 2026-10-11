@@ -951,6 +951,11 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Pin helpers detect two actors on one physical core**
+  (`primitives`, hft-audit-2 S-7).
+  - **In plain words:** the node can tell when two busy threads are
+    accidentally sharing one CPU core.
+
 - **Thread-pool sizing knobs, physical-core defaults** (`config`,
   `node`, `executor`, hft-audit-2 C-1/X-3/N-9): new `[performance]`
   settings `verify_workers`, `intake_threads` and `rayon_threads`

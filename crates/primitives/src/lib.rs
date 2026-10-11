@@ -1455,6 +1455,20 @@ pub mod supervision {
 /// path by definition, so no syscall-wrapper `unsafe` enters the
 /// crate.
 ///
+/// A host without `taskset` gets a clear `NotFound` error and every
+/// caller continues unpinned — pinning is a locality property, never
+/// a correctness one. (`sched_setaffinity` via `libc` would remove the
+/// subprocess, but `libc` is not a dependency of this crate and the
+/// std-only rule outranks a once-per-thread startup cost.)
+///
+/// SMT awareness (hft-audit-2 S-7): `online_cpus` counts *logical*
+/// CPUs, so two actors can be "validly" pinned to the two hyperthreads
+/// of one physical core and silently run at half speed.
+/// [`pin::thread_siblings`] reads the sysfs sibling list and
+/// [`pin::smt_pin_report`] turns a set of pins into errors (two actors
+/// on one physical core) and warnings (a pinned core's sibling is
+/// neither pinned nor isolated) for config validation to surface.
+///
 /// Non-Linux targets compile to no-ops: the config surface stays
 /// portable and the caller logs the skipped pin.
 pub mod pin {
@@ -1485,9 +1499,26 @@ pub mod pin {
                 "could not parse /proc/thread-self tid",
             )
         })?;
-        let out = std::process::Command::new("taskset")
+        let out = match std::process::Command::new("taskset")
             .args(["-pc", &core.to_string(), &tid.to_string()])
-            .output()?;
+            .output()
+        {
+            Ok(out) => out,
+            // A missing binary is an environment gap (minimal container
+            // images ship without util-linux), not a topology error —
+            // say exactly that so the operator's log line is actionable.
+            // The caller still continues unpinned (hft-audit-2 S-7).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "taskset(1) not found on PATH (install util-linux); \
+                         cannot pin thread {tid} to core {core}"
+                    ),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
         if out.status.success() {
             return Ok(());
         }
@@ -1515,18 +1546,8 @@ pub mod pin {
     /// platforms fall back to `available_parallelism`.
     #[cfg(target_os = "linux")]
     pub fn online_cpus() -> u32 {
-        let mut count = 0u32;
-        if let Ok(s) = std::fs::read_to_string("/sys/devices/system/cpu/online") {
-            for part in s.trim().split(',') {
-                if let Some((lo, hi)) = part.split_once('-') {
-                    if let (Ok(lo), Ok(hi)) = (lo.parse::<u32>(), hi.parse::<u32>()) {
-                        count += hi - lo + 1;
-                    }
-                } else if part.parse::<u32>().is_ok() {
-                    count += 1;
-                }
-            }
-        }
+        let mut count = std::fs::read_to_string("/sys/devices/system/cpu/online")
+            .map_or(0, |s| u32::try_from(parse_cpu_list(&s).len()).unwrap_or(u32::MAX));
         if count == 0 {
             // `usize`→`u32` saturates: a host past 4 billion logical
             // CPUs reads as u32::MAX — an absurdity ceiling a pin
@@ -1545,6 +1566,134 @@ pub mod pin {
             .map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX))
     }
 
+    /// Parse a Linux CPU-list string (`"0-3,8-11"`, `"0,8"`, `"5"`) —
+    /// the format of `/sys/devices/system/cpu/{online,isolated}` and
+    /// `topology/thread_siblings_list` — into ascending CPU ids.
+    /// Malformed fragments are skipped (sysfs is trusted but a partial
+    /// read must not panic); a range wider than [`MAX_CPU_LIST_SPAN`]
+    /// is ignored rather than allocated.
+    #[must_use]
+    pub fn parse_cpu_list(s: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        for part in s.trim().split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            if let Some((lo, hi)) = part.split_once('-') {
+                if let (Ok(lo), Ok(hi)) = (lo.parse::<u32>(), hi.parse::<u32>())
+                    && lo <= hi
+                    && hi - lo < MAX_CPU_LIST_SPAN
+                {
+                    out.extend(lo..=hi);
+                }
+            } else if let Ok(c) = part.parse::<u32>() {
+                out.push(c);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Widest single `lo-hi` range [`parse_cpu_list`] will expand.
+    /// 65 536 logical CPUs is far beyond any shipping host (Linux's
+    /// `NR_CPUS` max is 8192); the cap only stops a corrupt sysfs read
+    /// from allocating gigabytes on a cold startup path.
+    pub const MAX_CPU_LIST_SPAN: u32 = 1 << 16;
+
+    /// SMT siblings of logical CPU `core`, including `core` itself
+    /// (Linux: `/sys/devices/system/cpu/cpuN/topology/
+    /// thread_siblings_list`). Two siblings share one physical core's
+    /// L1/L2 and execution ports, so two hot actors pinned to siblings
+    /// run at roughly half speed each — the silent 2× the audit warns
+    /// about (hft-audit-2 S-7). Returns `[core]` when the topology is
+    /// unreadable (non-Linux, offline core, sandboxed sysfs) — "no
+    /// known siblings", never an error.
+    #[must_use]
+    pub fn thread_siblings(core: u32) -> Vec<u32> {
+        #[cfg(target_os = "linux")]
+        {
+            let path = format!("/sys/devices/system/cpu/cpu{core}/topology/thread_siblings_list");
+            if let Ok(s) = std::fs::read_to_string(path) {
+                let list = parse_cpu_list(&s);
+                if list.contains(&core) {
+                    return list;
+                }
+            }
+        }
+        vec![core]
+    }
+
+    /// CPUs isolated from the general scheduler (`isolcpus=` /
+    /// `/sys/devices/system/cpu/isolated`); empty when none or off
+    /// Linux.
+    #[must_use]
+    pub fn isolated_cpus() -> Vec<u32> {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(s) = std::fs::read_to_string("/sys/devices/system/cpu/isolated") {
+                return parse_cpu_list(&s);
+            }
+        }
+        Vec::new()
+    }
+
+    /// Outcome of [`smt_pin_report`]: hard misconfigurations and
+    /// advisory findings, as operator-readable strings.
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    pub struct SmtReport {
+        /// Two pinned actors share one physical core (same logical CPU
+        /// or SMT siblings). Config validation should reject these.
+        pub errors: Vec<String>,
+        /// A pinned actor's SMT sibling is neither pinned by us nor
+        /// isolated, so arbitrary threads can land on the other half
+        /// of its core. Worth a startup warning, not a refusal.
+        pub warnings: Vec<String>,
+    }
+
+    /// Check a set of `(setting name, logical CPU)` pins against live
+    /// SMT topology ([`thread_siblings`], [`isolated_cpus`]).
+    ///
+    /// Cold path: config validation at startup.
+    #[must_use]
+    pub fn smt_pin_report(pins: &[(&str, u32)]) -> SmtReport {
+        smt_pin_report_with(pins, thread_siblings, &isolated_cpus())
+    }
+
+    /// [`smt_pin_report`] with injected topology — the testable core
+    /// (testing-standards: no ambient system state in unit tests).
+    #[must_use]
+    pub fn smt_pin_report_with(
+        pins: &[(&str, u32)],
+        siblings: impl Fn(u32) -> Vec<u32>,
+        isolated: &[u32],
+    ) -> SmtReport {
+        let mut report = SmtReport::default();
+        for (i, &(name_a, core_a)) in pins.iter().enumerate() {
+            let sibs = siblings(core_a);
+            for &(name_b, core_b) in &pins[i + 1..] {
+                if core_a == core_b {
+                    report
+                        .errors
+                        .push(format!("{name_a} and {name_b} are both pinned to CPU {core_a}"));
+                } else if sibs.contains(&core_b) {
+                    report.errors.push(format!(
+                        "{name_a} (CPU {core_a}) and {name_b} (CPU {core_b}) are SMT \
+                         siblings of one physical core — each would run at ~half speed"
+                    ));
+                }
+            }
+            for &sib in sibs.iter().filter(|&&c| c != core_a) {
+                let pinned_by_us = pins.iter().any(|&(_, c)| c == sib);
+                if !pinned_by_us && !isolated.contains(&sib) {
+                    report.warnings.push(format!(
+                        "{name_a} (CPU {core_a}): SMT sibling CPU {sib} is not isolated — \
+                         other threads can share this physical core (isolcpus={sib} or \
+                         disable SMT)"
+                    ));
+                }
+            }
+        }
+        report
+    }
+
     /// Whether NUMA node `node` exists (Linux sysfs); always `true`
     /// elsewhere — the field is informational off Linux.
     #[cfg(target_os = "linux")]
@@ -1557,6 +1706,68 @@ pub mod pin {
     #[cfg(not(target_os = "linux"))]
     pub fn numa_node_present(_node: u32) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::pin::{parse_cpu_list, smt_pin_report_with, thread_siblings};
+
+    #[test]
+    fn test_parse_cpu_list_handles_ranges_singles_and_garbage() {
+        assert_eq!(parse_cpu_list("0-3,8-11\n"), vec![0, 1, 2, 3, 8, 9, 10, 11]);
+        assert_eq!(parse_cpu_list("0,8"), vec![0, 8]);
+        assert_eq!(parse_cpu_list("5"), vec![5]);
+        assert_eq!(parse_cpu_list(""), Vec::<u32>::new());
+        assert_eq!(parse_cpu_list("x,3-1,2,2,0-"), vec![2], "malformed parts skipped");
+        assert_eq!(parse_cpu_list("0-4294967295"), Vec::<u32>::new(), "absurd span ignored");
+    }
+
+    /// Topology of the audit box: 8 cores × 2 threads, siblings N and N+8.
+    fn epyc_siblings(c: u32) -> Vec<u32> {
+        let base = c % 8;
+        vec![base, base + 8]
+    }
+
+    #[test]
+    fn test_smt_report_rejects_two_actors_on_one_physical_core() {
+        let r = smt_pin_report_with(
+            &[("consensus_core", 2), ("exec_lane_core", 10)],
+            epyc_siblings,
+            &[],
+        );
+        assert_eq!(r.errors.len(), 1, "{r:?}");
+        assert!(r.errors[0].contains("SMT"));
+        assert!(r.warnings.is_empty(), "siblings pinned by us are not 'unisolated': {r:?}");
+
+        let same = smt_pin_report_with(&[("a", 3), ("b", 3)], epyc_siblings, &[]);
+        assert_eq!(same.errors.len(), 1);
+    }
+
+    #[test]
+    fn test_smt_report_warns_on_unisolated_sibling_only() {
+        let r = smt_pin_report_with(
+            &[("consensus_core", 2), ("exec_lane_core", 4)],
+            epyc_siblings,
+            &[],
+        );
+        assert!(r.errors.is_empty(), "distinct physical cores: {r:?}");
+        assert_eq!(r.warnings.len(), 2, "{r:?}");
+
+        let isolated = smt_pin_report_with(
+            &[("consensus_core", 2), ("exec_lane_core", 4)],
+            epyc_siblings,
+            &[10, 12],
+        );
+        assert_eq!(isolated, super::pin::SmtReport::default());
+    }
+
+    #[test]
+    fn test_thread_siblings_always_contains_the_core() {
+        // Live sysfs (or the fallback): never empty, always includes
+        // the queried CPU — callers rely on that invariant.
+        assert!(thread_siblings(0).contains(&0));
+        assert_eq!(thread_siblings(u32::MAX - 1), vec![u32::MAX - 1]);
     }
 }
 

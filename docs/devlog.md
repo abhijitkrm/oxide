@@ -23970,3 +23970,13 @@ edge-value cube plus 20k generated triples. Parity, not a speedup:
 rustc 1.98 already paired the div/rem. A u64 hardware-division fast path
 was measured (10.2 ns) and rejected. New row `fixed/mul_div_half_up_wide`
 covers the >u64 path the audit noted was never benched (11.82 ns).
+
+### S-7: SMT-sibling checks in the pin module
+
+`online_cpus` counts logical CPUs, so two hot actors could be pinned to
+hyperthreads of one physical core and silently run at half speed. New:
+`parse_cpu_list` (also used by `online_cpus`), `thread_siblings(core)`,
+`isolated_cpus()`, and `smt_pin_report(pins) -> SmtReport { errors,
+warnings }` (errors: two pins on one physical core; warnings: a pinned
+core's sibling is neither pinned nor isolated). A missing `taskset` now
+yields a clear `NotFound` naming util-linux. Cold path; no bench.
