@@ -1233,6 +1233,12 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Changed
 
+- **`oxide-matcher` defaults to `--mode ring`** (`matcher`,
+  hft-audit-2 M-3), and multi mode no longer blocks async network
+  threads while waiting on a market worker.
+  - **In plain words:** the fast single-sequencer path is the
+    default, and multi-market mode can't freeze other clients.
+
 - **Typed transaction-rejection categories.** Module rejections
   (`ExecError::ModuleRejected`) now carry a stable
   `RejectCategory` — `insufficient_funds`, `unauthorized`,

@@ -613,3 +613,51 @@ async fn accept_order_entry_sets_tcp_nodelay() {
     );
     drop(client.await.expect("connect task").expect("connect"));
 }
+
+/// hft-audit-2 M-3: the multi-market transport helpers run the
+/// blocking matcher round trip off the async executor. On a
+/// current-thread runtime, a sibling task must make progress while
+/// orders are in flight, and the orders must still be answered.
+#[tokio::test(flavor = "current_thread")]
+async fn multi_submit_runs_off_the_executor_thread() {
+    let balances = Arc::new(crate::AtomicBalanceCache::new(1_000));
+    let (secret, owner) = test_account(3);
+    balances.set(&owner, 1_000_000_000_000);
+    let matcher = Arc::new(crate::MultiMarketMatcher::new(vec![cfg()], balances));
+    let order = signed_req(&secret, Side::Sell, 1);
+    let batch = vec![signed_req(&secret, Side::Sell, 2), signed_req(&secret, Side::Sell, 3)];
+    let ticker = tokio::spawn(async { 7u8 });
+    let one = submit_one_multi(&matcher, order).await;
+    let many = submit_batch_multi(&matcher, batch).await;
+    assert!(!one.rejected, "single order must be accepted: {one:?}");
+    assert_eq!(many.len(), 2);
+    assert!(many.iter().all(|r| !r.rejected), "batch orders must be accepted: {many:?}");
+    assert_eq!(ticker.await.expect("sibling task"), 7);
+}
+
+/// hft-audit-2 M-3: a panic inside the blocking multi-market call
+/// (an out-of-range market trips `submit_batch`'s range assert)
+/// becomes an aligned `EngineError` per order instead of killing the
+/// connection task.
+#[tokio::test(flavor = "current_thread")]
+async fn multi_batch_panic_maps_to_aligned_engine_errors() {
+    let balances = Arc::new(crate::AtomicBalanceCache::new(1_000));
+    let (secret, owner) = test_account(4);
+    balances.set(&owner, 1_000_000_000_000);
+    let matcher = Arc::new(crate::MultiMarketMatcher::new(vec![cfg()], balances));
+    let mut bad = signed_req(&secret, Side::Sell, 1);
+    bad.market = 9;
+    crate::protocol::sign_order(&mut bad, &secret);
+    let mut bad2 = bad;
+    bad2.nonce = 2;
+    crate::protocol::sign_order(&mut bad2, &secret);
+    let responses = submit_batch_multi(&matcher, vec![bad, bad2]).await;
+    assert_eq!(responses.len(), 2);
+    assert!(
+        responses
+            .iter()
+            .all(|r| r.rejected
+                && r.reject_reason == Some(crate::protocol::RejectReason::EngineError)),
+        "{responses:?}"
+    );
+}

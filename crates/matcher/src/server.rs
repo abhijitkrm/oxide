@@ -1292,23 +1292,61 @@ pub async fn run_server_ring(
 /// Splits the batch by market, sends each sub-batch to the correct
 /// market worker, and collects responses. Preserves the original
 /// order by tagging each response with its index.
-fn submit_batch_multi(
-    matcher: &crate::MultiMarketMatcher,
+///
+/// `MultiMarketMatcher::submit_batch` is synchronous: it verifies
+/// signatures, takes the shared nonce mutex, and blocks on
+/// `std::sync::mpsc::Receiver::recv` until every market worker
+/// answers. Called inline from a connection task, that parked a tokio
+/// worker thread for the whole exchange and stalled every other task
+/// scheduled on it (hft-audit-2 M-3). The call runs on the blocking
+/// pool instead, so the executor thread stays free to serve other
+/// connections. If the blocking task panics (for example, a worker
+/// died mid-batch, which `submit_batch` documents as a panic), every
+/// order gets an aligned `EngineError` instead of the connection task
+/// dying.
+async fn submit_batch_multi(
+    matcher: &Arc<crate::MultiMarketMatcher>,
     orders: Vec<OrderRequest>,
 ) -> Vec<OrderResponse> {
     if orders.is_empty() {
         return Vec::new();
     }
-    // `submit_batch` authenticates every request on this thread,
-    // routes each verified order by its own `market` field (single-
-    // and mixed-market batches both), and merges responses at their
-    // original positions — no transport-side grouping needed.
-    matcher.submit_batch(orders)
+    // `submit_batch` authenticates every request on the calling
+    // thread, routes each verified order by its own `market` field
+    // (single- and mixed-market batches both), and merges responses
+    // at their original positions — no transport-side grouping needed.
+    let n = orders.len();
+    let matcher = Arc::clone(matcher);
+    tokio::task::spawn_blocking(move || matcher.submit_batch(orders)).await.unwrap_or_else(|_| {
+        (0..n).map(|_| OrderResponse::rejected(RejectReason::EngineError)).collect()
+    })
 }
 
-/// Submit a single order through the multi-market parallel matcher.
-fn submit_one_multi(matcher: &crate::MultiMarketMatcher, req: OrderRequest) -> OrderResponse {
-    matcher.submit_one(req)
+/// Submit a single order through the multi-market parallel matcher —
+/// on the blocking pool, for the same reason as
+/// [`submit_batch_multi`]: `submit_one` blocks on an mpsc `recv`
+/// (hft-audit-2 M-3).
+async fn submit_one_multi(
+    matcher: &Arc<crate::MultiMarketMatcher>,
+    req: OrderRequest,
+) -> OrderResponse {
+    let matcher = Arc::clone(matcher);
+    tokio::task::spawn_blocking(move || matcher.submit_one(req))
+        .await
+        .unwrap_or_else(|_| OrderResponse::rejected(RejectReason::EngineError))
+}
+
+/// Dispatch a pre-authenticated action through the multi-market
+/// matcher — on the blocking pool, because the worker round trip is a
+/// blocking mpsc `recv` (hft-audit-2 M-3).
+async fn submit_action_multi(
+    matcher: &Arc<crate::MultiMarketMatcher>,
+    action: crate::protocol::VerifiedAction,
+) -> OrderResponse {
+    let matcher = Arc::clone(matcher);
+    tokio::task::spawn_blocking(move || matcher.submit_verified_action(action))
+        .await
+        .unwrap_or_else(|_| OrderResponse::rejected(RejectReason::EngineError))
 }
 
 /// Run a binary TCP server backed by the multi-market parallel
@@ -1369,7 +1407,7 @@ async fn handle_connection_multi(
                 let _ = socket.write_all(&encode_response(&resp)).await;
                 continue;
             };
-            let responses = submit_batch_multi(&matcher, orders);
+            let responses = submit_batch_multi(&matcher, orders).await;
             let batch_resp = crate::protocol::encode_batch_response(&responses);
             if socket.write_all(&batch_resp).await.is_err() {
                 break;
@@ -1397,7 +1435,7 @@ async fn handle_connection_multi(
             };
             // Ship the proof token — the market worker runs the nonce
             // check + dispatch without re-verifying.
-            let action_resp = matcher.submit_verified_action(verified);
+            let action_resp = submit_action_multi(&matcher, verified).await;
             if socket.write_all(&encode_response(&action_resp)).await.is_err() {
                 break;
             }
@@ -1414,7 +1452,7 @@ async fn handle_connection_multi(
                 let _ = socket.write_all(&encode_response(&rej)).await;
                 continue;
             };
-            let order_resp = submit_one_multi(&matcher, req);
+            let order_resp = submit_one_multi(&matcher, req).await;
             if socket.write_all(&encode_response(&order_resp)).await.is_err() {
                 break;
             }
@@ -1470,7 +1508,7 @@ pub async fn run_jsonrpc_tcp_server_multi(
                     };
                     // Ship the proof token — the market worker runs the
                     // nonce check + dispatch without re-verifying.
-                    let resp = matcher.submit_verified_action(verified);
+                    let resp = submit_action_multi(&matcher, verified).await;
                     let result = crate::jsonrpc::format_jsonrpc_response(&resp);
                     let response =
                         serde_json::json!({ "jsonrpc": "2.0", "result": result, "id": id });
@@ -1490,7 +1528,7 @@ pub async fn run_jsonrpc_tcp_server_multi(
 "#).await;
                     continue;
                 };
-                let resp = submit_one_multi(&matcher, order_req);
+                let resp = submit_one_multi(&matcher, order_req).await;
                 let result = crate::jsonrpc::format_jsonrpc_response(&resp);
                 let response = serde_json::json!({ "jsonrpc": "2.0", "result": result, "id": id });
                 let mut response_line = serde_json::to_string(&response).unwrap_or_default();
@@ -1576,7 +1614,7 @@ pub async fn run_fix_server_multi(
                     };
                     // Ship the proof token — the market worker runs the
                     // nonce check + dispatch without re-verifying.
-                    let resp = matcher.submit_verified_action(verified);
+                    let resp = submit_action_multi(&matcher, verified).await;
                     crate::fix::format_fix_execution_report_into(
                         &resp,
                         &cl_ord_id,
@@ -1600,7 +1638,7 @@ pub async fn run_fix_server_multi(
                     let _ = socket.write_all(report_buf.as_bytes()).await;
                     continue;
                 };
-                let resp = submit_one_multi(&matcher, req);
+                let resp = submit_one_multi(&matcher, req).await;
                 crate::fix::format_fix_execution_report_into(&resp, &cl_ord_id, &mut report_buf);
                 let _ = socket.write_all(report_buf.as_bytes()).await;
             }
@@ -1654,7 +1692,7 @@ pub async fn run_websocket_server_multi(
                         ws_sender.send(Message::Text(r#"{"error":"invalid order"}"#.into())).await;
                     continue;
                 };
-                let resp = submit_one_multi(&matcher, req);
+                let resp = submit_one_multi(&matcher, req).await;
                 let response = crate::ws::format_ws_response(&resp, 0);
                 if ws_sender.send(Message::Text(response.into())).await.is_err() {
                     break;

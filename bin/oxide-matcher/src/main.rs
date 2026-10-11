@@ -24,6 +24,14 @@
 //!
 //! # With a specific batch settlement interval (50ms)
 //! oxide-matcher --settlement-key <64-hex> --batch-interval 50
+//!
+//! # Order path: `ring` (default — single sequencer, SPSC rings),
+//! # `multi` (one worker per market), or `mutex` (compatibility)
+//! oxide-matcher --settlement-key <64-hex> --mode multi --markets 6
+//!
+//! # Ring-mode sequencer idle policy: spin ~200 µs before parking
+//! # (default) or park immediately (shared hosts)
+//! oxide-matcher --settlement-key <64-hex> --sequencer-idle park
 //! ```
 
 #![allow(clippy::cast_precision_loss)]
@@ -73,7 +81,14 @@ const DEFAULT_ACCOUNTS: usize = 10_000;
 /// Default initial balance per account (1T quote units).
 const DEFAULT_BALANCE: u64 = 1_000_000_000_000;
 
-/// Default number of markets for multi-market mode.
+/// Default order path. `ring` (single sequencer + SPSC rings) is
+/// the low-latency production path; `multi` and `mutex` are opt-in
+/// (hft-audit-2 M-3). Changing this changes what a bare
+/// `oxide-matcher` invocation serves, so update the usage docs too.
+const DEFAULT_MODE: &str = "ring";
+
+/// Default number of markets for multi-market mode (`--mode multi`
+/// only; ring and mutex modes serve market 0).
 const DEFAULT_MARKETS: usize = 128;
 
 /// Default balance shard count.
@@ -109,7 +124,14 @@ fn parse_cli() -> CliConfig {
         fix_port: parse_flag("--fix-port", 36002u16),
         ws_port: parse_flag("--ws-port", 36003u16),
         batch_interval: parse_flag("--batch-interval", 100u64),
-        mode: parse_flag("--mode", "multi".to_string()),
+        // `ring` is the default (hft-audit-2 M-3): one pinned-able
+        // single-writer sequencer fed by lock-free SPSC rings. `multi`
+        // (one worker thread per market, a shared nonce mutex, mpsc
+        // round trips) is estimated at least 2x slower at 8+ connections
+        // and oversubscribes the box at its 128-market default; it
+        // stays available for multi-market deployments via
+        // `--mode multi`.
+        mode: parse_flag("--mode", DEFAULT_MODE.to_string()),
         markets: parse_flag("--markets", DEFAULT_MARKETS),
         accounts_cap: parse_flag("--accounts-cap", DEFAULT_ACCOUNTS_CAP),
         // Signature domain: signatures produced under another chain
@@ -488,6 +510,13 @@ fn parse_flag_opt<T: std::str::FromStr>(name: &str) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// hft-audit-2 M-3: a bare `oxide-matcher` must serve the
+    /// low-latency ring path, not the multi-market worker pool.
+    #[test]
+    fn default_mode_is_ring() {
+        assert_eq!(DEFAULT_MODE, "ring");
+    }
 
     #[test]
     fn settlement_key_required() {

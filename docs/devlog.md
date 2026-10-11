@@ -23708,3 +23708,15 @@ Measured push→response p50/p99 on the EPYC box: 20 µs gaps
 11.7/404 → 2.2/11.3 µs; 50 µs gaps 7.2/17.9 → 0.7/4.9 µs; 150 µs gaps
 10.7/479 → 2.9/11.4 µs; 1 ms gaps (past the window) unchanged
 (12.3/41.8 vs 13.4/37.2 µs).
+
+### M-3: ring mode is the default; multi mode stops blocking tokio
+
+A bare `oxide-matcher` ran multi mode with 128 markets: a global nonce
+mutex per order, and a tokio worker blocked in `mpsc::Receiver::recv()`
+inside the async handler, stalling every other connection on that
+worker. `--mode` now defaults to `ring` (`DEFAULT_MODE`); multi mode's
+`submit_one_multi` / `submit_batch_multi` / `submit_action_multi` run
+on `spawn_blocking`, and a panic there (out-of-range market) yields an
+aligned `EngineError` per order instead of killing the connection task.
+Still open: multi mode's shared nonce mutex (per-market rings and
+sharded nonces are a redesign).
