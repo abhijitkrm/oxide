@@ -220,33 +220,56 @@ pub fn signing_message(req: &OrderRequest) -> Vec<u8> {
     signing_message_with_chain_id(req, CHAIN_ID)
 }
 
+/// Length in bytes of an order signing message: the domain tag, the
+/// chain ID (8), market/side/type/tif (1 each), price/qty/nonce (8
+/// each), and the 20-byte owner. Derived from the layout so a domain
+/// tag change cannot desynchronise it.
+pub const SIGNING_MESSAGE_LEN: usize = SIGNING_DOMAIN.len() + 8 + 1 + 1 + 1 + 1 + 8 + 8 + 8 + 20;
+
 /// [`signing_message`] with an explicit chain ID — the production
 /// form. The devnet default [`CHAIN_ID`] is only for tests and
 /// local tooling.
 #[must_use]
 pub fn signing_message_with_chain_id(req: &OrderRequest, chain_id: u64) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(SIGNING_DOMAIN.len() + 8 + 1 + 1 + 1 + 1 + 8 + 8 + 8 + 20);
-    msg.extend_from_slice(SIGNING_DOMAIN);
-    msg.extend_from_slice(&chain_id.to_le_bytes());
-    msg.push(req.market);
-    msg.push(match req.side {
+    signing_message_array(req, chain_id).to_vec()
+}
+
+/// The order signing message as a fixed-size stack array — the
+/// single encoder behind [`signing_message_with_chain_id`]. The
+/// verify paths use this form so authenticating an order does not
+/// heap-allocate its message (hft-audit-2 M-6).
+///
+/// Budget: a ~70-byte memcpy-shaped fill, no allocation.
+#[must_use]
+pub fn signing_message_array(req: &OrderRequest, chain_id: u64) -> [u8; SIGNING_MESSAGE_LEN] {
+    let mut msg = [0u8; SIGNING_MESSAGE_LEN];
+    let mut at = 0usize;
+    let mut put = |bytes: &[u8]| {
+        msg[at..at + bytes.len()].copy_from_slice(bytes);
+        at += bytes.len();
+    };
+    put(SIGNING_DOMAIN);
+    put(&chain_id.to_le_bytes());
+    put(&[req.market]);
+    put(&[match req.side {
         Side::Buy => 0,
         Side::Sell => 1,
-    });
-    msg.push(match req.order_type {
+    }]);
+    put(&[match req.order_type {
         OrderType::Limit => 0,
         OrderType::Market => 1,
         OrderType::PostOnly => 2,
-    });
-    msg.push(match req.tif {
+    }]);
+    put(&[match req.tif {
         TimeInForce::Gtc => 0,
         TimeInForce::Ioc => 1,
         TimeInForce::Fok => 2,
-    });
-    msg.extend_from_slice(&req.price.0.to_le_bytes());
-    msg.extend_from_slice(&req.qty.0.to_le_bytes());
-    msg.extend_from_slice(&req.nonce.to_le_bytes());
-    msg.extend_from_slice(&req.owner.0);
+    }]);
+    put(&req.price.0.to_le_bytes());
+    put(&req.qty.0.to_le_bytes());
+    put(&req.nonce.to_le_bytes());
+    put(&req.owner.0);
+    debug_assert_eq!(at, SIGNING_MESSAGE_LEN, "signing message layout drifted from its length");
     msg
 }
 
@@ -289,7 +312,7 @@ pub fn verify_order_with_chain_id(req: &OrderRequest, chain_id: u64) -> bool {
     let Ok(signature) = crypto::ed25519::Ed25519Signature::from_slice(&req.signature) else {
         return false;
     };
-    let msg = signing_message_with_chain_id(req, chain_id);
+    let msg = signing_message_array(req, chain_id);
     crypto::ed25519::verify_message(&pubkey, &msg, &signature).is_ok()
 }
 
@@ -317,7 +340,7 @@ pub fn sign_order_with_chain_id(
     let verifying = secret.verifying_key();
     req.pubkey = verifying.to_bytes();
     req.owner = crypto::ed25519::owner_address(&verifying);
-    let msg = signing_message_with_chain_id(req, chain_id);
+    let msg = signing_message_array(req, chain_id);
     let sig = crypto::ed25519::sign_message(secret, &msg);
     req.signature = sig.to_bytes();
 }
@@ -375,15 +398,28 @@ impl VerifiedOrder {
     /// Admission accepts the inconsistency — the signed payload still
     /// binds the same owner account either way — and consensus never
     /// consumes these signatures.
+    ///
+    /// A batch of one skips the batch machinery entirely and runs the
+    /// per-item `verify_strict` path (hft-audit-2 M-6). Batch
+    /// verification only pays off when several items share the
+    /// multi-scalar multiplication. At n = 1 it is slower than
+    /// `verify_strict` and costs extra allocations (key, signature,
+    /// message and index vectors) on the single-order fast path that
+    /// every non-batch client takes.
     #[must_use]
     pub fn batch_with_chain_id(reqs: &[OrderRequest], chain_id: u64) -> Vec<Option<Self>> {
+        if let [req] = reqs {
+            return vec![Self::with_chain_id(*req, chain_id)];
+        }
         // Phase 1 — per-item checks that batch verification cannot
         // express: key parsing, the owner-binding derivation, and
         // signature parsing. Only parse-valid triples enter the
         // batch; everything else is a positional `None`.
         let mut out: Vec<Option<Self>> = Vec::with_capacity(reqs.len());
         let mut pending: Vec<usize> = Vec::with_capacity(reqs.len());
-        let mut messages: Vec<Vec<u8>> = Vec::with_capacity(reqs.len());
+        // Fixed-size messages: one contiguous allocation for the
+        // whole batch instead of one heap `Vec` per item.
+        let mut messages: Vec<[u8; SIGNING_MESSAGE_LEN]> = Vec::with_capacity(reqs.len());
         let mut keys: Vec<crypto::ed25519::Ed25519PublicKey> = Vec::with_capacity(reqs.len());
         let mut signatures: Vec<crypto::ed25519::Ed25519Signature> = Vec::with_capacity(reqs.len());
         for (i, req) in reqs.iter().enumerate() {
@@ -399,7 +435,7 @@ impl VerifiedOrder {
             match item {
                 Some((pubkey, signature)) => {
                     pending.push(i);
-                    messages.push(signing_message_with_chain_id(req, chain_id));
+                    messages.push(signing_message_array(req, chain_id));
                     keys.push(pubkey);
                     signatures.push(signature);
                     out.push(None);
@@ -411,7 +447,8 @@ impl VerifiedOrder {
             return out;
         }
         // Phase 2 — one batch equation over the collected triples.
-        let message_refs: Vec<&[u8]> = messages.iter().map(Vec::as_slice).collect();
+        let message_refs: Vec<&[u8]> =
+            messages.iter().map(<[u8; SIGNING_MESSAGE_LEN]>::as_slice).collect();
         let all_valid = crypto::ed25519::verify_batch(&message_refs, &keys, &signatures).is_ok();
         for (slot, &i) in pending.iter().enumerate() {
             let ok = all_valid
@@ -1308,6 +1345,49 @@ mod tests {
         let out = VerifiedOrder::batch_with_chain_id(&[bad], CHAIN_ID);
         assert_eq!(out.len(), 1);
         assert!(out[0].is_none());
+    }
+
+    /// hft-audit-2 M-6: the stack-array encoder must produce exactly
+    /// the wire-contract bytes the old `Vec` encoder did — clients
+    /// sign this layout, so any drift invalidates every signature.
+    #[test]
+    fn signing_message_array_matches_wire_layout() {
+        let mut req = signed_order(0x0102_0304_0506_0708, 0x11);
+        req.market = 3;
+        req.side = Side::Sell;
+        req.order_type = OrderType::PostOnly;
+        req.tif = TimeInForce::Fok;
+        let chain_id = 0xA1B2_C3D4_E5F6_0718u64;
+        let mut expected = Vec::new();
+        expected.extend_from_slice(SIGNING_DOMAIN);
+        expected.extend_from_slice(&chain_id.to_le_bytes());
+        expected.extend_from_slice(&[3, 1, 2, 2]);
+        expected.extend_from_slice(&req.price.0.to_le_bytes());
+        expected.extend_from_slice(&req.qty.0.to_le_bytes());
+        expected.extend_from_slice(&req.nonce.to_le_bytes());
+        expected.extend_from_slice(&req.owner.0);
+        assert_eq!(expected.len(), SIGNING_MESSAGE_LEN);
+        assert_eq!(signing_message_array(&req, chain_id).as_slice(), expected.as_slice());
+        assert_eq!(signing_message_with_chain_id(&req, chain_id), expected);
+    }
+
+    /// hft-audit-2 M-6: a batch of one takes the `verify_strict`
+    /// path and must admit/reject exactly as the per-item verifier.
+    #[test]
+    fn batch_of_one_matches_single_verify() {
+        let good = signed_order(1, 0x21);
+        let mut forged = signed_order(2, 0x22);
+        forged.qty = Qty(forged.qty.0 + 1_000);
+        let mut wrong_owner = signed_order(3, 0x23);
+        wrong_owner.owner = addr(0xAB);
+        for (req, admit) in [(good, true), (forged, false), (wrong_owner, false)] {
+            let out = VerifiedOrder::batch_with_chain_id(&[req], CHAIN_ID);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].is_some(), admit, "{req:?}");
+            assert_eq!(out[0], VerifiedOrder::with_chain_id(req, CHAIN_ID));
+        }
+        // Chain-domain separation holds on the n = 1 path too.
+        assert!(VerifiedOrder::batch_with_chain_id(&[good], CHAIN_ID + 1)[0].is_none());
     }
 
     #[test]

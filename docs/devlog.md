@@ -23720,3 +23720,15 @@ on `spawn_blocking`, and a panic there (out-of-range market) yields an
 aligned `EngineError` per order instead of killing the connection task.
 Still open: multi mode's shared nonce mutex (per-market rings and
 sharded nonces are a redesign).
+
+### M-6: single orders verified with `verify_strict`
+
+Every single-order request ran the Ed25519 batch equation over one item
+(slower than `verify_strict`) and allocated five vectors including a
+`Vec<Vec<u8>>` of signing messages. With n = 1, `batch_with_chain_id`
+now calls `verify_strict`, and the signing message is a 70-byte stack
+array (`signing_message_array`, `SIGNING_MESSAGE_LEN`) — the single
+encoder; the batch path stores fixed-size arrays in one allocation. A
+golden test pins the wire bytes. Verify 62–65 → 53 µs per order (~15%),
+four fewer allocations. Cross-connection batching (the 3× lever) is
+still open.

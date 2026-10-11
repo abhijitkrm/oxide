@@ -48,6 +48,12 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Single orders verify ~15% faster** (`matcher`, hft-audit-2 M-6):
+  `verify_strict` with a stack signing message instead of a one-item
+  batch verify (62–65 → 53 µs, four fewer allocations).
+  - **In plain words:** checking a lone order's signature costs less
+    CPU, so each core admits more orders.
+
 - **Matcher sequencer spins briefly before sleeping** (`matcher`,
   hft-audit-2 M-2): new `--sequencer-idle spin|park` (default
   `spin`). Push→response p50 at 50 µs order spacing 7.2 → 0.7 µs,
