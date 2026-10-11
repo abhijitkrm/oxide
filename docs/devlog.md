@@ -23791,3 +23791,14 @@ pushed between the drain and the arm was silently lost; with an idle
 fanout that is the *first* update after a quiet period, every time. The
 re-check now broadcasts what it pops. A lock-step publish/receive test
 lost update 0 on every run before the fix.
+
+### N-10: mirror exec certificates only when one was added
+
+The pump called `rpc.record_exec_certificates(engine.exec_certificates())`
+every pass; `exec_certificates` builds a `BTreeMap` and clones every
+retained certificate, so an idle validator paid that allocation churn
+at ~1 kHz. The engine now bumps `exec_cert_generation` on each insert
+into `exec_certs` / `verified_exec_certs`, and the pump pushes to the
+mirror only when the generation moved. Removals don't bump it — the
+mirror has its own cap and serving an already-pruned (still valid)
+cert is harmless.

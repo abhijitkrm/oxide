@@ -1108,6 +1108,10 @@ fn run_consensus_loop(
     // and admitted together at its end (hft-audit-2 N-2).
     let mut gossip_batch: Vec<TxBytes> = Vec::new();
 
+    // `engine.exec_cert_generation()` as of the last RPC mirror push
+    // (hft-audit-2 N-10); `None` forces the first push.
+    let mut mirrored_cert_generation: Option<u64> = None;
+
     loop {
         // Set when this pass did work whose follow-up belongs to the
         // next pass — a consumed frame, verdict or gossiped tx, a
@@ -2147,8 +2151,17 @@ fn run_consensus_loop(
         // dedups by height); a syncing client verifies the cert
         // against its own validator-set checkpoint, so serving the
         // bytes costs this node no trust assumption.
+        //
+        // Only when the engine gained a certificate since the last
+        // push (hft-audit-2 N-10): `exec_certificates` builds a
+        // `BTreeMap` and clones every retained cert, which at the
+        // idle loop's ~1 kHz was pure allocator churn.
         if let Some(rpc) = rpc {
-            rpc.record_exec_certificates(engine.exec_certificates());
+            let generation = engine.exec_cert_generation();
+            if mirrored_cert_generation != Some(generation) {
+                rpc.record_exec_certificates(engine.exec_certificates());
+                mirrored_cert_generation = Some(generation);
+            }
         }
 
         // Feed the certified serve store: every committed height —

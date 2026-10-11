@@ -48,6 +48,12 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Idle validator loop stops re-copying execution certificates**
+  (`consensus`, `node`, hft-audit-2 N-10): the RPC mirror is updated
+  only when a new certificate exists, instead of every loop pass.
+  - **In plain words:** less needless memory churn on every consensus
+    loop pass.
+
 - **Order path skips the clock read when rate limiting is off**
   (`matcher`, hft-audit-2 M-15).
   - **In plain words:** one less system call per order in the default

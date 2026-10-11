@@ -857,6 +857,10 @@ pub struct OxideBft {
     /// different certificate for the same block re-verifies. Cleared
     /// at epoch rotation with the rest of the epoch-scoped state.
     verified_qcs: std::collections::VecDeque<QuorumCertificate>,
+    /// Bumped on every insert into `exec_certs` / `verified_exec_certs`
+    /// so a driver can mirror [`exec_certificates`](Self::exec_certificates)
+    /// only when something new exists (hft-audit-2 N-10).
+    exec_cert_generation: u64,
     /// How long the vote path may block waiting for the execution
     /// lane to produce a certified height's local root. Default
     /// `EXEC_ATTEST_WAIT` (250 ms) suits drivers that call `vote`
@@ -1082,6 +1086,7 @@ impl OxideBft {
             exec_certs: std::collections::BTreeMap::new(),
             verified_exec_certs: std::collections::BTreeMap::new(),
             verified_qcs: std::collections::VecDeque::with_capacity(VERIFIED_QC_MEMO),
+            exec_cert_generation: 0,
             exec_attest_wait: votes::EXEC_ATTEST_WAIT,
             rejected_headers: std::collections::HashSet::new(),
             last_attestation: None,
@@ -1417,6 +1422,15 @@ impl OxideBft {
             }
         }
         RepairOutcome::NoAnchor
+    }
+
+    /// A counter that changes whenever a certificate is added to the
+    /// set [`exec_certificates`](Self::exec_certificates) returns.
+    /// Removals (retention, epoch rotation) do not bump it: a mirror
+    /// that already holds a pruned cert may keep serving it.
+    #[must_use]
+    pub fn exec_cert_generation(&self) -> u64 {
+        self.exec_cert_generation
     }
 
     /// The execution certificates this engine holds, keyed by

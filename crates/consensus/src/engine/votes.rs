@@ -996,6 +996,7 @@ impl OxideBft {
             return false;
         }
         self.verified_exec_certs.insert(cert.height.value(), cert.clone());
+        self.exec_cert_generation = self.exec_cert_generation.wrapping_add(1);
         true
     }
 
@@ -1213,6 +1214,7 @@ impl OxideBft {
                     let i = usize::from(*v);
                     signer_bitmap[i / 8] |= 1u8 << (i % 8);
                 }
+                self.exec_cert_generation = self.exec_cert_generation.wrapping_add(1);
                 self.exec_certs.insert(
                     att.height.value(),
                     ExecCertificate {
