@@ -23634,3 +23634,20 @@ memo is cleared with the epoch-scoped state, and is inert in
 conformance mode. Test: the formed QC is a hit, a twin with a forged
 aggregate is not and still fails `deliver_qc`, and a follower's
 delivered QC becomes a hit.
+
+### X-2: a preverify-cache miss costs one recovery, not a run
+
+`dispatch_run` took the preverified path only if *every* tx in the run
+hit the ingest cache; one miss (a dropped gossip frame, a tx first seen
+in the block) sent the whole run through `handle_batch`, re-recovering
+every cached sender — ~50 µs × run length on the EPYC box. Each tx is
+now resolved on its own: a hit is consumed as `verified_locally`, the
+misses are recovered together through the module's own
+`preverify_batch` (rayon for the EVM, and equally this node's own
+recovery), and a miss the module cannot preverify goes in with a zero
+sender and `verified_locally = false` so the module's
+recover-and-compare gate fails it with the same decode / chain-id /
+recovery check `handle_batch` applies. Execution results are identical
+on either path; a single probe per tx replaces the old
+`contains_key` + `remove` pair. New test: a block with one cached and
+one never-ingested tx dispatches both through the preverified path.

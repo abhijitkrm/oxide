@@ -48,6 +48,14 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **One missed transaction no longer slows its whole batch**
+  (`executor`, hft-audit-2 X-2): block execution reuses the
+  signature checks done at admission for every transaction that has
+  one and checks only the ones it missed. Before, a single missing
+  entry made it re-check every transaction in the run (~50 µs each).
+  - **In plain words:** a block no longer pays to re-verify hundreds
+    of signatures because the node missed one transaction's gossip.
+
 - **Each quorum certificate is signature-checked once per node**
   (`consensus`, hft-audit-2 N-4): the leader no longer re-verifies a
   QC it just formed, and voters no longer re-verify a `high_qc` they

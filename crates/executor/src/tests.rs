@@ -683,6 +683,35 @@ fn preverify_cache_key_matches_between_ingest_and_execute() {
     assert_eq!(fallback, 0, "fallback path should not have been used (no cache miss)");
 }
 
+/// hft-audit-2 X-2: one cache miss must not push the whole run off
+/// the preverified path. A block carrying one ingested (cached) tx
+/// and one tx this node never saw dispatches both through
+/// `handle_batch_preverified`, recovering only the miss.
+#[test]
+fn preverify_cache_miss_does_not_force_whole_run_fallback() {
+    let mut executor = test_executor(100);
+    let tracker = Arc::new(PreverifyTrackingModule::new());
+    executor.register_module(tracker.clone());
+
+    let cached = make_tx_with_fee_and_sender(2, &[0xAA], 0, 0, 0xA1);
+    executor.ingest_tx(cached.clone());
+    // Never ingested here — e.g. its gossip frame was dropped.
+    let uncached = make_tx_with_fee_and_sender(2, &[0xBB], 0, 0, 0xB2);
+
+    let block = FinalizedBlock {
+        context: types::BlockContext::default(),
+        height: Height::new(0),
+        txs: vec![cached, uncached],
+        signers: Vec::new(),
+    };
+    executor.finalize_block(&block);
+
+    let preverified = *primitives::sync::lock_state(&tracker.preverified_calls);
+    let fallback = *primitives::sync::lock_state(&tracker.fallback_calls);
+    assert_eq!(preverified, 2, "both txs take the preverified path");
+    assert_eq!(fallback, 0, "a single miss must not re-route the run to handle_batch");
+}
+
 /// A test module with a *real* `preverify_batch` (returns a
 /// non-zero recovered sender, like the EVM's signature recovery)
 /// that deliberately does NOT override `handle_batch_preverified`.

@@ -355,40 +355,75 @@ impl Executor {
 
     /// Dispatch one run to its module and return per-tx results.
     ///
-    /// Phase E: zero-copy payload handling. If every tx in the run
-    /// has a cached sender, borrowed `PreverifiedTx`s are built
-    /// straight from the block bytes and the run goes through the
-    /// preverified path — parallel when it clears
-    /// `parallel_threshold` (speculation is sound inside a run:
-    /// the planner only batches contiguous same-module txs). If any
-    /// sender is uncached, the fallback `handle_batch` path is used
-    /// directly — no preverified Vec constructed, no wasted clones.
-    /// (Previously the preverified Vec was always built, cloning
-    /// payloads for txs the fallback path never used.)
+    /// Every run goes through the preverified path — parallel when
+    /// it clears `parallel_threshold` (speculation is sound inside a
+    /// run: the planner only batches contiguous same-module txs) —
+    /// with each tx's sender resolved individually (hft-audit-2 X-2):
+    ///
+    /// - a preverify-cache hit is this node's own ingest-time
+    ///   recovery over these exact bytes → `verified_locally`;
+    /// - a miss (gossip race, dropped frame, a tx first seen in the
+    ///   block) is recovered now through the module's own
+    ///   `preverify_batch` (rayon-parallel for the EVM) — also this
+    ///   node's recovery, so also `verified_locally`;
+    /// - a miss the module cannot preverify (undecodable, wrong
+    ///   chain, bad signature) is passed with a zero sender and
+    ///   `verified_locally = false`, so the module's
+    ///   recover-and-compare gate fails it exactly as `handle_batch`
+    ///   would (same decode / chain-id / recovery check).
+    ///
+    /// Previously the run took this path only if *every* tx hit the
+    /// cache; one miss sent the whole run through `handle_batch`,
+    /// re-recovering every cached sender (~50 µs each on the EPYC
+    /// target) — a block-sized cliff from a single dropped frame.
+    /// Results are identical either way: both paths decode, check
+    /// the chain id and execute under the recovered signer.
     pub(crate) fn dispatch_run(
         &self,
         module: &dyn Module,
         group: &[GroupedTx<'_>],
         preverify_cache: &mut primitives::digest_map::DigestMap<[u8; 20]>,
     ) -> Vec<Result<Vec<Event>, ExecError>> {
-        let all_cached = group.iter().all(|t| preverify_cache.contains_key(&t.tx_hash));
-        if !all_cached {
-            let batch: Vec<(TxContext, &[u8])> = group.iter().map(|t| (t.ctx, t.payload)).collect();
-            return module.handle_batch(&batch);
+        // One probe per tx: a hit is consumed here (the entry has
+        // served its purpose), a miss is remembered for recovery.
+        let cached: Vec<Option<[u8; 20]>> =
+            group.iter().map(|t| preverify_cache.remove(&t.tx_hash)).collect();
+        let miss_payloads: Vec<&[u8]> = group
+            .iter()
+            .zip(&cached)
+            .filter(|(_, hit)| hit.is_none())
+            .map(|(t, _)| t.payload)
+            .collect();
+        let mut recovered = if miss_payloads.is_empty() {
+            Vec::new()
+        } else {
+            module.preverify_batch(&miss_payloads)
         }
-        // All senders are pre-recovered — build borrowed
-        // `PreverifiedTx`s straight from the block bytes.
+        .into_iter();
+        // Borrowed `PreverifiedTx`s straight from the block bytes.
         let preverified: Vec<PreverifiedTx<'_>> = group
             .iter()
-            .map(|t| PreverifiedTx {
-                raw: t.payload,
-                sender: preverify_cache.remove(&t.tx_hash).unwrap_or([0u8; 20]),
-                // Provenance (F-06): `all_cached` held, so every
-                // `t.tx_hash` — computed locally from the same bytes
-                // `t.payload` borrows — is in the ingest-verified
-                // cache. The sender IS this node's own recovery;
-                // consumers may skip re-verification.
-                verified_locally: true,
+            .zip(&cached)
+            .map(|(t, hit)| match hit {
+                // Provenance (F-06): `t.tx_hash` — computed locally
+                // from the same bytes `t.payload` borrows — was in
+                // the ingest-verified cache.
+                Some(sender) => {
+                    PreverifiedTx { raw: t.payload, sender: *sender, verified_locally: true }
+                }
+                // `preverify_batch` keeps input order, one result per
+                // miss; a module that does not pre-recover returns
+                // `verified_locally = false` itself.
+                None => match recovered.next() {
+                    Some(Ok(pv)) => PreverifiedTx {
+                        raw: t.payload,
+                        sender: pv.sender,
+                        verified_locally: pv.verified_locally,
+                    },
+                    Some(Err(_)) | None => {
+                        PreverifiedTx { raw: t.payload, sender: [0u8; 20], verified_locally: false }
+                    }
+                },
             })
             .collect();
         // Each tx keeps its own authenticated envelope context —
