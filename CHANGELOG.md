@@ -48,6 +48,12 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Committed blocks are copied once, not twice, on the consensus
+  thread** (`executor`, hft-audit-2 X-7): the block log and the
+  execution queue share one copy of each finalized block.
+  - **In plain words:** handing a committed block to execution no
+    longer duplicates every transaction in it.
+
 - **Faster transaction lookups in the mempool and gossip dedup**
   (`mempool`, `node`, hft-audit-2 N-8): maps keyed by transaction
   hash skip the general-purpose `SipHash` and use the hash's own bytes.

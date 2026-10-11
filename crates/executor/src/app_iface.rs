@@ -573,7 +573,11 @@ impl AppInterface for Executor {
             // below) when execution lands. `finalized` is inserted
             // BEFORE the hand-off so the backlog drain can see this
             // block too.
-            self.insert_finalized(block.height.value(), block.clone());
+            // One deep copy, shared by the block log and the lane
+            // queue (hft-audit-2 X-7): each used to take its own
+            // clone of every tx's bytes on the consensus thread.
+            let shared = Arc::new(block.clone());
+            self.insert_finalized(block.height.value(), Arc::clone(&shared));
             *primitives::sync::lock_state(&self.next_proposal_height) =
                 block.height.value().saturating_add(1); // M2 fix
             let lane_dead = {
@@ -589,7 +593,7 @@ impl AppInterface for Executor {
                 // thread stalling inside a blocking channel send.
                 // Consensus keeps pumping — catch-up, timeouts, QC
                 // adoption all still work — while the backlog drains.
-                s.pending.push_back(block.clone());
+                s.pending.push_back(shared);
                 s.enqueued = Some(block.height.value());
                 // Capping the threshold at `retention - 1` keeps the
                 // maximum backlog (deque + one in-flight) inside the
@@ -684,7 +688,7 @@ impl AppInterface for Executor {
                 s.enqueued = Some(block.height.value());
                 s.executed = Some(block.height.value());
             }
-            self.insert_finalized(block.height.value(), block.clone());
+            self.insert_finalized(block.height.value(), Arc::new(block.clone()));
             *primitives::sync::lock_state(&self.next_proposal_height) =
                 block.height.value().saturating_add(1); // M2 fix
         }

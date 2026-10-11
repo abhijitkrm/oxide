@@ -23814,3 +23814,13 @@ so their bytes are uniform and not attacker-choosable — the property
 `DigestHasher` relies on. Not separately benched (the audit estimates
 ~0.3 µs per selected tx; `mempool/select_100_of_10000` measured
 3.4 µs/tx before).
+
+### X-7: one shared copy of each finalized block
+
+`finalize_block` on the consensus thread deep-cloned the
+`FinalizedBlock` (every tx's bytes) twice in async-lane mode — once
+into the `finalized` log, once into the lane's `pending` queue — and
+the backlog drain cloned it a third time out of the log. Both
+structures now hold `Arc<FinalizedBlock>`: one deep copy per commit,
+shared, and the drain's lookup is a refcount bump. The audit's ~1–2 ms
+per 10k-tx block is the copy volume removed.

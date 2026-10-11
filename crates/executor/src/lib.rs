@@ -1643,7 +1643,7 @@ struct ExecSync {
     /// as a *signal* — crossing it sets `saturated` and the engine
     /// throttles new commits at the source. Condvar-signalled on
     /// every push; drained strictly in commit order.
-    pending: std::collections::VecDeque<FinalizedBlock>,
+    pending: std::collections::VecDeque<Arc<FinalizedBlock>>,
     /// `pending` exceeded [`EXEC_LANE_DEPTH`] — the engine reads
     /// this via `exec_saturated` and withholds votes + defers
     /// commit walks until the worker drains the deque empty. The
@@ -1732,7 +1732,7 @@ pub struct Executor {
     /// Finalized blocks, keyed by height. Bounded to the newest
     /// [`MAX_RETAINED_HISTORY`] heights — full history is the
     /// journal's job; this map serves recent-height queries only.
-    finalized: Mutex<BTreeMap<u64, FinalizedBlock>>,
+    finalized: Mutex<BTreeMap<u64, Arc<FinalizedBlock>>>,
     /// State roots per finalized height. Same retention bound.
     state_roots: Mutex<BTreeMap<u64, Hash>>,
     /// The next proposal height.

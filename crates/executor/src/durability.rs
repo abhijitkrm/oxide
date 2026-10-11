@@ -621,7 +621,7 @@ impl Executor {
                     // Stage, don't execute yet: the backlog drain
                     // below replays in height order through the same
                     // path the live commit used.
-                    self.insert_finalized(height, block);
+                    self.insert_finalized(height, std::sync::Arc::new(block));
                     covered = Some(height);
                     applied_tip = height;
                     report.blocks_replayed += 1;
@@ -766,7 +766,7 @@ impl Executor {
                         if height != expected {
                             return Err(DurabilityError::JournalGap { expected, found: height });
                         }
-                        self.insert_finalized(height, block);
+                        self.insert_finalized(height, std::sync::Arc::new(block));
                         covered = height;
                     }
                     other => return Err(DurabilityError::UnknownRecordTag(other)),

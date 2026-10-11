@@ -2719,7 +2719,7 @@ fn finalized_pruning_pins_unexecuted_heights() {
     // Nothing executed: every committed height is unexecuted —
     // the pin holds all of them even past the window.
     for h in 0..4 {
-        executor.insert_finalized(h, finalized_block(h, 1, h));
+        executor.insert_finalized(h, Arc::new(finalized_block(h, 1, h)));
     }
     assert_eq!(
         primitives::sync::lock_state(&executor.finalized).len(),
@@ -2733,7 +2733,7 @@ fn finalized_pruning_pins_unexecuted_heights() {
         let (lock, _cv) = &*executor.exec_sync;
         primitives::sync::lock_state(lock).executed = Some(2);
     }
-    executor.insert_finalized(4, finalized_block(4, 1, 4));
+    executor.insert_finalized(4, Arc::new(finalized_block(4, 1, 4)));
     let kept: Vec<u64> =
         primitives::sync::lock_state(&executor.finalized).keys().copied().collect();
     assert_eq!(kept, vec![3, 4], "only executed heights may be evicted");

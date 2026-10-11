@@ -10,6 +10,7 @@
 //! leaving finalized blocks unexecuted.
 
 use super::{Executor, FinalizedBlock, InsertRetained, LaneDeath};
+use std::sync::Arc;
 
 impl Executor {
     /// Phase D: enable the async execution lane.
@@ -94,7 +95,7 @@ impl Executor {
                                 // empty (not merely below the threshold)
                                 // keeps the flag honest — a half-drained
                                 // backlog is still debt.
-                                let batch: Vec<FinalizedBlock> = s.pending.drain(..).collect();
+                                let batch: Vec<Arc<FinalizedBlock>> = s.pending.drain(..).collect();
                                 s.saturated = false;
                                 break batch;
                             }
@@ -192,7 +193,7 @@ impl Executor {
     /// non-nested critical sections keep the lock graph flat. A
     /// stale read only makes eviction more conservative, never
     /// wrong.
-    pub(crate) fn insert_finalized(&self, height: u64, block: FinalizedBlock) {
+    pub(crate) fn insert_finalized(&self, height: u64, block: Arc<FinalizedBlock>) {
         let executed = {
             let (lock, _cv) = &*self.exec_sync;
             primitives::sync::lock_state(lock).executed
