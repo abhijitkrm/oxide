@@ -8583,3 +8583,49 @@ fn qc_evidence_verify_context_resolves_stale_carried_qc() {
         Ok(None)
     ));
 }
+
+/// hft-audit-2 N-3: a pending tail of large blocks must never produce
+/// a WAL entry above the recovery cap — recovery would reject it as
+/// torn and roll the vote lock back. Bodies are kept lowest height
+/// first within the budget; the rest persist header-only.
+#[test]
+fn wal_entry_pending_bodies_stay_under_entry_cap() {
+    let mut engine = OxideBft::new(Arc::new(MockApp::new()), single_validator_set());
+    let body_len = 7 << 20; // three of these exceed the 15 MiB budget
+    let mut prev = Hash::ZERO;
+    for tag in 0..3u8 {
+        let height = u64::from(tag);
+        let header = BlockHeader {
+            height: Height::new(height),
+            view: View::new(height),
+            epoch: Epoch::new(0),
+            prev_block: prev,
+            tx_root: Hash([0xC0 + tag; 32]),
+            high_qc: None,
+            timeout_cert: None,
+            proposer: Hash::ZERO,
+            timestamp: 0,
+            proposer_signature: None,
+            exec_cert: None,
+            body_commitment: Hash::ZERO,
+            body_hash: Hash::ZERO,
+        };
+        let proposal = Proposal {
+            height: header.height,
+            txs: vec![TxBytes::new(vec![tag; body_len])],
+            attestation: None,
+        };
+        let mut encoded = Vec::new();
+        proposal.encode(&mut encoded);
+        assert!(super::persist::proposal_encoded_bound(&proposal) >= encoded.len());
+        prev = OxideBft::block_hash(&header);
+        engine.blocks.insert(prev, (header, BlockBody::Complete(proposal)));
+    }
+
+    let entry = engine.wal_entry(false);
+    let bodies: Vec<bool> = entry.pending.iter().map(|(_, b)| b.is_some()).collect();
+    assert_eq!(bodies, vec![true, true, false], "lowest bodies first, the rest header-only");
+    let mut payload = Vec::new();
+    entry.encode(&mut payload);
+    assert!(payload.len() <= 16 << 20, "entry {} B exceeds the recovery cap", payload.len());
+}

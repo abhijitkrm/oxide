@@ -24043,3 +24043,21 @@ precedes the signature check, and an undecodable key still fails as
 `InvalidQcSignature`. Crypto bench: 128 signers 3.53 → 1.93 ms per
 verify; at 4 validators the difference is within noise. The verify
 pool's `QcVerifyMaterial` still carries compressed keys.
+
+### N-3 (safety half): WAL entries can no longer exceed the recovery cap
+
+Each WAL entry carries the uncommitted tail — up to 8 blocks *with
+bodies*. The writer had no size limit, but recovery treats any entry
+over `MAX_WAL_ENTRY_BYTES` (16 MiB) as a torn tail and falls back to the
+previous entry. At the chain's 16 MiB block budget a 2-block tail
+crossed it, so a crash right after such a vote would recover the
+*previous* vote lock — and a restarted validator could sign a
+conflicting vote. `pending_tail` now keeps bodies lowest height first
+within `MAX_PERSISTED_BODY_BYTES` (cap − 1 MiB headroom for the safety
+fields, headers, QC, an attached validator set and recent signers),
+sized by a no-encode upper bound (`proposal_encoded_bound`); bodies past
+the budget persist header-only, the existing `Awaiting` shape recovery
+already handles (the commit walk waits for block sync: liveness, not
+safety). The performance half of N-3 — not re-writing bodies on every
+vote, via a body log keyed by hash — is still open; it changes the WAL
+format.

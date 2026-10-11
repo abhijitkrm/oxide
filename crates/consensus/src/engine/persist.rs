@@ -177,24 +177,44 @@ impl OxideBft {
     /// restored map must match the pre-crash resolution capability —
     /// a header lost on restart is strictly worse than a body still
     /// in flight.
+    ///
+    /// Bodies are kept, lowest height first, only while their encoded
+    /// size fits [`crate::wal::MAX_PERSISTED_BODY_BYTES`]; later
+    /// blocks persist header-only (hft-audit-2 N-3). Without the
+    /// budget a tail of large blocks produced an entry recovery
+    /// rejects as torn, silently rolling the vote lock back.
     fn pending_tail(&self) -> Vec<(super::BlockHeader, Option<types::Proposal>)> {
-        let mut tail: Vec<(super::BlockHeader, Option<types::Proposal>)> = self
+        let mut tail: Vec<(&super::BlockHeader, &super::BlockBody)> = self
             .blocks
-            .iter()
-            .filter(|(_, (header, _))| {
+            .values()
+            .filter(|(header, _)| {
                 self.last_committed.is_none_or(|(_, committed)| header.height > committed)
             })
-            .map(|(_, (header, body))| {
+            .map(|(header, body)| (header, body))
+            .collect();
+        tail.sort_by_key(|(header, _)| header.height.value());
+        tail.truncate(crate::wal::MAX_PERSISTED_PENDING);
+        let mut body_budget = crate::wal::MAX_PERSISTED_BODY_BYTES;
+        tail.into_iter()
+            .map(|(header, body)| {
                 let body = match body {
-                    super::BlockBody::Complete(proposal) => Some(proposal.clone()),
+                    super::BlockBody::Complete(proposal) => {
+                        let size = proposal_encoded_bound(proposal);
+                        if size <= body_budget {
+                            body_budget -= size;
+                            Some(proposal.clone())
+                        } else {
+                            // Out of budget: this and every higher
+                            // body persist header-only.
+                            body_budget = 0;
+                            None
+                        }
+                    }
                     super::BlockBody::Awaiting => None,
                 };
                 (header.clone(), body)
             })
-            .collect();
-        tail.sort_by_key(|(header, _)| header.height.value());
-        tail.truncate(crate::wal::MAX_PERSISTED_PENDING);
-        tail
+            .collect()
     }
 
     pub(crate) fn wal_entry(&self, include_set: bool) -> crate::wal::WalEntry {
@@ -577,4 +597,13 @@ impl OxideBft {
             self.next_height = height.saturating_next();
         }
     }
+}
+
+/// Upper bound on `proposal`'s codec-encoded size without encoding it:
+/// height (8) + tx-count varint (≤ 10) + each tx's bytes plus its
+/// length varint (≤ 10) + the attestation flag, length and bytes.
+pub(crate) fn proposal_encoded_bound(proposal: &types::Proposal) -> usize {
+    let txs: usize = proposal.txs.iter().map(|tx| tx.as_bytes().len().saturating_add(10)).sum();
+    let attestation = proposal.attestation.as_ref().map_or(0, |a| a.len().saturating_add(10));
+    19usize.saturating_add(txs).saturating_add(attestation)
 }

@@ -127,6 +127,23 @@ const MAX_WAL_ENTRY_BYTES: usize = 16 << 20;
 /// replay (the walk stops at the first missing body either way).
 pub(crate) const MAX_PERSISTED_PENDING: usize = 8;
 
+/// Budget for the pending tail's proposal *bodies* in one entry
+/// (hft-audit-2 N-3).
+///
+/// Unit: bytes (an upper bound on the bodies' encoded size). Origin:
+/// an entry over [`MAX_WAL_ENTRY_BYTES`] is still written, but
+/// recovery treats it as a torn tail and falls back to the previous
+/// entry — losing the vote lock it recorded, so a restart could sign
+/// a conflicting vote. At the chain's 16 MiB block budget a 2-block
+/// tail already crossed the cap. Bodies are persisted lowest height
+/// first while they fit in this budget; the rest persist as bare
+/// headers, which recovery already handles (the commit walk stops at
+/// the first missing body and block sync supplies it — a liveness
+/// cost, never a safety one). The 1 MiB of headroom covers the safety
+/// fields, headers, `high_qc`, an attached validator set (~100 B per
+/// validator) and `recent_signers`.
+pub(crate) const MAX_PERSISTED_BODY_BYTES: usize = MAX_WAL_ENTRY_BYTES - (1 << 20);
+
 /// WAL size that triggers a checkpoint compaction.
 ///
 /// Unit: bytes appended since the last checkpoint (or since file

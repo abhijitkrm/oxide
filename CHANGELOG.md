@@ -541,6 +541,15 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Consensus WAL entries stay within what recovery accepts**
+  (`consensus`, hft-audit-2 N-3): with very large blocks, a vote's WAL
+  record could exceed the 16 MiB recovery limit and be discarded as
+  torn after a crash, rolling back the validator's vote lock. Block
+  bodies in the record are now capped; bodies past the cap are
+  recovered through block sync.
+  - **In plain words:** a validator that crashes while handling huge
+    blocks can no longer forget that it already voted.
+
 - **Pin validation rejects two hot threads on one physical core**
   (`node`, hft-audit-2 S-7): `consensus_core` and `exec_lane_core` on
   the same CPU or on SMT siblings now fail config validation, and
