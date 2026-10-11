@@ -54,6 +54,11 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **CRC-32 for journal/WAL records ~7× faster on x86, identical
+  output** (`primitives`, hft-audit-2 S-3).
+  - **In plain words:** checking a 1 MB block for disk corruption now
+    takes 0.09 ms instead of 0.65 ms; files on disk are unchanged.
+
 - **Faster keccak (assembly) and short-input BLAKE3** (`crypto`,
   hft-audit-2 S-9): 14–23% on the per-tx hashes.
   - **In plain words:** computing Ethereum transaction hashes and the

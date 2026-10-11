@@ -19,12 +19,14 @@
 //! | `hash/from_slice`        | < 15 ns         | 32-byte copy + length validation    |
 //! | `digest_map/get_hit`     | < 10 ns         | one multiply-mix + one probe; the   |
 //! |                          |                 | `SipHash` map it replaced: ~25 ns   |
+//! | `crc32/{4KiB,1MiB}`      | ≥ 8 GB/s on     | slice-by-8 software path (~1.5–2    |
+//! |                          | PCLMULQDQ hosts | GB/s) — hft-audit-2 S-3             |
 //!
 //! These functions sit on the matching-engine hot path (every fill does
 //! a notional and a fee `mul_div`), so their budgets are inputs to the
 //! Phase 3 order-op gate (p50 < 200ns, README → Roadmap).
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use primitives::Hash;
 use primitives::digest_map::DigestMap;
 use primitives::fixed::{self, Price, Qty};
@@ -97,5 +99,21 @@ fn bench_fixed(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_fixed);
+fn bench_crc32(c: &mut Criterion) {
+    // Journal-record / WAL-entry shapes: a small entry and a ~1 MiB
+    // block body (hft-audit-2 S-3: CRC runs over whole block bodies
+    // inside the journal mutex).
+    let data: Vec<u8> =
+        (0u32..(1 << 20)).map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes()[2]).collect();
+    let mut g = c.benchmark_group("crc32");
+    for (name, len) in [("4KiB", 4096usize), ("1MiB", 1 << 20)] {
+        g.throughput(Throughput::Bytes(len as u64));
+        g.bench_function(name, |b| {
+            b.iter(|| black_box(primitives::crc32::checksum(black_box(&data[..len]))));
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(benches, bench_fixed, bench_crc32);
 criterion_main!(benches);

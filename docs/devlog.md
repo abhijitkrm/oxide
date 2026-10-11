@@ -23946,3 +23946,17 @@ preimages < 256 B with one `blake3::hash` over a stack buffer
 (byte-identical to the streaming form, tested). p50: `hash_one/32b`
 137.9 → 106.7 ns, `hash_pair` 220.5 → 189.1 ns, `keccak256/64b` 452.6 →
 377.1 ns. `recover_address` unchanged within noise (EC-bound).
+
+### S-3: PCLMULQDQ CRC-32 for journal and WAL records
+
+Journal and WAL records checksum whole block bodies at ~1.5 GB/s with
+slice-by-8. Inputs ≥ 128 B now go to a PCLMULQDQ folding kernel (4
+lanes, Barrett reduction, zlib/Linux constants) selected by
+`is_x86_feature_detected!("pclmulqdq")` + `("sse4.1")`; other hosts keep
+slice-by-8 (`software_update`). The kernel is a safe `#[target_feature]`
+fn with no raw-pointer loads; the only `#[allow(unsafe_code)]` is the
+call site, with a SAFETY comment (fallocate pattern). Format tests: KAT
+0xCBF43926 through both paths; equality with software at every length
+0..1100 × 16 alignments; 400 seeded inputs up to 65 KB; arbitrary start
+values. `crc32/4KiB` 2.498 µs → 352 ns; `crc32/1MiB` 647 → 92.2 µs
+(10.6 GiB/s).

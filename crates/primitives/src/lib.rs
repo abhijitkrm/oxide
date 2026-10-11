@@ -876,11 +876,52 @@ pub mod sync {
 /// for the WAL's former bitwise loop, which LLVM optimizes to the
 /// same speed) — ~4.7×. The journal checksums whole block batches
 /// on the commit path, so throughput there is commit latency.
+///
+/// On `x86_64` hosts with PCLMULQDQ + SSE4.1 (every x86 server CPU since
+/// 2010), inputs of at least [`crc32::CLMUL_MIN_LEN`] bytes take a
+/// carry-less-multiply folding path instead (hft-audit-2 S-3): four
+/// 128-bit lanes folded 64 bytes per step, then a Barrett reduction to
+/// 32 bits — the Intel "Fast CRC Computation Using PCLMULQDQ" scheme
+/// (Gopal et al., 2009) as implemented in zlib/Linux/`crc32fast`. The
+/// feature check is `is_x86_feature_detected!` (one cached atomic load);
+/// hosts without it, and other architectures, keep slice-by-8. Both
+/// paths produce bit-identical output (pinned by tests) — the on-disk
+/// formats depend on it.
 pub mod crc32 {
+    /// Shortest input routed to the PCLMULQDQ path. The folding loop
+    /// needs 64 bytes to seed its four lanes plus the 128→32-bit
+    /// reduction tail; below ~128 bytes that fixed cost is not repaid
+    /// against slice-by-8 (the threshold zlib and `crc32fast` use).
+    pub const CLMUL_MIN_LEN: usize = 128;
+
     /// CRC-32 of `data`.
     #[must_use]
     pub fn checksum(data: &[u8]) -> u32 {
-        let mut crc = 0xFFFF_FFFF_u32;
+        #[cfg(target_arch = "x86_64")]
+        {
+            if data.len() >= CLMUL_MIN_LEN
+                && std::arch::is_x86_feature_detected!("pclmulqdq")
+                && std::arch::is_x86_feature_detected!("sse4.1")
+            {
+                #[allow(unsafe_code)]
+                // SAFETY: `clmul::update` is a `#[target_feature(enable =
+                // "pclmulqdq,sse4.1")]` function; calling it is sound iff
+                // the running CPU supports both features, which the two
+                // `is_x86_feature_detected!` checks above just proved.
+                // The function body itself is safe code (no raw-pointer
+                // loads) — the feature contract is the only invariant.
+                let crc = unsafe { clmul::update(0xFFFF_FFFF, data) };
+                return !crc;
+            }
+        }
+        !software_update(0xFFFF_FFFF, data)
+    }
+
+    /// The portable slice-by-8 path: advances the raw (pre-xorout) CRC
+    /// register `crc` over `data`. `checksum` = `!software_update(!0,
+    /// data)`; the PCLMULQDQ path also uses it for its sub-16-byte tail.
+    #[must_use]
+    pub fn software_update(mut crc: u32, data: &[u8]) -> u32 {
         let (chunks, rest) = data.as_chunks::<8>();
         for c in chunks {
             let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]) ^ crc;
@@ -897,7 +938,116 @@ pub mod crc32 {
         for &byte in rest {
             crc = (crc >> 8) ^ TABLES[0][((crc ^ u32::from(byte)) & 0xFF) as usize];
         }
-        !crc
+        crc
+    }
+
+    /// PCLMULQDQ folding for the reflected IEEE polynomial.
+    ///
+    /// Constants are `x^k mod P(x)` values in the bit-reflected domain
+    /// (Gopal et al. §"Folding"; identical to zlib's `crc32_simd` and
+    /// Linux `crc32-pclmul_asm.S`): `K1/K2` fold a lane 512 bits
+    /// forward (4-lane loop), `K3/K4` fold 128 bits (1-lane loop and
+    /// lane merge), `K5` reduces 96→64 bits, and `P_X`/`U_PRIME` are the
+    /// polynomial and its Barrett constant `floor(x^64 / P(x))`, both
+    /// reflected. Changing any of them changes every on-disk checksum.
+    #[cfg(target_arch = "x86_64")]
+    mod clmul {
+        use std::arch::x86_64::{
+            __m128i, _mm_and_si128, _mm_clmulepi64_si128, _mm_cvtsi32_si128, _mm_extract_epi32,
+            _mm_set_epi32, _mm_set_epi64x, _mm_srli_si128, _mm_xor_si128,
+        };
+
+        const K1: i64 = 0x1_5444_2bd4;
+        const K2: i64 = 0x1_c6e4_1596;
+        const K3: i64 = 0x1_7519_97d0;
+        const K4: i64 = 0x0_ccaa_009e;
+        const K5: i64 = 0x1_63cd_6124;
+        const P_X: i64 = 0x1_DB71_0641;
+        const U_PRIME: i64 = 0x1_F701_1641;
+
+        /// Advance the raw CRC register `crc` over `data`
+        /// (`data.len() >= 64`; [`super::CLMUL_MIN_LEN`] guarantees it).
+        ///
+        /// Safe code throughout — 16-byte loads go through
+        /// `u64::from_le_bytes` + `_mm_set_epi64x` (which LLVM lowers to
+        /// one `movdqu`), so the only obligation on callers is the
+        /// target-feature contract stated at the `checksum` call site.
+        #[target_feature(enable = "pclmulqdq,sse4.1")]
+        #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+        // Justification: the casts reinterpret bit patterns between the
+        // u32/u64 CRC domain and the signed lane types the intrinsics
+        // take — no arithmetic meaning is attached to the sign.
+        pub(super) fn update(crc: u32, data: &[u8]) -> u32 {
+            debug_assert!(data.len() >= 64);
+            let (blocks, tail) = data.as_chunks::<16>();
+            let (seed, rest) = blocks.split_at(4.min(blocks.len()));
+            if seed.len() < 4 {
+                return super::software_update(crc, data);
+            }
+
+            // Seed four lanes with the first 64 bytes; fold the running
+            // register into the lowest 32 bits of lane 3 (the CRC is
+            // linear, so pre-xoring the state into the first bytes is
+            // exactly "continue from `crc`").
+            let mut x3 = _mm_xor_si128(load(&seed[0]), _mm_cvtsi32_si128(crc as i32));
+            let mut x2 = load(&seed[1]);
+            let mut x1 = load(&seed[2]);
+            let mut x0 = load(&seed[3]);
+
+            // Fold 64 bytes per step while four full blocks remain.
+            let k1k2 = _mm_set_epi64x(K2, K1);
+            let (quads, singles) = rest.as_chunks::<4>();
+            for q in quads {
+                x3 = fold(x3, load(&q[0]), k1k2);
+                x2 = fold(x2, load(&q[1]), k1k2);
+                x1 = fold(x1, load(&q[2]), k1k2);
+                x0 = fold(x0, load(&q[3]), k1k2);
+            }
+
+            // Merge the four lanes, then fold any leftover 16-byte blocks.
+            let k3k4 = _mm_set_epi64x(K4, K3);
+            let mut x = fold(x3, x2, k3k4);
+            x = fold(x, x1, k3k4);
+            x = fold(x, x0, k3k4);
+            for b in singles {
+                x = fold(x, load(b), k3k4);
+            }
+
+            // 128 → 64 bits.
+            let low32 = _mm_set_epi32(0, 0, 0, !0);
+            let x = _mm_xor_si128(_mm_clmulepi64_si128::<0x10>(x, k3k4), _mm_srli_si128::<8>(x));
+            let x = _mm_xor_si128(
+                _mm_clmulepi64_si128::<0x00>(_mm_and_si128(x, low32), _mm_set_epi64x(0, K5)),
+                _mm_srli_si128::<4>(x),
+            );
+
+            // Barrett reduction 64 → 32 bits (bit-reflected variant: the
+            // result is the upper half of the low 64-bit word).
+            let pu = _mm_set_epi64x(U_PRIME, P_X);
+            let t1 = _mm_clmulepi64_si128::<0x10>(_mm_and_si128(x, low32), pu);
+            let t2 = _mm_clmulepi64_si128::<0x00>(_mm_and_si128(t1, low32), pu);
+            let crc = _mm_extract_epi32::<1>(_mm_xor_si128(x, t2)) as u32;
+
+            super::software_update(crc, tail)
+        }
+
+        /// `a·k_lo ⊕ a·k_hi ⊕ b` — fold lane `a` forward onto block `b`.
+        #[inline]
+        #[target_feature(enable = "pclmulqdq,sse4.1")]
+        fn fold(a: __m128i, b: __m128i, keys: __m128i) -> __m128i {
+            let lo = _mm_clmulepi64_si128::<0x00>(a, keys);
+            let hi = _mm_clmulepi64_si128::<0x11>(a, keys);
+            _mm_xor_si128(_mm_xor_si128(b, lo), hi)
+        }
+
+        /// Unaligned 16-byte little-endian load without raw pointers.
+        #[inline]
+        #[target_feature(enable = "pclmulqdq,sse4.1")]
+        #[allow(clippy::cast_possible_wrap)]
+        fn load(block: &[u8; 16]) -> __m128i {
+            let (lo, hi) = block.as_chunks::<8>().0.split_at(1);
+            _mm_set_epi64x(u64::from_le_bytes(hi[0]) as i64, u64::from_le_bytes(lo[0]) as i64)
+        }
     }
 
     /// `TABLES[0]` is the classic byte table; `TABLES[k][i]` is the
@@ -954,6 +1104,86 @@ pub mod crc32 {
         fn known_answers() {
             assert_eq!(checksum(b"123456789"), 0xCBF4_3926);
             assert_eq!(checksum(b""), 0);
+            assert_eq!(!super::software_update(!0, b"123456789"), 0xCBF4_3926);
+            // Through the PCLMULQDQ path too (≥ CLMUL_MIN_LEN bytes):
+            // the check string repeated, against the bitwise definition.
+            let long: Vec<u8> = b"123456789".iter().copied().cycle().take(1000).collect();
+            assert_eq!(checksum(&long), reference(&long));
+        }
+
+        /// hft-audit-2 S-3: the dispatching `checksum` (PCLMULQDQ on
+        /// capable x86 hosts) must equal the software slice-by-8 path
+        /// at every length across the `CLMUL_MIN_LEN` boundary, the
+        /// 64-byte fold stride and the 16-byte tail, at every alignment
+        /// in a 16-byte window — and the bitwise definition on large
+        /// inputs. The on-disk journal/WAL formats depend on it.
+        #[test]
+        fn clmul_path_matches_software_at_all_lengths_and_alignments() {
+            let data: Vec<u8> =
+                (0u32..8192).map(|i| i.wrapping_mul(2_246_822_519).to_le_bytes()[3]).collect();
+            for start in 0..16 {
+                for len in 0..1100 {
+                    let s = &data[start..start + len];
+                    let sw = !super::software_update(!0, s);
+                    assert_eq!(checksum(s), sw, "start {start} len {len}");
+                }
+            }
+            for len in [4095, 4096, 4097, 8192 - 16] {
+                let s = &data[..len];
+                assert_eq!(checksum(s), reference(s), "len {len}");
+            }
+        }
+
+        /// Randomised equality over many (offset, length, content)
+        /// triples from a fixed-seed splitmix64 stream — deterministic
+        /// (testing-standards: no ambient randomness) yet covering
+        /// content patterns the structured sweep above does not.
+        #[test]
+        fn clmul_path_matches_software_on_pseudorandom_inputs() {
+            let mut state = 0x0123_4567_89AB_CDEF_u64;
+            let mut next = || {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^ (z >> 31)
+            };
+            let mut buf = vec![0u8; 70_000];
+            for b in buf.chunks_mut(8) {
+                let w = next().to_le_bytes();
+                b.copy_from_slice(&w[..b.len()]);
+            }
+            for _ in 0..400 {
+                let start = usize::try_from(next() % 64).unwrap();
+                let len = usize::try_from(next() % 65_000).unwrap();
+                let s = &buf[start..start + len];
+                assert_eq!(checksum(s), !super::software_update(!0, s), "start {start} len {len}");
+            }
+        }
+
+        /// The PCLMULQDQ kernel itself, called directly with arbitrary
+        /// starting registers, matches the software path — so the
+        /// equality tests above are not comparing software with itself
+        /// on a capable host. Skips (passes) on hosts without the
+        /// features.
+        #[cfg(target_arch = "x86_64")]
+        #[test]
+        fn clmul_update_matches_software_directly() {
+            if !(std::arch::is_x86_feature_detected!("pclmulqdq")
+                && std::arch::is_x86_feature_detected!("sse4.1"))
+            {
+                return;
+            }
+            let data: Vec<u8> =
+                (0u32..5000).map(|i| i.wrapping_mul(7).wrapping_add(3).to_le_bytes()[0]).collect();
+            for len in 64..600 {
+                for init in [0xFFFF_FFFF_u32, 0, 0x1234_5678] {
+                    #[allow(unsafe_code)]
+                    // SAFETY: both required CPU features were detected above.
+                    let hw = unsafe { super::clmul::update(init, &data[..len]) };
+                    assert_eq!(hw, super::software_update(init, &data[..len]), "len {len}");
+                }
+            }
         }
 
         #[test]
