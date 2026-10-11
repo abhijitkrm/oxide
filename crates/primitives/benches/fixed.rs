@@ -15,6 +15,8 @@
 //! | `fixed/notional`         | < 10 ns         | a single `u128` multiply — the floor |
 //! | `fixed/mul_div_half_up`  | < 150 ns        | `u128` div is software-emulated;    |
 //! |                          |                 | margin over `notional` = the divide |
+//! | `fixed/mul_div_half_up_wide` | < 60 ns     | product > `u64::MAX`: the `u128` |
+//! |                          |                 | software divide path                |
 //! | `fixed/qty_checked_ops`  | < 5 ns          | checked `u64` add+sub pair          |
 //! | `hash/from_slice`        | < 15 ns         | 32-byte copy + length validation    |
 //! | `digest_map/get_hit`     | < 10 ns         | one multiply-mix + one probe; the   |
@@ -50,6 +52,19 @@ fn bench_fixed(c: &mut Criterion) {
                 black_box(1_000_000),
                 black_box(10),
                 black_box(10_000),
+            ))
+        });
+    });
+
+    // The 128-bit division path (hft-audit-2 §8: the row above never
+    // leaves u64): a 1e12-raw notional times a 1e10 scale factor —
+    // product ~1e22 > u64::MAX — divided back down by PRICE_SCALE.
+    c.bench_function("fixed/mul_div_half_up_wide", |b| {
+        b.iter(|| {
+            black_box(fixed::mul_div_half_up(
+                black_box(1_000_000_000_000),
+                black_box(10_000_000_000),
+                black_box(100_000_000),
             ))
         });
     });

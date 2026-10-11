@@ -54,6 +54,11 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Fee rounding divides exactly once by construction; a bench covers
+  the 128-bit path** (`primitives`, hft-audit-2 S-8).
+  - **In plain words:** same speed and results, now guaranteed by
+    the code rather than the compiler.
+
 - **CRC-32 for journal/WAL records ~7× faster on x86, identical
   output** (`primitives`, hft-audit-2 S-3).
   - **In plain words:** checking a 1 MB block for disk corruption now

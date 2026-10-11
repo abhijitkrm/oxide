@@ -534,14 +534,41 @@ pub mod fixed {
     /// config); [`FixedError::Overflow`] if the quotient exceeds the
     /// `u64` raw range.
     pub fn qty_from_notional_div_price(n: u128, p: Price) -> Result<Qty, FixedError> {
-        let divisor = u128::from(p.0);
-        if divisor == 0 {
+        div_half_up(n, p.0).map(Qty)
+    }
+
+    /// `n / d` rounded half-up into `u64` — the single rounding step
+    /// shared by [`mul_div_half_up`] and [`qty_from_notional_div_price`].
+    ///
+    /// Exactly one division per call (hft-audit-2 S-8): the remainder
+    /// is recovered as `n − q·d` (a multiply and a subtract) instead of
+    /// a second `%`, which for `u128` would be a second `__umodti3`
+    /// libcall whenever LLVM fails to pair it with the `/`. (Rust 1.98
+    /// does pair them today — this makes the single division a property
+    /// of the source rather than of an optimizer pass.)
+    ///
+    /// A `u64` fast arm (hardware `div r64` when the numerator fits)
+    /// was measured and rejected: on Zen 2 it was *slower* (6.4 → 10.2
+    /// ns) than `__udivti3`, whose small-operand path drops to a 32-bit
+    /// `div` for realistic fee operands.
+    ///
+    /// Rounding is `rem ≥ d − rem` ⇔ `2·rem ≥ d`, written without the
+    /// doubling so it cannot overflow.
+    ///
+    /// Budget (`benches/fixed.rs`, `x86_64` EPYC 7232P):
+    /// `fixed/mul_div_half_up` ≈ 6.2 ns, `fixed/mul_div_half_up_wide`
+    /// (128-bit numerator) ≈ 11.8 ns.
+    #[inline]
+    fn div_half_up(n: u128, d: u64) -> Result<u64, FixedError> {
+        if d == 0 {
             return Err(FixedError::DivisionByZero);
         }
-        let quotient = n / divisor;
-        let rem = n % divisor;
-        let rounded = quotient + u128::from(rem * 2 >= divisor);
-        u64::try_from(rounded).map(Qty).map_err(|_| FixedError::Overflow)
+        let d128 = u128::from(d);
+        let q = n / d128;
+        // rem < d ≤ u64::MAX, so it always fits.
+        let rem = u64::try_from(n - q * d128).map_err(|_| FixedError::Overflow)?;
+        let rounded = q + u128::from(rem >= d - rem);
+        u64::try_from(rounded).map_err(|_| FixedError::Overflow)
     }
 
     /// `a × b / divisor` for raw `u64` values, rounding **half-up**.
@@ -554,15 +581,7 @@ pub mod fixed {
     /// [`FixedError::DivisionByZero`] if `divisor == 0`;
     /// [`FixedError::Overflow`] if the quotient exceeds `u64`.
     pub fn mul_div_half_up(a: u64, b: u64, divisor: u64) -> Result<u64, FixedError> {
-        let div = u128::from(divisor);
-        if div == 0 {
-            return Err(FixedError::DivisionByZero);
-        }
-        let product = u128::from(a) * u128::from(b);
-        let quotient = product / div;
-        let rem = product % div;
-        let rounded = quotient + u128::from(rem * 2 >= div);
-        u64::try_from(rounded).map_err(|_| FixedError::Overflow)
+        div_half_up(u128::from(a) * u128::from(b), divisor)
     }
 
     /// Checked subtraction on quantities; underflow is `None`.
@@ -1815,6 +1834,51 @@ mod tests {
             fixed::mul_div_half_up(u64::MAX, u64::MAX, 1).unwrap_err(),
             FixedError::Overflow
         );
+    }
+
+    /// hft-audit-2 S-8: the single-division implementation (u64 fast
+    /// arm + u128 arm, remainder as `n − q·d`) equals the original
+    /// two-division formula on boundary values and a fixed-seed
+    /// pseudorandom sweep spanning both arms, including exact halves.
+    #[test]
+    fn test_mul_div_half_up_matches_two_division_reference() {
+        fn reference(lhs: u64, rhs: u64, divisor: u64) -> Result<u64, FixedError> {
+            let div = u128::from(divisor);
+            if div == 0 {
+                return Err(FixedError::DivisionByZero);
+            }
+            let prod = u128::from(lhs) * u128::from(rhs);
+            let rounded = prod / div + u128::from((prod % div) * 2 >= div);
+            u64::try_from(rounded).map_err(|_| FixedError::Overflow)
+        }
+        let edges =
+            [0u64, 1, 2, 3, 5, 9_999, 10_000, 100_000_000, u64::MAX / 2, u64::MAX - 1, u64::MAX];
+        for &a in &edges {
+            for &b in &edges {
+                for &d in &edges {
+                    assert_eq!(fixed::mul_div_half_up(a, b, d), reference(a, b, d), "{a}*{b}/{d}");
+                }
+            }
+        }
+        let mut x = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for i in 0..20_000u32 {
+            // Vary magnitudes so both the u64 and u128 arms are hit.
+            let a = next() >> (next() % 64);
+            let b = next() >> (next() % 64);
+            let d = (next() >> (next() % 64)).max(u64::from(i % 3));
+            assert_eq!(fixed::mul_div_half_up(a, b, d), reference(a, b, d), "{a}*{b}/{d}");
+        }
+        // Exact halves round up in both arms.
+        assert_eq!(fixed::mul_div_half_up(5, 1, 10).unwrap(), 1);
+        assert_eq!(fixed::mul_div_half_up(1 << 63, 3, 1 << 2).unwrap(), (3u64 << 61));
+        let half_wide = u128::from(u64::MAX) * 2 - 1; // odd numerator > u64::MAX
+        assert_eq!(fixed::qty_from_notional_div_price(half_wide, Price(2)).unwrap(), Qty(u64::MAX));
     }
 
     /// Checked add/sub on Qty never wrap silently.

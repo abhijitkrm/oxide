@@ -23960,3 +23960,13 @@ call site, with a SAFETY comment (fallocate pattern). Format tests: KAT
 0..1100 × 16 alignments; 400 seeded inputs up to 65 KB; arbitrary start
 values. `crc32/4KiB` 2.498 µs → 352 ns; `crc32/1MiB` 647 → 92.2 µs
 (10.6 GiB/s).
+
+### S-8: one division per half-up rounding, by construction
+
+`mul_div_half_up` and `qty_from_notional_div_price` now share
+`div_half_up`, which divides once and recovers the remainder as
+`n - q*d`; a test pins it to the old two-division formula on an
+edge-value cube plus 20k generated triples. Parity, not a speedup:
+rustc 1.98 already paired the div/rem. A u64 hardware-division fast path
+was measured (10.2 ns) and rejected. New row `fixed/mul_div_half_up_wide`
+covers the >u64 path the audit noted was never benched (11.82 ns).
