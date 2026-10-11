@@ -407,7 +407,14 @@ impl MarketDataFanout {
                 self.subscribers.push(sub);
                 self.subscriber_count.store(self.subscribers.len() as u64, Ordering::Relaxed);
             }
-            if self.rx.pop().is_some() || drained {
+            // A message popped by this re-check must be broadcast,
+            // not just used as a wake signal — discarding it silently
+            // lost an update that raced the arm.
+            if let Some(msg) = self.rx.pop() {
+                self.broadcast(&msg);
+                continue;
+            }
+            if drained {
                 continue;
             }
             if self.rx.producer_gone() {
@@ -551,6 +558,26 @@ mod tests {
         assert!(msg.contains("\"feed\":\"l1\""));
         assert!(msg.contains("\"best_bid_price\":1500000000"));
         assert!(msg.contains("\"best_ask_price\":null"));
+    }
+
+    /// Lock-step publish → receive: every update must arrive. The
+    /// fanout's post-arm re-check used to pop a message that raced
+    /// the arm and discard it, so some step here timed out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn racing_update_is_broadcast_not_dropped() {
+        let (publisher, _fanout) = start();
+        let mut rx = publisher.subscribe(vec![FeedType::Trades], vec![]);
+        while publisher.subscriber_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+        for i in 0..5_000u64 {
+            publisher.publish_trade(0, Price(1_000 + i), Qty(1), true);
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("update {i} was lost"))
+                .expect("fanout alive");
+            assert!(msg.contains(&format!("\"price\":{}", 1_000 + i)), "update {i} out of order");
+        }
     }
 
     #[tokio::test]

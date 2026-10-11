@@ -461,6 +461,13 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Market-data fanout no longer drops updates** (`matcher`): an
+  update published while the fanout was going idle (typically the
+  first one after a quiet period) was popped and discarded instead
+  of being sent to subscribers.
+  - **In plain words:** subscribers no longer miss the first price
+    update after a lull.
+
 - **Order-entry sockets set `TCP_NODELAY`** (`matcher`, hft-audit-2
   M-5): acks no longer wait on Nagle × delayed-ACK (up to 40 ms) for
   clients that pipeline orders.

@@ -23780,3 +23780,14 @@ even with `max_orders_per_second = 0`, the shipped default, where the
 limiter never reads it. `RiskEngine::needs_clock()` gates the read in
 both `execute_order` paths; a counting-clock test pins zero reads when
 off.
+
+### Market-data fanout dropped a racing update
+
+Found by the matcher-remediation pass (outside the audit's list).
+`MarketDataFanout::run` re-checks the ring after arming its wait with
+`if self.rx.pop().is_some() || drained { continue }` — the popped
+message was used only as a wake signal and never broadcast. Any update
+pushed between the drain and the arm was silently lost; with an idle
+fanout that is the *first* update after a quiet period, every time. The
+re-check now broadcasts what it pops. A lock-step publish/receive test
+lost update 0 on every run before the fix.
