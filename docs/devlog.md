@@ -23567,3 +23567,11 @@ Dead end worth recording: `pkill -f 'cargo build'` from inside a shell
 whose own command line contains that string kills the shell (exit 144).
 Toolchain + `build-essential` were installed on the box for the
 measurements (`rustup` 1.98.1 pinned, `cc` 15.2).
+
+## Session: HFT audit pass 2 remediation
+
+Working through the findings of `hft-audit-2.md` (committed at
+`c8075c3`). The report itself is removed from the tree at the start of
+this session; it stays in git history (`git show c8075c3:hft-audit-2.md`),
+and code comments cite its finding ids (`hft-audit-2 N-1`, …) against
+that revision. Each fix below lands as its own commit.
