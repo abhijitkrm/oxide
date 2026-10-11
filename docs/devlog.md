@@ -23933,3 +23933,16 @@ deliberately left alone — inlining `write::*` made
 `encode/varint_u64_max` ~25% slower; the policy is recorded in a
 comment. `order_msg_roundtrip` 34.06 → 24.59 ns; `vs_bincode/decode`
 49.46 → 36.53 ns.
+
+### S-9 (part 1): asm keccak, `s` from sig bytes, single-shot short hashes
+
+`crypto::secp::keccak256` used software `sha3` while alloy already links
+`keccak-asm`; it now uses `keccak-asm` (exact-pinned `=0.1.8`, already
+in the lockfile — a new direct edge, no new crate), with `sha3` kept as a
+dev-dependency to pin outputs for every length 0..700. `recover_sender`
+reads `s` from `sig[32..64]` instead of round-tripping
+`to_standard().serialize_compact()`. `hash_one`/`hash_pair` hash
+preimages < 256 B with one `blake3::hash` over a stack buffer
+(byte-identical to the streaming form, tested). p50: `hash_one/32b`
+137.9 → 106.7 ns, `hash_pair` 220.5 → 189.1 ns, `keccak256/64b` 452.6 →
+377.1 ns. `recover_address` unchanged within noise (EC-bound).

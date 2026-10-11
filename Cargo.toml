@@ -122,6 +122,12 @@ alloy-rlp = "0.3.16"
 # the padding differs). MIT/Apache-2.0 licensed.
 sha3 = "0.11.0"
 
+# keccak-asm: assembly Keccak-256 for `crypto::secp::keccak256`
+# (hft-audit-2 S-9). Already in the graph via alloy-primitives'
+# `asm-keccak` feature — exact-pinned to the lockfile's version, so
+# this adds a direct edge, not a crate. BSD-3-Clause.
+keccak-asm = "=0.1.8"
+
 # alloy-trie: Merkle-Patricia Trie state root calculator and proof
 # generator (Phase B). Same alloy ecosystem as revm (B256, alloy-rlp,
 # nybbles). Used by foundry/reth tooling. MIT/Apache-2.0 licensed.

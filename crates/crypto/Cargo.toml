@@ -28,10 +28,12 @@ blst = "0.3.17"
 # (ecdsa recover for sender recovery from signed txs), rand (test
 # signing key generation).
 secp256k1 = { workspace = true }
-# sha3: Keccak-256 for EVM tx hashing and address derivation (Phase A).
-# Already a transitive dep via revm. The `sha3` crate's `Keccak256`
-# digest is Ethereum's keccak256 (not NIST SHA3-256). MIT/Apache-2.0.
-sha3 = { workspace = true }
+# keccak-asm: Keccak-256 for EVM tx hashing and address derivation —
+# the CRYPTOGAMS assembly permutation (hft-audit-2 S-9; replaced the
+# pure-Rust `sha3` crate on this path). Zero new crates:
+# alloy-primitives' `asm-keccak` feature already links this exact
+# version into the node (see Cargo.lock). BSD-3-Clause.
+keccak-asm = { workspace = true }
 # ed25519-dalek: Ed25519 signatures for native module authenticity
 # (Phase G). Pure Rust, constant-time. BSD-3-Clause. Used for
 # signing native (non-EVM) transactions: staking, exchange, perps.
@@ -67,6 +69,9 @@ workspace = true
 
 [dev-dependencies]
 criterion = "0.7.0"
+# sha3: the pure-Rust keccak256 reference the asm implementation is
+# pinned against (`keccak256_matches_reference_vectors`).
+sha3 = { workspace = true }
 
 [[bench]]
 name = "hash"

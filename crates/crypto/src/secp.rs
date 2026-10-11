@@ -226,9 +226,15 @@ pub fn recover_sender(msg_hash: &[u8], sig: &[u8], recid: u8) -> Result<Address,
     // (bytes 32..64) and compare it to `n / 2` (half the secp256k1
     // curve order). Rejecting rather than silently normalizing lets
     // the caller see the original byzantine input.
-    let standard_sig = recoverable.to_standard();
-    let compact = standard_sig.serialize_compact();
-    let s_bytes = &compact[32..64];
+    //
+    // `s` is read straight from the caller's bytes (hft-audit-2 S-9):
+    // `from_compact` above succeeded, so `sig` is exactly 64 bytes
+    // `r ‖ s` big-endian, and libsecp256k1's compact parse stores `s`
+    // unmodified (it rejects s ≥ n but never normalizes), so
+    // `sig[32..64]` is byte-identical to what the old
+    // `to_standard().serialize_compact()[32..64]` round-trip produced —
+    // minus a signature conversion and a 64-byte serialization per tx.
+    let s_bytes = sig.get(32..64).ok_or(SecpError::InvalidSignature)?;
     if s_bytes > &HALF_ORDER[..] {
         return Err(SecpError::InvalidSignature);
     }
@@ -394,23 +400,53 @@ pub fn generate_keypair_for_test() -> ([u8; 32], Address) {
     (privkey, addr)
 }
 
-/// keccak-256 hash. Uses the `sha3` crate's `Keccak256` digest, which
-/// is Ethereum's keccak256 (not NIST SHA3-256 — the padding differs).
-/// Already a transitive dep via revm; declared explicitly here.
+/// keccak-256 hash — Ethereum's keccak256 (not NIST SHA3-256; the
+/// padding differs).
 ///
-/// For EVM transaction hashing and address derivation, this is the
-/// correct hash function.
+/// Backed by `keccak-asm` (the CRYPTOGAMS assembly permutation that
+/// `alloy-primitives`' `asm-keccak` feature already links into the
+/// node), not the pure-Rust `sha3` crate: the same function, ~1.5–3×
+/// faster per call, and it runs per tx (address derivation inside
+/// [`recover_sender`], EVM tx hashing). hft-audit-2 S-9. The
+/// `keccak256_matches_reference_vectors` test pins the output to the
+/// `sha3` implementation and known vectors.
 #[must_use]
+#[inline]
 pub fn keccak256(data: &[u8]) -> [u8; 32] {
-    use sha3::Digest;
-    let mut hasher = sha3::Keccak256::new();
-    hasher.update(data);
-    hasher.finalize().into()
+    keccak_asm::Keccak256::digest(data).into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// hft-audit-2 S-9: the asm keccak must equal Ethereum keccak256 —
+    /// known vectors plus bit-for-bit agreement with the pure-Rust
+    /// `sha3` crate across lengths spanning the 136-byte rate boundary.
+    #[test]
+    fn keccak256_matches_reference_vectors() {
+        fn hex32(s: &str) -> [u8; 32] {
+            let mut out = [0u8; 32];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+            }
+            out
+        }
+        assert_eq!(
+            keccak256(b""),
+            hex32("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+        );
+        assert_eq!(
+            keccak256(b"hello"),
+            hex32("1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8")
+        );
+        let data: Vec<u8> = (0..700u32).map(|i| u8::try_from(i % 256).unwrap()).collect();
+        for len in 0..data.len() {
+            use sha3::Digest;
+            let reference: [u8; 32] = sha3::Keccak256::digest(&data[..len]).into();
+            assert_eq!(keccak256(&data[..len]), reference, "keccak diverged at len {len}");
+        }
+    }
 
     /// A known-answer test using a fixed key and message. This pins
     /// the recovery implementation against a specific expected address.

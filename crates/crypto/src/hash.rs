@@ -172,6 +172,17 @@ pub enum Domain {
     BodyHash = 21,
 }
 
+/// Largest preimage (domain tag + payload, bytes) that the single-shot
+/// helpers assemble on the stack before calling `blake3::hash`.
+///
+/// 256 bytes = four BLAKE3 blocks: covers every fixed-shape preimage on
+/// the hot path (tx-hash inputs of short transfers, MMR/shard nodes,
+/// nonce and committed-map leaves) while keeping the zeroed stack
+/// buffer to four cache lines. Raising it trades a bigger memset+copy
+/// for the hasher setup it avoids — past a few hundred bytes the copy
+/// wins nothing, so do not raise it without re-running `benches/hash.rs`.
+pub const SHORT_PREIMAGE_MAX: usize = 256;
+
 /// A domain-separated BLAKE3 hasher. The domain tag is written first,
 /// unconditionally, on construction; subsequent `update` calls append
 /// the preimage parts. Call `finalize` to produce the digest.
@@ -223,10 +234,27 @@ impl Hasher {
     }
 
     /// Single-shot: hash `domain ‖ bytes` and return the digest. This is
-    /// the common case (one payload, one hash) and avoids constructing
-    /// an intermediate `Hasher` for readability without sacrificing
-    /// performance — BLAKE3's single-shot path is the same internally.
+    /// the common case (one payload, one hash).
+    ///
+    /// Short payloads (≤ [`SHORT_PREIMAGE_MAX`] bytes including the tag)
+    /// are assembled in a stack buffer and hashed with one
+    /// `blake3::hash` call — byte-identical to the streaming form but
+    /// without the `blake3::Hasher` state setup and the per-`update`
+    /// block buffering that a 1-byte tag write followed by a payload
+    /// write costs (hft-audit-2 S-9; the `storage::mmr::hash_node`
+    /// pattern). Longer payloads stream, where the copy would cost
+    /// more than the setup it saves.
+    ///
+    /// Budget (criterion, `benches/hash.rs`): see the S-9 devlog entry
+    /// for the measured before/after on `hash_one/32b` and `/100b`.
+    #[inline]
     pub fn hash_one(domain: Domain, bytes: &[u8]) -> Hash {
+        if bytes.len() < SHORT_PREIMAGE_MAX {
+            let mut preimage = [0u8; SHORT_PREIMAGE_MAX];
+            preimage[0] = domain as u8;
+            preimage[1..=bytes.len()].copy_from_slice(bytes);
+            return Hash(blake3::hash(&preimage[..=bytes.len()]).into());
+        }
         let mut h = Self::new(domain);
         h.update(bytes);
         h.finalize()
@@ -234,8 +262,18 @@ impl Hasher {
 
     /// Hash two parts (common for Merkle nodes: `domain ‖ left ‖ right`).
     /// Convenience over `new` + two `update` calls; the intent (a binary
-    /// node) is named at the call site.
+    /// node) is named at the call site. Uses the same short-preimage
+    /// single-shot path as [`Hasher::hash_one`] when both parts fit.
+    #[inline]
     pub fn hash_pair(domain: Domain, left: &[u8], right: &[u8]) -> Hash {
+        let len = left.len() + right.len();
+        if len < SHORT_PREIMAGE_MAX {
+            let mut preimage = [0u8; SHORT_PREIMAGE_MAX];
+            preimage[0] = domain as u8;
+            preimage[1..=left.len()].copy_from_slice(left);
+            preimage[1 + left.len()..=len].copy_from_slice(right);
+            return Hash(blake3::hash(&preimage[..=len]).into());
+        }
         let mut h = Self::new(domain);
         h.update(left);
         h.update(right);
@@ -296,6 +334,37 @@ mod tests {
         h.update(&right);
         let streamed = h.finalize();
         assert_eq!(pair, streamed, "hash_pair must be equivalent to streaming");
+    }
+
+    /// hft-audit-2 S-9: the stack single-shot path must be
+    /// byte-identical to the streaming form at every length, across
+    /// the `SHORT_PREIMAGE_MAX` boundary in both helpers.
+    #[test]
+    fn single_shot_matches_streaming_at_every_length() {
+        let data: Vec<u8> =
+            (0..600u32).map(|i| u8::try_from(i % 251).unwrap().wrapping_mul(7)).collect();
+        for len in 0..data.len() {
+            let mut h = Hasher::new(Domain::Transaction);
+            h.update(&data[..len]);
+            assert_eq!(
+                Hasher::hash_one(Domain::Transaction, &data[..len]),
+                h.finalize(),
+                "hash_one diverged at len {len}"
+            );
+        }
+        for total in [0usize, 1, 64, 254, 255, 256, 257, 400] {
+            for split in [0, total / 3, total] {
+                let (l, r) = data[..total].split_at(split);
+                let mut h = Hasher::new(Domain::MmrNode);
+                h.update(l);
+                h.update(r);
+                assert_eq!(
+                    Hasher::hash_pair(Domain::MmrNode, l, r),
+                    h.finalize(),
+                    "hash_pair diverged at total {total} split {split}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -1343,6 +1343,7 @@ dependencies = [
  "codec",
  "criterion",
  "ed25519-dalek",
+ "keccak-asm",
  "primitives",
  "secp256k1",
  "sha3",

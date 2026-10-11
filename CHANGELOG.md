@@ -54,6 +54,11 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Faster keccak (assembly) and short-input BLAKE3** (`crypto`,
+  hft-audit-2 S-9): 14–23% on the per-tx hashes.
+  - **In plain words:** computing Ethereum transaction hashes and the
+    chain's own short hashes takes noticeably less time.
+
 - **Message decoding ~25–28% faster** (`codec`, hft-audit-2 S-5).
   - **In plain words:** every network message is unpacked about a
     quarter faster.

@@ -23,6 +23,13 @@ fn bench_hash_one(c: &mut Criterion) {
         b.iter(|| black_box(Hasher::hash_one(Domain::Block, black_box(&payload))));
     });
 
+    // 100-byte payload: the executor-nonce / committed-leaf preimage
+    // shape (hft-audit-2 S-9: the short-input single-shot path).
+    let payload100 = [0x42u8; 100];
+    c.bench_function("hash_one/100b", |b| {
+        b.iter(|| black_box(Hasher::hash_one(Domain::Block, black_box(&payload100))));
+    });
+
     // 256-byte payload (a small block header).
     let payload256 = [0x42u8; 256];
     c.bench_function("hash_one/256b", |b| {
@@ -41,5 +48,19 @@ fn bench_hash_pair(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_hash_one, bench_hash_pair);
+fn bench_keccak(c: &mut Criterion) {
+    // keccak256 over 64 bytes: the uncompressed-pubkey → address step
+    // inside every `recover_sender` (hft-audit-2 S-9).
+    let pubkey = [0x5au8; 64];
+    c.bench_function("keccak256/64b", |b| {
+        b.iter(|| black_box(crypto::secp::keccak256(black_box(&pubkey))));
+    });
+    // A ~200-byte signed EVM transfer: the tx-hash shape.
+    let tx = [0x5au8; 200];
+    c.bench_function("keccak256/200b", |b| {
+        b.iter(|| black_box(crypto::secp::keccak256(black_box(&tx))));
+    });
+}
+
+criterion_group!(benches, bench_hash_one, bench_hash_pair, bench_keccak);
 criterion_main!(benches);
