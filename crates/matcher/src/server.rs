@@ -288,6 +288,44 @@ async fn submit_action_ring(
         .unwrap_or_else(|_| OrderResponse::rejected(crate::protocol::RejectReason::EngineError))
 }
 
+// ── Accept path ──────────────────────────────────────────────────────
+
+/// Accept one order-entry connection and configure it for
+/// request/response latency before any byte is exchanged.
+///
+/// Every order-entry listener in this file accepts through here
+/// (hft-audit-2 M-5) so no protocol can silently regress to the
+/// kernel default. The one setting applied is `TCP_NODELAY`:
+/// order entry is a small-message request/response protocol (a
+/// 13-byte binary ack, a ~200-byte FIX `ExecutionReport`), which is
+/// exactly the shape Nagle's algorithm penalises. With Nagle on, a
+/// pipelining client that sends order N+1 before acking response N
+/// leaves response N+1 queued behind the unacked segment until the
+/// peer's delayed-ACK timer fires — up to 40 ms on Linux, 200 ms on
+/// some stacks — for a venue whose match takes ~0.5 µs. Disabling it
+/// costs a few extra small segments on a loopback/TLS-proxy hop (the
+/// only supported deployment shape, module docs S3), which is
+/// negligible.
+///
+/// A `set_nodelay` failure is logged and the connection is kept:
+/// the socket is still correct, only slower, and refusing service
+/// over a latency knob would turn a tuning problem into an outage.
+///
+/// Cold path (once per connection).
+///
+/// # Errors
+///
+/// Propagates `accept` errors exactly as the inline `accept()` did.
+async fn accept_order_entry(
+    listener: &tokio::net::TcpListener,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let (socket, _addr) = listener.accept().await?;
+    if let Err(e) = socket.set_nodelay(true) {
+        eprintln!("order-entry socket: failed to set TCP_NODELAY: {e}");
+    }
+    Ok(socket)
+}
+
 // ── Binary TCP server ────────────────────────────────────────────────
 
 /// Run a binary TCP order-entry server on the given port.
@@ -351,7 +389,7 @@ async fn run_binary_tcp_server_impl(
     eprintln!("binary TCP server listening on 127.0.0.1:{port}");
 
     loop {
-        let (socket, _addr) = listener.accept().await?;
+        let socket = accept_order_entry(&listener).await?;
         let matcher = Arc::clone(&matcher);
         let ring_matcher = ring_matcher.clone();
         let ring_counter = Arc::clone(&ring_counter);
@@ -551,7 +589,7 @@ async fn run_jsonrpc_tcp_server_impl(
     eprintln!("JSON-RPC server listening on 127.0.0.1:{port}");
 
     loop {
-        let (mut socket, _) = listener.accept().await?;
+        let mut socket = accept_order_entry(&listener).await?;
         let matcher = Arc::clone(&matcher);
         let ring_matcher = ring_matcher.clone();
         let ring_counter = Arc::clone(&ring_counter);
@@ -686,7 +724,7 @@ async fn run_fix_server_impl(
     eprintln!("FIX server listening on 127.0.0.1:{port}");
 
     loop {
-        let (mut socket, _) = listener.accept().await?;
+        let mut socket = accept_order_entry(&listener).await?;
         let matcher = Arc::clone(&matcher);
         let ring_matcher = ring_matcher.clone();
         let ring_counter = Arc::clone(&ring_counter);
@@ -853,7 +891,7 @@ async fn run_websocket_server_impl(
     eprintln!("WebSocket server listening on 127.0.0.1:{port}");
 
     loop {
-        let (socket, _) = listener.accept().await?;
+        let socket = accept_order_entry(&listener).await?;
         let matcher = Arc::clone(&matcher);
         let ring_matcher = ring_matcher.clone();
         let ring_counter = Arc::clone(&ring_counter);
@@ -1266,7 +1304,7 @@ pub async fn run_binary_tcp_server_multi(
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("binary TCP (multi-market) server listening on 127.0.0.1:{port}");
     loop {
-        let (socket, _) = listener.accept().await?;
+        let socket = accept_order_entry(&listener).await?;
         let matcher = Arc::clone(&matcher);
         tokio::spawn(handle_connection_multi(socket, matcher));
     }
@@ -1375,7 +1413,7 @@ pub async fn run_jsonrpc_tcp_server_multi(
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("JSON-RPC (multi-market) server listening on 127.0.0.1:{port}");
     loop {
-        let (mut socket, _) = listener.accept().await?;
+        let mut socket = accept_order_entry(&listener).await?;
         let matcher = Arc::clone(&matcher);
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1454,7 +1492,7 @@ pub async fn run_fix_server_multi(
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("FIX (multi-market) server listening on 127.0.0.1:{port}");
     loop {
-        let (mut socket, _) = listener.accept().await?;
+        let mut socket = accept_order_entry(&listener).await?;
         let matcher = Arc::clone(&matcher);
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1561,7 +1599,7 @@ pub async fn run_websocket_server_multi(
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("WebSocket (multi-market) server listening on 127.0.0.1:{port}");
     loop {
-        let (socket, _) = listener.accept().await?;
+        let socket = accept_order_entry(&listener).await?;
         let matcher = Arc::clone(&matcher);
         tokio::spawn(async move {
             use tokio_tungstenite::tungstenite::Message;

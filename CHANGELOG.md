@@ -423,6 +423,12 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Order-entry sockets set `TCP_NODELAY`** (`matcher`, hft-audit-2
+  M-5): acks no longer wait on Nagle × delayed-ACK (up to 40 ms) for
+  clients that pipeline orders.
+  - **In plain words:** replies to your orders go out immediately
+    instead of sometimes waiting up to 40 ms.
+
 - **Validator loop no longer idles between dependent steps**
   (`node`, hft-audit-2 N-1): the consensus pump again skips its 1 ms
   idle wait after a pass that did work, and polls every 50 µs while

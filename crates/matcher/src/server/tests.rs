@@ -596,3 +596,20 @@ async fn ring_concurrent_exchanges_isolate_responses() {
         );
     }
 }
+
+/// hft-audit-2 M-5: every order-entry accept goes through
+/// `accept_order_entry`, which must hand back a socket with Nagle
+/// disabled — otherwise a pipelining client can wait up to a
+/// delayed-ACK timeout (40 ms) for a 13-byte ack.
+#[tokio::test]
+async fn accept_order_entry_sets_tcp_nodelay() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+    let socket = accept_order_entry(&listener).await.expect("accept");
+    assert!(
+        socket.nodelay().expect("read TCP_NODELAY"),
+        "accepted order-entry socket must have TCP_NODELAY set"
+    );
+    drop(client.await.expect("connect task").expect("connect"));
+}

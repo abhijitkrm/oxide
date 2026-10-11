@@ -23684,3 +23684,13 @@ pools keep their measured split (intake vs execution; see
 the verify pool keeps its existing default unless set. The global pool
 is sized at `assemble_executor`; a second assembly in one process keeps
 the first pool.
+
+### M-5: TCP_NODELAY on order-entry sockets
+
+No order-entry listener disabled Nagle, so a client pipelining orders
+could wait up to a 40 ms delayed-ACK timeout for a 13-byte ack against
+a ~0.5 µs match. All 8 accept sites (binary TCP, JSON-RPC, FIX and
+WebSocket, ring and multi variants) now go through one helper,
+`accept_order_entry`, which sets `TCP_NODELAY`; a failure is logged and
+the connection kept. A unit test checks the accepted socket reports
+nodelay.
