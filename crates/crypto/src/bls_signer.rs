@@ -32,7 +32,8 @@
 
 use blst::BLST_ERROR;
 use blst::min_pk::{
-    AggregateSignature as BlstAggSig, PublicKey as BlstPk, SecretKey, Signature as BlstSig,
+    AggregatePublicKey as BlstAggPk, AggregateSignature as BlstAggSig, PublicKey as BlstPk,
+    SecretKey, Signature as BlstSig,
 };
 
 use crate::bls::{AggregateSignature, PublicKey, Signature};
@@ -384,6 +385,80 @@ pub fn aggregate_verify(
     if result == BLST_ERROR::BLST_SUCCESS { Ok(()) } else { Err(BlsError::InvalidSignature) }
 }
 
+/// A BLS public key decompressed once, for repeated aggregate verifies
+/// (hft-audit-2 S-9).
+///
+/// [`aggregate_verify`] decompresses every 48-byte [`PublicKey`] on
+/// every call — a G1 point decompression (an `Fp` square root) per
+/// signer, i.e. 100–200 µs of a 100-validator QC verify spent re-deriving
+/// points that only change at epoch boundaries. Holders of a stable
+/// validator set (the consensus engine's per-epoch key table) build
+/// these once with [`PreparedPublicKey::new`] and verify with
+/// [`aggregate_verify_prepared`].
+///
+/// Construction applies exactly the decoding [`aggregate_verify`]
+/// applies per call (`blst` `from_bytes`: on-curve, no subgroup check —
+/// admission-time [`validate_point`]/[`pop_verify`] own that), so the
+/// two paths accept and reject the same inputs.
+#[derive(Clone, Debug)]
+pub struct PreparedPublicKey(BlstPk);
+
+impl PreparedPublicKey {
+    /// Decompress `pk` once.
+    ///
+    /// Cold path: once per key per epoch.
+    ///
+    /// # Errors
+    /// `BlsError::InvalidKeyMaterial` (via `From<BLST_ERROR>`) if the
+    /// bytes do not decode to a curve point.
+    pub fn new(pk: &PublicKey) -> Result<Self, BlsError> {
+        Ok(Self(BlstPk::from_bytes(pk.as_bytes())?))
+    }
+}
+
+/// [`aggregate_verify`] over pre-decompressed keys: same message, one
+/// pairing check, no per-call key decompression and no allocation.
+///
+/// `pks` is any iterator of prepared keys — typically the validator
+/// table filtered by the certificate's signer bitmap — so the caller
+/// never materialises a key vector either. Semantics are identical to
+/// [`aggregate_verify`] (`blst` `fast_aggregate_verify` with the
+/// signature group check on and per-key validation off): the keys are
+/// summed into one aggregate key, then checked against the signature.
+///
+/// Budget (criterion, `benches/bls.rs`): see the
+/// `bls/aggregate_verify_prepared/*` rows next to the unprepared ones.
+///
+/// # Errors
+/// `BlsError::EmptyAggregation` if `pks` yields nothing;
+/// `BlsError::InvalidSignature` if the signature does not decode or
+/// does not verify.
+pub fn aggregate_verify_prepared<'a>(
+    agg_sig: &AggregateSignature,
+    domain: Domain,
+    msg: &[u8],
+    pks: impl IntoIterator<Item = &'a PreparedPublicKey>,
+) -> Result<(), BlsError> {
+    let mut pks = pks.into_iter();
+    let Some(first) = pks.next() else {
+        return Err(BlsError::EmptyAggregation);
+    };
+    let mut agg_pk = BlstAggPk::from_public_key(&first.0);
+    for pk in pks {
+        // `pk_validate = false`, as `fast_aggregate_verify` does: the
+        // add cannot fail without validation.
+        agg_pk.add_public_key(&pk.0, false).map_err(|_| BlsError::InvalidSignature)?;
+    }
+    let blst_agg = BlstSig::from_bytes(agg_sig.as_bytes())?;
+    let result = blst_agg.fast_aggregate_verify_pre_aggregated(
+        true,
+        msg,
+        dst(domain),
+        &agg_pk.to_public_key(),
+    );
+    if result == BLST_ERROR::BLST_SUCCESS { Ok(()) } else { Err(BlsError::InvalidSignature) }
+}
+
 /// Validate that a compressed [`PublicKey`] decodes to a well-formed
 /// BLS12-381 group element in the correct subgroup.
 ///
@@ -532,6 +607,39 @@ mod tests {
     fn sk(byte: u8) -> BlsSecretKey {
         let ikm = vec![byte; 32];
         BlsSecretKey::from_ikm(&ikm).expect("key gen")
+    }
+
+    /// hft-audit-2 S-9: the prepared-key path accepts exactly what
+    /// `aggregate_verify` accepts and rejects exactly what it rejects —
+    /// valid QC, wrong message, wrong domain, a missing signer, an
+    /// extra non-signer, and the empty set.
+    #[test]
+    fn aggregate_verify_prepared_matches_unprepared() {
+        let keys: Vec<BlsSecretKey> = (1u8..=7).map(sk).collect();
+        let pks: Vec<PublicKey> = keys.iter().map(BlsSecretKey::public_key).collect();
+        let prepared: Vec<PreparedPublicKey> =
+            pks.iter().map(|pk| PreparedPublicKey::new(pk).expect("valid key")).collect();
+        let msg = b"view 9 block";
+        let sigs: Vec<Signature> = keys[..5].iter().map(|k| k.sign(Domain::Vote, msg)).collect();
+        let agg = aggregate(&sigs).expect("aggregate");
+
+        let cases: [(&[u8], Domain, std::ops::Range<usize>); 5] = [
+            (msg, Domain::Vote, 0..5),
+            (b"other block", Domain::Vote, 0..5),
+            (msg, Domain::Timeout, 0..5),
+            (msg, Domain::Vote, 0..4),
+            (msg, Domain::Vote, 0..6),
+        ];
+        for (i, (m, d, signers)) in cases.into_iter().enumerate() {
+            let plain = aggregate_verify(&agg, d, m, &pks[signers.clone()]);
+            let fast = aggregate_verify_prepared(&agg, d, m, &prepared[signers]);
+            assert_eq!(plain.is_ok(), fast.is_ok(), "case {i}");
+            assert_eq!(fast.is_ok(), i == 0, "only the honest case verifies (case {i})");
+        }
+        assert!(matches!(
+            aggregate_verify_prepared(&agg, Domain::Vote, msg, &prepared[..0]),
+            Err(BlsError::EmptyAggregation)
+        ));
     }
 
     #[test]

@@ -24006,3 +24006,13 @@ The image built with `rust:1.95-bookworm` while `rust-toolchain.toml`
 pins 1.98.1 (and the toolchain file isn't copied into the image). The
 builder is now `rust:1.98.1-bookworm`; both files carry a "bump
 together" comment.
+
+### S-9 (part 2): prepared BLS keys
+
+`aggregate_verify` decompresses every signer's key on every call (~12 µs
+each) and allocates two Vecs. New `PreparedPublicKey` (decoded once) and
+`aggregate_verify_prepared`, which sums the keys and calls blst's
+`fast_aggregate_verify_pre_aggregated` — what `fast_aggregate_verify`
+does internally minus decompression and Vecs; a test checks identical
+verdicts over 6 cases. p50: n=32 2.06 → 1.86 ms; n=128 3.53 → 1.93 ms;
+n=4 within noise. Not yet adopted by consensus.

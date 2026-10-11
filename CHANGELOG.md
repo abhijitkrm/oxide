@@ -956,6 +956,12 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Prepared-key BLS aggregate verify** (`crypto`, hft-audit-2 S-9):
+  ~45% faster at 128 signers (3.53 → 1.93 ms); not yet wired into
+  consensus.
+  - **In plain words:** checking a large validator vote certificate
+    can drop from 3.5 ms to 1.9 ms once consensus adopts it.
+
 - **Pin helpers detect two actors on one physical core**
   (`primitives`, hft-audit-2 S-7).
   - **In plain words:** the node can tell when two busy threads are

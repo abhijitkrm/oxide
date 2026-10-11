@@ -75,5 +75,38 @@ fn bench_aggregate_verify(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_sign, bench_verify, bench_aggregate, bench_aggregate_verify);
+/// hft-audit-2 S-9: the same QC verify with keys decompressed once
+/// (per epoch, in production) instead of per call — the head-to-head
+/// against `bls/aggregate_verify/{n}` above.
+fn bench_aggregate_verify_prepared(c: &mut Criterion) {
+    for &n in &[4usize, 32, 128] {
+        let keys = make_keys(n);
+        let prepared: Vec<_> = keys
+            .iter()
+            .map(|k| crypto::PreparedPublicKey::new(&k.public_key()).expect("valid key"))
+            .collect();
+        let msg = [0x42u8; 32];
+        let sigs: Vec<_> = keys.iter().map(|k| k.sign(Domain::QuorumCertificate, &msg)).collect();
+        let agg = aggregate(&sigs).expect("aggregate");
+        c.bench_function(&format!("bls/aggregate_verify_prepared/{n}"), |b| {
+            b.iter(|| {
+                let _ = crypto::aggregate_verify_prepared(
+                    black_box(&agg),
+                    Domain::QuorumCertificate,
+                    black_box(&msg),
+                    black_box(&prepared),
+                );
+            });
+        });
+    }
+}
+
+criterion_group!(
+    benches,
+    bench_sign,
+    bench_verify,
+    bench_aggregate,
+    bench_aggregate_verify,
+    bench_aggregate_verify_prepared
+);
 criterion_main!(benches);
