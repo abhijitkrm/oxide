@@ -23988,3 +23988,14 @@ now folds the peak stack via `bag_root_iter`, byte-identical. New row
 `mmr/root_16_peaks` (fixed forest): 2.73 → 2.60 µs. The journal
 `fallocate` half of S-10 is not done — the journal core is std-only and
 storage has no libc dependency.
+
+### §8 / G-1: durability benches on a real filesystem
+
+The journal, backend and consensus `*_signed_wal` benches wrote to
+`/tmp` — tmpfs on the target box and most CI images — so every "fsync"
+row measured RAM. A shared `crates/storage/benches/support/bench_dir.rs`
+(included by the consensus bench via `#[path]`) uses `$OXIDE_BENCH_DIR`,
+defaulting to cargo's `CARGO_TARGET_TMPDIR` under `target/`. Durability
+row names now carry the filesystem type from mountinfo (row IDs
+change). Same box: `journal/sync_1000_records_info/ext4` 5.70 ms vs
+`/tmpfs` 122.5 µs; `vote_signed_wal/ext4` 13.3 ms.

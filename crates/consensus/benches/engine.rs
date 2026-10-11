@@ -42,6 +42,12 @@
 //! fsyncs (~17 ms) to 1 for a follower (~5.6 ms) and 2 for a
 //! leader (~10.8 ms: proposal + self-vote) — every non-signature
 //! state record rides the next signature's `sync_data`.
+//!
+//! WAL files live under `$OXIDE_BENCH_DIR`, else cargo's
+//! `CARGO_TARGET_TMPDIR` (under `target/`) — `tempfile::tempdir()`
+//! used `/tmp`, which is tmpfs on most Linux hosts, so every fsync row
+//! measured RAM (hft-audit-2 §8). Each `*_signed_wal` row's name carries
+//! the backing filesystem type (`vote_signed_wal/ext4`).
 
 use consensus::wal::Wal;
 use consensus::{OxideBft, ValidatorSet};
@@ -49,6 +55,23 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use ports::mock::MockApp;
 use std::hint::black_box;
 use std::sync::Arc;
+
+#[path = "../../storage/benches/support/bench_dir.rs"]
+mod bench_dir;
+
+/// A self-deleting WAL directory on the bench filesystem (see the
+/// module doc) rather than tmpfs `/tmp`.
+fn wal_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("oxide-consensus-bench-")
+        .tempdir_in(bench_dir::bench_root())
+        .expect("tempdir")
+}
+
+/// `name/<fstype>` — the filesystem the WAL rows actually fsync on.
+fn wal_row(name: &str) -> String {
+    format!("{name}/{}", bench_dir::fs_type(&bench_dir::bench_root()))
+}
 
 /// Set up a single-validator oxideBFT engine with a mock app.
 fn setup_engine() -> OxideBft {
@@ -134,10 +157,10 @@ fn setup_production_engine(
 /// Gates the C10 durable-order contract — a vote whose locks aren't
 /// durable must never leave the process.
 fn bench_vote_signed_wal(c: &mut Criterion) {
-    c.bench_function("vote_signed_wal", |b| {
+    c.bench_function(&wal_row("vote_signed_wal"), |b| {
         b.iter_batched(
             || {
-                let dir = tempfile::tempdir().expect("tempdir");
+                let dir = wal_tempdir();
                 let keys = production_keys();
                 // Validator 0 leads view 0; the genesis-height
                 // propose is unconditional.
@@ -160,10 +183,10 @@ fn bench_vote_signed_wal(c: &mut Criterion) {
 /// aggregate before the QC may be emitted — and `deliver_qc`, which
 /// re-verifies the aggregate and fsyncs the adopted `high_qc`.
 fn bench_qc_signed_wal(c: &mut Criterion) {
-    c.bench_function("form_qc_signed_wal", |b| {
+    c.bench_function(&wal_row("form_qc_signed_wal"), |b| {
         b.iter_batched(
             || {
-                let dir = tempfile::tempdir().expect("tempdir");
+                let dir = wal_tempdir();
                 let keys = production_keys();
                 let mut leader = setup_production_engine(&dir, &keys, 0);
                 let (header, proposal) = leader.propose().expect("genesis propose");
@@ -195,10 +218,10 @@ fn bench_qc_signed_wal(c: &mut Criterion) {
 /// it must be durable before it leaves. Measures the fsync +
 /// header build + BLS sign the leader pays per view.
 fn bench_propose_signed_wal(c: &mut Criterion) {
-    c.bench_function("propose_signed_wal", |b| {
+    c.bench_function(&wal_row("propose_signed_wal"), |b| {
         b.iter_batched(
             || {
-                let dir = tempfile::tempdir().expect("tempdir");
+                let dir = wal_tempdir();
                 let keys = production_keys();
                 // Validator 0 leads view 0; genesis propose is
                 // unconditional, so a fresh engine always emits.
@@ -223,10 +246,10 @@ fn bench_propose_signed_wal(c: &mut Criterion) {
 /// fsync in the loop. The gate drops accordingly: what remains is
 /// pure crypto and a ~200 B write, not a durable store.
 fn bench_deliver_qc_signed_wal(c: &mut Criterion) {
-    c.bench_function("deliver_qc_signed_wal", |b| {
+    c.bench_function(&wal_row("deliver_qc_signed_wal"), |b| {
         b.iter_batched(
             || {
-                let dir = tempfile::tempdir().expect("tempdir");
+                let dir = wal_tempdir();
                 let keys = production_keys();
                 let mut leader = setup_production_engine(&dir, &keys, 0);
                 let (header, proposal) = leader.propose().expect("genesis propose");
@@ -238,7 +261,7 @@ fn bench_deliver_qc_signed_wal(c: &mut Criterion) {
                 let qc = leader.try_form_qc().expect("quorum reached");
                 // The QC consumer: any validator identity works —
                 // a separate tempdir so its WAL file is its own.
-                let rx_dir = tempfile::tempdir().expect("tempdir");
+                let rx_dir = wal_tempdir();
                 let receiver = setup_production_engine(&rx_dir, &keys, 3);
                 (receiver, qc, dir, rx_dir)
             },

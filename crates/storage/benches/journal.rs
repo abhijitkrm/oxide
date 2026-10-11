@@ -13,6 +13,12 @@
 //! batch, so fsync is *never* per-op and is reported separately as an
 //! informational (ungated) bench.
 //!
+//! Scratch files live under `$OXIDE_BENCH_DIR`, else cargo's
+//! `CARGO_TARGET_TMPDIR` (under `target/`) — never `/tmp`, which is
+//! tmpfs on most Linux hosts and would make the sync row measure RAM
+//! (hft-audit-2 §8). The sync row's name carries the backing filesystem
+//! type (`journal/sync_1000_records_info/ext4`).
+//!
 //! `missing_docs` is allowed for this bench crate only: the criterion
 //! entry-point macros generate undocumented functions, and benches are
 //! internal tooling, not published API.
@@ -23,11 +29,14 @@ use std::hint::black_box;
 use std::path::PathBuf;
 use storage::{JournalConfig, JournalWriter};
 
-/// Unique temp dir per bench run (journal core is std-only; no tempfile
-/// dependency by policy — see production-rust skill §5).
+#[path = "support/bench_dir.rs"]
+mod bench_dir;
+
+/// Unique scratch dir per bench run, on a real filesystem (see the
+/// module doc). The journal creates its own directory, so the freshly
+/// made empty one is removed again and only its path handed over.
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("oxide-journal-bench-{}-{tag}", std::process::id()));
+    let dir = bench_dir::scratch_dir("oxide-journal-bench", tag);
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -83,7 +92,8 @@ fn bench_journal(c: &mut Criterion) {
         let dir = temp_dir("sync");
         let mut j = JournalWriter::create(&dir, JournalConfig::default()).expect("writer");
         let payload = [0x5Au8; 100];
-        c.bench_function("journal/sync_1000_records_info", |b| {
+        let fs = bench_dir::fs_type(&dir);
+        c.bench_function(&format!("journal/sync_1000_records_info/{fs}"), |b| {
             b.iter(|| {
                 for _ in 0..1000 {
                     black_box(j.append(black_box(&payload)).expect("append"));

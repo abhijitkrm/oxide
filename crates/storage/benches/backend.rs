@@ -20,6 +20,12 @@
 #![allow(missing_docs)]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+
+// Disk-backed adapters write under `$OXIDE_BENCH_DIR` / `target/`, not
+// tmpfs `/tmp` (hft-audit-2 §8) — see the module's own doc.
+#[cfg(any(feature = "redb", feature = "rocksdb", feature = "mdbx"))]
+#[path = "support/bench_dir.rs"]
+mod bench_dir;
 use primitives::Hash;
 use storage::{Op, StorageBackend, Volatile};
 
@@ -73,7 +79,7 @@ fn bench_apply_batch(c: &mut Criterion) {
     group.bench_with_input(BenchmarkId::new("apply_batch", "RedbBackend"), &batch, |b, batch| {
         b.iter_with_setup(
             || {
-                let path = std::env::temp_dir().join(format!(
+                let path = bench_dir::bench_root().join(format!(
                     "oxide_bench_redb_{}_{}.db",
                     std::process::id(),
                     std::time::SystemTime::now()
@@ -98,7 +104,7 @@ fn bench_apply_batch(c: &mut Criterion) {
         |b, batch| {
             b.iter_with_setup(
                 || {
-                    let path = std::env::temp_dir().join(format!(
+                    let path = bench_dir::bench_root().join(format!(
                         "oxide_bench_rocksdb_{}_{}.db",
                         std::process::id(),
                         std::time::SystemTime::now()
@@ -123,7 +129,7 @@ fn bench_apply_batch(c: &mut Criterion) {
     group.bench_with_input(BenchmarkId::new("apply_batch", "MdbxBackend"), &batch, |b, batch| {
         b.iter_with_setup(
             || {
-                let path = std::env::temp_dir().join(format!(
+                let path = bench_dir::bench_root().join(format!(
                     "oxide_bench_mdbx_{}_{}.db",
                     std::process::id(),
                     std::time::SystemTime::now()
@@ -160,7 +166,7 @@ fn bench_get(c: &mut Criterion) {
     // redb (disk-backed, pure Rust).
     #[cfg(feature = "redb")]
     group.bench_with_input(BenchmarkId::new("get", "RedbBackend"), &batch, |b, batch| {
-        let path = std::env::temp_dir().join(format!(
+        let path = bench_dir::bench_root().join(format!(
             "oxide_bench_get_redb_{}_{}.db",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
@@ -173,7 +179,7 @@ fn bench_get(c: &mut Criterion) {
     // RocksDB (disk-backed, LSM).
     #[cfg(feature = "rocksdb")]
     group.bench_with_input(BenchmarkId::new("get", "RocksDbBackend"), &batch, |b, batch| {
-        let path = std::env::temp_dir().join(format!(
+        let path = bench_dir::bench_root().join(format!(
             "oxide_bench_get_rocksdb_{}_{}.db",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
@@ -186,7 +192,7 @@ fn bench_get(c: &mut Criterion) {
     // MDBX (disk-backed, B-tree).
     #[cfg(feature = "mdbx")]
     group.bench_with_input(BenchmarkId::new("get", "MdbxBackend"), &batch, |b, batch| {
-        let path = std::env::temp_dir().join(format!(
+        let path = bench_dir::bench_root().join(format!(
             "oxide_bench_get_mdbx_{}_{}.db",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()

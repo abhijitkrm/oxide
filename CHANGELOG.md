@@ -1358,6 +1358,11 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Changed
 
+- **Durability benches default to disk under `target/`, with an
+  `OXIDE_BENCH_DIR` override** (`bench`, hft-audit-2 §8).
+  - **In plain words:** the "save to disk" benchmarks now actually
+    touch the disk — ~5.7 ms instead of the misleading 0.12 ms.
+
 - **Default on-chain markets hold 65,536 resting orders, not 64**
   (`node`, hft-audit-2 T-4). The bound is committed state, so this
   changes genesis state roots: existing chains must treat it as a
