@@ -347,7 +347,7 @@ impl MultiMarketMatcher {
                 Some(vo) => {
                     // The nonce tracker is the replay gate: a panic
                     // mid-`check_and_consume` can leave `last_seen`
-                    // and `dirty` torn. Panic on poison (loud halt)
+                    // and `pending` torn. Panic on poison (loud halt)
                     // rather than reject — a poisoned gate must not
                     // keep looking alive while refusing orders.
                     let ok = primitives::sync::lock_state(&self.nonces)

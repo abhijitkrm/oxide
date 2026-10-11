@@ -1133,6 +1133,46 @@ fn corrupt_nonce_store_fails_closed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// hft-audit-2 M-1: admission never touches the disk. Consuming
+/// thousands of nonces stays on the in-memory path (the writer
+/// thread does the I/O), and once `sync_durable` returns, a crash
+/// (state read straight off disk while the tracker and its writer
+/// are still alive, with no clean-shutdown checkpoint) still holds
+/// every consumed nonce, including the partial buffer below the
+/// 64-admission hand-off.
+#[test]
+fn nonce_durability_survives_crash_after_sync() {
+    let dir = std::env::temp_dir().join(format!("oxnc-m1-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap_or_default();
+    let path = dir.join("nonces.oxnc");
+    let mut tracker = NonceTracker::new();
+    tracker.attach_store(path.clone());
+    // 1000 owners × 3 nonces = 3000 admissions: 46 full hand-offs
+    // plus a partial buffer of 56 that only `sync_durable` hands off.
+    for n in 1..=3u64 {
+        for o in 0..1000u32 {
+            let mut a = [0u8; 20];
+            a[..4].copy_from_slice(&o.to_le_bytes());
+            assert!(tracker.check_and_consume(&primitives::Address(a), n));
+        }
+    }
+    tracker.sync_durable();
+    let on_disk = crate::nonce_wal::recover(&path).expect("recover");
+    assert_eq!(on_disk.len(), 1000);
+    assert!(on_disk.values().all(|&n| n == 3), "every owner's last nonce must be durable");
+    // A tracker restarted over the same files rejects every replay.
+    drop(tracker);
+    let mut restarted = NonceTracker::new();
+    restarted.attach_store(path.clone());
+    let mut a = [0u8; 20];
+    a[..4].copy_from_slice(&999u32.to_le_bytes());
+    assert!(!restarted.check_and_consume(&primitives::Address(a), 3));
+    assert!(restarted.check_and_consume(&primitives::Address(a), 4));
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Two fills between the same registered order pair at the same
 /// price merge into ONE chain leg — `floor(price × Σqty / SCALE)`,
 /// not `Σ floor(price × qty_i / SCALE)`. The marginal-cost

@@ -48,6 +48,13 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **`--nonce-state` persistence moved to a background write-ahead
+  log** (`matcher`, hft-audit-2 M-1): `<path>.wal` next to the
+  checkpoint, written and fsynced off the sequencer. With the store
+  on disk: ~15k → ~3M orders/s, p99 3–4 ms → <1 µs.
+  - **In plain words:** turning on replay protection no longer makes
+    the matcher stop for a disk write every 64 orders.
+
 - **Order/response ring hand-off several times faster across cores**
   (`matcher`, hft-audit-2 M-8): padded flags, cached peer indices,
   notify only when a producer waits. Cross-CCX stream 1.8–2.0 →

@@ -9,9 +9,11 @@
 //!   is bit-identical to the off-chain reservation cache.
 //! - [`SettledFill`] is the per-fill record the settler aggregates.
 //! - [`NonceTracker`]/[`NonceStore`] are the replay gate: consumed
-//!   (owner, nonce) pairs checkpoint to disk every
-//!   [`NONCE_FLUSH_EVERY`] admissions, bounding the restart replay
-//!   window to the flush interval.
+//!   (owner, nonce) pairs are handed, every [`NONCE_FLUSH_EVERY`]
+//!   admissions, to an off-thread write-ahead log
+//!   ([`crate::nonce_wal`], hft-audit-2 M-1) that bounds the restart
+//!   replay window to about one `fdatasync` interval without ever
+//!   blocking the admitting thread on disk.
 
 use primitives::fixed::{Price, Qty};
 use std::collections::HashMap;
@@ -278,54 +280,77 @@ pub struct SettledFill {
 pub(crate) struct NonceTracker {
     /// owner → last consumed nonce.
     pub(crate) last_seen: HashMap<primitives::Address, u64>,
-    /// Optional durable checkpoint. Without it, every restart resets
-    /// the replay gate to empty — ANY captured signed request is
-    /// then replayable once (the first request from an owner is
-    /// always accepted). With a store attached, the replay window
-    /// shrinks to the entries consumed since the last flush.
-    pub(crate) store: Option<NonceStore>,
-    /// Mutations since the last successful flush.
-    pub(crate) dirty: u32,
+    /// Optional off-thread durability (hft-audit-2 M-1). Without it,
+    /// every restart resets the replay gate to empty: ANY captured
+    /// signed request is then replayable once (the first request from
+    /// an owner is always accepted). With it attached, the replay
+    /// window shrinks to the admissions not yet `fdatasync`ed by the
+    /// writer (see [`crate::nonce_wal`] for the crash story).
+    pub(crate) durability: Option<crate::nonce_wal::NonceDurability>,
+    /// Consumed `(owner, nonce)` pairs not yet handed to the writer.
+    /// Only filled when `durability` is attached, so a memory-only
+    /// gate pays nothing for it.
+    pub(crate) pending: crate::nonce_wal::DeltaBatch,
 }
 
-/// Consumed-nonce mutations between durable checkpoints. Chosen to
-/// bound crash loss to ~64 admissions while keeping writes rare —
-/// `seal_batch` (the settler cadence) also flushes, so a graceful
-/// run checkpoints far more often than this bound.
+/// Admissions buffered on the admitting thread before one hand-off
+/// to the durability writer. Each hand-off costs a channel send and
+/// one recycled `Vec` swap, so 64 makes it about 1/64th of a send
+/// per order. The buffered deltas are the part of the crash window
+/// that sits on the hot thread (the rest is the writer's sync
+/// interval). Lower means a tighter window but more sends; higher
+/// means the reverse. `seal_batch` (the settler cadence) also hands
+/// off, so a quiet venue never sits on a partial buffer for long.
 pub(crate) const NONCE_FLUSH_EVERY: u32 = 64;
 
 impl NonceTracker {
     /// Create an empty tracker.
     pub(crate) fn new() -> Self {
-        Self { last_seen: HashMap::new(), store: None, dirty: 0 }
+        Self { last_seen: HashMap::new(), durability: None, pending: Vec::new() }
     }
 
-    /// Attach a durable checkpoint file, loading any previously
-    /// persisted nonces. Must be called before serving traffic —
-    /// entries already consumed are NOT loaded again.
+    /// Attach durable storage at `path` (checkpoint plus `<path>.wal`),
+    /// loading every previously persisted nonce. Must be called before
+    /// serving traffic: entries already consumed are NOT loaded again.
     ///
     /// # Errors / panics
     ///
-    /// Panics if the file exists but does not decode — a corrupt
-    /// replay DB must fail closed (refuse to start) rather than
-    /// silently reopen the replay window for every account.
+    /// Panics if the checkpoint exists but does not decode, if the
+    /// log cannot be read, or if the fresh startup checkpoint cannot
+    /// be written. A replay DB that cannot be verified or kept durable
+    /// must fail closed (refuse to start) rather than silently reopen
+    /// the replay window for every account.
     pub(crate) fn attach_store(&mut self, path: std::path::PathBuf) {
-        let loaded = NonceStore::load(&path)
+        let loaded = crate::nonce_wal::recover(&path)
             .unwrap_or_else(|e| panic!("nonce store at {} is corrupt: {e}", path.display()));
-        // Max-merge, never overwrite downward: a checkpoint is a
+        // Max-merge, never overwrite downward: persisted state is a
         // LOWER bound of consumed nonces. Regressing a watermark
         // would let already-consumed requests replay.
         for (owner, nonce) in loaded {
             self.last_seen.entry(owner).and_modify(|e| *e = (*e).max(nonce)).or_insert(nonce);
         }
-        self.store = Some(NonceStore { path });
-        self.dirty = 0;
+        // Drop any previous writer first (it checkpoints and joins),
+        // so two writers never own the same files.
+        self.flush();
+        self.durability = None;
+        let durability =
+            crate::nonce_wal::NonceDurability::start(path.clone(), self.last_seen.clone())
+                .unwrap_or_else(|e| {
+                    panic!("nonce store at {} is not writable: {e}", path.display())
+                });
+        self.pending = durability.take_buffer(NONCE_FLUSH_EVERY as usize);
+        self.durability = Some(durability);
     }
 
     /// Returns `true` and consumes `nonce` iff it is strictly
     /// greater than the last seen for `owner`; `false` on replay
     /// (the map is not modified). The first request from a new
     /// owner is always accepted.
+    ///
+    /// Budget: one `HashMap` probe/insert, plus a `Vec` push when
+    /// durability is attached; every 64th call adds one channel send.
+    /// No file I/O and no syscall on this thread (hft-audit-2 M-1:
+    /// the old inline checkpoint cost 4–13 ms every 64th call).
     pub(crate) fn check_and_consume(&mut self, owner: &primitives::Address, nonce: u64) -> bool {
         if let Some(&last) = self.last_seen.get(owner)
             && nonce <= last
@@ -333,21 +358,44 @@ impl NonceTracker {
             return false;
         }
         self.last_seen.insert(*owner, nonce);
-        self.dirty += 1;
-        if self.dirty >= NONCE_FLUSH_EVERY {
-            self.flush();
+        if self.durability.is_some() {
+            self.pending.push((*owner, nonce));
+            if self.pending.len() >= NONCE_FLUSH_EVERY as usize {
+                self.flush();
+            }
         }
         true
     }
 
-    /// Persist consumed nonces if a store is attached. Best-effort:
-    /// a failed write is ignored (the in-memory gate keeps working;
-    /// only the restart boundary widens).
+    /// Hand buffered deltas to the durability writer. Non-blocking:
+    /// the writer group-commits them on its own thread. A no-op
+    /// without a store or with nothing buffered.
     pub(crate) fn flush(&mut self) {
-        let Some(store) = &self.store else { return };
-        if store.save(&self.last_seen).is_ok() {
-            self.dirty = 0;
+        let Some(d) = &self.durability else { return };
+        if self.pending.is_empty() {
+            return;
         }
+        let next = d.take_buffer(NONCE_FLUSH_EVERY as usize);
+        d.submit(std::mem::replace(&mut self.pending, next));
+    }
+
+    /// Hand off buffered deltas and block until the writer has made
+    /// them durable. Test-only: a clean drop already hands off and
+    /// joins the writer, and the admission path never waits on disk.
+    #[cfg(test)]
+    pub(crate) fn sync_durable(&mut self) {
+        self.flush();
+        if let Some(d) = &self.durability {
+            d.sync();
+        }
+    }
+}
+
+impl Drop for NonceTracker {
+    /// Graceful shutdown: hand the last buffered deltas to the writer
+    /// before its handle drops (which drains, checkpoints and joins).
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -375,8 +423,9 @@ impl std::fmt::Display for NonceCheckpointError {
 
 impl std::error::Error for NonceCheckpointError {}
 
-/// A file-backed checkpoint of consumed nonces — bounds the
-/// restart replay window to the flush interval instead of forever.
+/// A file-backed checkpoint of consumed nonces. Together with the
+/// write-ahead log in [`crate::nonce_wal`], it bounds the restart
+/// replay window to the writer's sync interval instead of forever.
 ///
 /// Format (little-endian, strict):
 /// `[magic "OXNC"][version u32=1][count u32][entry × count]` where
@@ -467,6 +516,16 @@ impl NonceStore {
         if let Ok(f) = std::fs::File::open(&tmp) {
             let _ = f.sync_all();
         }
-        std::fs::rename(&tmp, &self.path)
+        std::fs::rename(&tmp, &self.path)?;
+        // Make the rename itself durable before anyone relies on it.
+        // The durability writer truncates the log right after a
+        // checkpoint (hft-audit-2 M-1); without this directory fsync,
+        // a crash could keep the truncation but lose the rename, and
+        // with it every logged nonce.
+        let dir = match self.path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => std::path::Path::new("."),
+        };
+        std::fs::File::open(dir)?.sync_all()
     }
 }

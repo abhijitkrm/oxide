@@ -23746,3 +23746,20 @@ fence-paired so no wakeup is lost; `space_notify()` removed). Tests:
 capacity-2 cross-thread FIFO stress, 50k-item lost-wakeup run.
 Two-thread stream: same-CCX 7–10 → 26–30 M items/s, cross-CCX
 1.8–2.0 → 31–38 M items/s; cross-CCX round trip ~1.1 → 0.82 µs.
+
+### M-1: nonce durability moves to a WAL thread
+
+With `--nonce-state`, every 64 admissions serialized the whole nonce
+map and wrote + fsynced + renamed it on the sequencer (4–13 ms per fsync
+on the md RAID-1 box). Admission now buffers `(owner, nonce)` and hands
+a batch every 64 orders (and at seal) to a supervised writer thread
+(`nonce_wal.rs`) that appends CRC-checked 32-byte records to
+`<path>.wal`, fdatasyncs in groups, and compacts into the existing OXNC
+checkpoint. Recovery: both files only raise watermarks (replay twice or
+out of order is harmless); a torn/corrupt record is skipped, never
+trusted; startup rewrites a fresh checkpoint and truncates the log;
+`NonceStore::save` now fsyncs the directory after rename; a corrupt or
+unwritable store still refuses to start. A hard crash loses up to 63
+buffered nonces plus ~one fdatasync interval. Measured on ext4/md
+RAID-1: 11–17k → 2.7–3.9M orders/s; p99 3–4 ms → 0.39–0.66 µs; max
+36–121 ms → 20–90 µs.

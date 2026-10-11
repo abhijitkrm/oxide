@@ -82,6 +82,7 @@ pub use ring::{SequencerIdle, SpscReceiver, SpscSender, Wakeup, spsc_ring, spsc_
 pub use risk::{RiskConfig, RiskDecision, RiskEngine};
 
 mod multimarket;
+mod nonce_wal;
 mod settlement;
 
 pub use multimarket::MultiMarketMatcher;
@@ -273,15 +274,20 @@ impl MatchingServer {
     /// Attach a durable checkpoint file for consumed nonces. Without
     /// it the replay gate is memory-only: every restart forgets all
     /// consumed nonces, so ANY captured signed request becomes
-    /// replayable once. With a store attached, the replay window
-    /// shrinks to the entries consumed since the last checkpoint —
-    /// flushed every [`NONCE_FLUSH_EVERY`] admissions and on every
-    /// [`Self::seal_batch`]. Call before serving traffic.
+    /// replayable once. With a store attached (`path` plus a
+    /// `<path>.wal` write-ahead log), consumed nonces are handed to a
+    /// background durability thread every [`NONCE_FLUSH_EVERY`]
+    /// admissions and on every [`Self::seal_batch`]. The replay window
+    /// shrinks to the admissions not yet `fdatasync`ed, and the
+    /// sequencer never touches the disk (hft-audit-2 M-1). Call
+    /// before serving traffic.
     ///
     /// # Panics
     ///
-    /// Panics if the file exists but is corrupt — a replay DB that
-    /// can't be verified must fail closed, not silently reset.
+    /// Panics if the checkpoint is corrupt, the log is unreadable, or
+    /// the startup checkpoint cannot be written. A replay DB that
+    /// cannot be verified or kept durable must fail closed, not
+    /// silently reset.
     pub fn set_nonce_store(&mut self, path: std::path::PathBuf) {
         self.nonces.attach_store(path);
     }
