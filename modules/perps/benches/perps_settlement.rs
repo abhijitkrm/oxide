@@ -18,25 +18,41 @@
 //! | `perps_place_cancel_mm_account` | full `handle()`: place + cancel one bid on an account already resting 256 bids | none yet — measurement row (hft-audit-2 T-2) |
 //! | `perps_sweep_10_levels` | full `handle()`: one taker sweeps 10 one-maker levels (no reduce-only resting) | none yet — measurement row (hft-audit-2 T-6) |
 //!
-//! ## Measured results (M-series dev Mac, criterion p50)
+//! ## Measured results
+//!
+//! x86 audit box (Zen 2, 16 cores, shared/loaded host — relative
+//! numbers), criterion p50, after hft-audit-2 T-2/T-3:
 //!
 //! | Bench | p50 | Throughput | Gate | Verdict |
 //! |-------|-----|-----------|------|---------|
-//! | `perps_place_with_margin` | 723 ns | ~1.38M orders/s/core | < 3 µs | ✅ |
-//! | `perps_deposit` | 274 ns | ~3.65M deposits/s/core | < 2 µs | ✅ |
-//! | `perps_liquidation_check` | 150 ns | ~6.7M checks/s/core | < 5 µs | ✅ |
-//! | `raw_perps_engine_place` | 406 ns | ~2.46M fills/s/core | baseline | — |
-//! | Perps overhead | ~316 ns/fill | — | — | — |
+//! | `perps_place_with_margin` | 3.58 µs | ~280k orders/s/core | < 3 µs | ❌ (was 6.16 µs at audit) |
+//! | `perps_deposit` | 503 ns | ~2.0M deposits/s/core | < 2 µs | ✅ |
+//! | `perps_liquidation_check` | 49 ns | ~20M checks/s/core | < 5 µs | ✅ |
+//! | `raw_perps_engine_place` | 349 ns | ~2.9M fills/s/core | baseline | — |
+//! | Perps overhead | ~3.2 µs/fill | — | — | — |
+//! | `perps_sweep_10_levels` | 35.5 µs | — | none yet | — |
+//! | `perps_place_cancel_mm_account` | 50.7 µs | — | none yet | — |
+//!
+//! The earlier M-series table (723 ns place, "~316 ns/fill" overhead)
+//! no longer describes this path: it predates the committed account
+//! fold, whose whole-account leaf is re-hashed on every account
+//! mutation (hft-audit-2 T-8). The failing place gate and the MM row
+//! are tracked as the remaining T-2 work (two-level account leaf,
+//! maintained open-order IM).
 //!
 //! ## Why these gates
 //!
 //! The perps module adds, on top of the raw matching engine:
-//! - `apply_fill_to_position` per fill: BTreeMap lookup for the
-//!   account, BTreeMap lookup/insert for the position, VWAP entry
-//!   price recalculation (i128 multiply + divide),
-//! - `margin_check` per place: clone of configs + marks BTreeMaps,
-//!   equity calculation (iterate positions, i128 PnL + scale
-//!   conversion), maintenance calculation,
+//! - `apply_fill_to_position` per fill: in-place account updates
+//!   through the committed `accounts` map, each folding the old and
+//!   new whole-account leaf (two hashes over the full account
+//!   encoding), VWAP entry price recalculation (i128 multiply +
+//!   divide),
+//! - admission: the initial-margin check walks every open order of
+//!   the account (O(open orders)) to price existing reservations,
+//! - `margin_check` per touched account after the trade: equity
+//!   calculation (iterate positions, i128 PnL + scale conversion),
+//!   maintenance calculation (borrowing configs + marks, no clone),
 //! - event emission (Vec allocations for fill + outcome events).
 //!
 //! The perps path is heavier than the spot exchange path because of

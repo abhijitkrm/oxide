@@ -23899,3 +23899,14 @@ New bench rows `perps_sweep_10_levels` and `perps_place_cancel_mm_account`
 open: each mutation hashes the whole account twice and admission walks
 every open order — fixing those needs a two-level account leaf, a
 state-root format change.
+
+### T-8: settlement bench docs match the code; failing gates marked
+
+The exchange and perps settlement bench headers described paths that no
+longer exist ("one `ledger.transfer()`, ~370 ns/fill"; "723 ns") and
+showed every gate green. They now describe the real per-fill work with
+fresh EPYC numbers and mark the three gates that fail here:
+`settlement_single_fill` 2.04 µs vs 2 µs, `settlement_sweep/10_levels`
+17.2 µs vs 10 µs (both pending the rest of T-3 / T-7), and
+`perps_place_with_margin` 3.58 µs vs 3 µs (pending the rest of T-2).
+`state_root_vs_book` no longer claims the root re-serializes the book.

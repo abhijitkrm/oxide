@@ -11,45 +11,56 @@
 //!
 //! | Bench | What | Gate (source: plan.md §13 Phase 3, §9.2) |
 //! |---|---|---|
-//! | `settlement_single_fill` | full `handle()`: parse + pre-trade check + match + ledger transfer + event emit | p50 < 2 µs ⇒ ≥500k orders/s/core settled |
+//! | `settlement_single_fill` | full `handle()`: parse + admission escrow + match + DvP custody/ledger settlement + event emit | p50 < 2 µs ⇒ ≥500k orders/s/core settled |
 //! | `settlement_sweep_10_levels` | full `handle()` sweeping 10 resting makers | p50 < 10 µs ⇒ ≥100k sweeps/s/core |
 //! | `raw_engine_single_fill` | `MatchingEngine::place()` only (no settlement) | baseline for head-to-head |
 //! | `settlement_overhead` | derived: `settlement_single_fill − raw_engine_single_fill` | the ledger + event overhead per fill |
 //! | `batch_settle_1k_distinct_pairs` | `handle_batch_settle`, 1k fills, every leg a unique (buyer,seller) pair | p50 < 1 ms ⇒ ≥1M fills/s settled |
 //! | `batch_settle_1k_same_pair` | `handle_batch_settle`, 1k fills collapsing to 1 transfer | p50 < 1 ms ⇒ ≥1M fills/s validated |
 //!
-//! ## Measured results (M-series dev Mac, criterion p50)
+//! ## Measured results
+//!
+//! x86 audit box (Zen 2, 16 cores, shared/loaded host — relative
+//! numbers; the 16-core rig is the source for absolute gate claims),
+//! criterion p50, after hft-audit-2 T-3 (inline `CanonicalState`):
 //!
 //! | Bench | p50 | Throughput | Gate | Verdict |
 //! |-------|-----|-----------|------|---------|
-//! | `settlement_single_fill` | 829 ns | ~1.2M orders/s/core | < 2 µs | ✅ |
-//! | `settlement_sweep_10_levels` | 3.08 µs | ~325k sweeps/s/core | < 10 µs | ✅ |
-//! | `raw_engine_single_fill` | 459 ns | ~2.2M fills/s/core | baseline | — |
-//! | Settlement overhead | ~370 ns/fill | — | — | — |
-//! | `batch_settle_1k_distinct_pairs` | 254 µs/1k fills | ~3.9M fills/s | < 1 ms | ✅ |
-//! | `batch_settle_1k_same_pair` | 9.0 µs/1k fills | ~110M fills/s | < 1 ms | ✅ |
+//! | `settlement_single_fill` | 2.04 µs | ~490k orders/s/core | < 2 µs | ❌ marginal (was 2.72 µs before T-3) |
+//! | `settlement_sweep/10_levels` | 17.2 µs | ~58k sweeps/s/core | < 10 µs | ❌ (was 25.3 µs before T-3) |
+//! | `raw_engine_single_fill` | 343 ns | ~2.9M fills/s/core | baseline | — |
+//! | Settlement overhead | ~1.7 µs/fill | — | — | — |
+//! | `batch_settle_1k_distinct_pairs` | 760 µs/1k fills | ~1.3M fills/s | < 1 ms | ✅ |
+//! | `batch_settle_1k_same_pair` | 135 µs/1k fills | ~7.4M fills/s | < 1 ms | ✅ |
 //!
-//! `batch_settle` is the 1M-orders/s settlement path: ~254 ns/fill
-//! worst-case (no pair aggregation — one ledger transfer per fill),
-//! ~9 ns/fill when the batch aggregates to a single pair. End-to-end
-//! through the 4-validator oxideBFT TCP pipeline it sustains
-//! ~1.85M fills/s (~3.7M orders/s) at the 65,536-fill wire maximum —
-//! see `crates/devnet/tests/settle_tps.rs`.
+//! The earlier M-series table (829 ns single fill, "~370 ns/fill"
+//! overhead) predates base custody and the incremental state-root
+//! folds and no longer describes this path (hft-audit-2 T-8). The two
+//! failing book-path gates are tracked as T-3 (remaining per-fill leaf
+//! hashes and `Vec<Event>` allocations) and T-7 (custody map walks).
+//!
+//! `batch_settle` is the 1M-orders/s settlement path (one ledger
+//! transfer per distinct pair, aggregated). End-to-end through the
+//! 4-validator oxideBFT TCP pipeline see
+//! `crates/devnet/tests/settle_tps.rs`.
 //!
 //! ## Why these gates
 //!
-//! The matching engine alone sustains 22.5M ops/s/core (44.5 ns/op,
-//! `crates/trading/benches/matching.rs`). Settlement adds, per fill:
-//! - one `ledger.balance()` account-cache read (pre-trade check),
-//! - one `ledger.transfer()` = two BTreeMap lookups + two inserts,
-//! - one `fill_event` Vec allocation + byte copies,
-//! - one `outcome_event` Vec allocation.
+//! The matching engine alone sustains >10M ops/s/core
+//! (`crates/trading/benches/matching.rs`). A book-path fill adds, per
+//! fill (`settle.rs` `BookSettlement::apply`):
+//! - DvP custody: the maker's `base_holds` entry and the buyer's
+//!   `base_balances` entry — each a `CommittedMap` get + insert, and
+//!   each insert hashes the old and new leaf (4 leaf hashes),
+//! - the quote leg: `ledger.credit` to the seller on the native EVM
+//!   ledger (account-cache write + undo capture),
+//! - the protocol fee: a `fee_vault` get + insert (2 leaf hashes),
+//! - the engine's resting fold for the maker (`fold_replace`, 2 leaf
+//!   hashes on a partial fill, 1 on a full fill),
+//! - `fill_event` + `outcome_event` allocations and byte copies.
 //!
-//! The ledger's account-cache write (plus undo capture) is the dominant settlement
-//! cost: each `transfer` does two key lookups and two key allocations
-//! (`addr.0.to_vec()`). The gate (≥500k orders/s/core settled) is
-//! conservative — it is 1/40th of the raw engine throughput, reflecting
-//! that settlement is BTreeMap-bound, not arena-bound.
+//! So settlement is hash- and BTreeMap-bound, not arena-bound; the
+//! gates (≥500k orders/s/core settled) are 1/40th of the raw engine.
 //!
 //! ## Method notes
 //!
@@ -160,8 +171,10 @@ fn register_working_order(
 /// Gate: p50 < 2 µs (≥500k orders/s/core settled).
 ///
 /// Measures the full `ExchangeModule::handle()` path for a single
-/// fill: message parse, pre-trade balance check, engine match, ledger
-/// transfer (debit buyer + credit seller), and event emission. The
+/// fill: message parse, admission escrow (buyer quote debit, seller
+/// base hold), engine match, DvP settlement (custody map updates,
+/// seller quote credit, fee accrual — see the module doc for the
+/// per-fill leaf hashes), and event emission. The
 /// setup rests one maker sell; the measured section places one taker
 /// buy that fills it.
 fn settlement_single_fill(c: &mut Criterion) {
@@ -208,8 +221,8 @@ fn settlement_single_fill(c: &mut Criterion) {
 ///
 /// Measures the full `handle()` path for a D-level sweep: D resting
 /// makers at consecutive ticks, one marketable taker buy that fills
-/// all D. Each fill triggers a separate `ledger.transfer()` plus a
-/// pushed fill event, so settlement cost should scale linearly with
+/// all D. Each fill settles separately (custody map updates, a
+/// seller `ledger.credit`, fee accrual) plus a pushed fill event, so settlement cost should scale linearly with
 /// fill count — and the fill/event `Vec` must grow by amortized
 /// doubling, not per-push reallocation. The depth axis
 /// {10, 100, 500} reports per-fill cost (`throughput` = fills/s), so
@@ -492,12 +505,13 @@ fn exchange_with_book(n_orders: usize) -> ExchangeModule {
     ex
 }
 
-/// No gate — this bench REPORTS the cost the audit's 7.4 entry
-/// names: `state_root` re-serializes the entire committed book every
-/// block, so per-block commitment cost scales with resting orders,
-/// not with touched state. Rows measure `Module::state_root` over
-/// 100 / 1k / 10k resting sells — the baseline any incremental
-/// (Merkle-ized book) redesign must beat.
+/// No gate — scaling check for the 7.4 incremental commitment:
+/// `Module::state_root` over 100 / 1k / 10k resting sells. The book
+/// root reads each engine's maintained `resting_fold` instead of
+/// re-serializing the book, so the rows stay flat in book size
+/// (x86 audit box, loaded host: 4–12 µs at every size, dominated by
+/// noise, not by `n`). A row that starts scaling with `n` means a
+/// mutation escaped the fold and the root fell back to a walk.
 fn state_root_vs_book(c: &mut Criterion) {
     let mut group = c.benchmark_group("state_root_vs_book");
     for &n in &[100usize, 1_000, 10_000] {

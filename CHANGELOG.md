@@ -12,6 +12,12 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Documentation
 
+- **Settlement benchmark docs describe the current code and flag the
+  three gates that currently fail** (`exchange`, `perps`, hft-audit-2
+  T-8).
+  - **In plain words:** the performance notes stop claiming targets
+    the code doesn't currently meet.
+
 - **Local end-to-end and measurement scripts** (`scripts/`):
   `e2e-local.sh` drives real `oxide-devnet` processes (no Docker)
   through liveness, wiped-node rejoin, agreement and tx inclusion —
