@@ -24061,3 +24061,12 @@ already handles (the commit walk waits for block sync: liveness, not
 safety). The performance half of N-3 — not re-writing bodies on every
 vote, via a body log keyed by hash — is still open; it changes the WAL
 format.
+
+### X-13: tx outcome store keyed by `DigestMap`
+
+`TxOutcomeStore.outcomes` (written once per executed tx on the exec
+lane, read by every RPC receipt lookup) was a SipHash `HashMap<Hash, _>`
+over BLAKE3 tx digests; it now uses `DigestMap`, like the preverify
+cache and (N-8) the mempool. The remaining X-13 maps (`ExecutedNonces`,
+`BlockNonces`, `touched`) are keyed by addresses, which senders choose,
+so they keep the DoS-resistant default hasher.

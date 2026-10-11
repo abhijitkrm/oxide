@@ -54,6 +54,11 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Transaction outcome lookups use the digest map** (`executor`,
+  hft-audit-2 X-13).
+  - **In plain words:** recording and looking up a transaction's
+    result is a little cheaper.
+
 - **Consensus certificate checks skip per-call key decompression**
   (`consensus`, hft-audit-2 S-9): validator keys are decoded once per
   committee, and QC / execution-certificate verification uses them

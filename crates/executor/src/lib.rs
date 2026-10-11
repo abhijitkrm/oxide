@@ -1461,8 +1461,10 @@ const MAX_TX_OUTCOMES: usize = 8192;
 struct TxOutcomeStore {
     /// Hashes in record order — front is oldest.
     order: std::collections::VecDeque<Hash>,
-    /// The outcomes themselves.
-    outcomes: HashMap<Hash, TxOutcome>,
+    /// The outcomes themselves, keyed by BLAKE3 tx digest — a
+    /// `DigestMap` skips `SipHash` over the 32-byte key on the
+    /// per-tx record and every RPC receipt lookup (hft-audit-2 X-13).
+    outcomes: primitives::digest_map::DigestMap<TxOutcome>,
 }
 
 impl TxOutcomeStore {
