@@ -381,6 +381,15 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Validator loop no longer idles between dependent steps**
+  (`node`, hft-audit-2 N-1): the consensus pump again skips its 1 ms
+  idle wait after a pass that did work, and polls every 50 µs while
+  signature checks are outstanding, so a vote, QC or next proposal
+  goes out in the following pass instead of up to 1 ms later (2–3
+  such waits per view).
+  - **In plain words:** each consensus round stops paying a few
+    milliseconds of pure waiting.
+
 - **Votes no longer stall the validator loop behind a lagging
   execution lane** (`consensus`, `node`): with an execution
   certificate for a height not yet executed locally, the vote path

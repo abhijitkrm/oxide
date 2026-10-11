@@ -23575,3 +23575,18 @@ Working through the findings of `hft-audit-2.md` (committed at
 this session; it stays in git history (`git show c8075c3:hft-audit-2.md`),
 and code comments cite its finding ids (`hft-audit-2 N-1`, …) against
 that revision. Each fix below lands as its own commit.
+
+### N-1: the pump's idle quantum, again
+
+Root cause: merge `7cbcbcd` dropped the `progressed` flag that
+`1c9bc93` added, so the pump again ended *every* pass in a 1 ms
+`recv_timeout` on the transport. Work produced in a pass whose
+follow-up runs next pass (verdict → pending → vote, view advance →
+propose) waited out the quantum: 2–3 quanta per view. Verify-pool
+verdicts arrive on their own crossbeam channel, which the transport
+wait cannot observe, so even the "wakeup-capable" wait was blind to
+them. Fix: `progressed` is restored and set by every productive step
+(frame, verdict, gossip, proposal, vote, QC, view advance); a
+productive pass skips the wait, and while verify jobs are in flight
+the wait shrinks to `BUSY_POLL` (50 µs). Idle CPU is unchanged: an
+idle pass still blocks 1 ms.

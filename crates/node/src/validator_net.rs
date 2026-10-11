@@ -1098,6 +1098,14 @@ fn run_consensus_loop(
     let mut wake_msg: Option<ports::transport::InboundMessage> = None;
 
     loop {
+        // Set when this pass did work whose follow-up belongs to the
+        // next pass — a consumed frame, verdict or gossiped tx, a
+        // produced proposal or vote, a formed QC, a view advance.
+        // The idle wait at the bottom is skipped after such a pass so
+        // the follow-up (vote, QC, next proposal) goes out without
+        // waiting out the idle quantum. Commit 1c9bc93 introduced
+        // this; merge 7cbcbcd dropped it (hft-audit-2 N-1).
+        let mut progressed = false;
         // Graceful shutdown: SIGINT/SIGTERM sets the flag, we break
         // cleanly so the transport can flush and the WAL can be
         // closed by `Drop`.
@@ -1135,6 +1143,7 @@ fn run_consensus_loop(
                 }
             });
             if let Some((header, proposal)) = produced {
+                progressed = true;
                 let proposal_view = header.view.value();
                 proposed_views.insert(proposal_view);
                 pending_proposals.push((header.clone(), proposal.clone()));
@@ -1170,6 +1179,7 @@ fn run_consensus_loop(
                 continue; // Leader already self-voted.
             }
             if let Some(vote) = engine.vote(header, proposal) {
+                progressed = true;
                 let mut buf = Vec::with_capacity(1 + 137);
                 buf.push(MSG_VOTE);
                 vote.encode(&mut buf);
@@ -1188,6 +1198,7 @@ fn run_consensus_loop(
         // receive must consume to wake — hft-audit F-01); it is
         // processed first, then the queue drains non-blocking.
         while let Some(msg) = wake_msg.take().or_else(|| transport.recv()) {
+            progressed = true;
             if msg.bytes.is_empty() {
                 continue;
             }
@@ -1684,6 +1695,7 @@ fn run_consensus_loop(
         // stale or contradictory verdict can never move consensus.
         while let Some(done) = verify_pool.try_recv() {
             use crate::verify_pool::VerifyOutcome;
+            progressed = true;
             match done.outcome {
                 VerifyOutcome::Proposal { header, proposal, sig_ok, commit_ok } => {
                     // The dedupe key is claimed only by a verdict
@@ -1774,6 +1786,7 @@ fn run_consensus_loop(
         // iteration — each send is a channel push to the peer's
         // writer task, non-blocking.
         while let Ok(tx_bytes) = gossip_rx.try_recv() {
+            progressed = true;
             fanout_tx(engine, transport, our_addr, &mut seen_txs, &mut seen_txs_fifo, &tx_bytes);
         }
 
@@ -1905,6 +1918,7 @@ fn run_consensus_loop(
 
         // Phase 4: form QC (if quorum reached).
         if let Some(qc) = engine.try_form_qc() {
+            progressed = true;
             let mut qc_buf = Vec::with_capacity(1 + 150);
             qc_buf.push(MSG_QC);
             qc.encode(&mut qc_buf);
@@ -1928,6 +1942,9 @@ fn run_consensus_loop(
         // byzantine or crashed leader.
         let current_view_now = engine.current_view().value();
         if current_view_now != prev_view {
+            // A new view may make us leader: propose next pass, not
+            // after an idle quantum.
+            progressed = true;
             // View advanced — reset the timer and clear the sent flag.
             view_start = std::time::Instant::now();
             timeout_sent_for_view = None;
@@ -2235,17 +2252,26 @@ fn run_consensus_loop(
         // Idle wait — wakeup-capable, not a blind sleep (hft-audit
         // F-01): `recv_timeout` parks on the inbound channel's
         // condvar, so an arriving proposal/vote/QC wakes the pump
-        // THIS pass instead of up to a millisecond late — the sleep
-        // made every message pay up to 1ms of queue latency while
-        // claiming to be the fast path. The 1ms bound keeps the
-        // pacemaker, gossip drain, and sync cadence identical to the
-        // sleep it replaced: those duties need the loop to run on a
-        // ~ms quantum, and the timeout is exactly that quantum.
+        // THIS pass instead of up to a millisecond late. The 1ms
+        // bound keeps the pacemaker, gossip drain, and sync cadence
+        // on a ~ms quantum when idle.
+        //
+        // Skipped entirely after a productive pass (hft-audit-2
+        // N-1): the follow-up work (vote on an admitted proposal,
+        // propose after a view advance) is in the next pass and must
+        // not wait out the quantum. While verify jobs are in flight
+        // the wait shrinks to `BUSY_POLL`: verdicts arrive on the
+        // pool's own channel, which this wait cannot observe.
         // A wait that ends with a frame stashes it in `wake_msg`;
         // Phase 3 next pass processes it before draining — nothing
         // popped to wake is ever dropped.
-        if wake_msg.is_none() {
-            wake_msg = transport.recv_timeout(std::time::Duration::from_millis(1));
+        if wake_msg.is_none() && !progressed {
+            let wait = if verify_pool.busy() {
+                crate::verify_pool::BUSY_POLL
+            } else {
+                std::time::Duration::from_millis(1)
+            };
+            wake_msg = transport.recv_timeout(wait);
         }
     }
 }

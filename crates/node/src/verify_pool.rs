@@ -206,6 +206,18 @@ pub(crate) enum VerifyOutcome {
     Panicked,
 }
 
+/// Idle wait the pump uses while verify jobs are outstanding.
+///
+/// Unit: microseconds. Origin: hft-audit-2 N-1 — a BLS verdict lands
+/// on the results channel, which the transport's `recv_timeout`
+/// cannot observe, so with the full 1 ms idle quantum a proposal's
+/// verdict waited up to a millisecond to be applied (and the vote up
+/// to another). 50 µs is ~1/30 of one pairing (~1.4 ms on the EPYC
+/// target), so polling costs a negligible share of a core while the
+/// verdict-to-vote latency drops from ≤1 ms to ≤50 µs. Lower trades
+/// CPU for latency; raising it toward 1 ms reintroduces N-1.
+pub(crate) const BUSY_POLL: std::time::Duration = std::time::Duration::from_micros(50);
+
 /// The bounded worker pool. Owns the send half of the job queue,
 /// the receive half of the results, and the fairness accounting —
 /// workers are detached daemon threads that exit when the pump's
@@ -337,6 +349,15 @@ impl VerifyPool {
             }
         }
         Some(done)
+    }
+
+    /// Whether any submitted job has not had its verdict drained
+    /// yet. Verdicts travel on their own channel, so the pump's
+    /// transport wait cannot wake on them; while this is true the
+    /// pump shortens its idle wait to [`BUSY_POLL`] instead of the
+    /// full idle quantum (hft-audit-2 N-1).
+    pub(crate) fn busy(&self) -> bool {
+        self.queued_jobs > 0
     }
 
     /// Outstanding queued+running jobs — tests observe the bound.
