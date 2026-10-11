@@ -120,6 +120,42 @@ pub struct GenesisValidator {
     pub public_key: Option<Vec<u8>>,
 }
 
+/// Resting-order capacity of the default spot and perps markets
+/// [`assemble_executor`] lists at genesis (orders per market).
+///
+/// Source: plan.md §9.1 (market arenas sized from genesis) and
+/// hft-audit-2 T-4. The previous hard-coded 64 made every
+/// "orders/s chain-wide" figure meaningless: the 65th resting order
+/// was rejected with `BookFull`, so a single market maker quoting a
+/// realistic ladder exhausted the book. 2^16 matches the capacity
+/// every throughput test, the off-chain matcher, and the trading
+/// benches already use.
+///
+/// This is a *consensus* parameter, not a per-node knob: the value is
+/// committed in the market's canonical header (and therefore in the
+/// exchange/perps state roots), so it is a compile-time constant every
+/// validator shares rather than a `NodeConfig` field an operator could
+/// set differently from its peers.
+///
+/// Memory: the engine reserves `max_resting` × 64-byte pool nodes
+/// (4 MiB virtual, faulted in as orders rest) and eagerly fills an
+/// id-map of the next power of two above `2 × max_resting` 16-byte
+/// entries (2 MiB resident) — ~6 MiB per market, ~12 MiB per node for
+/// the two default markets. Raising it towards
+/// [`trading::MAX_RESTING_LIMIT`] (2^20, ~96 MiB per market) needs
+/// prefaulted huge-page arenas first (T-10); lowering it rejects
+/// resting depth real books need.
+pub const DEFAULT_MARKET_MAX_RESTING: u32 = 1 << 16;
+
+// Compile-time guard: the default must stay at production scale
+// (T-4 floor) and inside the protocol ceiling `MarketConfig::validate`
+// enforces, so a careless edit fails the build rather than the
+// genesis listing.
+const _: () = assert!(
+    DEFAULT_MARKET_MAX_RESTING >= 1 << 16
+        && DEFAULT_MARKET_MAX_RESTING <= trading::MAX_RESTING_LIMIT
+);
+
 /// Genesis state applied at executor assembly.
 ///
 /// The single shared input to [`assemble_executor`]'s genesis path:
@@ -908,7 +944,8 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     let staking_module = Arc::new(staking_module);
     executor.register_module(staking_module.clone());
     // Register the exchange module with a default spot market
-    // (tick 0.01, lot 0.001, [$10, $20], 64 max resting). The
+    // (tick 0.01, lot 0.001, [$10, $20],
+    // `DEFAULT_MARKET_MAX_RESTING` max resting). The
     // exchange settles fills against EVM balances (plan.md §9.2).
     let mut exchange_mod = exchange::ExchangeModule::with_ledger(evm_module.clone())
         .with_committee(staking_module.clone());
@@ -923,7 +960,7 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
             lot_size: Qty(1_000),
             min_price: Price(1_000_000_000),
             max_price: Price(2_000_000_000),
-            max_resting: 64,
+            max_resting: DEFAULT_MARKET_MAX_RESTING,
         })
         .expect("default market config is valid");
     executor.register_module(exchange.clone());
@@ -942,7 +979,7 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
                 lot_size: Qty(1_000),
                 min_price: Price(1_000_000_000),
                 max_price: Price(2_000_000_000),
-                max_resting: 64,
+                max_resting: DEFAULT_MARKET_MAX_RESTING,
             },
             max_leverage: 10,
             mmr_base_bps: 50,

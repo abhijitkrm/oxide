@@ -23824,3 +23824,18 @@ the backlog drain cloned it a third time out of the log. Both
 structures now hold `Arc<FinalizedBlock>`: one deep copy per commit,
 shared, and the drain's lookup is a refcount bump. The audit's ~1–2 ms
 per 10k-tx block is the copy volume removed.
+
+### T-4: default markets hold 2^16 resting orders
+
+The node listed its default spot and perps markets with a hard-coded
+`max_resting: 64`; the 65th resting order chain-wide hit `BookFull`, so
+any "orders/s chain-wide" figure measured a toy book. Both listings now
+use `DEFAULT_MARKET_MAX_RESTING = 1 << 16` (const-asserted between 2^16
+and `MAX_RESTING_LIMIT`). A constant, not a `NodeConfig` knob, on
+purpose: `max_resting` is committed in the market header and therefore
+in the state roots, so a per-node setting would let one validator fork
+itself off. Memory: ~6 MiB per market (4 MiB pool reserved virtually,
+2 MiB id-map filled), ~12 MiB per node. **Consensus-visible:** genesis
+state roots of new chains change, and replaying an existing chain's
+journal under this binary produces different roots — a hard fork for
+existing deployments; validators built from the same source agree.

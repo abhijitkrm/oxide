@@ -1288,6 +1288,13 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Changed
 
+- **Default on-chain markets hold 65,536 resting orders, not 64**
+  (`node`, hft-audit-2 T-4). The bound is committed state, so this
+  changes genesis state roots: existing chains must treat it as a
+  hard fork.
+  - **In plain words:** the chain's built-in markets can now hold a
+    real order book instead of filling up after 64 orders.
+
 - **`oxide-matcher` defaults to `--mode ring`** (`matcher`,
   hft-audit-2 M-3), and multi mode no longer blocks async network
   threads while waiting on a market worker.
