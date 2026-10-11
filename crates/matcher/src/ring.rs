@@ -283,6 +283,138 @@ impl Default for Wakeup {
     }
 }
 
+/// How long the sequencer keeps busy-polling its rings after the last
+/// unit of work before it parks on the [`Wakeup`] condvar
+/// (hft-audit-2 M-2).
+///
+/// Why spin at all: parking costs the NEXT order a `mutex +
+/// notify_one` on the producer, a futex wake, and a scheduler/C-state
+/// exit on the sequencer — 15–100 µs measured on the x86 target box
+/// against a ~0.5 µs match. Order flow arrives in bursts, so most
+/// inter-arrival gaps at sub-saturation load are far shorter than
+/// this window and the next order lands on a hot, running thread.
+///
+/// Why 200 µs: the audit's recommended band is 100–300 µs. It is
+/// long enough to cover a client's ack→next-order round trip on
+/// loopback (~20–60 µs) with margin, and short enough that an idle
+/// venue burns at most 200 µs of one core per burst before it
+/// sleeps. Raising it trades CPU for tail latency on sparser flow;
+/// lowering it toward 0 converges on [`SequencerIdle::Park`].
+pub const SEQUENCER_SPIN_BUDGET: Duration = Duration::from_micros(200);
+
+/// Empty passes between clock reads while spinning. A pass over the
+/// default 256 rings is a few hundred ns, so 16 passes gives ~5–15 µs
+/// budget resolution while keeping `Instant::now` (a vDSO call) out of
+/// most of the spin. Larger values overshoot the budget more; smaller
+/// values spend more of the spin reading the clock.
+const SPIN_PASSES_PER_CLOCK_CHECK: u32 = 16;
+
+/// What the sequencer does when a full pass over its rings finds no
+/// work (`--sequencer-idle` on `oxide-matcher`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SequencerIdle {
+    /// Busy-poll for [`SEQUENCER_SPIN_BUDGET`], then park. The
+    /// default: a burst's follow-on orders reach a running thread
+    /// instead of paying a futex wake each (hft-audit-2 M-2).
+    #[default]
+    Spin,
+    /// Park on the first empty pass — the pre-M-2 behaviour. For
+    /// shared hosts and laptops where a briefly burning core matters
+    /// more than wake latency.
+    Park,
+}
+
+/// A `--sequencer-idle` value that is neither `spin` nor `park`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownSequencerIdle(pub String);
+
+impl std::fmt::Display for UnknownSequencerIdle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown sequencer idle policy '{}' (use spin or park)", self.0)
+    }
+}
+
+impl std::error::Error for UnknownSequencerIdle {}
+
+impl std::str::FromStr for SequencerIdle {
+    type Err = UnknownSequencerIdle;
+
+    /// Parses the CLI spelling: `spin` or `park`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "spin" => Ok(Self::Spin),
+            "park" => Ok(Self::Park),
+            other => Err(UnknownSequencerIdle(other.to_string())),
+        }
+    }
+}
+
+/// The sequencer's spin-then-park bookkeeping. Call [`on_work`]
+/// after a pass that did work and [`should_park`] after one that did
+/// not. It reads the clock only once every
+/// [`SPIN_PASSES_PER_CLOCK_CHECK`] empty passes, and never while work
+/// keeps arriving, so a busy sequencer pays nothing for it.
+///
+/// [`on_work`]: IdleSpinner::on_work
+/// [`should_park`]: IdleSpinner::should_park
+#[derive(Debug)]
+pub(crate) struct IdleSpinner {
+    /// Spin window; `None` = park immediately ([`SequencerIdle::Park`]).
+    budget: Option<Duration>,
+    /// When the current run of empty passes began; `None` while busy.
+    idle_since: Option<std::time::Instant>,
+    /// Empty passes since the last clock read.
+    passes: u32,
+}
+
+impl IdleSpinner {
+    /// A spinner for `policy`, using the production budget.
+    pub(crate) fn new(policy: SequencerIdle) -> Self {
+        Self::with_budget(match policy {
+            SequencerIdle::Spin => Some(SEQUENCER_SPIN_BUDGET),
+            SequencerIdle::Park => None,
+        })
+    }
+
+    /// A spinner with an explicit window (tests drive edge budgets).
+    pub(crate) fn with_budget(budget: Option<Duration>) -> Self {
+        Self { budget, idle_since: None, passes: 0 }
+    }
+
+    /// The last pass did work (or the thread just woke): the next
+    /// empty pass starts a fresh spin window.
+    #[inline]
+    pub(crate) fn on_work(&mut self) {
+        self.idle_since = None;
+        self.passes = 0;
+    }
+
+    /// The last pass found nothing. Returns `true` when the spin
+    /// window is used up and the caller should park; otherwise issues
+    /// a CPU spin hint and returns `false` so the caller polls again.
+    #[inline]
+    pub(crate) fn should_park(&mut self) -> bool {
+        let Some(budget) = self.budget else {
+            return true;
+        };
+        let Some(since) = self.idle_since else {
+            self.idle_since = Some(std::time::Instant::now());
+            self.passes = 0;
+            std::hint::spin_loop();
+            return false;
+        };
+        self.passes += 1;
+        if self.passes >= SPIN_PASSES_PER_CLOCK_CHECK {
+            self.passes = 0;
+            if since.elapsed() >= budget {
+                return true;
+            }
+        }
+        std::hint::spin_loop();
+        false
+    }
+}
+
 /// Why a `push` failed. The value is always returned to the caller
 /// so it can retry without data loss.
 #[derive(Debug)]
@@ -562,6 +694,47 @@ impl<T> SpscReceiver<T> {
         Some(value)
     }
 
+    /// Pop, busy-polling for up to `budget` before giving up — the
+    /// "brief spin" half of spin-then-park for an async consumer
+    /// (hft-audit-2 M-2). A response that lands within the window is
+    /// taken without the `Notify` round trip through the tokio
+    /// scheduler (a remote wake when the consumer task has already
+    /// yielded its worker).
+    ///
+    /// Returns `None` once the budget is spent or the producer is
+    /// gone; the caller then falls back to its `Notify` wait, which
+    /// stays the only correctness path. The clock is read every
+    /// [`SPIN_PASSES_PER_CLOCK_CHECK`] polls, so the window can
+    /// overshoot by a few hundred ns. Callers on an async executor
+    /// must keep `budget` short (tens of µs): spinning holds the
+    /// worker thread.
+    #[inline]
+    pub fn pop_spin(&self, budget: Duration) -> Option<T> {
+        if let Some(v) = self.pop() {
+            return Some(v);
+        }
+        if budget.is_zero() {
+            return None;
+        }
+        let start = std::time::Instant::now();
+        let mut polls = 0u32;
+        loop {
+            std::hint::spin_loop();
+            if let Some(v) = self.pop() {
+                return Some(v);
+            }
+            polls += 1;
+            if polls >= SPIN_PASSES_PER_CLOCK_CHECK {
+                polls = 0;
+                if self.producer_gone() || start.elapsed() >= budget {
+                    // One last probe: a value published just before
+                    // the producer dropped is still deliverable.
+                    return self.pop();
+                }
+            }
+        }
+    }
+
     /// The `Notify` signalled by producer pushes when this ring was
     /// built with [`spsc_ring_with_notify`] — the consumer task
     /// awaits it instead of `yield_now` polling (hft-audit F-15).
@@ -753,6 +926,79 @@ mod tests {
         });
         w.signal();
         assert!(handle.join().unwrap());
+    }
+
+    #[test]
+    fn idle_spinner_park_policy_parks_on_first_empty_pass() {
+        // `SequencerIdle::Park` is the pre-M-2 behaviour: no spin.
+        let mut s = IdleSpinner::new(SequencerIdle::Park);
+        assert!(s.should_park());
+    }
+
+    #[test]
+    fn idle_spinner_spins_until_budget_then_parks() {
+        // A window far longer than the test spins for: never parks
+        // within a bounded number of passes.
+        let mut long = IdleSpinner::with_budget(Some(Duration::from_secs(3600)));
+        for _ in 0..10 * SPIN_PASSES_PER_CLOCK_CHECK {
+            assert!(!long.should_park(), "must keep spinning inside the window");
+        }
+        // A zero window parks at the first clock check after the run
+        // of empty passes starts, never on the very first pass.
+        let mut zero = IdleSpinner::with_budget(Some(Duration::ZERO));
+        assert!(!zero.should_park(), "first empty pass only opens the window");
+        let parked_after = (1..=SPIN_PASSES_PER_CLOCK_CHECK).find(|_| zero.should_park());
+        assert_eq!(parked_after, Some(SPIN_PASSES_PER_CLOCK_CHECK));
+    }
+
+    #[test]
+    fn idle_spinner_work_resets_the_window() {
+        // Work mid-spin must restart the window, or a steady trickle
+        // of orders would eventually park between every one.
+        let mut s = IdleSpinner::with_budget(Some(Duration::ZERO));
+        assert!(!s.should_park());
+        for _ in 1..SPIN_PASSES_PER_CLOCK_CHECK {
+            assert!(!s.should_park());
+        }
+        s.on_work();
+        assert!(!s.should_park(), "a fresh window never parks on its first pass");
+    }
+
+    #[test]
+    fn sequencer_idle_parses_cli_spellings() {
+        assert_eq!("spin".parse::<SequencerIdle>(), Ok(SequencerIdle::Spin));
+        assert_eq!("park".parse::<SequencerIdle>(), Ok(SequencerIdle::Park));
+        assert!("busy".parse::<SequencerIdle>().is_err());
+        assert_eq!(SequencerIdle::default(), SequencerIdle::Spin);
+    }
+
+    #[test]
+    fn pop_spin_returns_value_pushed_during_the_spin() {
+        let (tx, rx) = spsc_ring::<u64>(4);
+        let producer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            tx.push(9).ok();
+            tx
+        });
+        // Generous window: the value must be taken by the spin, not
+        // left for a Notify wait.
+        assert_eq!(rx.pop_spin(Duration::from_secs(30)), Some(9));
+        drop(producer.join().unwrap());
+    }
+
+    #[test]
+    fn pop_spin_gives_up_on_empty_ring_and_dead_producer() {
+        let (tx, rx) = spsc_ring::<u64>(4);
+        assert_eq!(rx.pop_spin(Duration::ZERO), None);
+        assert_eq!(rx.pop_spin(Duration::from_micros(50)), None);
+        // A dead producer ends the spin early even with a huge budget
+        // — but a value it published first is still delivered.
+        tx.push(3).ok();
+        drop(tx);
+        assert_eq!(rx.pop_spin(Duration::from_secs(3600)), Some(3));
+        let t0 = Instant::now();
+        assert_eq!(rx.pop_spin(Duration::from_secs(3600)), None);
+        assert!(t0.elapsed() < Duration::from_secs(5), "dead producer must end the spin");
     }
 
     #[test]

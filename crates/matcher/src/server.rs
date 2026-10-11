@@ -46,6 +46,17 @@ use primitives::fixed::{Price, Qty};
 use std::sync::Arc;
 use trading::MarketConfig;
 
+/// How long a lease holder busy-polls its response ring before it
+/// arms the `Notify` and yields (hft-audit-2 M-2).
+///
+/// A spinning sequencer turns a single order around in ~1–5 µs, so
+/// 20 µs catches the common case with margin and saves a remote
+/// tokio wake (futex plus scheduler latency) per order. It is kept
+/// short on purpose: the spin holds a tokio worker, and tokio wants
+/// tasks to yield within tens of µs. Larger values starve sibling
+/// connections on the same worker; 0 restores pure Notify waiting.
+const RESPONSE_SPIN_BUDGET: std::time::Duration = std::time::Duration::from_micros(20);
+
 /// Submit a batch of orders through the ring matcher's SPSC rings
 /// (no mutex). Acquires an exclusive ring lease, pushes the WHOLE
 /// batch as one item, and pops the batch response — all under the
@@ -154,7 +165,13 @@ async fn submit_batch_ring(
         if sent {
             let data = Arc::clone(response_receiver.data_notify());
             let worker_responses = loop {
-                if let Some(r) = response_receiver.pop() {
+                // Brief spin first (hft-audit-2 M-2): a spinning
+                // sequencer answers a small batch in a few µs, so
+                // polling for RESPONSE_SPIN_BUDGET usually takes the
+                // response without a Notify wake through the tokio
+                // scheduler. On a miss, fall through to the Notify
+                // wait, which is the path correctness relies on.
+                if let Some(r) = response_receiver.pop_spin(RESPONSE_SPIN_BUDGET) {
                     break Some(r);
                 }
                 // The response ring's sender lives on the matcher
@@ -1034,6 +1051,10 @@ pub struct ServerConfig {
     /// lands on `base + i` (`run_server_multi` only). `None` runs
     /// workers unpinned.
     pub worker_base_core: Option<u32>,
+    /// What the ring-mode sequencer does when it runs out of work
+    /// (hft-audit-2 M-2): spin for a bounded window before parking
+    /// (default) or park at once. `run_server_ring` only.
+    pub sequencer_idle: crate::SequencerIdle,
 }
 
 impl Default for ServerConfig {
@@ -1051,6 +1072,7 @@ impl Default for ServerConfig {
             risk: crate::RiskConfig::default(),
             sequencer_core: None,
             worker_base_core: None,
+            sequencer_idle: crate::SequencerIdle::default(),
         }
     }
 }
@@ -1173,11 +1195,12 @@ pub async fn run_server_ring(
     sender: primitives::Address,
 ) {
     // The ring matcher owns the server (and thus the one book).
-    let ring = Arc::new(crate::RingMatcher::new(
+    let ring = Arc::new(crate::RingMatcher::with_idle(
         server,
         DEFAULT_RING_COUNT,
         DEFAULT_RING_CAPACITY,
         config.sequencer_core,
+        config.sequencer_idle,
     ));
     // Shared lease-scan hint: every request across ALL protocols
     // starts its free-ring search at a different index, so load

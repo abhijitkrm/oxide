@@ -97,6 +97,7 @@ struct CliConfig {
     risk: matcher::RiskConfig,
     sequencer_core: Option<u32>,
     worker_base_core: Option<u32>,
+    sequencer_idle: matcher::SequencerIdle,
 }
 
 /// Parse CLI flags into a `CliConfig`.
@@ -157,6 +158,21 @@ fn parse_cli() -> CliConfig {
         // for dev boxes where pinning collides with other load.
         sequencer_core: parse_flag_opt::<u32>("--pin-sequencer"),
         worker_base_core: parse_flag_opt::<u32>("--pin-worker-base"),
+        // Sequencer idle policy (hft-audit-2 M-2, ring mode): `spin`
+        // (default) busy-polls ~200 µs after the last order before
+        // parking, so follow-on orders skip the futex wake; `park`
+        // sleeps at once, for hosts where a briefly burning core
+        // matters more than latency. A typo is a startup error, not a
+        // silent fallback.
+        sequencer_idle: parse_flag_opt::<String>("--sequencer-idle").map_or_else(
+            matcher::SequencerIdle::default,
+            |v| {
+                v.parse().unwrap_or_else(|e| {
+                    eprintln!("error: --sequencer-idle: {e}");
+                    std::process::exit(1);
+                })
+            },
+        ),
     }
 }
 
@@ -229,6 +245,7 @@ fn build_server_config(cli: &CliConfig) -> ServerConfig {
         risk: cli.risk,
         sequencer_core: cli.sequencer_core,
         worker_base_core: cli.worker_base_core,
+        sequencer_idle: cli.sequencer_idle,
     }
 }
 
@@ -288,6 +305,9 @@ fn main() {
     println!("  mode:            {}", cli.mode);
     println!("  accounts:        {}", cli.accounts);
     println!("  balance/account: {DEFAULT_BALANCE}");
+    if cli.mode == "ring" {
+        println!("  sequencer idle:  {:?}", cli.sequencer_idle);
+    }
     if cli.mode == "multi" {
         println!("  markets:         {}", cli.markets);
         println!("  balance capacity: {}", cli.accounts_cap);

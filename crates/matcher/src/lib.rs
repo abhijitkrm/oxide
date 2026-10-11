@@ -78,7 +78,7 @@ pub use balance::{AtomicBalanceCache, BalanceCache, DEFAULT_SHARD_COUNT, Sharded
 pub use protocol::{
     ActionRequest, ActionType, OrderAction, OrderRequest, OrderResponse, RejectReason,
 };
-pub use ring::{SpscReceiver, SpscSender, Wakeup, spsc_ring, spsc_ring_with_wakeup};
+pub use ring::{SequencerIdle, SpscReceiver, SpscSender, Wakeup, spsc_ring, spsc_ring_with_wakeup};
 pub use risk::{RiskConfig, RiskDecision, RiskEngine};
 
 mod multimarket;
@@ -1087,6 +1087,26 @@ impl RingMatcher {
         ring_capacity: usize,
         sequencer_core: Option<u32>,
     ) -> Self {
+        Self::with_idle(server, num_rings, ring_capacity, sequencer_core, SequencerIdle::default())
+    }
+
+    /// [`RingMatcher::new`] with an explicit sequencer idle policy
+    /// (hft-audit-2 M-2): [`SequencerIdle::Spin`] busy-polls the rings
+    /// for [`ring::SEQUENCER_SPIN_BUDGET`] after the last unit of work
+    /// before parking; [`SequencerIdle::Park`] parks on the first
+    /// empty pass.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_rings` is 0.
+    #[must_use]
+    pub fn with_idle(
+        server: MatchingServer,
+        num_rings: usize,
+        ring_capacity: usize,
+        sequencer_core: Option<u32>,
+        idle: SequencerIdle,
+    ) -> Self {
         assert!(num_rings > 0, "must have at least one ring");
         // Shared wakeup signal for all ORDER rings. A push on any
         // order ring signals this, waking the sequencer from its
@@ -1138,7 +1158,9 @@ impl RingMatcher {
             "matcher-sequencer",
             true,
             sequencer_core,
-            move || run_sequencer(server, order_receivers, response_senders, control_rx, wake),
+            move || {
+                run_sequencer(server, order_receivers, response_senders, control_rx, wake, idle);
+            },
         )
         .expect("spawn matcher-sequencer thread");
 
@@ -1357,6 +1379,12 @@ impl RingMatcher {
 /// ring pop path returns `None` only on empty — teardown is the
 /// process ending, so the loop is `loop {}`).
 ///
+/// Idle protocol (hft-audit-2 M-2): an empty pass does not park
+/// immediately under [`SequencerIdle::Spin`] — the loop keeps polling
+/// for [`ring::SEQUENCER_SPIN_BUDGET`] so a burst's next order finds
+/// a running thread; only then does it park on the shared
+/// [`ring::Wakeup`].
+///
 /// Parking protocol (F-04): a response batch that can't push (client
 /// hasn't drained its previous exchange — the lease caps in-flight
 /// batches at one per ring) moves to `parked` and retries once per
@@ -1368,7 +1396,9 @@ fn run_sequencer(
     response_senders: Vec<ring::SpscSender<Vec<OrderResponse>>>,
     control_rx: std::sync::mpsc::Receiver<ControlCommand>,
     wake: Arc<ring::Wakeup>,
+    idle: SequencerIdle,
 ) {
+    let mut spinner = ring::IdleSpinner::new(idle);
     // Response batches that could not be pushed yet —
     // `(ring_idx, responses)`. Bounded by `num_rings` (one lease in
     // flight per ring). Parked instead of spun: the client is either
@@ -1441,16 +1471,26 @@ fn run_sequencer(
             }
             did_work = true;
         }
-        if !did_work {
-            // No work on any ring — announce parking, then re-check
-            // ring occupancy inside the wakeup so a push that raced
-            // the announcement is seen (the parked-flag protocol
-            // covers the window). The 1 ms timeout bounds
-            // control-channel latency for senders that somehow missed
-            // the explicit signal — and anything else anomalous.
+        if did_work {
+            spinner.on_work();
+        } else if spinner.should_park() {
+            // Spin window used up (or `SequencerIdle::Park`): announce
+            // parking, then re-check ring occupancy inside the wakeup
+            // so a push that raced the announcement is seen (the
+            // parked-flag protocol covers the window). The 1 ms
+            // timeout bounds control-channel latency for senders that
+            // somehow missed the explicit signal — and anything else
+            // anomalous.
+            //
+            // Until the window is used up the loop re-polls every ring
+            // (and the control channel and the parked responses), so
+            // an order arriving mid-spin is seen within one pass
+            // without the producer touching the futex — `signal()` is
+            // one swap while `parked == false` (hft-audit-2 M-2).
             wake.wait_for_work(std::time::Duration::from_millis(1), || {
                 order_receivers.iter().any(|r| !r.is_empty())
             });
+            spinner.on_work();
         }
     }
 }

@@ -23694,3 +23694,17 @@ WebSocket, ring and multi variants) now go through one helper,
 `accept_order_entry`, which sets `TCP_NODELAY`; a failure is logged and
 the connection kept. A unit test checks the accepted socket reports
 nodelay.
+
+### M-2: the sequencer spins before it parks
+
+The ring sequencer parked the moment a pass found no work, so below
+saturation almost every order paid a mutex + futex wake + scheduler
+exit. It now polls every ring for 200 µs (`SEQUENCER_SPIN_BUDGET`,
+reading the clock once per 16 empty passes) before parking, and the
+lease holder polls its response for 20 µs (`SpscReceiver::pop_spin`)
+before waiting on its `Notify`. Exposed as `SequencerIdle {Spin
+(default), Park}` / `oxide-matcher --sequencer-idle spin|park`.
+Measured push→response p50/p99 on the EPYC box: 20 µs gaps
+11.7/404 → 2.2/11.3 µs; 50 µs gaps 7.2/17.9 → 0.7/4.9 µs; 150 µs gaps
+10.7/479 → 2.9/11.4 µs; 1 ms gaps (past the window) unchanged
+(12.3/41.8 vs 13.4/37.2 µs).

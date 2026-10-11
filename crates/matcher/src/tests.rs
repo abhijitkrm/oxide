@@ -304,6 +304,18 @@ fn spam_orders_rejected_without_balance() {
 
 #[test]
 fn ring_matcher_seals_from_the_one_book() {
+    ring_matcher_seals_from_the_one_book_with(crate::SequencerIdle::Spin);
+}
+
+/// hft-audit-2 M-2: the pre-M-2 park-immediately policy must stay a
+/// fully working sequencer (every pass parks; wakes come only from
+/// the producer's `signal` / control-channel signals).
+#[test]
+fn ring_matcher_park_policy_serves_orders_and_control() {
+    ring_matcher_seals_from_the_one_book_with(crate::SequencerIdle::Park);
+}
+
+fn ring_matcher_seals_from_the_one_book_with(idle: crate::SequencerIdle) {
     // The ring matcher's owner thread holds THE book. Submit
     // orders through the ring, then seal via the control channel
     // — the seal must return the SAME fills the protocols
@@ -313,7 +325,7 @@ fn ring_matcher_seals_from_the_one_book() {
     let mut server = MatchingServer::new(cfg(), 100);
     server.fund_account(&seller, 1_000_000_000);
     server.fund_account(&buyer, 1_000_000_000);
-    let ring = RingMatcher::new(server, 4, 1024, None);
+    let ring = RingMatcher::with_idle(server, 4, 1024, None, idle);
 
     // Push a maker sell + taker buy as one batch through ring 0.
     // The ring only accepts `VerifiedOrder` proofs — transport

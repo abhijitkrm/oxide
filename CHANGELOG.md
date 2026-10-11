@@ -48,6 +48,14 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Matcher sequencer spins briefly before sleeping** (`matcher`,
+  hft-audit-2 M-2): new `--sequencer-idle spin|park` (default
+  `spin`). Push→response p50 at 50 µs order spacing 7.2 → 0.7 µs,
+  p99 at 20 µs spacing 404 → 11 µs.
+  - **In plain words:** when orders arrive close together the
+    matcher is already awake, so each one is answered several times
+    faster.
+
 - **EVM state no longer fsyncs every block when the block journal is
   on** (`storage`, `node`, hft-audit-2 X-8): with a durability
   directory configured, the redb state file makes its writes durable
