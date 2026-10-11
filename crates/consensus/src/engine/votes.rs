@@ -1446,24 +1446,27 @@ impl OxideBft {
         let Some(first) = self.votes.iter().find_map(Option::as_ref) else {
             return false;
         };
-        let mut signer_pks: Vec<crypto::bls::PublicKey> = Vec::with_capacity(self.votes.len());
+        // Pre-decompressed keys (hft-audit-2 S-9): this runs once per
+        // formed QC on the pump, and decoding each signer's key per
+        // call was ~12 µs × committee size.
+        let mut signer_keys: Vec<Option<&crypto::PreparedPublicKey>> =
+            Vec::with_capacity(self.votes.len());
         for (i, vote) in self.votes.iter().enumerate() {
             if vote.is_none() {
                 continue;
             }
-            let Ok(voter) = u16::try_from(i) else {
+            if i >= self.validator_set.n() {
                 return false;
-            };
-            let Ok(pk) = self.validator_set.validator(voter) else {
-                return false;
-            };
-            signer_pks.push(*pk);
-        }
-        if signer_pks.is_empty() {
-            return false;
+            }
+            signer_keys.push(self.validator_set.prepared_key(i));
         }
         let msg = self.vote_signing_message(first.view, first.phase as u8, &first.block_hash);
-        crypto::aggregate_verify(aggregate, crypto::hash::Domain::Vote, &msg, &signer_pks).is_ok()
+        crate::verify::prepared_aggregate_verifies(
+            aggregate,
+            crypto::hash::Domain::Vote,
+            &msg,
+            &signer_keys,
+        )
     }
 
     /// Aggregate the buffered votes and prove the result verifies

@@ -161,6 +161,51 @@ pub(crate) fn signer_keys_and_power(
     Ok((signer_pks, voting_power))
 }
 
+/// [`signer_keys_and_power`] over the set's pre-decompressed keys
+/// (hft-audit-2 S-9): no key copies and no per-verify decompression.
+/// An entry is `None` when that signer's key does not decode; callers
+/// treat any `None` as a failed signature check *after* the quorum
+/// check, the order `aggregate_verify`'s decode failure produced.
+///
+/// # Errors
+/// [`ConsensusError::SignerOutOfBounds`], as [`signer_keys_and_power`].
+pub(crate) fn signer_prepared_and_power<'a>(
+    vset: &'a ValidatorSet,
+    bitmap: &[u8],
+) -> Result<(Vec<Option<&'a crypto::PreparedPublicKey>>, u64), ConsensusError> {
+    let mut keys = Vec::with_capacity(vset.n());
+    let mut voting_power = 0u64;
+    for (i, byte) in bitmap.iter().enumerate() {
+        for bit in 0..8 {
+            if (byte >> bit) & 1 == 1 {
+                let idx =
+                    u16::try_from(i * 8 + bit).map_err(|_| ConsensusError::SignerOutOfBounds)?;
+                // Bounds via `validator`, like the unprepared walk.
+                vset.validator(idx).map_err(|_| ConsensusError::SignerOutOfBounds)?;
+                voting_power = voting_power.saturating_add(
+                    vset.stake(idx).map_err(|_| ConsensusError::SignerOutOfBounds)?,
+                );
+                keys.push(vset.prepared_key(usize::from(idx)));
+            }
+        }
+    }
+    Ok((keys, voting_power))
+}
+
+/// Aggregate-verify over prepared signer keys; `false` if any key
+/// failed to decode or the list is empty.
+pub(crate) fn prepared_aggregate_verifies(
+    agg: &crypto::bls::AggregateSignature,
+    domain: crypto::hash::Domain,
+    msg: &[u8],
+    keys: &[Option<&crypto::PreparedPublicKey>],
+) -> bool {
+    !keys.is_empty()
+        && keys.iter().all(Option::is_some)
+        && crypto::aggregate_verify_prepared(agg, domain, msg, keys.iter().flatten().copied())
+            .is_ok()
+}
+
 /// Voting power behind a certificate bitmap, checked against the
 /// stake quorum. A convenience for structural (pre-signature)
 /// checks that need the power without the keys — equivalent to
@@ -257,7 +302,7 @@ pub fn verify_exec_cert(
     if cert.epoch != epoch {
         return Err(ConsensusError::CertEpochMismatch { cert_epoch: cert.epoch, epoch });
     }
-    let (signer_pks, voting_power) = signer_keys_and_power(vset, &cert.signer_bitmap)?;
+    let (signer_keys, voting_power) = signer_prepared_and_power(vset, &cert.signer_bitmap)?;
     if voting_power < vset.quorum_stake() {
         return Err(ConsensusError::InsufficientQuorum {
             voting_power,
@@ -265,13 +310,16 @@ pub fn verify_exec_cert(
         });
     }
     let msg = attestation_signing_message(epoch, cert.height, &cert.state_root);
-    crypto::aggregate_verify(
+    if prepared_aggregate_verifies(
         &cert.aggregate_signature,
         crypto::hash::Domain::ExecAttest,
         &msg,
-        &signer_pks,
-    )
-    .map_err(|_| ConsensusError::InvalidQcSignature)
+        &signer_keys,
+    ) {
+        Ok(())
+    } else {
+        Err(ConsensusError::InvalidQcSignature)
+    }
 }
 
 /// Verify a QC's aggregate signature against the signer bitmap
@@ -300,8 +348,8 @@ pub(crate) fn verify_qc_signature(
     qc: &QuorumCertificate,
 ) -> Result<VerifiedQc, ConsensusError> {
     // Resolve the bitmap into signer keys + voting power.
-    let (signer_pks, voting_power) = signer_keys_and_power(vset, &qc.signer_bitmap)?;
-    if signer_pks.is_empty() {
+    let (signer_keys, voting_power) = signer_prepared_and_power(vset, &qc.signer_bitmap)?;
+    if signer_keys.is_empty() {
         return Err(ConsensusError::InvalidQcSignature);
     }
     // A certificate is only a certificate at quorum. Callers
@@ -318,13 +366,14 @@ pub(crate) fn verify_qc_signature(
     // C3 fix: verify against the full (view, phase, block_hash,
     // epoch) message, not just the block hash.
     let msg = vote_signing_message(epoch, qc.view, qc.phase as u8, &qc.block_hash);
-    crypto::aggregate_verify(
+    if !prepared_aggregate_verifies(
         &qc.aggregate_signature,
         crypto::hash::Domain::Vote,
         &msg,
-        &signer_pks,
-    )
-    .map_err(|_| ConsensusError::InvalidQcSignature)?;
+        &signer_keys,
+    ) {
+        return Err(ConsensusError::InvalidQcSignature);
+    }
     Ok(VerifiedQc { qc: qc.clone() })
 }
 

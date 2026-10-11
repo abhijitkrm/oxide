@@ -24028,3 +24028,18 @@ also checks membership in the online CPU *set* rather than
 ones on a sparse online list (`0-3,8-11`); the count remains the
 non-Linux fallback. Sibling-not-isolated findings are advisory and not
 surfaced yet.
+
+### S-9 follow-up: consensus verifies with pre-decompressed keys
+
+`ValidatorSet` now decompresses each key once at construction
+(`PreparedKeys`, `Arc`-shared so clones stay cheap, excluded from
+equality since it is derived from the compressed keys), and the inline
+certificate checks — `verify_qc_signature`, `verify_exec_cert`, and the
+leader's `buffered_aggregate_verifies` at QC formation — run
+`aggregate_verify_prepared` over the bitmap's prepared keys instead of
+copying `PublicKey`s and decompressing each per call (~12 µs per signer).
+Semantics are unchanged: the same decoding, the quorum check still
+precedes the signature check, and an undecodable key still fails as
+`InvalidQcSignature`. Crypto bench: 128 signers 3.53 → 1.93 ms per
+verify; at 4 validators the difference is within noise. The verify
+pool's `QcVerifyMaterial` still carries compressed keys.

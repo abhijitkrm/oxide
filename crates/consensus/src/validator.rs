@@ -56,6 +56,35 @@ pub struct ValidatorSet {
     leader_schedule: Vec<ValidatorIndex>,
     /// Total stake across all validators.
     total_stake: u64,
+    /// Each key decompressed once at construction (hft-audit-2 S-9):
+    /// `aggregate_verify` decompresses every signer's key on every
+    /// call (~12 µs each), so a 128-signer QC paid ~1.5 ms of pure
+    /// decoding per verify. Derived from `validators`.
+    prepared: PreparedKeys,
+}
+
+/// The validator table's decompressed keys, index-parallel to
+/// `ValidatorSet::validators`; `None` for a key that does not decode
+/// (it can then never verify, exactly as with `aggregate_verify`).
+///
+/// Shared (`Arc`) so cloning a set stays cheap, and excluded from
+/// equality: it is a pure function of the compressed keys, which
+/// `ValidatorSet`'s derived `PartialEq` already compares.
+#[derive(Clone)]
+struct PreparedKeys(std::sync::Arc<[Option<crypto::PreparedPublicKey>]>);
+
+impl PartialEq for PreparedKeys {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for PreparedKeys {}
+
+impl std::fmt::Debug for PreparedKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PreparedKeys({})", self.0.len())
+    }
 }
 
 /// Maximum number of views in one leader-rotation cycle.
@@ -195,7 +224,10 @@ impl ValidatorSet {
         }
         let total_stake = acc;
         let leader_schedule = build_leader_schedule(&stakes, total_stake);
-        Ok(Self { validators, stakes, validator_addresses, leader_schedule, total_stake })
+        let prepared = PreparedKeys(
+            validators.iter().map(|pk| crypto::PreparedPublicKey::new(pk).ok()).collect(),
+        );
+        Ok(Self { validators, stakes, validator_addresses, leader_schedule, total_stake, prepared })
     }
 
     /// The public keys in this set, indexed by `ValidatorIndex`.
@@ -420,6 +452,12 @@ impl ValidatorSet {
     #[must_use]
     pub fn total_stake(&self) -> u64 {
         self.total_stake
+    }
+
+    /// The decompressed key of the validator at `index`, `None` when
+    /// the index is out of range or the key does not decode.
+    pub(crate) fn prepared_key(&self, index: usize) -> Option<&crypto::PreparedPublicKey> {
+        self.prepared.0.get(index).and_then(Option::as_ref)
     }
 
     /// The validator at `index`.

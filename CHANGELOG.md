@@ -54,6 +54,13 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Consensus certificate checks skip per-call key decompression**
+  (`consensus`, hft-audit-2 S-9): validator keys are decoded once per
+  committee, and QC / execution-certificate verification uses them
+  directly (~45% faster at 128 validators: 3.5 → 1.9 ms).
+  - **In plain words:** large committees verify each round's proof of
+    agreement almost twice as fast.
+
 - **MMR root computed with no heap allocation** (`storage`,
   hft-audit-2 S-10), ~5% faster.
   - **In plain words:** finalizing each block's history commitment
