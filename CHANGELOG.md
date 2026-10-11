@@ -54,6 +54,10 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Message decoding ~25–28% faster** (`codec`, hft-audit-2 S-5).
+  - **In plain words:** every network message is unpacked about a
+    quarter faster.
+
 - **Digest-keyed map lookups skip a redundant hashing step**
   (`primitives`, hft-audit-2 S-6), ~3% faster.
   - **In plain words:** looking up a transaction by its hash does

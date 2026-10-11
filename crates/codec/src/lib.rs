@@ -132,11 +132,13 @@ pub struct Reader<'a> {
 #[allow(clippy::missing_errors_doc)]
 impl<'a> Reader<'a> {
     /// Begin reading `buf` from its start.
+    #[inline]
     pub fn new(buf: &'a [u8]) -> Self {
         Reader { buf }
     }
 
     /// Bytes not yet consumed.
+    #[inline]
     pub fn remaining(&self) -> usize {
         self.buf.len()
     }
@@ -144,6 +146,7 @@ impl<'a> Reader<'a> {
     /// True once every input byte has been consumed. Protocols call this
     /// after a full message to reject trailing garbage (a common
     /// framing-slash tactic).
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
@@ -153,6 +156,7 @@ impl<'a> Reader<'a> {
     /// Public because types sized at runtime (e.g. via [`Fixed::LEN`])
     /// need slice-level access; array-sized callers prefer
     /// [`Reader::read_fixed`].
+    #[inline]
     pub fn read_slice(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         if self.buf.len() < n {
             // needed/remaining rather than a bare EOF: callers at trust
@@ -165,29 +169,34 @@ impl<'a> Reader<'a> {
     }
 
     /// Read one byte.
+    #[inline]
     pub fn read_u8(&mut self) -> Result<u8, DecodeError> {
         Ok(self.read_slice(1)?[0])
     }
 
     /// Read a little-endian `u16`.
+    #[inline]
     pub fn read_u16(&mut self) -> Result<u16, DecodeError> {
         let b = self.read_slice(2)?;
         Ok(u16::from_le_bytes([b[0], b[1]]))
     }
 
     /// Read a little-endian `u32`.
+    #[inline]
     pub fn read_u32(&mut self) -> Result<u32, DecodeError> {
         let b = self.read_slice(4)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     /// Read a little-endian `u64`.
+    #[inline]
     pub fn read_u64(&mut self) -> Result<u64, DecodeError> {
         let b = self.read_slice(8)?;
         Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
     }
 
     /// Read a little-endian `u128`.
+    #[inline]
     pub fn read_u128(&mut self) -> Result<u128, DecodeError> {
         let b = self.read_slice(16)?;
         let mut arr = [0u8; 16];
@@ -199,6 +208,7 @@ impl<'a> Reader<'a> {
     ///
     /// Strictness is deliberate: any other byte is attacker-chosen
     /// ambiguity about which validators saw which truth value.
+    #[inline]
     pub fn read_bool(&mut self) -> Result<bool, DecodeError> {
         match self.read_u8()? {
             0 => Ok(false),
@@ -212,6 +222,7 @@ impl<'a> Reader<'a> {
     /// Rejects varints longer than 10 bytes or with out-of-range bits in
     /// the final byte, so a peer can't spend 100 bytes making us "decode"
     /// a 64-bit number (a cheap `DoS`) — see `InvalidVarint`.
+    #[inline]
     pub fn read_varint(&mut self) -> Result<u64, DecodeError> {
         let mut value: u64 = 0;
         let mut shift = 0u32;
@@ -240,6 +251,7 @@ impl<'a> Reader<'a> {
 
     /// Read a length-prefixed byte string, returning a **borrowed**
     /// subslice (zero-copy; valid for the lifetime of the input).
+    #[inline]
     pub fn read_bytes(&mut self) -> Result<&'a [u8], DecodeError> {
         let claimed = self.read_varint()?;
         let remaining = self.buf.len() as u64;
@@ -257,6 +269,7 @@ impl<'a> Reader<'a> {
 
     /// Read exactly `N` bytes into a fixed array (no prefix; the length
     /// lives in the type).
+    #[inline]
     pub fn read_fixed<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
         let b = self.read_slice(N)?;
         let mut arr = [0u8; N];
@@ -354,6 +367,17 @@ impl<'a, T> Codec<'a> for T where T: Encode + Decode<'a> {}
 
 // ---------------------------------------------------------------------------
 // Primitive impls
+//
+// Inlining policy (hft-audit-2 S-5): every `Reader` method and every
+// `Decode` impl is `#[inline]` so the read side can be flattened into
+// the caller's message decoder across the crate boundary — thin LTO's
+// import heuristic otherwise skips the looping `read_varint` /
+// `read_bytes` first. Measured (`benches/wire.rs`, x86_64 box):
+// `codec/order_msg_roundtrip` 34.1 -> 24.6 ns, `vs_bincode/decode`
+// 49.5 -> 36.5 ns. The write side (`write::*`, `Encode` impls) is
+// deliberately NOT marked: forcing `Vec` growth paths inline regressed
+// `codec/encode/varint_u64_max` 13.9 -> 17.3 ns with no offsetting win;
+// LLVM already inlines those one-liners where it pays.
 // ---------------------------------------------------------------------------
 
 impl Encode for u8 {
@@ -363,6 +387,7 @@ impl Encode for u8 {
 }
 
 impl<'a> Decode<'a> for u8 {
+    #[inline]
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         reader.read_u8()
     }
@@ -375,6 +400,7 @@ impl Encode for u16 {
 }
 
 impl<'a> Decode<'a> for u16 {
+    #[inline]
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         reader.read_u16()
     }
@@ -387,6 +413,7 @@ impl Encode for u32 {
 }
 
 impl<'a> Decode<'a> for u32 {
+    #[inline]
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         reader.read_u32()
     }
@@ -399,6 +426,7 @@ impl Encode for u64 {
 }
 
 impl<'a> Decode<'a> for u64 {
+    #[inline]
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         reader.read_u64()
     }
@@ -411,6 +439,7 @@ impl Encode for u128 {
 }
 
 impl<'a> Decode<'a> for u128 {
+    #[inline]
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         reader.read_u128()
     }
@@ -423,6 +452,7 @@ impl Encode for bool {
 }
 
 impl<'a> Decode<'a> for bool {
+    #[inline]
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         reader.read_bool()
     }
@@ -438,6 +468,7 @@ impl Encode for Vec<u8> {
 }
 
 impl<'a> Decode<'a> for Vec<u8> {
+    #[inline]
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         Ok(reader.read_bytes()?.to_vec())
     }
@@ -457,6 +488,7 @@ impl Encode for Hash {
 }
 
 impl<'a> Decode<'a> for Hash {
+    #[inline]
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         let bytes = reader.read_slice(Hash::LEN)?;
         // from_slice re-checks the length; the mapping keeps error types
@@ -473,6 +505,7 @@ impl Encode for Address {
 }
 
 impl<'a> Decode<'a> for Address {
+    #[inline]
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         let bytes = reader.read_slice(Address::LEN)?;
         Address::from_slice(bytes)
@@ -490,6 +523,7 @@ impl<T: IdSpace> Encode for Id<T> {
 }
 
 impl<'a, T: IdSpace> Decode<'a> for Id<T> {
+    #[inline]
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         Ok(Id::new(reader.read_u64()?))
     }
@@ -502,6 +536,7 @@ impl Encode for TimestampMs {
 }
 
 impl<'a> Decode<'a> for TimestampMs {
+    #[inline]
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         Ok(TimestampMs(reader.read_u64()?))
     }
@@ -517,6 +552,7 @@ impl Encode for Price {
 }
 
 impl<'a> Decode<'a> for Price {
+    #[inline]
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         Ok(Price(reader.read_u64()?))
     }
@@ -529,6 +565,7 @@ impl Encode for Qty {
 }
 
 impl<'a> Decode<'a> for Qty {
+    #[inline]
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         Ok(Qty(reader.read_u64()?))
     }

@@ -23923,3 +23923,13 @@ chains even in keyed SipHash maps. `DigestHasher` still folds every
 byte (executor `OccKey`s are structured, not uniform), now reading whole
 words without a zero-pad copy; its "one multiply" doc is corrected.
 `digest_map/get_hit` 9.07 → 8.82 ns.
+
+### S-5: codec `Reader` / `Decode` inlined across crates
+
+codec had zero `#[inline]`, so thin LTO could leave every `Reader` call
+out of line in consumer crates. All `Reader` methods and primitive
+`Decode` impls are `#[inline]` now. The encode side was measured and
+deliberately left alone — inlining `write::*` made
+`encode/varint_u64_max` ~25% slower; the policy is recorded in a
+comment. `order_msg_roundtrip` 34.06 → 24.59 ns; `vs_bincode/decode`
+49.46 → 36.53 ns.
