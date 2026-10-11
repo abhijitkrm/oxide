@@ -23590,3 +23590,18 @@ them. Fix: `progressed` is restored and set by every productive step
 productive pass skips the wait, and while verify jobs are in flight
 the wait shrinks to `BUSY_POLL` (50 µs). Idle CPU is unchanged: an
 idle pass still blocks 1 ms.
+
+### P-1: one sender recovery per RPC-submitted tx
+
+`eth_sendRawTransaction` recovers the sender to build the envelope,
+then `ingest_tx` → `preverify_batch` recovered the same payload again:
+~50 µs of secp256k1 (51.8 µs measured on the EPYC box) thrown away per
+submit, half the RPC ingest CPU. `TxSubmitter` gains
+`submit_tx_recovered(tx, sender)` (default: forward to `submit_tx`,
+so every other submitter stays correct), and the executor gains
+`ingest_tx_recovered`, which substitutes the caller's recovery for the
+module preverify. Every other gate still runs — replay, envelope
+binding (sender/nonce/fee vs the signed payload), chain id, nonce,
+gas, balance — and the sender is cached `verified_locally` exactly as
+the preverify would have. The gossiping submitter also drops one of
+its two envelope copies on this path.

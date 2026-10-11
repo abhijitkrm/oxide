@@ -29,10 +29,19 @@ pub struct ExecutorTxSubmitter {
 
 impl rpc::TxSubmitter for ExecutorTxSubmitter {
     fn submit_tx(&self, tx: TxBytes) -> Result<(), String> {
-        match self.executor.ingest_tx(tx) {
-            MempoolAck::Accepted => Ok(()),
-            MempoolAck::Rejected { reason } => Err(reason),
-        }
+        ack_to_result(self.executor.ingest_tx(tx))
+    }
+
+    fn submit_tx_recovered(&self, tx: TxBytes, sender: [u8; 20]) -> Result<(), String> {
+        ack_to_result(self.executor.ingest_tx_recovered(tx, sender))
+    }
+}
+
+/// The RPC layer's `Result` view of a mempool verdict.
+fn ack_to_result(ack: MempoolAck) -> Result<(), String> {
+    match ack {
+        MempoolAck::Accepted => Ok(()),
+        MempoolAck::Rejected { reason } => Err(reason),
     }
 }
 
@@ -64,6 +73,15 @@ impl rpc::TxSubmitter for GossipingTxSubmitter {
         let _ = self.gossip.try_send(tx.as_bytes().to_vec());
         Ok(())
     }
+
+    fn submit_tx_recovered(&self, tx: TxBytes, sender: [u8; 20]) -> Result<(), String> {
+        // One copy for the gossip frame; the original moves into the
+        // mempool (`submit_tx_ref` paid two).
+        let frame = tx.as_bytes().to_vec();
+        ack_to_result(self.inner.executor.ingest_tx_recovered(tx, sender))?;
+        let _ = self.gossip.try_send(frame);
+        Ok(())
+    }
 }
 
 impl ExecutorTxSubmitter {
@@ -75,10 +93,7 @@ impl ExecutorTxSubmitter {
     /// Returns the mempool's rejection reason if the executor
     /// declines the envelope.
     pub fn submit_tx_ref(&self, tx: &TxBytes) -> Result<(), String> {
-        match self.executor.ingest_tx(TxBytes::new(tx.as_bytes().to_vec())) {
-            MempoolAck::Accepted => Ok(()),
-            MempoolAck::Rejected { reason } => Err(reason),
-        }
+        ack_to_result(self.executor.ingest_tx(TxBytes::new(tx.as_bytes().to_vec())))
     }
 }
 

@@ -530,6 +530,8 @@ fn net_listening_returns_true() {
 struct MockSubmitter {
     submissions: std::sync::Mutex<Vec<TxBytes>>,
     reject_next: std::sync::Mutex<bool>,
+    /// Senders handed over through `submit_tx_recovered`.
+    recovered: std::sync::Mutex<Vec<[u8; 20]>>,
 }
 
 impl MockSubmitter {
@@ -537,6 +539,7 @@ impl MockSubmitter {
         Self {
             submissions: std::sync::Mutex::new(Vec::new()),
             reject_next: std::sync::Mutex::new(false),
+            recovered: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -556,6 +559,11 @@ impl TxSubmitter for MockSubmitter {
         }
         primitives::sync::lock_state(&self.submissions).push(tx);
         Ok(())
+    }
+
+    fn submit_tx_recovered(&self, tx: TxBytes, sender: [u8; 20]) -> Result<(), String> {
+        primitives::sync::lock_state(&self.recovered).push(sender);
+        self.submit_tx(tx)
     }
 }
 
@@ -648,6 +656,14 @@ fn eth_send_raw_transaction_with_submitter_submits_envelope() {
     // The RLP payload starts at offset 37.
     let rlp_payload = &bytes[37..];
     assert_eq!(rlp_payload, raw.as_slice(), "RLP payload must match the raw tx");
+
+    // hft-audit-2 P-1: the sender the endpoint recovered travels with
+    // the envelope so admission does not recover it again — and it is
+    // the payload's real signer, matching the envelope header.
+    let tx_sender = signed.recover_sender().expect("recover");
+    let carried = primitives::sync::lock_state(&submitter.recovered).clone();
+    assert_eq!(carried, vec![tx_sender.0], "submit must carry the recovered sender");
+    assert_eq!(&bytes[..20], tx_sender.0.as_slice(), "envelope sender must be the signer");
 }
 
 /// When the submitter rejects (e.g. mempool full), the RPC returns

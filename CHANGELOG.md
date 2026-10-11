@@ -48,6 +48,14 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **RPC tx submission recovers the sender once** (`rpc`, `executor`,
+  `node`, hft-audit-2 P-1): `eth_sendRawTransaction` hands the sender
+  it already recovered to admission instead of admission recovering
+  it again — ~50 µs of signature math saved per submitted tx (about
+  half of RPC ingest CPU).
+  - **In plain words:** every transaction sent through RPC used to
+    have its signature checked twice; now it's checked once.
+
 - **Snapshot serving exports once per height** (`rpc`, `node`):
   `/snapshot/manifest` re-exported the whole state on every request
   — twice, since the node's `snapshot_meta` exports too — and

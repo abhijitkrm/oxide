@@ -73,6 +73,23 @@ pub trait TxSubmitter: Send + Sync {
     /// signature, wrong nonce, insufficient balance, duplicate,
     /// pool full, etc.).
     fn submit_tx(&self, tx: TxBytes) -> Result<(), String>;
+
+    /// Submit an EVM envelope whose payload signer this process has
+    /// already recovered (hft-audit-2 P-1): `eth_sendRawTransaction`
+    /// recovers the sender to build the envelope, and admission would
+    /// otherwise recover it a second time. `sender` must be the
+    /// address recovered from the envelope's signed payload.
+    ///
+    /// The default forwards to [`submit_tx`](Self::submit_tx), which
+    /// re-recovers — correct for any submitter, just slower.
+    ///
+    /// # Errors
+    ///
+    /// As [`submit_tx`](Self::submit_tx).
+    fn submit_tx_recovered(&self, tx: TxBytes, sender: [u8; 20]) -> Result<(), String> {
+        let _ = sender;
+        self.submit_tx(tx)
+    }
 }
 
 /// One exported snapshot instance kept for chunk serving: the

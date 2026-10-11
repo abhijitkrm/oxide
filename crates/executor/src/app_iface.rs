@@ -17,8 +17,33 @@ use primitives::{Address, Hash};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use std::sync::Arc;
 
-impl AppInterface for Executor {
-    fn ingest_tx(&self, tx: TxBytes) -> MempoolAck {
+impl Executor {
+    /// Admit a tx whose payload signer the caller already recovered
+    /// (hft-audit-2 P-1).
+    ///
+    /// `eth_sendRawTransaction` must recover the sender to build the
+    /// envelope, and `ingest_tx` then recovered the same payload a
+    /// second time inside `preverify_batch` — ~50 µs of secp256k1 per
+    /// submitted tx thrown away, half the RPC ingest CPU. This entry
+    /// takes the sender as already recovered and skips the module's
+    /// preverify; every other admission gate (replay, envelope
+    /// binding, chain id, nonce, gas, balance) still runs.
+    ///
+    /// Contract: `payload_sender` MUST be the address this process
+    /// recovered from the envelope's module payload (the EVM's signed
+    /// RLP) — it is cached as `verified_locally` and execution trusts
+    /// it. Only in-process callers that performed that recovery (the
+    /// RPC submit path) may use it; anything received from a peer
+    /// goes through [`AppInterface::ingest_tx`].
+    pub fn ingest_tx_recovered(&self, tx: TxBytes, payload_sender: [u8; 20]) -> MempoolAck {
+        self.ingest_tx_with(tx, Some(payload_sender))
+    }
+
+    /// Shared single-tx admission body: `recovered` is `Some` only
+    /// on the [`ingest_tx_recovered`](Self::ingest_tx_recovered)
+    /// path, where the payload preverify is replaced by the caller's
+    /// recovery.
+    fn ingest_tx_with(&self, tx: TxBytes, recovered: Option<[u8; 20]>) -> MempoolAck {
         // A4: route mempool admission through `Module::validate`.
         // Before storing the tx in the mempool, we parse the envelope,
         // find the target module, and call its `validate` method. This
@@ -83,7 +108,12 @@ impl AppInterface for Executor {
         // `msgs` must outlive `preverify_result` — the returned
         // `PreverifiedTx` borrows the payload slice.
         let msgs = [payload];
-        let preverify_result = module.preverify_batch(&msgs);
+        let preverify_result = match recovered {
+            Some(sender) => {
+                vec![Ok(PreverifiedTx { raw: payload, sender, verified_locally: true })]
+            }
+            None => module.preverify_batch(&msgs),
+        };
         if let Err(e) =
             module.validate_preverified(&ctx, payload, preverify_result[0].as_ref().ok())
         {
@@ -159,6 +189,12 @@ impl AppInterface for Executor {
                 MempoolAck::Rejected { reason: "intake ring closed".to_string() }
             }
         }
+    }
+}
+
+impl AppInterface for Executor {
+    fn ingest_tx(&self, tx: TxBytes) -> MempoolAck {
+        self.ingest_tx_with(tx, None)
     }
 
     /// Phase E: batch mempool intake — the parallel admission path.

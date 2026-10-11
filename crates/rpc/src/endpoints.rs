@@ -900,8 +900,10 @@ impl RpcServer {
             let nonce = signed.nonce();
             // Wrap the raw RLP in the Oxide envelope and submit.
             let envelope = evm::wrap_evm_tx_envelope(&sender, nonce, fee, &raw);
+            // Hand the recovered sender along so admission does not
+            // repeat the ~50 µs recovery (hft-audit-2 P-1).
             submitter
-                .submit_tx(TxBytes::new(envelope))
+                .submit_tx_recovered(TxBytes::new(envelope), sender.0)
                 .map_err(|reason| RpcError::transaction_rejected(&reason))?;
             // Feed pending-tx subscribers/filters — the tx is now
             // in this node's mempool.
