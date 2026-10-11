@@ -23875,3 +23875,12 @@ checks, and order is consensus-visible (each check can emit events and
 liquidate), so a `BTreeSet` of checked owners keeps first-fill order at
 O(fills · log makers). New test for a repeating maker (A, B, A); the
 perps golden root is unchanged.
+
+### T-13: OrderPool indexing can't alias slot 0
+
+`Index`/`IndexMut` used `usize::try_from(slot).unwrap_or(0)`: a failed
+conversion would silently return slot 0's node — another order's. The
+doc also wrongly claimed release builds skip the bounds check. Now
+`slot as usize` behind `const _: () = assert!(usize::BITS >= u32::BITS)`,
+docs corrected; a test indexes `NIL` and expects a panic in debug and
+release. No hot-path cost.

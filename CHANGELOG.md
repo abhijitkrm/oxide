@@ -493,6 +493,11 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **An invalid order-pool index fails loudly instead of reading
+  another order** (`trading`, hft-audit-2 T-13).
+  - **In plain words:** a potential silent mix-up between orders is
+    now an immediate error.
+
 - **Deep perps sweeps no longer slow down quadratically in margin
   checks** (`perps`, hft-audit-2 T-14).
   - **In plain words:** an order that hits many resting orders no

@@ -27,7 +27,8 @@
 //!   means "no neighbor".
 //! - A slot returned by [`OrderPool::release`] must not be read again
 //!   until [`OrderPool::alloc`] hands it back (the engine enforces this;
-//!   debug builds assert on use of `NIL`/out-of-range indices).
+//!   debug builds assert on use of `NIL`/out-of-range indices, release
+//!   builds panic on them via the slice bounds check).
 
 use primitives::Address;
 use primitives::fixed::{Price, Qty};
@@ -167,17 +168,28 @@ impl OrderPool {
     }
 }
 
+// Compile-time guard that every `u32` slot index converts to `usize`
+// losslessly, so `slot as usize` in the arena accessors can never
+// truncate and alias another slot. Fails the build on a 16-bit
+// target rather than miscompiling the book there.
+const _: () = assert!(usize::BITS >= u32::BITS);
+
 impl std::ops::Index<u32> for OrderPool {
     type Output = OrderNode;
 
-    /// Immutable node access. In debug builds, panics on `NIL` or
-    /// out-of-range indices — both are engine logic bugs (a
-    /// freed/unlinked node read after detach). In release builds,
-    /// the checks are skipped for hot-path performance; a bug would
-    /// read garbage but not crash the validator (DoS-safe).
+    /// Immutable node access.
+    ///
+    /// `NIL` or an out-of-range slot is an engine logic bug (a
+    /// freed/unlinked node read after detach). Debug builds report it
+    /// with the slot and arena length; release builds still panic via
+    /// the slice bounds check — never a silent read of another
+    /// order's node. (The previous `usize::try_from(slot)
+    /// .unwrap_or(0)` would have aliased slot 0 on a failed
+    /// conversion; the conversion is now lossless by the
+    /// module-level compile-time guard — hft-audit-2 T-13.)
     #[inline]
     fn index(&self, slot: u32) -> &OrderNode {
-        let idx = usize::try_from(slot).unwrap_or(0);
+        let idx = slot as usize;
         debug_assert!(
             idx < self.nodes.len(),
             "slot {slot} out of range (len {})",
@@ -191,7 +203,7 @@ impl std::ops::IndexMut<u32> for OrderPool {
     /// Mutable node access, same panic discipline as `Index`.
     #[inline]
     fn index_mut(&mut self, slot: u32) -> &mut OrderNode {
-        let idx = usize::try_from(slot).unwrap_or(0);
+        let idx = slot as usize;
         debug_assert!(
             idx < self.nodes.len(),
             "slot {slot} out of range (len {})",
@@ -270,6 +282,19 @@ mod tests {
         // the property shows up in `cargo test` output by name.
         assert_eq!(std::mem::size_of::<OrderNode>(), 64);
         assert_eq!(std::mem::align_of::<OrderNode>(), 64);
+    }
+
+    /// An out-of-range slot must panic, not alias slot 0 (hft-audit-2
+    /// T-13). `NIL` is the most likely bogus index — a link followed
+    /// past the end of a level.
+    #[test]
+    // Both the debug message ("slot N out of range") and the release
+    // slice bounds-check message name the bogus index, NIL = u32::MAX.
+    #[should_panic(expected = "4294967295")]
+    fn index_of_nil_panics_instead_of_aliasing_slot_zero() {
+        let mut pool = OrderPool::with_capacity(4);
+        let _ = pool.alloc(node(1));
+        let _ = &pool[NIL];
     }
 
     #[test]
