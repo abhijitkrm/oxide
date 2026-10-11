@@ -882,6 +882,33 @@ fn rate_limiter_uses_clock_not_order_counter() {
     assert!(!server.submit_order(&req).rejected, "order after the window slid must be allowed");
 }
 
+/// hft-audit-2 M-15: with rate limiting off (the venue default) the
+/// order path must not read the clock at all; with it on, it must.
+#[test]
+fn clock_is_read_only_when_rate_limiting_is_on() {
+    for (limit, expect_reads) in [(0u64, false), (1_000u64, true)] {
+        let mut server = MatchingServer::with_risk_config(
+            cfg(),
+            100,
+            RiskConfig { max_orders_per_second: limit, ..RiskConfig::default() },
+        );
+        let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = Arc::clone(&reads);
+        server.set_clock(Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            0
+        }));
+        let (sk, owner) = test_account(5);
+        server.fund_account(&owner, 1_000_000_000_000);
+        for nonce in 0..3 {
+            let req = signed_req(&sk, 0, Side::Sell, nonce, 1_500_000_000, 1_000);
+            assert!(!server.submit_order(&req).rejected);
+        }
+        let n = reads.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(n > 0, expect_reads, "limit {limit}: {n} clock reads");
+    }
+}
+
 /// Regression: a maker filled to zero left the book but kept
 /// its resting-order slot — active market makers accumulated
 /// phantom counts until the per-account cap rejected them.

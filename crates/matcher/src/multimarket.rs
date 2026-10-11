@@ -774,7 +774,8 @@ impl MarketWorker {
             (Some((bid, _)), Some((ask, _))) => u64::midpoint(bid.0, ask.0),
             _ => 0,
         };
-        let now_ms = (self.clock)();
+        // Clock only when the rate limiter consumes it (M-15).
+        let now_ms = if self.risk.needs_clock() { (self.clock)() } else { 0 };
         if let RiskDecision::Reject(reason) =
             self.risk.check(&req.owner, now_ms, req.price.0, req.qty.0, mid)
         {

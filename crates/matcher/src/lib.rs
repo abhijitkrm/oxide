@@ -381,7 +381,10 @@ impl MatchingServer {
             (Some((bid, _)), Some((ask, _))) => u64::midpoint(bid.0, ask.0),
             _ => 0, // no mid available — skip price-band check
         };
-        let now_ms = (self.clock)();
+        // The clock is read only when the rate limiter is on, the
+        // check's sole consumer of time (M-15). With it off, `0` is
+        // never looked at.
+        let now_ms = if self.risk.needs_clock() { (self.clock)() } else { 0 };
         let decision = self.risk.check(&req.owner, now_ms, req.price.0, req.qty.0, mid);
         if let RiskDecision::Reject(reason) = decision {
             self.risk_rejections += 1;

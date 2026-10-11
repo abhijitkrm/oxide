@@ -177,6 +177,18 @@ impl RiskEngine {
         Self::new(RiskConfig::default())
     }
 
+    /// Whether [`Self::check`] reads its `now_ms` argument, which is
+    /// true only when rate limiting is on (`max_orders_per_second >
+    /// 0`). Callers skip the clock read when this is false
+    /// (hft-audit-2 M-15). That read is an `Arc<dyn Fn>` call plus a
+    /// `SystemTime::now` per order, and venue-scale deployments run
+    /// with the limiter off (admission throttling lives upstream).
+    #[inline]
+    #[must_use]
+    pub fn needs_clock(&self) -> bool {
+        self.config.max_orders_per_second > 0
+    }
+
     /// Run all risk checks for a new order. Returns `Allow` or
     /// `Reject(reason)`. The `now_ms` parameter is the current
     /// timestamp in milliseconds (used for rate limiting). The

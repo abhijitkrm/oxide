@@ -23772,3 +23772,11 @@ its 128 workers one at a time. `take_presized_batch` leaves capacity
 ≥ `SETTLEMENT_BATCH_CAPACITY` (10,000) or the drained batch's capacity;
 multi-market seal now sends to all workers before collecting replies in
 market order.
+
+### M-15: no clock read with rate limiting off
+
+Every order called the injected clock (`dyn Fn` + `SystemTime::now`)
+even with `max_orders_per_second = 0`, the shipped default, where the
+limiter never reads it. `RiskEngine::needs_clock()` gates the read in
+both `execute_order` paths; a counting-clock test pins zero reads when
+off.

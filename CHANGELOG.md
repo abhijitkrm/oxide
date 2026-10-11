@@ -48,6 +48,11 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Order path skips the clock read when rate limiting is off**
+  (`matcher`, hft-audit-2 M-15).
+  - **In plain words:** one less system call per order in the default
+    setup.
+
 - **Settlement batches no longer regrow after every seal**
   (`matcher`, hft-audit-2 M-12); multi-market seals run concurrently.
   - **In plain words:** removes a small stutter every settlement
