@@ -56,6 +56,19 @@ const TABLE: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("oxide_sta
 /// database in its pre-batch state — no partial writes.
 pub struct RedbBackend {
     db: Database,
+    /// `Some` in journal-backed mode (hft-audit-2 X-8): batches commit
+    /// with `Durability::None` and `sync` makes them durable with an
+    /// `Immediate` commit only every `every` calls. `None` keeps the
+    /// default: every `apply_batch` commit is durable on return.
+    deferred: Option<DeferredSync>,
+}
+
+/// Bookkeeping for journal-backed mode — see [`RedbBackend::open_journal_backed`].
+struct DeferredSync {
+    /// `sync` calls between durable (`Immediate`) commits.
+    every: u32,
+    /// `sync` calls since the last durable commit.
+    pending: u32,
 }
 
 impl RedbBackend {
@@ -75,7 +88,47 @@ impl RedbBackend {
     /// `Result` to catch I/O errors.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, redb::DatabaseError> {
         let db = Database::create(path)?;
-        Ok(Self { db })
+        Ok(Self { db, deferred: None })
+    }
+
+    /// Open `path` for a caller whose own write-ahead journal already
+    /// makes every batch recoverable (hft-audit-2 X-8).
+    ///
+    /// The default mode pays one `fsync` per `apply_batch` commit —
+    /// ~4 ms p50 / 13 ms p99 on the md RAID-1 target, serialized on
+    /// the exec lane once per block on top of the executor journal's
+    /// own sync. When the executor journal is enabled it is the crash
+    /// authority (`executor::durability`: recovery re-imports the last
+    /// checkpoint and replays journaled blocks above whatever height
+    /// the modules restored), so this backend may lag. Here batches
+    /// commit with `Durability::None` — atomic and visible to readers,
+    /// not yet on disk — and every `sync_every`-th
+    /// [`sync`](StorageBackend::sync) issues one `Immediate` commit,
+    /// which makes every earlier commit durable. A crash rolls the
+    /// file back to the last durable commit, never to a torn state;
+    /// the journal replays the gap. Dropping the backend flushes.
+    ///
+    /// Never use this without such a journal: the lag is lost state.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open).
+    pub fn open_journal_backed<P: AsRef<Path>>(
+        path: P,
+        sync_every: u32,
+    ) -> Result<Self, redb::DatabaseError> {
+        let db = Database::create(path)?;
+        Ok(Self { db, deferred: Some(DeferredSync { every: sync_every.max(1), pending: 0 }) })
+    }
+
+    /// One `Immediate` commit of an empty write transaction — in redb
+    /// this persists every preceding `Durability::None` commit.
+    fn durable_commit(&self) -> Result<(), ApplyError> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| ApplyError(format!("redb begin write failed: {e}")))?;
+        txn.commit().map_err(|e| ApplyError(format!("redb durable commit failed: {e}")))
     }
 
     /// Open an in-memory `redb` database (for tests).
@@ -95,7 +148,7 @@ impl RedbBackend {
         // Clean up on drop by leaking the path — redb will remove the
         // file when the Database is dropped. For tests this is fine.
         std::mem::forget(path);
-        Ok(Self { db })
+        Ok(Self { db, deferred: None })
     }
 }
 
@@ -158,10 +211,15 @@ impl StorageBackend for RedbBackend {
         // txn applies nothing on drop, and the caller learns the
         // batch did not happen instead of the process dying mid-
         // commit on a recoverable engine error.
-        let txn = self
+        let mut txn = self
             .db
             .begin_write()
             .map_err(|e| ApplyError(format!("redb begin write failed: {e}")))?;
+        if self.deferred.is_some() {
+            // Journal-backed: durable at the next `sync` cadence point.
+            txn.set_durability(redb::Durability::None)
+                .map_err(|e| ApplyError(format!("redb set durability failed: {e}")))?;
+        }
         {
             let mut table = txn
                 .open_table(TABLE)
@@ -182,6 +240,22 @@ impl StorageBackend for RedbBackend {
             }
         }
         txn.commit().map_err(|e| ApplyError(format!("redb commit failed: {e}")))
+    }
+
+    fn sync(&mut self) -> Result<(), ApplyError> {
+        // Default mode: every commit was already durable on return.
+        let Some(deferred) = self.deferred.as_mut() else {
+            return Ok(());
+        };
+        deferred.pending = deferred.pending.saturating_add(1);
+        if deferred.pending < deferred.every {
+            return Ok(());
+        }
+        self.durable_commit()?;
+        if let Some(deferred) = self.deferred.as_mut() {
+            deferred.pending = 0;
+        }
+        Ok(())
     }
 
     fn snapshot_export(&self) -> Snapshot {
@@ -267,6 +341,18 @@ fn prefix_bounds(prefix: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
     (lo, Some(hi))
 }
 
+impl Drop for RedbBackend {
+    /// Journal-backed mode flushes its lag on a clean shutdown so a
+    /// restart replays nothing it doesn't have to. Best effort: a
+    /// failure here leaves the file at its last durable commit, which
+    /// the journal covers.
+    fn drop(&mut self) {
+        if self.deferred.as_ref().is_some_and(|d| d.pending > 0) {
+            let _ = self.durable_commit();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +364,35 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         RedbBackend::open(&path).expect("open redb")
+    }
+
+    /// hft-audit-2 X-8: journal-backed commits are visible at once,
+    /// and survive a clean close/reopen (the drop-time flush plus the
+    /// cadence commit).
+    #[test]
+    fn journal_backed_commits_visible_and_flushed_on_drop() {
+        let path = std::env::temp_dir().join(format!(
+            "oxide_redb_deferred_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let k1 = Hash([0x11; 32]);
+        let k2 = Hash([0x22; 32]);
+        {
+            let mut store = RedbBackend::open_journal_backed(&path, 2).expect("open");
+            store.apply_batch(&[Op::Set { key: k1, value: b"one".to_vec() }]).expect("apply");
+            store.sync().expect("sync below cadence");
+            assert_eq!(store.get(&k1), Some(b"one".to_vec()), "None-durability commit is visible");
+            store.apply_batch(&[Op::Set { key: k2, value: b"two".to_vec() }]).expect("apply");
+            store.sync().expect("cadence sync");
+            store.apply_batch(&[Op::Delete { key: k1 }]).expect("apply");
+            store.sync().expect("pending again");
+        }
+        let store = RedbBackend::open(&path).expect("reopen");
+        assert_eq!(store.get(&k1), None, "drop flushed the trailing batch");
+        assert_eq!(store.get(&k2), Some(b"two".to_vec()));
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

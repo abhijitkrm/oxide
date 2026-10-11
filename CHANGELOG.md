@@ -48,6 +48,16 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **EVM state no longer fsyncs every block when the block journal is
+  on** (`storage`, `node`, hft-audit-2 X-8): with a durability
+  directory configured, the redb state file makes its writes durable
+  every 64 blocks instead of every block. Crash recovery already
+  replays from the journal, so the gap is rebuilt on restart. This
+  removes one disk flush (~4 ms on the target box) from each block's
+  execution.
+  - **In plain words:** the node stops waiting on the disk twice per
+    block when one record is already enough to recover from a crash.
+
 - **One missed transaction no longer slows its whole batch**
   (`executor`, hft-audit-2 X-2): block execution reuses the
   signature checks done at admission for every transaction that has

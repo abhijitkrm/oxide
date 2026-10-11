@@ -23651,3 +23651,20 @@ recovery check `handle_batch` applies. Execution results are identical
 on either path; a single probe per tx replaces the old
 `contains_key` + `remove` pair. New test: a block with one cached and
 one never-ingested tx dispatches both through the preverified path.
+
+### X-8: redb stops fsyncing every block when the journal is on
+
+`end_block` flushed the EVM state through `RedbBackend::apply_batch`
+(redb's default `Immediate` commit) and then `sync` — one fsync per
+block on the exec lane, 4 ms p50 / 13 ms p99 on the md RAID-1 box,
+serialized before the next block and on top of the executor journal's
+own sync. With `durability_dir` set, the executor journal is the crash
+authority: recovery imports `snapshot.bin`/the baseline and replays
+journaled blocks above whatever height the modules restored, so the
+redb file may lag. redb 4.2 has no `Eventual`; the new
+`RedbBackend::open_journal_backed(path, n)` commits batches with
+`Durability::None` (atomic, visible, not yet on disk) and issues an
+empty `Immediate` commit — which persists every earlier `None` commit —
+on every n-th `sync` and on drop. The node uses it with n = 64 only
+when the journal is enabled; without it every commit stays durable.
+Test: commits are visible at once and survive close/reopen.

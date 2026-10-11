@@ -671,6 +671,18 @@ pub struct AssembledExecutor {
     pub chain_params: Arc<types::ChainParams>,
 }
 
+/// Blocks between durable redb commits when the executor journal is
+/// on (hft-audit-2 X-8).
+///
+/// Unit: blocks (one `sync` per `end_block` flush). Origin: an
+/// `Immediate` redb commit is one fsync — 4 ms p50 / 13 ms p99 on the
+/// md RAID-1 target — and the journal already makes every block
+/// recoverable, so the only cost of a larger value is a longer replay
+/// after a crash (≤ 64 blocks, well under one checkpoint interval).
+/// 1 restores a sync per block; raising it further saves nothing
+/// measurable once the fsync is amortized away.
+const REDB_JOURNAL_SYNC_EVERY: u32 = 64;
+
 /// Assemble the executor + full module graph from `config`.
 ///
 /// This is **the** executor assembly path: `Node::assemble` calls it,
@@ -776,6 +788,15 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     // parameters cannot diverge.
     let evm_module: Arc<evm::EvmModule> = if config.evm_persistence {
         let backend: Box<dyn storage::StorageBackend + Send> = match &config.storage_path {
+            // With the executor journal on, it is the crash authority
+            // and redb may lag it: per-block commits skip the fsync
+            // and every `REDB_JOURNAL_SYNC_EVERY`-th block syncs
+            // (hft-audit-2 X-8). Without the journal every commit
+            // stays durable.
+            Some(path) if config.durability_dir.is_some() => Box::new(
+                storage::RedbBackend::open_journal_backed(path, REDB_JOURNAL_SYNC_EVERY)
+                    .expect("redb backend"),
+            ),
             Some(path) => Box::new(storage::RedbBackend::open(path).expect("redb backend")),
             None => Box::new(storage::Volatile::new()),
         };
