@@ -23999,3 +23999,10 @@ defaulting to cargo's `CARGO_TARGET_TMPDIR` under `target/`. Durability
 row names now carry the filesystem type from mountinfo (row IDs
 change). Same box: `journal/sync_1000_records_info/ext4` 5.70 ms vs
 `/tmpfs` 122.5 µs; `vote_signed_wal/ext4` 13.3 ms.
+
+### B-4: Docker builder on the pinned toolchain
+
+The image built with `rust:1.95-bookworm` while `rust-toolchain.toml`
+pins 1.98.1 (and the toolchain file isn't copied into the image). The
+builder is now `rust:1.98.1-bookworm`; both files carry a "bump
+together" comment.

@@ -1358,6 +1358,11 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Changed
 
+- **Docker testnet image builds with the pinned 1.98.1 toolchain**
+  (`build`, hft-audit-2 B-4).
+  - **In plain words:** testnet containers use the same compiler
+    version CI tests.
+
 - **Durability benches default to disk under `target/`, with an
   `OXIDE_BENCH_DIR` override** (`bench`, hft-audit-2 §8).
   - **In plain words:** the "save to disk" benchmarks now actually

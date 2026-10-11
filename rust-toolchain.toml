@@ -5,6 +5,7 @@
 #
 # Bump deliberately: update this file and the matching
 # `dtolnay/rust-toolchain@<version>` refs in .github/workflows/*.yml
+# and the `FROM rust:<version>-bookworm` builder in the Dockerfile
 # together. The advertised minimum (`workspace.package.rust-version`)
 # stays lower — this pin is the *tested* toolchain, the MSRV job in
 # ci.yml proves the floor still compiles.

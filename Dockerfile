@@ -15,7 +15,11 @@
 # The image is based on debian:bookworm-slim for glibc compatibility
 # and includes iproute2 for traffic shaping.
 
-FROM rust:1.95-bookworm AS builder
+# Builder toolchain: must match the `channel` in rust-toolchain.toml
+# exactly (that file is not copied into the image, so the image's own
+# rustc is what compiles). Bump both together — a drifted image builds
+# the testnet with a compiler CI never tested.
+FROM rust:1.98.1-bookworm AS builder
 
 WORKDIR /oxide
 
