@@ -48,6 +48,12 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Faster transaction lookups in the mempool and gossip dedup**
+  (`mempool`, `node`, hft-audit-2 N-8): maps keyed by transaction
+  hash skip the general-purpose `SipHash` and use the hash's own bytes.
+  - **In plain words:** looking up a transaction by its hash got
+    cheaper on the busiest paths.
+
 - **Idle validator loop stops re-copying execution certificates**
   (`consensus`, `node`, hft-audit-2 N-10): the RPC mirror is updated
   only when a new certificate exists, instead of every loop pass.

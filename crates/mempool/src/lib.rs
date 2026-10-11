@@ -33,7 +33,8 @@
 //! per-account nonce tracking. No rate limiting, no eviction policy
 //! beyond size cap, no mempool gossip. Those arrive in Phase 2+.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use primitives::digest_map::{DigestMap, DigestSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use primitives::{Address, Hash};
 use types::TxBytes;
@@ -100,7 +101,11 @@ pub struct PreparedTx {
 /// in the deterministic runtime).
 pub struct Mempool {
     /// All entries, indexed by tx hash for O(1) dedup.
-    by_hash: HashMap<Hash, PoolEntry>,
+    /// Keyed by BLAKE3 tx digest — `DigestMap` takes the key's own
+    /// (already uniform, not attacker-choosable) bytes as the hash
+    /// instead of running `SipHash` over 32 bytes per probe
+    /// (hft-audit-2 N-8).
+    by_hash: DigestMap<PoolEntry>,
     /// Per-sender nonce-ordered queues. `BTreeMap<nonce, hash>` gives
     /// us nonce-ordered iteration per sender for free.
     by_sender: HashMap<Address, BTreeMap<u64, Hash>>,
@@ -187,7 +192,7 @@ pub struct Mempool {
     /// If the committed block carried these txs they are already
     /// gone from the pool; if a different branch won the position,
     /// the txs become selectable again.
-    proposed: VecDeque<HashSet<Hash>>,
+    proposed: VecDeque<DigestSet>,
 }
 
 /// Maximum outstanding proposal positions tracked for in-flight
@@ -350,7 +355,7 @@ impl Mempool {
     /// Construct an empty mempool with the given capacity.
     pub fn new(max_entries: usize) -> Self {
         Self {
-            by_hash: HashMap::new(),
+            by_hash: DigestMap::default(),
             by_sender: HashMap::new(),
             by_fee: BTreeMap::new(),
             max_entries,
@@ -809,7 +814,7 @@ impl Mempool {
     /// `TxBytes`: O(proposal txs) hashing on the proposal path —
     /// the same price `remove_committed` pays at finalization.
     pub fn note_proposed(&mut self, txs: &[TxBytes]) {
-        let set: HashSet<Hash> =
+        let set: DigestSet =
             txs.iter().map(|tx| Hasher::hash_one(Domain::Transaction, tx.as_bytes())).collect();
         self.proposed.push_back(set);
         while self.proposed.len() > MAX_IN_FLIGHT_PROPOSALS {

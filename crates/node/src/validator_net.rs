@@ -867,7 +867,7 @@ fn fanout_tx(
     engine: &consensus::OxideBft,
     transport: &mut p2p::tcp::TcpTransport,
     our_addr: primitives::Address,
-    seen_txs: &mut std::collections::HashSet<primitives::Hash>,
+    seen_txs: &mut primitives::digest_map::DigestSet,
     seen_txs_fifo: &mut std::collections::VecDeque<primitives::Hash>,
     tx_bytes: &[u8],
 ) {
@@ -1035,8 +1035,13 @@ fn run_consensus_loop(
     // validator set was rotated by `complete_rotation`. Update the
     // shared set so `GET /validator-set` reflects the new set.
     let mut last_epoch = engine.epoch().value();
-    let mut seen_txs: std::collections::HashSet<primitives::Hash> =
-        std::collections::HashSet::with_capacity(GOSSIP_SEEN_CAP.min(4096));
+    // Digest-keyed: `DigestSet` skips `SipHash` over the 32-byte BLAKE3
+    // key on every gossip probe (hft-audit-2 N-8).
+    let mut seen_txs: primitives::digest_map::DigestSet =
+        primitives::digest_map::DigestSet::with_capacity_and_hasher(
+            GOSSIP_SEEN_CAP.min(4096),
+            primitives::digest_map::DigestBuildHasher::default(),
+        );
     let mut seen_txs_fifo: std::collections::VecDeque<primitives::Hash> =
         std::collections::VecDeque::new();
     // ── Certified block sync state ────────────────────────

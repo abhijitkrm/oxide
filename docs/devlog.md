@@ -23802,3 +23802,15 @@ into `exec_certs` / `verified_exec_certs`, and the pump pushes to the
 mirror only when the generation moved. Removals don't bump it — the
 mirror has its own cap and serving an already-pruned (still valid)
 cert is harmless.
+
+### N-8: digest-keyed maps in the mempool and gossip dedup
+
+The mempool's `by_hash` map, its 16 in-flight `proposed` sets (probed
+per selected tx in `select`) and the pump's gossip `seen_txs` set all
+ran SipHash over 32-byte BLAKE3 digests on every probe; F-25 built
+`DigestMap`/`DigestSet` for exactly this and applied it only to the
+preverify cache. All three now use it. Tx digests are BLAKE3 outputs,
+so their bytes are uniform and not attacker-choosable — the property
+`DigestHasher` relies on. Not separately benched (the audit estimates
+~0.3 µs per selected tx; `mempool/select_100_of_10000` measured
+3.4 µs/tx before).
