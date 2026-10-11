@@ -9,6 +9,7 @@
 //! |---------------------------|-----------------------------|
 //! | `mmr/push_amortized`      | p50 < 20 ns (⇒ 1M ops < 20 ms, pre-hashed leaves) |
 //! | `mmr/root_after_pushes`   | informational (bagging only) |
+//! | `mmr/root_16_peaks`       | informational: fixed 2^16−1-leaf forest, reproducible bagging cost |
 //! | `mmr/full_build_1m`       | informational: total wall-clock for 1M leaves incl. leaf hashing — hash-throughput-bound by design (spec §3) |
 //!
 //! Framing for `push_amortized`: leaves are **pre-hashed outside the
@@ -48,6 +49,20 @@ fn bench_mmr(c: &mut Criterion) {
     c.bench_function("mmr/root_after_pushes", |b| {
         b.iter(|| black_box(mmr.root()));
     });
+
+    // Root over a fixed forest shape: 2^16 − 1 leaves = 16 peaks, the
+    // worst case for its size. Unlike `root_after_pushes` (whose leaf
+    // count depends on how many iterations the push bench ran), this
+    // row is reproducible run to run (hft-audit-2 S-10).
+    {
+        let mut fixed = Mmr::new();
+        for i in 0..(1u64 << 16) - 1 {
+            fixed.push(leaves[usize::try_from(i & 4095).unwrap()]);
+        }
+        c.bench_function("mmr/root_16_peaks", |b| {
+            b.iter(|| black_box(black_box(&fixed).root()));
+        });
+    }
 
     // The hash floor: one internal-node hash (65-byte preimage = two
     // BLAKE3 compression blocks). Every push amortizes to exactly ≤1 of

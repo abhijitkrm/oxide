@@ -127,15 +127,22 @@ pub fn hash_node(left: &Hash, right: &Hash) -> Hash {
 /// Bag peaks right-to-left and finalize the root:
 /// `H(Domain::MmrRoot ‖ bag ‖ leaf_count LE)`.
 fn bag_root(peaks: &[Hash], leaf_count: u64) -> Hash {
+    bag_root_iter(peaks.iter().copied(), leaf_count)
+}
+
+/// [`bag_root`] over any double-ended peak sequence (left to right), so
+/// [`Mmr::root`] can bag straight from its `(index, height, hash)` peak
+/// stack without first collecting the hashes into a fresh `Vec` — one
+/// heap allocation per block commit removed (hft-audit-2 S-10).
+fn bag_root_iter(mut peaks: impl DoubleEndedIterator<Item = Hash>, leaf_count: u64) -> Hash {
     // An empty forest commits to the zero hash with leaf_count 0 —
     // documented, deterministic, and only reachable pre-genesis.
-    if peaks.is_empty() {
+    let Some(mut acc) = peaks.next_back() else {
         return Hash::ZERO;
-    }
-    let mut acc = peaks[peaks.len() - 1];
+    };
     // Fold from the second-rightmost peak leftward: acc = H(peak ‖ acc).
-    for peak in peaks[..peaks.len() - 1].iter().rev() {
-        acc = hash_node(peak, &acc);
+    for peak in peaks.rev() {
+        acc = hash_node(&peak, &acc);
     }
     let mut preimage = [0u8; ROOT_PREIMAGE_LEN];
     preimage[0] = Domain::MmrRoot as u8;
@@ -290,8 +297,7 @@ impl Mmr {
     /// O(#peaks) hashes (~log n); maintained incrementally by [`push`],
     /// so calling this after every append costs the bagging only.
     pub fn root(&self) -> Hash {
-        let peak_hashes: Vec<Hash> = self.peaks.iter().map(|&(_, _, h)| h).collect();
-        bag_root(&peak_hashes, self.leaf_count)
+        bag_root_iter(self.peaks.iter().map(|&(_, _, h)| h), self.leaf_count)
     }
 
     /// Build an inclusion proof for leaf `leaf_index` (0-based).

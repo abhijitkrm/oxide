@@ -54,6 +54,11 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **MMR root computed with no heap allocation** (`storage`,
+  hft-audit-2 S-10), ~5% faster.
+  - **In plain words:** finalizing each block's history commitment
+    does one less memory allocation.
+
 - **Fee rounding divides exactly once by construction; a bench covers
   the 128-bit path** (`primitives`, hft-audit-2 S-8).
   - **In plain words:** same speed and results, now guaranteed by

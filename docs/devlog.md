@@ -23980,3 +23980,11 @@ hyperthreads of one physical core and silently run at half speed. New:
 warnings }` (errors: two pins on one physical core; warnings: a pinned
 core's sibling is neither pinned nor isolated). A missing `taskset` now
 yields a clear `NotFound` naming util-linux. Cold path; no bench.
+
+### S-10 (MMR part): root bagged straight from the peak stack
+
+`Mmr::root()` collected the peaks into a fresh Vec per block commit; it
+now folds the peak stack via `bag_root_iter`, byte-identical. New row
+`mmr/root_16_peaks` (fixed forest): 2.73 → 2.60 µs. The journal
+`fallocate` half of S-10 is not done — the journal core is std-only and
+storage has no libc dependency.
