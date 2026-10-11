@@ -93,13 +93,22 @@ struct Ring<T> {
     /// dead when a consumer stops draining — the consumer's next
     /// liveness probe sees `false` and tears down instead of
     /// holding a lease forever. Producer-written, consumer-read.
-    severed: AtomicBool,
-    /// Signaled once per successful `pop` — a producer retrying on
-    /// `Full` parks on this instead of `yield_now` polling
-    /// (hft-audit F-15). Lives on the ring body so both halves can
-    /// reach it; the producer only ever awaits it, the consumer only
-    /// ever fires it.
-    space: tokio::sync::Notify,
+    /// Own cache line (hft-audit-2 M-8): unpadded, it shared a line
+    /// with `slots`/`mask`, which both halves read on every op.
+    severed: CacheLine<AtomicBool>,
+    /// `true` while a producer that saw `Full` is (about to be)
+    /// parked on `space` (hft-audit-2 M-8). `pop` fires `space` only
+    /// when this is set, so the no-waiter common case costs the
+    /// consumer a fence and a load instead of a `Notify` CAS per pop.
+    /// See [`SpscSender::push_wait`] for the Dekker-style protocol
+    /// that makes the gate lossless.
+    space_waiter: CacheLine<AtomicBool>,
+    /// Fired when a pop frees a slot and `space_waiter` was set — a
+    /// producer retrying on `Full` parks on this instead of
+    /// `yield_now` polling (hft-audit F-15). Own cache line: the
+    /// `Notify` state word is written on every notify and must not
+    /// false-share with the read-mostly fields above (M-8).
+    space: CacheLine<tokio::sync::Notify>,
 }
 
 // SAFETY: `Ring` is shared between exactly one producer and one
@@ -444,6 +453,17 @@ pub struct SpscSender<T> {
     ring: Arc<Ring<T>>,
     /// Capacity in items (slots); `push` is `Full` at this depth.
     capacity: usize,
+    /// The producer's last-observed consumer `head` (rigtorp-style
+    /// index cache, hft-audit-2 M-8). `push` checks fullness against
+    /// this and re-reads the shared `head` only when the cache says
+    /// full, so a ring with slack does not pull the consumer's
+    /// cache line across cores on every push. Any stale value is safe:
+    /// `head` only grows, so a stale cache can only make the ring look
+    /// fuller than it is, which triggers a refresh and never an
+    /// overwrite. An atomic (Relaxed) rather than a `Cell` only so
+    /// the sender stays `Sync` for lease-serialized sharing; the lease
+    /// hand-off orders accesses across holders.
+    cached_head: CacheLine<AtomicUsize>,
     /// What a successful push signals.
     wake: WakeTarget,
     /// Debug-build guard flag: held for the duration of each `push`'s
@@ -456,8 +476,9 @@ pub struct SpscSender<T> {
 /// The consumer half of an SPSC ring.
 ///
 /// `pop` is non-blocking — it returns `None` when the ring is empty.
-/// A successful pop fires the ring's `space` notify so an async
-/// producer retrying on `Full` wakes without polling.
+/// A successful pop wakes a producer parked in
+/// [`SpscSender::push_wait`] (only when one is parked — M-8), so an
+/// async producer retrying on `Full` wakes without polling.
 ///
 /// Deliberately NOT `Clone`: a cloned consumer can race the real
 /// one and steal responses addressed to another requester.
@@ -467,6 +488,13 @@ pub struct SpscReceiver<T> {
     /// Signaled by each producer `push` when [`WakeTarget::Async`] —
     /// the consumer task awaits it between pops.
     data: Arc<tokio::sync::Notify>,
+    /// The consumer's last-observed producer `tail` — the mirror of
+    /// [`SpscSender`]'s `cached_head` (hft-audit-2 M-8). `pop` reads
+    /// the shared `tail` only when the cache says empty, so draining a
+    /// backlog touches the producer's line once, not once per item.
+    /// Stale is safe: `tail` only grows, so a stale value can only
+    /// under-report what is available.
+    cached_tail: CacheLine<AtomicUsize>,
 }
 
 /// Create an SPSC ring pair: (sender, receiver). Pushes do not wake
@@ -521,26 +549,29 @@ fn spsc_ring_inner<T>(capacity: usize, wake: WakeTarget) -> (SpscSender<T>, Spsc
         head: CacheLine::new(AtomicUsize::new(0)),
         consumer_alive: CacheLine::new(AtomicBool::new(true)),
         producer_alive: CacheLine::new(AtomicBool::new(true)),
-        severed: AtomicBool::new(false),
-        space: tokio::sync::Notify::new(),
+        severed: CacheLine::new(AtomicBool::new(false)),
+        space_waiter: CacheLine::new(AtomicBool::new(false)),
+        space: CacheLine::new(tokio::sync::Notify::new()),
     });
     (
         SpscSender {
             ring: Arc::clone(&ring),
             capacity,
+            cached_head: CacheLine::new(AtomicUsize::new(0)),
             wake,
             #[cfg(debug_assertions)]
             in_push: Arc::new(AtomicBool::new(false)),
         },
-        SpscReceiver { ring, data },
+        SpscReceiver { ring, data, cached_tail: CacheLine::new(AtomicUsize::new(0)) },
     )
 }
 
 impl<T> SpscSender<T> {
     /// Push a value into the ring.
     ///
-    /// One atomic load (`head`), one slot write, one release store
-    /// (`tail`), one swap on the wakeup — no CAS loop, no syscall.
+    /// One slot write, one release store (`tail`), one swap on the
+    /// wakeup — no CAS loop, no syscall. The consumer's `head` line is
+    /// read only when the cached copy says full (M-8).
     /// On `Err` the value is handed back for retry without loss.
     ///
     /// # Errors
@@ -570,13 +601,21 @@ impl<T> SpscSender<T> {
         };
         let ring = &*self.ring;
         let tail = ring.tail.value.load(Ordering::Relaxed);
-        // Acquire: observe the consumer's reclamation stores.
-        let head = ring.head.value.load(Ordering::Acquire);
-        if tail - head == self.capacity {
-            return Err(PushError::Full(value));
+        // Fullness against the cached head first (M-8); refresh from
+        // the shared index only when the cache says full. Acquire on
+        // the refresh: observe the consumer's reclamation stores (its
+        // reads of the slots we are about to overwrite happen-before
+        // them). A cached value was itself produced by such an
+        // acquire, so the edge holds on the cached path too.
+        if tail - self.cached_head.value.load(Ordering::Relaxed) == self.capacity {
+            let head = ring.head.value.load(Ordering::Acquire);
+            self.cached_head.value.store(head, Ordering::Relaxed);
+            if tail - head == self.capacity {
+                return Err(PushError::Full(value));
+            }
         }
         if !ring.consumer_alive.value.load(Ordering::Acquire)
-            || ring.severed.load(Ordering::Acquire)
+            || ring.severed.value.load(Ordering::Acquire)
         {
             return Err(PushError::Disconnected(value));
         }
@@ -609,7 +648,7 @@ impl<T> SpscSender<T> {
     /// This is the F-04 escape: a client that stops draining no
     /// longer deadlocks the sequencer's response path.
     pub fn sever(&self) {
-        self.ring.severed.store(true, Ordering::Release);
+        self.ring.severed.value.store(true, Ordering::Release);
         // Wake the consumer so it observes the flag promptly instead
         // of timing out.
         match &self.wake {
@@ -619,14 +658,53 @@ impl<T> SpscSender<T> {
         }
     }
 
-    /// The `Notify` this producer awaits when `push` reports `Full` —
-    /// signalled once per successful consumer `pop` (hft-audit F-15:
-    /// replaces `yield_now` polling). Use the register-then-recheck
-    /// pattern: `notified()` + `enable()`, re-attempt `push`, then
-    /// `await` only if still full.
-    #[must_use]
-    pub fn space_notify(&self) -> &tokio::sync::Notify {
-        &self.ring.space
+    /// Push, waiting asynchronously while the ring is full — the
+    /// only supported way to wait for space (hft-audit F-15 replaced
+    /// `yield_now` polling with this `Notify` wait).
+    ///
+    /// # Lossless gated wakeup (hft-audit-2 M-8)
+    ///
+    /// `pop` fires the `space` notify only when `space_waiter` is set,
+    /// so the protocol must make "producer parks" and "consumer frees
+    /// a slot" impossible to miss each other. It is the Dekker shape,
+    /// with a `SeqCst` fence on each side:
+    ///
+    /// - producer: arm the `Notified` future → `space_waiter = true` →
+    ///   fence → re-try `push` (re-reads `head`) → await only if still
+    ///   full;
+    /// - consumer (`pop`): store `head` → fence → load `space_waiter`
+    ///   → swap it false and `notify_one` if it was set.
+    ///
+    /// The two fences are totally ordered. Either the producer's
+    /// re-read sees the freed slot, or the consumer's load sees the
+    /// flag and notifies a future that was already armed. Arming
+    /// before announcing matters: a notify can never land in the gap
+    /// before the future can receive it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the value when the consumer is gone or the ring is
+    /// severed — retrying is futile.
+    pub async fn push_wait(&self, value: T) -> Result<(), T> {
+        let mut pending = value;
+        loop {
+            match self.push(pending) {
+                Ok(()) => return Ok(()),
+                Err(PushError::Disconnected(v)) => return Err(v),
+                Err(PushError::Full(v)) => pending = v,
+            }
+            let notified = self.ring.space.value.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            self.ring.space_waiter.value.store(true, Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::SeqCst);
+            match self.push(pending) {
+                Ok(()) => return Ok(()),
+                Err(PushError::Disconnected(v)) => return Err(v),
+                Err(PushError::Full(v)) => pending = v,
+            }
+            notified.await;
+        }
     }
 
     /// Number of items in flight (an instantaneous, racy estimate —
@@ -668,16 +746,25 @@ impl<T> SpscReceiver<T> {
     /// Pop a value from the ring. Returns `None` if empty (probe
     /// `producer_gone`/`severed` to distinguish idle from dead).
     ///
-    /// One acquire load (`tail`), one slot read, one release store
-    /// (`head`) — plus a `Notify` store that is a single atomic in
-    /// the no-waiter common case.
+    /// One slot read, one release store (`head`), one `SeqCst` fence
+    /// plus a load of the space-waiter flag — `notify_one` only when a
+    /// producer is parked (M-8). The producer's `tail` line is read
+    /// only when the cached copy says empty.
     #[inline]
     pub fn pop(&self) -> Option<T> {
         let ring = &*self.ring;
         let head = ring.head.value.load(Ordering::Relaxed);
-        let tail = ring.tail.value.load(Ordering::Acquire);
-        if head == tail {
-            return None;
+        // Emptiness against the cached tail first (M-8); refresh from
+        // the shared index only when the cache says empty. Acquire on
+        // the refresh pairs with the producer's release of `tail`, and
+        // that edge also covers the cached path (the cache came from
+        // such an acquire).
+        if head == self.cached_tail.value.load(Ordering::Relaxed) {
+            let tail = ring.tail.value.load(Ordering::Acquire);
+            self.cached_tail.value.store(tail, Ordering::Relaxed);
+            if head == tail {
+                return None;
+            }
         }
         // SAFETY: the consumer owns reads below `tail`; this slot was
         // initialized by the producer's release-published write, and
@@ -687,10 +774,18 @@ impl<T> SpscReceiver<T> {
         // Release: publishes slot reclamation to the producer's
         // acquire load of `head`.
         ring.head.value.store(head + 1, Ordering::Release);
-        // Wake a producer parked on space. Single atomic store when
-        // nobody waits — the no-waiter case dominates (consumers are
-        // normally behind, not ahead, of producers).
-        self.ring.space.notify_one();
+        // Wake a producer parked on space — only if one announced
+        // itself (M-8; protocol on `SpscSender::push_wait`). The fence
+        // orders our `head` store before the flag load; without it the
+        // store could sit in the store buffer while we read a stale
+        // `false`, and a producer re-checking `head` at that moment
+        // would park forever.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if ring.space_waiter.value.load(Ordering::Relaxed)
+            && ring.space_waiter.value.swap(false, Ordering::AcqRel)
+        {
+            ring.space.value.notify_one();
+        }
         Some(value)
     }
 
@@ -751,7 +846,7 @@ impl<T> SpscReceiver<T> {
     #[must_use]
     pub fn producer_gone(&self) -> bool {
         !self.ring.producer_alive.value.load(Ordering::Acquire)
-            || self.ring.severed.load(Ordering::Acquire)
+            || self.ring.severed.value.load(Ordering::Acquire)
     }
 
     /// Number of items in flight (instantaneous estimate — the
@@ -999,6 +1094,75 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(rx.pop_spin(Duration::from_secs(3600)), None);
         assert!(t0.elapsed() < Duration::from_secs(5), "dead producer must end the spin");
+    }
+
+    /// hft-audit-2 M-8: cached head/tail indices must never let the
+    /// producer overwrite an unread slot or the consumer read an
+    /// unpublished one. Capacity 2 forces a cache refresh on nearly
+    /// every op, across threads, through many wraparounds.
+    #[test]
+    fn cached_indices_preserve_fifo_at_tiny_capacity() {
+        const N: u64 = 200_000;
+        let (tx, rx) = spsc_ring::<u64>(2);
+        let producer = thread::spawn(move || {
+            for i in 0..N {
+                let mut v = i;
+                while let Err(PushError::Full(back)) = tx.push(v) {
+                    v = back;
+                    std::hint::spin_loop();
+                }
+            }
+        });
+        let mut expected = 0u64;
+        while expected < N {
+            if let Some(v) = rx.pop() {
+                assert_eq!(v, expected, "FIFO order broken by a stale index cache");
+                expected += 1;
+            }
+        }
+        producer.join().unwrap();
+        assert!(rx.pop().is_none());
+    }
+
+    /// hft-audit-2 M-8: `pop` only fires `space` when a producer has
+    /// announced itself, so the gated wakeup must be lossless. A
+    /// producer pushing 50k items into a 2-slot ring through
+    /// `push_wait` parks over and over; one lost wakeup would hang
+    /// it, which the outer timeout turns into a failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_wait_never_loses_a_space_wakeup() {
+        const N: u64 = 50_000;
+        let (tx, rx) = spsc_ring::<u64>(2);
+        let consumer = thread::spawn(move || {
+            let mut expected = 0u64;
+            while expected < N {
+                if let Some(v) = rx.pop() {
+                    assert_eq!(v, expected);
+                    expected += 1;
+                    // Occasionally stall so the producer really parks.
+                    if expected.is_multiple_of(1_024) {
+                        thread::sleep(Duration::from_micros(50));
+                    }
+                }
+            }
+        });
+        let produce = async move {
+            for i in 0..N {
+                tx.push_wait(i).await.expect("consumer alive");
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), produce)
+            .await
+            .expect("push_wait hung: a space wakeup was lost");
+        consumer.join().unwrap();
+    }
+
+    /// `push_wait` hands the value back when the consumer is gone.
+    #[tokio::test]
+    async fn push_wait_returns_value_when_disconnected() {
+        let (tx, rx) = spsc_ring::<u64>(2);
+        drop(rx);
+        assert_eq!(tx.push_wait(5).await, Err(5));
     }
 
     #[test]

@@ -132,36 +132,11 @@ async fn submit_batch_ring(
         let ring_idx = lease.ring_idx();
         let order_sender = ring.order_sender(ring_idx);
         let response_receiver = ring.response_receiver(ring_idx);
-        let mut pending = verified;
-        let sent = loop {
-            match order_sender.push(pending) {
-                Ok(()) => break true,
-                Err(crate::ring::PushError::Disconnected(_)) => {
-                    // Worker thread died — verified slots fall through
-                    // to EngineError below.
-                    break false;
-                }
-                Err(crate::ring::PushError::Full(returned)) => {
-                    pending = returned;
-                    // Register interest BEFORE the re-push: a pop
-                    // landing between the failed push and the await
-                    // fires `space` — with the permit armed it is
-                    // observed; arming after the recheck would miss it
-                    // (F-15: Notify wait replaces `yield_now` spin).
-                    let notified = order_sender.space_notify().notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    match order_sender.push(pending) {
-                        Ok(()) => break true,
-                        Err(crate::ring::PushError::Disconnected(_)) => break false,
-                        Err(crate::ring::PushError::Full(back)) => {
-                            pending = back;
-                            notified.await;
-                        }
-                    }
-                }
-            }
-        };
+        // `push_wait` owns the register-then-recheck protocol for a
+        // full ring (F-15 Notify wait; M-8 gated wakeup). An `Err`
+        // means the worker thread died — verified slots fall through
+        // to EngineError below.
+        let sent = order_sender.push_wait(verified).await.is_ok();
         if sent {
             let data = Arc::clone(response_receiver.data_notify());
             let worker_responses = loop {

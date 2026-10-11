@@ -48,6 +48,13 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Order/response ring hand-off several times faster across cores**
+  (`matcher`, hft-audit-2 M-8): padded flags, cached peer indices,
+  notify only when a producer waits. Cross-CCX stream 1.8–2.0 →
+  31–38 M items/s.
+  - **In plain words:** passing an order from the network thread to
+    the matcher and back costs much less.
+
 - **Single orders verify ~15% faster** (`matcher`, hft-audit-2 M-6):
   `verify_strict` with a stack signing message instead of a one-item
   batch verify (62–65 → 53 µs, four fewer allocations).

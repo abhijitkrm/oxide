@@ -23732,3 +23732,17 @@ encoder; the batch path stores fixed-size arrays in one allocation. A
 golden test pins the wire bytes. Verify 62–65 → 53 µs per order (~15%),
 four fewer allocations. Cross-connection batching (the 3× lever) is
 still open.
+
+### M-8: SPSC ring cache-line hygiene
+
+Three costs on the order/response hand-off only show up across cores:
+`severed` and the `space` Notify shared a line with fields both sides
+read every op (and every pop wrote that Notify); each push read the
+consumer index and each pop the producer index; and every pop did a
+`notify_one` CAS with nobody waiting. Flags now have their own lines,
+each side caches the peer's index (rigtorp style), and pop notifies
+only when a producer announced it is waiting (`SpscSender::push_wait`,
+fence-paired so no wakeup is lost; `space_notify()` removed). Tests:
+capacity-2 cross-thread FIFO stress, 50k-item lost-wakeup run.
+Two-thread stream: same-CCX 7–10 → 26–30 M items/s, cross-CCX
+1.8–2.0 → 31–38 M items/s; cross-CCX round trip ~1.1 → 0.82 µs.
