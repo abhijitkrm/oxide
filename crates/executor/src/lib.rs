@@ -1960,6 +1960,42 @@ impl Executor {
         self
     }
 
+    /// Size the mempool-intake rayon pool to `threads` (hft-audit-2
+    /// X-3). The default pool takes rayon's default — one thread per
+    /// *logical* CPU — so on the 8-core/16-thread target the intake
+    /// pool alone was 16 threads beside a 16-thread global pool, the
+    /// pinned pump and lane, and the verify workers. secp256k1 gains
+    /// nothing from an SMT sibling. A failed rebuild keeps the
+    /// current pool.
+    #[must_use]
+    pub fn with_intake_threads(mut self, threads: usize) -> Self {
+        if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads.max(1))
+            .thread_name(|i| format!("oxide-intake-{i}"))
+            .build()
+        {
+            self.intake_pool = Some(pool);
+        }
+        self
+    }
+
+    /// Size rayon's global pool — the one block execution's parallel
+    /// EVM paths run on — to `threads` (hft-audit-2 X-3). Must run
+    /// before anything touches the global pool; rayon allows one
+    /// initialization per process.
+    ///
+    /// # Errors
+    ///
+    /// The rayon error text when the global pool already exists
+    /// (another assembly in the same process, or an earlier
+    /// `par_iter`); the existing pool stays in use.
+    pub fn init_global_pool(threads: usize) -> Result<(), String> {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads.max(1))
+            .build_global()
+            .map_err(|e| e.to_string())
+    }
+
     /// Pin the exec lane to logical CPU `core` (hft-audit F-02).
     ///
     /// The lane is the single writer for block execution → state

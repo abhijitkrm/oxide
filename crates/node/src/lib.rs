@@ -45,6 +45,9 @@
 //!     consensus_core: None,
 //!     exec_lane_core: None,
 //!     numa_node: None,
+//!     verify_workers: None,
+//!     intake_threads: None,
+//!     rayon_threads: None,
 //! };
 //! let mut node = Node::assemble(&config);
 //! // Drive consensus, inspect state, etc.
@@ -206,6 +209,15 @@ pub struct NodeConfig {
     /// this node's cores so shared state (book memory, chain
     /// buffers) stays node-local. `None` disables the check.
     pub numa_node: Option<u32>,
+    /// BLS verify-pool workers (hft-audit-2 C-1). `None` = the pool's
+    /// default (`available_parallelism − 1`, clamped to [2, 8]).
+    pub verify_workers: Option<usize>,
+    /// Mempool-intake rayon threads (hft-audit-2 X-3). `None` =
+    /// [`physical_cores`].
+    pub intake_threads: Option<usize>,
+    /// Global rayon pool threads (hft-audit-2 X-3). `None` =
+    /// [`physical_cores`].
+    pub rayon_threads: Option<usize>,
     /// Minimum transaction fee (`ctx.fee`) for native-module txs.
     /// Txs declaring less are skipped before execution — the fee
     /// field is sender-controlled, so without a floor every tx could
@@ -282,8 +294,34 @@ impl Default for NodeConfig {
             consensus_core: None,
             exec_lane_core: None,
             numa_node: None,
+            verify_workers: None,
+            intake_threads: None,
+            rayon_threads: None,
         }
     }
+}
+
+/// Physical cores on this machine: distinct SMT sibling groups among
+/// the online CPUs (Linux sysfs), else the logical CPU count.
+///
+/// The default size for the CPU-bound rayon pools (hft-audit-2 X-3):
+/// secp256k1 and BLS saturate a core's ALUs, so a second thread on
+/// the SMT sibling adds contention, not throughput — on the 8-core /
+/// 16-thread target the old defaults ran ~50 threads on 8 cores.
+#[must_use]
+pub fn physical_cores() -> usize {
+    let logical = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let mut groups = std::collections::BTreeSet::new();
+    for cpu in 0..logical {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+        match std::fs::read_to_string(path) {
+            Ok(list) => {
+                groups.insert(list.trim().to_owned());
+            }
+            Err(_) => return logical,
+        }
+    }
+    groups.len().max(1)
 }
 
 impl NodeConfig {
@@ -720,6 +758,10 @@ const REDB_JOURNAL_SYNC_EVERY: u32 = 64;
 // module count, not its complexity.
 #[allow(clippy::too_many_lines)]
 pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
+    // Size the global rayon pool before anything can touch it
+    // (hft-audit-2 X-3). A second assembly in one process (tests,
+    // devnet clusters) finds it already built and keeps it.
+    let _ = Executor::init_global_pool(config.rayon_threads.unwrap_or_else(physical_cores));
     // Build the executor with standard modules. Use `with_config`
     // so the parallel threshold is configurable (default: 32 txs,
     // lowered from 100 in the block-size sweep session — rayon
@@ -744,6 +786,7 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
         .with_gas_limit(config.block_budget.max_gas)
         .with_chain_id(config.chain_id)
         .with_exec_lane_pin(config.exec_lane_core)
+        .with_intake_threads(config.intake_threads.unwrap_or_else(physical_cores))
         .with_unsigned_tx_policy(if config.require_signed_txs {
             executor::UnsignedTxPolicy::Reject
         } else {
@@ -1195,6 +1238,9 @@ pub fn node_config_from(
         consensus_core: config.performance.consensus_core,
         exec_lane_core: config.performance.exec_lane_core,
         numa_node: config.performance.numa_node,
+        verify_workers: config.performance.verify_workers,
+        intake_threads: config.performance.intake_threads,
+        rayon_threads: config.performance.rayon_threads,
     })
 }
 

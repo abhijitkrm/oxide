@@ -23668,3 +23668,19 @@ empty `Immediate` commit — which persists every earlier `None` commit —
 on every n-th `sync` and on drop. The node uses it with n = 64 only
 when the journal is enabled; without it every commit stays durable.
 Test: commits are visible at once and survive close/reopen.
+
+### C-1 / X-3 / N-9: size the CPU pools to physical cores
+
+A validator on the 8-core/16-thread target ran ~50 threads: two rayon
+pools at rayon's default (one thread per *logical* CPU — 16 + 16),
+8 verify workers, the pinned pump and lane, transport and RPC threads.
+secp256k1 and BLS saturate a core's ALUs, so the SMT siblings only add
+contention and scheduler jitter for the pinned threads. New
+`[performance]` knobs (TOML + `OXIDE_PERFORMANCE_*` env):
+`verify_workers`, `intake_threads`, `rayon_threads`. The two rayon
+pools keep their measured split (intake vs execution; see
+`Executor::intake_pool`) but now default to `node::physical_cores()`
+(distinct `thread_siblings_list` groups, else the logical count);
+the verify pool keeps its existing default unless set. The global pool
+is sized at `assemble_executor`; a second assembly in one process keeps
+the first pool.

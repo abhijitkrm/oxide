@@ -822,6 +822,17 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Thread-pool sizing knobs, physical-core defaults** (`config`,
+  `node`, `executor`, hft-audit-2 C-1/X-3/N-9): new `[performance]`
+  settings `verify_workers`, `intake_threads` and `rayon_threads`
+  (also `OXIDE_PERFORMANCE_*`). The two signature/execution rayon
+  pools now default to the number of physical cores instead of
+  logical CPUs (8 + 8 rather than 16 + 16 threads on an 8-core SMT
+  box).
+  - **In plain words:** the node stops starting twice as many
+    number-crunching threads as the machine has real cores, and
+    operators can size them.
+
 - **Equivocation evidence reaches staking** (`consensus`,
   `validator_net`, `types`, `devnet`): the engine now records each
   validator's vote per `(view, phase)` in a bounded log; a

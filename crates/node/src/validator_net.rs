@@ -641,6 +641,7 @@ pub fn run(spec: ValidatorNetSpec) {
         tx_inject,
         evidence_reporter,
         node_config.chain_id,
+        node_config.verify_workers,
     );
     // Flush any batched certified-record appends before the data
     // dir is handed to the snapshot exporter.
@@ -970,6 +971,7 @@ fn run_consensus_loop(
     mut tx_inject: Option<TxInject>,
     evidence_reporter: Option<EvidenceReporter>,
     chain_id: u64,
+    verify_workers: Option<usize>,
 ) {
     // (cap documented at module scope — `GOSSIP_SEEN_CAP`)
     // This pump re-attempts every un-voted pending proposal on each
@@ -1011,7 +1013,12 @@ fn run_consensus_loop(
     // material. Without this, the cheap gates bound *how much*
     // junk arrives but each admitted verification still blocked
     // the pump inside pairing code.
-    let mut verify_pool = crate::verify_pool::VerifyPool::spawn();
+    // Sized by `performance.verify_workers` when set (hft-audit-2
+    // C-1), else the pool's own default.
+    let mut verify_pool = match verify_workers {
+        Some(n) => crate::verify_pool::VerifyPool::with_workers(n),
+        None => crate::verify_pool::VerifyPool::spawn(),
+    };
     let mut voted_views: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut proposed_views: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut last_reported_height: u64 = 0;

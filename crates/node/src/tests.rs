@@ -1247,3 +1247,13 @@ fn governance_applies_chain_min_fee_end_to_end() {
         "fee-100 tx must skip under the governed 200 floor, got {outcome:?}"
     );
 }
+
+/// hft-audit-2 X-3: the pool-size default never exceeds the logical
+/// CPU count and is never zero.
+#[test]
+fn physical_cores_is_within_logical_count() {
+    let logical = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let physical = crate::physical_cores();
+    assert!(physical >= 1);
+    assert!(physical <= logical, "{physical} physical > {logical} logical");
+}

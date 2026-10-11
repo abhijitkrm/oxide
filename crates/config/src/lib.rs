@@ -669,6 +669,26 @@ pub struct PerformanceConfig {
     /// shared state stays node-local. `None` disables the check.
     #[serde(default)]
     pub numa_node: Option<u32>,
+
+    /// BLS signature-verification workers (hft-audit-2 C-1).
+    /// `None` = `available_parallelism − 1` clamped to [2, 8].
+    /// Pairing is ALU-bound, so on an SMT box this is best set to
+    /// the cores left after the pinned roles, not the thread count.
+    #[serde(default)]
+    pub verify_workers: Option<usize>,
+
+    /// Threads in the executor's mempool-intake rayon pool (parallel
+    /// secp256k1 recovery at admission) (hft-audit-2 X-3).
+    /// `None` = the physical-core count: SMT siblings add nothing to
+    /// recovery and only contend with the pinned threads.
+    #[serde(default)]
+    pub intake_threads: Option<usize>,
+
+    /// Threads in the global rayon pool (block execution: parallel
+    /// EVM recovery and speculation) (hft-audit-2 X-3).
+    /// `None` = the physical-core count, for the same reason.
+    #[serde(default)]
+    pub rayon_threads: Option<usize>,
 }
 
 impl PerformanceConfig {
@@ -682,6 +702,15 @@ impl PerformanceConfig {
         }
         if let Some(v) = get("OXIDE_PERFORMANCE_NUMA_NODE") {
             self.numa_node = if v.is_empty() { None } else { v.parse().ok() };
+        }
+        if let Some(v) = get("OXIDE_PERFORMANCE_VERIFY_WORKERS") {
+            self.verify_workers = if v.is_empty() { None } else { v.parse().ok() };
+        }
+        if let Some(v) = get("OXIDE_PERFORMANCE_INTAKE_THREADS") {
+            self.intake_threads = if v.is_empty() { None } else { v.parse().ok() };
+        }
+        if let Some(v) = get("OXIDE_PERFORMANCE_RAYON_THREADS") {
+            self.rayon_threads = if v.is_empty() { None } else { v.parse().ok() };
         }
     }
 }
@@ -978,5 +1007,32 @@ settlement_operator = "0xoperator"
         let mut config = Config::default();
         config.apply_env(&env);
         assert_eq!(config.exchange.settlement_operator, None);
+    }
+
+    /// hft-audit-2 C-1/X-3: the pool-size knobs parse from TOML and
+    /// env, default to `None`, and an empty env value clears them.
+    #[test]
+    fn performance_pool_sizes_from_toml_and_env() {
+        assert_eq!(Config::default().performance.verify_workers, None);
+        let config: Config = toml::from_str(
+            "[performance]\nverify_workers = 4\nintake_threads = 5\nrayon_threads = 6\n",
+        )
+        .expect("parse");
+        assert_eq!(config.performance.verify_workers, Some(4));
+        assert_eq!(config.performance.intake_threads, Some(5));
+        assert_eq!(config.performance.rayon_threads, Some(6));
+
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "OXIDE_PERFORMANCE_VERIFY_WORKERS" => Some("3".to_string()),
+                "OXIDE_PERFORMANCE_INTAKE_THREADS" => Some(String::new()),
+                _ => None,
+            }
+        };
+        let mut config = config;
+        config.apply_env(&env);
+        assert_eq!(config.performance.verify_workers, Some(3));
+        assert_eq!(config.performance.intake_threads, None);
+        assert_eq!(config.performance.rayon_threads, Some(6));
     }
 }
