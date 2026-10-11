@@ -729,7 +729,13 @@ impl OxideBft {
             if !self.bitmap_meets_quorum(&hqc.signer_bitmap) {
                 return None;
             }
-            if self.verify_signatures && self.verify_qc_signature(hqc).is_err() {
+            // A `high_qc` this engine already delivered was verified
+            // then (inline or by the pool) — skip the second pairing
+            // (hft-audit-2 N-4).
+            if self.verify_signatures
+                && !self.qc_memo_hit(hqc)
+                && self.verify_qc_signature(hqc).is_err()
+            {
                 return None;
             }
         }
@@ -1575,6 +1581,15 @@ impl OxideBft {
             signer_bitmap,
             aggregate_signature,
         };
+
+        // `aggregate_collected_votes` proved the aggregate over the
+        // buffered signers (quarantining any bad vote) and only
+        // returns when an honest quorum remains, so the leader's own
+        // `deliver_qc` of this QC need not pair again (hft-audit-2
+        // N-4). Conformance mode memoizes nothing.
+        if self.signer.is_some() {
+            self.memo_verified_qc(&qc);
+        }
 
         // Clear the vote buffer for the next view.
         self.votes.fill(None);

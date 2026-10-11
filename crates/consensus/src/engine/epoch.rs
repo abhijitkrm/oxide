@@ -181,6 +181,7 @@ impl OxideBft {
         self.exec_attest_pool.clear();
         self.exec_certs.clear();
         self.verified_exec_certs.clear();
+        self.verified_qcs.clear();
         self.rejected_headers.clear();
         // Staged sync records are signed under the outgoing
         // committee — unverifiable (and uncommittable) after the

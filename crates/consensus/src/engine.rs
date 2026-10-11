@@ -584,6 +584,15 @@ impl std::fmt::Display for ConsensusError {
 
 impl std::error::Error for ConsensusError {}
 
+/// Capacity of the verified-QC memo (hft-audit-2 N-4).
+///
+/// Unit: certificates. Origin: a QC is re-checked within the next
+/// view or two (leader `deliver_qc`, voters' `high_qc` gate), so a
+/// handful of recent entries catch every repeat; 8 covers the 2-chain
+/// window plus timeout churn. Each entry is ~150 B and a miss scans
+/// all of them by equality (tens of ns), so growing it buys nothing.
+const VERIFIED_QC_MEMO: usize = 8;
+
 /// The oxideBFT consensus engine.
 ///
 /// Implements `ports::ConsensusEngine`. In single-validator mode
@@ -836,6 +845,18 @@ pub struct OxideBft {
     /// the earlier verdict. Cleared at epoch rotation: verification
     /// is only defined against the epoch's validator set.
     verified_exec_certs: std::collections::BTreeMap<u64, ExecCertificate>,
+    /// QCs this engine already authenticated (quorum + aggregate)
+    /// under the current epoch's committee, newest last, at most
+    /// [`VERIFIED_QC_MEMO`] (hft-audit-2 N-4). The same certificate
+    /// used to be pairing-checked up to three times per view on the
+    /// pump — the leader's self-verify at formation, again in its own
+    /// `deliver_qc`, and every voter's re-verify of the header's
+    /// `high_qc` it had already delivered — at ~1.46 ms per
+    /// `aggregate_verify` on the EPYC target. A hit must equal the
+    /// presented QC in full (bitmap and signature included), so a
+    /// different certificate for the same block re-verifies. Cleared
+    /// at epoch rotation with the rest of the epoch-scoped state.
+    verified_qcs: std::collections::VecDeque<QuorumCertificate>,
     /// How long the vote path may block waiting for the execution
     /// lane to produce a certified height's local root. Default
     /// `EXEC_ATTEST_WAIT` (250 ms) suits drivers that call `vote`
@@ -1060,6 +1081,7 @@ impl OxideBft {
             exec_attest_pool: std::collections::BTreeMap::new(),
             exec_certs: std::collections::BTreeMap::new(),
             verified_exec_certs: std::collections::BTreeMap::new(),
+            verified_qcs: std::collections::VecDeque::with_capacity(VERIFIED_QC_MEMO),
             exec_attest_wait: votes::EXEC_ATTEST_WAIT,
             rejected_headers: std::collections::HashSet::new(),
             last_attestation: None,
@@ -2379,24 +2401,36 @@ impl OxideBft {
         // `verify_qc_with`; nothing here stores an unchecked
         // certificate.
         let mut adopts_pending_set = false;
-        let verified = match self.verify_qc_with(&self.validator_set, &qc) {
-            Ok(v) => v,
-            Err(current_err) => {
-                if !adopts_epoch {
-                    return Err(current_err);
-                }
-                let Some(pending) = self.next_validator_set.clone() else {
-                    return Err(current_err);
-                };
-                match self.verify_qc_with(&pending, &qc) {
-                    Ok(v) => {
-                        adopts_pending_set = true;
-                        v
+        // A certificate this engine already authenticated under the
+        // current committee (typically the leader's own freshly
+        // formed QC) skips the second pairing (hft-audit-2 N-4).
+        let verified = if self.qc_memo_hit(&qc) {
+            crate::verify::VerifiedQc::from_trusted(qc.clone())
+        } else {
+            match self.verify_qc_with(&self.validator_set, &qc) {
+                Ok(v) => {
+                    if !adopts_epoch {
+                        self.memo_verified_qc(&qc);
                     }
-                    // Report the current-set failure: that committee
-                    // is the one a correctly-synced node holds, so
-                    // its error is the primary diagnosis.
-                    Err(_) => return Err(current_err),
+                    v
+                }
+                Err(current_err) => {
+                    if !adopts_epoch {
+                        return Err(current_err);
+                    }
+                    let Some(pending) = self.next_validator_set.clone() else {
+                        return Err(current_err);
+                    };
+                    match self.verify_qc_with(&pending, &qc) {
+                        Ok(v) => {
+                            adopts_pending_set = true;
+                            v
+                        }
+                        // Report the current-set failure: that committee
+                        // is the one a correctly-synced node holds, so
+                        // its error is the primary diagnosis.
+                        Err(_) => return Err(current_err),
+                    }
                 }
             }
         };
@@ -2443,6 +2477,12 @@ impl OxideBft {
                 return Err(ConsensusError::InvalidQcSignature);
             }
         };
+        if !adopts_epoch && !adopts_pending_set {
+            // The pool verified it under the current committee: the
+            // voters' `high_qc` check on the next header reuses this
+            // verdict instead of pairing again (hft-audit-2 N-4).
+            self.memo_verified_qc(&qc);
+        }
         let verified = crate::verify::VerifiedQc::from_trusted(qc.clone());
         self.deliver_qc_tail(qc, verified, adopts_epoch, adopts_pending_set);
         Ok(())
@@ -2695,6 +2735,31 @@ impl OxideBft {
     /// power is below the stake quorum, or
     /// [`ConsensusError::InvalidQcSignature`] if the aggregate does
     /// not verify.
+    /// Whether `qc` is, byte for byte, a certificate this engine
+    /// already authenticated under the current epoch's committee
+    /// (hft-audit-2 N-4). Always `false` in conformance mode, which
+    /// verifies nothing and so has nothing to skip.
+    pub(crate) fn qc_memo_hit(&self, qc: &QuorumCertificate) -> bool {
+        self.verify_signatures
+            && qc.epoch == self.epoch
+            && self.verified_qcs.iter().rev().any(|known| known == qc)
+    }
+
+    /// Record `qc` as authenticated under the current committee.
+    /// Callers guarantee it passed quorum + aggregate verification
+    /// against `self.validator_set` for `self.epoch` — a wrong entry
+    /// here would let an unverified certificate through every
+    /// memo-checking gate.
+    pub(crate) fn memo_verified_qc(&mut self, qc: &QuorumCertificate) {
+        if !self.verify_signatures || qc.epoch != self.epoch || self.qc_memo_hit(qc) {
+            return;
+        }
+        if self.verified_qcs.len() >= VERIFIED_QC_MEMO {
+            self.verified_qcs.pop_front();
+        }
+        self.verified_qcs.push_back(qc.clone());
+    }
+
     fn verify_qc_signature(&self, qc: &QuorumCertificate) -> Result<VerifiedQc, ConsensusError> {
         crate::verify::verify_qc_signature(&self.validator_set, self.epoch, qc)
     }

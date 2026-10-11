@@ -1608,6 +1608,20 @@ fn bls_multi_validator_qc_verifies() {
         &pks,
     );
     assert!(result.is_ok(), "QC aggregate signature must verify against all 4 keys");
+
+    // hft-audit-2 N-4: the leader memoizes the QC it just proved, so
+    // its own `deliver_qc` skips the second pairing; a follower that
+    // delivers it memoizes it for the next header's `high_qc` gate.
+    assert!(leader.qc_memo_hit(&qc), "a freshly formed QC is memoized");
+    let mut forged = qc.clone();
+    forged.aggregate_signature = AggregateSignature::ZERO;
+    assert!(!leader.qc_memo_hit(&forged), "a hit must match the whole certificate");
+    let err = leader.deliver_qc(forged).expect_err("forged twin must still fail verification");
+    assert_eq!(err, ConsensusError::InvalidQcSignature);
+    leader.deliver_qc(qc.clone()).expect("leader delivers its own QC");
+    assert!(!followers[0].qc_memo_hit(&qc), "not yet verified by the follower");
+    followers[0].deliver_qc(qc.clone()).expect("follower verifies and delivers");
+    assert!(followers[0].qc_memo_hit(&qc), "a delivered QC is memoized");
 }
 
 // ---- C1 fix: signature verification tests ----

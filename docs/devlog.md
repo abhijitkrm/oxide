@@ -23616,3 +23616,21 @@ one replay lock, one mempool insert) was only reachable from RPC/devnet
 paths. The pump now collects the drain's `MSG_TX` envelopes and admits
 them with one `submit_txs` at the end of Phase 3. Dedup, pending-tx
 notification and drop-on-reject behaviour are unchanged.
+
+### N-4: one pairing per QC per node
+
+The same QC was pairing-checked up to three times per view on the pump:
+the leader self-verifies the aggregate in `try_form_qc`, verifies it
+again in its own `deliver_qc`, and every voter re-verifies the header's
+`high_qc` — a QC it had already delivered — in the vote path. At
+1.46 ms per `aggregate_verify/4` on the EPYC box that is ~4.4 ms of
+pump time per view. `OxideBft` now keeps a small memo (8 entries) of
+QCs it authenticated under the current committee: filled by
+`try_form_qc`, by a same-epoch `deliver_qc` that verified inline, and
+by `deliver_qc_preverified` with a `Current` verdict; consulted by
+`deliver_qc` and the vote path's `high_qc` gate. A hit requires full
+equality (bitmap and aggregate included) and the current epoch; the
+memo is cleared with the epoch-scoped state, and is inert in
+conformance mode. Test: the formed QC is a hit, a twin with a forged
+aggregate is not and still fails `deliver_qc`, and a follower's
+delivered QC becomes a hit.

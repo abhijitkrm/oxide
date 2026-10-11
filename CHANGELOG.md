@@ -48,6 +48,14 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Each quorum certificate is signature-checked once per node**
+  (`consensus`, hft-audit-2 N-4): the leader no longer re-verifies a
+  QC it just formed, and voters no longer re-verify a `high_qc` they
+  already delivered — up to two ~1.5 ms BLS checks off the consensus
+  thread per view.
+  - **In plain words:** validators stop re-checking the same proof
+    of agreement two or three times per round.
+
 - **Gossiped transactions are admitted in batches** (`node`,
   hft-audit-2 N-2): the validator loop collects the transactions its
   peers gossip during a pass and admits them together, verifying
