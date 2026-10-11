@@ -15,6 +15,8 @@
 //! | `perps_deposit` | full `handle()`: ledger debit + margin credit | p50 < 2 µs ⇒ ≥500k deposits/s/core |
 //! | `perps_liquidation_check` | `liquidation_check()`: equity + maintenance calc | p50 < 5 µs ⇒ ≥200k checks/s/core |
 //! | `raw_perps_engine_place` | `MatchingEngine::place()` only (no perps state) | baseline for head-to-head |
+//! | `perps_place_cancel_mm_account` | full `handle()`: place + cancel one bid on an account already resting 256 bids | none yet — measurement row (hft-audit-2 T-2) |
+//! | `perps_sweep_10_levels` | full `handle()`: one taker sweeps 10 one-maker levels (no reduce-only resting) | none yet — measurement row (hft-audit-2 T-6) |
 //!
 //! ## Measured results (M-series dev Mac, criterion p50)
 //!
@@ -280,6 +282,98 @@ fn raw_perps_engine_place(c: &mut Criterion) {
     });
 }
 
+/// Number of one-maker price levels the sweep row crosses — the same
+/// depth as `trading/match_sweep_10_levels` so the perps overhead per
+/// level reads directly against the raw engine row.
+const SWEEP_LEVELS: u64 = 10;
+
+/// No gate yet (hft-audit-2 T-6 measurement row): one taker buy sweeps
+/// `SWEEP_LEVELS` resting sells from distinct makers, none of them
+/// reduce-only — the common shape of an aggressive order on a perps
+/// book. Prices the per-maker `ReduceOnlyCap::cap` consult plus the
+/// per-fill position/margin work and post-trade margin checks.
+/// Measured (x86 audit box, loaded host, p50): 40.4 µs before the
+/// in-place account update, 35.0 µs after (hft-audit-2 T-2).
+fn perps_sweep_10_levels(c: &mut Criterion) {
+    let ledger = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+    let taker_tag = 1u8;
+    let maker_tags: Vec<u8> =
+        (0..SWEEP_LEVELS).map(|i| 10 + u8::try_from(i).expect("10 levels fit u8")).collect();
+    for tag in std::iter::once(taker_tag).chain(maker_tags.iter().copied()) {
+        ledger.mint(&addr(tag), 1_000_000_000_000_000);
+    }
+    let perps = PerpsModule::with_ledger(ledger);
+    let mid = perps.list_market(perps_cfg()).expect("perps config valid");
+    for tag in std::iter::once(taker_tag).chain(maker_tags.iter().copied()) {
+        perps.handle(&ctx(tag), &perps::msg::deposit(0xFF, 500_000_000)).unwrap();
+    }
+    let taker = limit(Side::Buy, 500 + SWEEP_LEVELS, SWEEP_LEVELS, taker_tag);
+
+    c.bench_function("perps_sweep_10_levels", |b| {
+        b.iter_batched(
+            || {
+                // Setup (excluded): margin top-ups keep the growing
+                // positions far from the initial-margin gate, then
+                // one 1-lot maker sell per level.
+                perps.handle(&ctx(taker_tag), &perps::msg::deposit(0xFF, 2_000_000)).unwrap();
+                for (i, tag) in maker_tags.iter().copied().enumerate() {
+                    perps.handle(&ctx(tag), &perps::msg::deposit(0xFF, 1_000_000)).unwrap();
+                    let maker = limit(Side::Sell, 500 + i as u64, 1, tag);
+                    perps.handle(&ctx(tag), &perps::msg::place(mid, maker)).unwrap();
+                }
+            },
+            |()| {
+                let events = perps
+                    .handle(black_box(&ctx(taker_tag)), black_box(&perps::msg::place(mid, taker)))
+                    .unwrap();
+                black_box(events);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+}
+
+/// Resting orders the market-maker-shaped account holds in
+/// `perps_place_cancel_mm_account` — a modest two-sided ladder for a
+/// real MM (hft-audit-2 T-2 found the gated rows only ever used
+/// accounts with at most one open order).
+const MM_RESTING_ORDERS: u64 = 256;
+
+/// No gate yet (hft-audit-2 T-2/T-8 measurement row): place one more
+/// resting bid and cancel it on an account that already rests
+/// `MM_RESTING_ORDERS` bids. Every account mutation re-serializes and
+/// re-hashes the whole account leaf, and the admission margin check
+/// walks every open order, so this row scales with the account's book
+/// size where `perps_place_with_margin` cannot. Measured (x86 audit
+/// box, loaded host, p50): 54.1 µs with clone-and-insert account
+/// updates, 50.4 µs in place — the rest is the two whole-account leaf
+/// hashes per mutation and the O(open orders) admission walk, which
+/// need a leaf-format change (two-level account leaf) to remove.
+fn perps_place_cancel_mm_account(c: &mut Criterion) {
+    let ledger = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+    ledger.mint(&addr(1), 1_000_000_000_000_000);
+    let perps = PerpsModule::with_ledger(ledger);
+    let mid = perps.list_market(perps_cfg()).expect("perps config valid");
+    perps.handle(&ctx(1), &perps::msg::deposit(0xFF, 100_000_000_000)).unwrap();
+    // One 1-lot bid per tick from the band floor up: all rest (no asks).
+    for i in 0..MM_RESTING_ORDERS {
+        perps.handle(&ctx(1), &perps::msg::place(mid, limit(Side::Buy, i, 1, 1))).unwrap();
+    }
+    let extra = limit(Side::Buy, MM_RESTING_ORDERS + 1, 1, 1);
+
+    c.bench_function("perps_place_cancel_mm_account", |b| {
+        b.iter(|| {
+            let events = perps
+                .handle(black_box(&ctx(1)), black_box(&perps::msg::place(mid, extra)))
+                .unwrap();
+            let resting = events.iter().find(|e| e.kind == "resting").expect("bid rests");
+            let id = u64::from_le_bytes(resting.data[1..9].try_into().unwrap());
+            let cancel = perps::msg::cancel(mid, trading::OrderId(id));
+            black_box(perps.handle(black_box(&ctx(1)), black_box(&cancel)).unwrap());
+        });
+    });
+}
+
 /// The 7.4 scaling gate: `state_root` must stay near-O(1) in
 /// committed-state size — the `accounts` fold, the store fold, and
 /// each market's `resting_fold` are maintained per mutation, so a
@@ -351,6 +445,8 @@ criterion_group!(
     perps_deposit,
     perps_liquidation_check,
     raw_perps_engine_place,
+    perps_sweep_10_levels,
+    perps_place_cancel_mm_account,
     state_root_vs_accounts
 );
 criterion_main!(benches);

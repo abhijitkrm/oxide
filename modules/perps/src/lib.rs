@@ -1085,10 +1085,10 @@ impl PerpsModule {
         addr: &Address,
         f: impl FnOnce(&mut AccountState) -> R,
     ) -> R {
-        let mut acct = inner.accounts.get(addr).cloned().unwrap_or_default();
-        let r = f(&mut acct);
-        inner.accounts.insert(*addr, acct);
-        r
+        // In place: same leaves out and in as clone → mutate →
+        // insert, without cloning the account's two BTreeMaps
+        // (hft-audit-2 T-2).
+        inner.accounts.update_or_insert_with(*addr, AccountState::default, f)
     }
 
     /// Apply funding to all open positions in a market. Longs pay

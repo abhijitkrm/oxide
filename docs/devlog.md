@@ -23884,3 +23884,18 @@ doc also wrongly claimed release builds skip the bounds check. Now
 `slot as usize` behind `const _: () = assert!(usize::BITS >= u32::BITS)`,
 docs corrected; a test indexes `NIL` and expects a panic in debug and
 release. No hot-path cost.
+
+### T-2 (partial): perps accounts updated in place
+
+`with_account_mut` (~4× per fill) cloned the whole `AccountState` (two
+BTreeMaps), mutated the copy and inserted it back; the cancel and
+removal-release paths did the same by hand. `CommittedMap` gains
+`update` / `update_or_insert_with`, which fold the old leaf out, mutate
+in place and fold the new leaf in — the same leaf pair the clone path
+XORed, so roots are bit-identical (framework test + perps golden root).
+New bench rows `perps_sweep_10_levels` and `perps_place_cancel_mm_account`
+(account already resting 256 bids). p50: `perps_place_with_margin`
+3.92 → 3.56 µs, sweep 40.4 → 35.0 µs, MM account 54.1 → 50.4 µs. Still
+open: each mutation hashes the whole account twice and admission walks
+every open order — fixing those needs a two-level account leaf, a
+state-root format change.

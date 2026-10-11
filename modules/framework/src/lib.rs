@@ -723,6 +723,60 @@ impl<K: Ord, V> CommittedMap<K, V> {
         self.map.insert(k, v)
     }
 
+    /// Mutate the value at `k` in place, folding the old leaf out
+    /// before `f` runs and the new leaf in after. Returns `None` (and
+    /// does not call `f`) when `k` is absent.
+    ///
+    /// The root is identical to `get(k).cloned()` → mutate →
+    /// `insert(k, v)` — the same two leaves leave and enter the fold —
+    /// but without cloning the value, which for a value holding
+    /// collections (a perps account's positions and open orders) is
+    /// one heap allocation per element (hft-audit-2 T-2).
+    ///
+    /// # Panics
+    /// Only if `f` panics. The fold is then out of step with the map
+    /// (the old leaf is out, the partially mutated value is in);
+    /// `recomputed_root` diverging from `root` makes that visible, and
+    /// a panic mid-mutation already leaves the module's state suspect.
+    pub fn update<R>(&mut self, k: &K, f: impl FnOnce(&mut V) -> R) -> Option<R> {
+        let leaf = self.leaf;
+        let v = self.map.get_mut(k)?;
+        xor_fold(&mut self.root, leaf(k, v));
+        let r = f(v);
+        xor_fold(&mut self.root, leaf(k, v));
+        Some(r)
+    }
+
+    /// Mutate the value at `k` in place, inserting `default()` first
+    /// when absent — the in-place equivalent of
+    /// `get(&k).cloned().unwrap_or_else(default)` → mutate →
+    /// `insert(k, v)`, with the same resulting map and root (an absent
+    /// key ends up present even if `f` changes nothing). See
+    /// [`Self::update`] for the clone this avoids and the panic note.
+    pub fn update_or_insert_with<R>(
+        &mut self,
+        k: K,
+        default: impl FnOnce() -> V,
+        f: impl FnOnce(&mut V) -> R,
+    ) -> R {
+        let leaf = self.leaf;
+        match self.map.entry(k) {
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                xor_fold(&mut self.root, leaf(slot.key(), slot.get()));
+                let out = f(slot.get_mut());
+                xor_fold(&mut self.root, leaf(slot.key(), slot.get()));
+                out
+            }
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                let mut value = default();
+                let out = f(&mut value);
+                xor_fold(&mut self.root, leaf(slot.key(), &value));
+                slot.insert(value);
+                out
+            }
+        }
+    }
+
     /// Remove `k`, folding its leaf out. Returns the removed value.
     pub fn remove(&mut self, k: &K) -> Option<V> {
         let prev = self.map.remove(k)?;
@@ -1615,5 +1669,56 @@ mod tests {
             bytes[..CANONICAL_INLINE_CAP].iter().enumerate().all(|(i, b)| *b == i as u8);
         assert!(prefix_ok);
         assert_eq!(bytes[CANONICAL_INLINE_CAP], 0xFF);
+    }
+
+    /// Leaf for the in-place update tests: `(k ‖ len ‖ v…)`.
+    // The `fn(&K, &V)` leaf slot fixes the by-reference shape.
+    #[allow(clippy::trivially_copy_pass_by_ref, clippy::ptr_arg)]
+    fn vec_leaf(k: &u8, v: &Vec<u64>) -> Hash {
+        let mut w = CanonicalState::new();
+        w.put_u8(*k).put_count(v.len());
+        for x in v {
+            w.put_u64(*x);
+        }
+        committed_leaf(0x77, w.as_bytes())
+    }
+
+    /// `update` / `update_or_insert_with` (hft-audit-2 T-2) must leave
+    /// exactly the map and root that the clone → mutate → `insert`
+    /// pattern they replace produces — present key, absent key, a
+    /// no-op mutation on an absent key (which still inserts), and an
+    /// `update` on an absent key (which must not insert).
+    #[test]
+    fn test_committed_map_in_place_update_matches_clone_insert() {
+        let mut inplace: CommittedMap<u8, Vec<u64>> = CommittedMap::new(vec_leaf);
+        let mut cloned: CommittedMap<u8, Vec<u64>> = CommittedMap::new(vec_leaf);
+        for k in 0..4u8 {
+            inplace.insert(k, vec![u64::from(k); usize::from(k)]);
+            cloned.insert(k, vec![u64::from(k); usize::from(k)]);
+        }
+        let steps: [(u8, u64); 6] = [(2, 9), (7, 1), (0, 5), (7, 2), (3, 0), (9, u64::MAX)];
+        for (k, x) in steps {
+            let len = inplace.update_or_insert_with(k, Vec::new, |v| {
+                v.push(x);
+                v.len()
+            });
+            let mut v = cloned.get(&k).cloned().unwrap_or_default();
+            v.push(x);
+            assert_eq!(len, v.len());
+            cloned.insert(k, v);
+            assert_eq!(inplace.root(), cloned.root(), "key {k}");
+        }
+        // No-op mutation on an absent key still inserts the default.
+        inplace.update_or_insert_with(42, Vec::new, |_| ());
+        cloned.insert(42, Vec::new());
+        assert_eq!(inplace.root(), cloned.root());
+        // `update` on a present key mutates; on an absent key it is a
+        // no-op that never calls the closure.
+        assert_eq!(inplace.update(&1, Vec::clear), Some(()));
+        cloned.insert(1, Vec::new());
+        assert_eq!(inplace.update(&200, |_| unreachable!("absent key")), None::<()>);
+        assert_eq!(inplace.root(), cloned.root());
+        assert_eq!(inplace.inner(), cloned.inner());
+        assert_eq!(inplace.root(), inplace.recomputed_root());
     }
 }

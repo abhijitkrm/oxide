@@ -48,6 +48,12 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Perps account updates no longer copy the whole account per fill**
+  (`perps`, `framework`, hft-audit-2 T-2, partial): about 9–13% faster
+  perps settlement, identical state roots.
+  - **In plain words:** perps orders settle faster with exactly the
+    same results.
+
 - **Perps order handling takes its state lock once instead of twice**
   (`perps`, hft-audit-2 T-12).
   - **In plain words:** one redundant step removed from every perps

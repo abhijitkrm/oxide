@@ -353,14 +353,13 @@ impl PerpsModule {
         removed: &[trading::MakerRemoval],
     ) {
         for r in removed {
-            if let Some(mut acct) = inner.accounts.get(&r.owner).cloned() {
+            inner.accounts.update(&r.owner, |acct| {
                 if r.remaining == 0 {
                     acct.open_orders.remove(&(market, r.order_id.0));
                 } else if let Some(resv) = acct.open_orders.get_mut(&(market, r.order_id.0)) {
                     resv.qty = r.remaining;
                 }
-                inner.accounts.insert(r.owner, acct);
-            }
+            });
         }
     }
 
@@ -437,10 +436,9 @@ impl PerpsModule {
             // (e.g. an STP-cancelled order the module was never told
             // about), drop it now — the reservation ledger heals
             // itself on contact.
-            if let Some(mut acct) = inner.accounts.get(&ctx.sender).cloned() {
+            inner.accounts.update(&ctx.sender, |acct| {
                 acct.open_orders.remove(&(market, order_id.0));
-                inner.accounts.insert(ctx.sender, acct);
-            }
+            });
             return Err(ExecError::rejected(RejectCategory::NotFound, "cancel: order not found"));
         }
         match engine.cancel(order_id) {
@@ -448,10 +446,9 @@ impl PerpsModule {
                 // Release the margin reservation — removing the entry
                 // IS the release; `total_open_order_im` recomputes
                 // from live entries.
-                if let Some(mut acct) = inner.accounts.get(&ctx.sender).cloned() {
+                inner.accounts.update(&ctx.sender, |acct| {
                     acct.open_orders.remove(&(market, order_id.0));
-                    inner.accounts.insert(ctx.sender, acct);
-                }
+                });
                 Ok(vec![cancel_event(market, canceled)])
             }
             Err(TradingError::OrderNotFound) => {
