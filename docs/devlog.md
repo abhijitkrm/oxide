@@ -24070,3 +24070,12 @@ over BLAKE3 tx digests; it now uses `DigestMap`, like the preverify
 cache and (N-8) the mempool. The remaining X-13 maps (`ExecutedNonces`,
 `BlockNonces`, `touched`) are keyed by addresses, which senders choose,
 so they keep the DoS-resistant default hasher.
+
+### CI: automatic triggers disabled
+
+`ci.yml` (push to `main`, pull requests) and `nightly.yml` (05:00 UTC
+schedule) now trigger only via `workflow_dispatch`, so nothing runs
+unprompted; the jobs themselves are unchanged and can still be run from
+the Actions tab. Each file carries a comment with the exact triggers to
+restore. Until CI is re-enabled the fmt + clippy + test gates are
+local-only: run them before merging.

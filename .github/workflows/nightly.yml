@@ -5,10 +5,12 @@
 
 name: nightly
 
+# Nightly is disabled: the schedule is removed. Run manually from the
+# Actions tab. To re-enable, restore:
+#   schedule:
+#     # 05:00 UTC daily — off-peak for US/EU dev cycles.
+#     - cron: "0 5 * * *"
 on:
-  schedule:
-    # 05:00 UTC daily — off-peak for US/EU dev cycles.
-    - cron: "0 5 * * *"
   workflow_dispatch: # manual trigger for debugging
 
 env:
