@@ -3,7 +3,7 @@
 //! so Oxide and matcher-rust are measured on identical command streams.
 //!
 //! ```text
-//! corpus <prefix> [--fold] [--block N] [--reps R] [--latency] [--sink vec|count] [--replace cancel|native]
+//! corpus <prefix> [--fold] [--block N] [--reps R] [--latency] [--sink vec|count] [--replace cancel|native] [--batch]
 //! ```
 //!
 //! Loads `<prefix>.setup.cmd.jsonl` (untimed) and `<prefix>.run.cmd.jsonl`
@@ -297,6 +297,8 @@ struct Ctx<'a> {
     tag: &'a str,
     setup_ops: &'a [Op],
     run_ops: &'a [Op],
+    /// `--batch`: the run phase as engine `Command`s for `apply_batch`.
+    run_cmds: Option<&'a [trading::Command]>,
 }
 
 fn replay<S: Probe>(c: &Ctx<'_>, sink: &mut S, lat: Option<&mut Vec<u64>>) -> f64 {
@@ -307,6 +309,20 @@ fn replay<S: Probe>(c: &Ctx<'_>, sink: &mut S, lat: Option<&mut Vec<u64>>) -> f6
     let mut acc = 0u64;
     let t0 = Instant::now();
     let mut lat = lat;
+    if let Some(cmds) = c.run_cmds {
+        for chunk in cmds.chunks(c.block) {
+            e.apply_batch(chunk, sink, |_, r| {
+                black_box(&r);
+            });
+            if c.fold {
+                e.settle_fold();
+                acc = acc.wrapping_add(u64::from(e.resting_fold()[0]));
+            }
+        }
+        let s = t0.elapsed().as_secs_f64();
+        black_box(acc);
+        return s;
+    }
     for chunk in c.run_ops.chunks(c.block) {
         for op in chunk {
             if let Some(l) = lat.as_deref_mut() {
@@ -411,7 +427,18 @@ fn main() {
     drop(scratch);
 
     let count_sink = args.iter().any(|a| a == "--sink") && args.iter().any(|a| a == "count");
+    let batch = args.iter().any(|a| a == "--batch");
+    let run_cmds: Vec<trading::Command> = run_ops
+        .iter()
+        .flat_map(|op| match *op {
+            Op::Place(o) => vec![trading::Command::Place(o)],
+            Op::Cancel(id) => vec![trading::Command::Cancel(id)],
+            Op::Replace(id, o) => vec![trading::Command::Cancel(id), trading::Command::Place(o)],
+            Op::Amend(id, price, qty) => vec![trading::Command::Amend { id, price, qty }],
+        })
+        .collect();
     let c = Ctx {
+        run_cmds: batch.then_some(run_cmds.as_slice()),
         max_orders,
         fold,
         block,

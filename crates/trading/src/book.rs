@@ -210,6 +210,13 @@ impl std::ops::Deref for ValidatedMarketConfig {
 /// - `slot` refers to a live pool node whose `price`/`side`/links are
 ///   consistent with the level it occupies.
 pub trait BookBackend {
+    /// Cache hint: `price_raw`'s level is about to be touched. Pure
+    /// read, never changes state; a backend with nothing useful to
+    /// preload keeps the default no-op.
+    #[allow(clippy::inline_always)] // a hint must not become a call
+    #[inline(always)]
+    fn touch_level(&self, _price_raw: u64) {}
+
     /// Best (highest) resting bid price, raw, if any.
     fn best_bid_price(&self) -> Option<u64>;
 
@@ -446,6 +453,17 @@ impl DenseBook {
 }
 
 impl BookBackend for DenseBook {
+    #[allow(clippy::inline_always)] // a hint must not become a call
+    #[inline(always)]
+    fn touch_level(&self, price_raw: u64) {
+        // Hint input is possibly stale or out of band: stay in bounds
+        // instead of going through the asserting `level_index`.
+        let idx = price_raw.saturating_sub(self.cfg.min_price.0) / self.cfg.tick_size.0;
+        if let Some(l) = usize::try_from(idx).ok().and_then(|i| self.levels.get(i)) {
+            crate::hint::prefetch(&l.head);
+        }
+    }
+
     #[inline]
     fn best_bid_price(&self) -> Option<u64> {
         // Highest active bid level → its price.

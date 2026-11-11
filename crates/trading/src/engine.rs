@@ -271,6 +271,53 @@ pub enum AmendOutcome {
     Rejected(RejectReason),
 }
 
+/// One command of a batch (see [`MatchingEngine::apply_batch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    /// [`MatchingEngine::place_into`].
+    Place(NewOrder),
+    /// [`MatchingEngine::cancel`].
+    Cancel(OrderId),
+    /// [`MatchingEngine::amend`] (`NoCap`).
+    Amend {
+        /// Order to amend.
+        id: OrderId,
+        /// New price.
+        price: Price,
+        /// New quantity.
+        qty: Qty,
+    },
+}
+
+/// The result of one batched [`Command`], in the same shape the
+/// single-command method returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandResult {
+    /// Result of a `Place`.
+    Placed(Result<OrderOutcome, TradingError>),
+    /// Result of a `Cancel`.
+    Canceled(Result<CanceledOrder, TradingError>),
+    /// Result of an `Amend`.
+    Amended(Result<AmendOutcome, TradingError>),
+}
+
+/// Look-ahead distances for [`MatchingEngine::apply_batch`], in
+/// commands. Unit: commands ahead of the one executing. Origin:
+/// matcher-rust `docs/LAYOUT.md` §4 (`D_MAP` 16 / `D_CHUNK` 8 / `D_LEVEL` 4),
+/// re-measured here. Each stage depends on the previous one having
+/// landed (id bucket → node → level), so the distances shrink; too
+/// short and the line has not arrived, too long and it is evicted
+/// before use.
+const D_MAP: usize = 16;
+const D_NODE: usize = 8;
+const D_LEVEL: usize = 4;
+
+/// Resting-order count below which `apply_batch` does not prefetch:
+/// a book this small is cache-resident and the look-ahead probes cost
+/// more than they save. Unit: resting orders (2^16 × 64 B nodes ≈
+/// 4 MiB, past an M1 performance cluster's L2 share).
+pub const PREFETCH_MIN_RESTING: u32 = 1 << 16;
+
 /// A successfully canceled resting order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanceledOrder {
@@ -340,6 +387,9 @@ pub struct MatchingEngine<B: BookBackend = DenseBook> {
     /// soft for the duration (it may exceed `fold_log_cap` by the
     /// amend's fills).
     fold_hold: bool,
+    /// Resting count from which `apply_batch` prefetches
+    /// (`PREFETCH_MIN_RESTING`; lowered by tests to exercise the hints).
+    prefetch_min: u32,
 }
 
 /// Default bound on the pending fold log — records, not mutations.
@@ -393,6 +443,7 @@ impl<B: BookBackend> MatchingEngine<B> {
             fold_log: Vec::new(),
             fold_log_cap: FOLD_LOG_CAP,
             fold_hold: false,
+            prefetch_min: PREFETCH_MIN_RESTING,
         })
     }
 
@@ -469,6 +520,12 @@ impl<B: BookBackend> MatchingEngine<B> {
                 self.pool[slot].dirty = false;
             }
         }
+    }
+
+    /// Override the prefetch threshold (tests only).
+    #[cfg(test)]
+    pub(crate) fn set_prefetch_min(&mut self, n: u32) {
+        self.prefetch_min = n;
     }
 
     /// Override the pending-log bound (tests only — forces early
@@ -847,6 +904,92 @@ impl<B: BookBackend> MatchingEngine<B> {
         }
         self.book.append(slot, &mut self.pool);
         Ok(AmendOutcome::Resting { price: new_price, resting_qty: Qty(rem) })
+    }
+
+    /// Run a batch of commands in order, with the memory each upcoming
+    /// command will touch preloaded while the current one executes.
+    ///
+    /// Equivalent to calling [`Self::place_into`], [`Self::cancel`] and
+    /// [`Self::amend`] on each command in turn — results and fills are
+    /// identical (`out` gets `(index, result)` after each command,
+    /// fills go to `fills` as booked). The only difference is timing:
+    /// above [`PREFETCH_MIN_RESTING`] resting orders the engine reads
+    /// ahead (id bucket, then order node, then price level) so DRAM
+    /// latency overlaps the current command. The hints are plain reads
+    /// of possibly-stale state and never write.
+    pub fn apply_batch<F: FillSink>(
+        &mut self,
+        cmds: &[Command],
+        fills: &mut F,
+        mut out: impl FnMut(usize, CommandResult),
+    ) {
+        let prefetch = self.resting >= self.prefetch_min;
+        for (i, c) in cmds.iter().enumerate() {
+            if prefetch {
+                if let Some(f) = cmds.get(i + D_MAP) {
+                    self.hint_map(f);
+                }
+                if let Some(f) = cmds.get(i + D_NODE) {
+                    self.hint_node(f);
+                }
+                if let Some(f) = cmds.get(i + D_LEVEL) {
+                    self.hint_level(f);
+                }
+            }
+            let r = match *c {
+                Command::Place(o) => CommandResult::Placed(self.place_into(o, fills)),
+                Command::Cancel(id) => CommandResult::Canceled(self.cancel(id)),
+                Command::Amend { id, price, qty } => {
+                    CommandResult::Amended(self.amend(id, price, qty, fills, &mut NoCap))
+                }
+            };
+            out(i, r);
+        }
+    }
+
+    /// Stage 1: the command's id bucket.
+    #[allow(clippy::inline_always)] // a hint must not become a call
+    #[inline(always)]
+    fn hint_map(&self, c: &Command) {
+        match c {
+            Command::Cancel(id) | Command::Amend { id, .. } => self.ids.touch(id.0),
+            Command::Place(_) => {}
+        }
+    }
+
+    /// Stage 2: the command's order node (needs the bucket from stage 1).
+    #[allow(clippy::inline_always)] // a hint must not become a call
+    #[inline(always)]
+    fn hint_node(&self, c: &Command) {
+        match c {
+            Command::Cancel(id) | Command::Amend { id, .. } => {
+                if let Some(slot) = self.ids.get(id.0) {
+                    self.pool.touch(slot);
+                }
+            }
+            Command::Place(_) => {}
+        }
+    }
+
+    /// Stage 3: the price level(s) the command will touch (needs the
+    /// node from stage 2 for cancel/amend's current level).
+    #[allow(clippy::inline_always)] // a hint must not become a call
+    #[inline(always)]
+    fn hint_level(&self, c: &Command) {
+        match c {
+            Command::Place(o) => self.book.touch_level(o.price.0),
+            Command::Cancel(id) => {
+                if let Some(slot) = self.ids.get(id.0) {
+                    self.book.touch_level(self.pool[slot].price.0);
+                }
+            }
+            Command::Amend { id, price, .. } => {
+                if let Some(slot) = self.ids.get(id.0) {
+                    self.book.touch_level(self.pool[slot].price.0);
+                }
+                self.book.touch_level(price.0);
+            }
+        }
     }
 
     /// Materialize every resting order in deterministic order (level

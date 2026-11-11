@@ -17,6 +17,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Real software prefetch in `apply_batch` (one audited `unsafe` helper in
+# `src/hint.rs`; the default build uses a plain load instead). Off by
+# default: it is a measured win on deep books only.
+prefetch = []
+
 [dependencies]
 # Deterministic fixed-point types (Price scale-8, Qty scale-6) and
 # Address. The one internal dependency hot-path crates may share.

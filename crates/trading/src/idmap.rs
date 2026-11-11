@@ -154,6 +154,16 @@ impl IdMap {
         }
     }
 
+    /// Cache hint for an upcoming `get`/`remove` of `key`: loads the
+    /// key's home bucket so the miss overlaps earlier work. A plain
+    /// read — it never changes state, and a stale or absent key is
+    /// harmless.
+    #[allow(clippy::inline_always)] // a hint must not become a call
+    #[inline(always)]
+    pub fn touch(&self, key: u64) {
+        crate::hint::prefetch(&self.slots[(key & self.mask) as usize].key);
+    }
+
     /// Look up the arena slot for `key`.
     #[inline]
     #[must_use]

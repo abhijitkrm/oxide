@@ -1009,6 +1009,63 @@ fn amend_matches_cancel_place_model() {
     }
 }
 
+/// `apply_batch` (with prefetch forced on) must produce exactly the
+/// results, fills and final book of running the same commands one at
+/// a time — the hints are timing-only.
+#[test]
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+fn apply_batch_matches_sequential() {
+    let mut seed: u64 = 0xA24B_AED4_963E_E407;
+    let mut rnd = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let mut cmds = Vec::new();
+    for _ in 0..3000 {
+        let price = 1_000_000_000 + (1 + rnd(40)) * 1_000_000;
+        let qty = (1 + rnd(9)) * 1_000;
+        cmds.push(match rnd(10) {
+            0..=5 => {
+                let side = if rnd(2) == 0 { Side::Buy } else { Side::Sell };
+                let tif = if rnd(5) == 0 { TimeInForce::Ioc } else { TimeInForce::Gtc };
+                Command::Place(order(side, OrderType::Limit, tif, price, qty, 1 + rnd(3) as u8))
+            }
+            6..=7 => Command::Cancel(OrderId(rnd(1500))),
+            _ => Command::Amend { id: OrderId(rnd(1500)), price: Price(price), qty: Qty(qty) },
+        });
+    }
+    let (mut seq, mut bat) = (engine(), engine());
+    bat.set_prefetch_min(0);
+    seq.enable_resting_fold(test_leaf);
+    bat.enable_resting_fold(test_leaf);
+    let (mut fs, mut fb) = (Vec::new(), Vec::new());
+    let mut want = Vec::new();
+    for c in &cmds {
+        want.push(match *c {
+            Command::Place(o) => CommandResult::Placed(seq.place_into(o, &mut fs)),
+            Command::Cancel(id) => CommandResult::Canceled(seq.cancel(id)),
+            Command::Amend { id, price, qty } => {
+                CommandResult::Amended(seq.amend(id, price, qty, &mut fs, &mut NoCap))
+            }
+        });
+    }
+    let mut got = Vec::new();
+    for chunk in cmds.chunks(37) {
+        bat.apply_batch(chunk, &mut fb, |_, r| got.push(r));
+    }
+    assert_eq!(want, got);
+    assert_eq!(fs.len(), fb.len());
+    assert!(fs.iter().zip(&fb).all(|(a, b)| a == b), "fills differ");
+    assert_eq!(seq.resting_fold(), bat.resting_fold());
+    assert_eq!(bat.resting_fold(), recompute_fold(&bat));
+    let (mut ea, mut eb) = (Vec::new(), Vec::new());
+    seq.resting_entries(&mut ea);
+    bat.resting_entries(&mut eb);
+    assert_eq!(ea, eb);
+}
+
 /// Deferred-fold differential: a seeded random stream (limit/market,
 /// GTC/IOC/FOK, every STP mode, cancels of live and dead ids) must
 /// keep the lazy `resting_fold` equal to the authoritative

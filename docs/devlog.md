@@ -24231,3 +24231,27 @@ is its headline one — a 1k-order, fully cache-resident book at 103M/s vs
 Oxide's 57M; nothing identifiable in the matching loop explains that gap (step
 5), and the fold-on number for that same book is leaf-hash-bound (~95 ns/hash
 vs ~10 ns of matching per op).
+
+### Matcher-parity, step 6: `apply_batch` look-ahead (opt-in `prefetch` feature)
+
+Depth sensitivity is real: 600k-order W5 book (corpus `w5_600k`), single core,
+native amend, no fold — Oxide 9.8M/s vs matcher-rust 12.9M/s (19.8M with its
+`prefetch` feature); at 100k Oxide is ahead (36.6M vs matcher 22.6M / 43.7M
+prefetch). So `MatchingEngine::apply_batch(&[Command], sink, out)` was added:
+above `PREFETCH_MIN_RESTING` (2^16) resting orders it looks ahead 16/8/4
+commands and loads, in turn, the id bucket, the order node and the price
+level (`IdMap::touch`, `OrderPool::touch`, `BookBackend::touch_level`; pure
+reads of possibly-stale state, never writes). Results/fills/final book are
+identical to one-at-a-time (`apply_batch_matches_sequential`, prefetch forced
+on, fold checked).
+
+Measured (M1, native amend, no fold, `--batch`): default (plain-load hint)
+600k 9.8 → 10.8M (+10%), 100k 36.7 → 34.6M (-6%, batch/closure overhead on a
+book the L2 mostly holds). With `--features prefetch` (real `prfm`; the
+crate's one audited `unsafe`, `src/hint.rs`, per the workspace
+reviewed-exception rule): 600k 10.0 → 13.6M (+36%), 100k 36.0 → 35.3M (flat).
+Look-ahead distances 12/6/3 … 32/16/8 are all within noise at 600k. So: the
+batch path is worth it only on genuinely deep books (≥ ~500k resting) and
+only with the real prefetch; the feature is therefore OFF by default and the
+single-command path stays the default for the chain (typical books are far
+shallower). No consumer calls `apply_batch` yet.

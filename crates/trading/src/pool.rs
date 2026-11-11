@@ -161,6 +161,17 @@ impl OrderPool {
         slot
     }
 
+    /// Cache hint for an upcoming access to `slot`: loads the node's
+    /// first word (its line). Out-of-range slots are ignored; the
+    /// hint never changes state.
+    #[allow(clippy::inline_always)] // a hint must not become a call
+    #[inline(always)]
+    pub fn touch(&self, slot: u32) {
+        if let Some(n) = self.nodes.get(slot as usize) {
+            crate::hint::prefetch(&n.qty.0);
+        }
+    }
+
     /// Return a slot to the free list.
     ///
     /// The node's links need not be cleared: the only legal next reader

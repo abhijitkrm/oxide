@@ -51,6 +51,7 @@ pub mod bitboard;
 pub mod book;
 pub mod engine;
 pub mod error;
+mod hint;
 pub mod idmap;
 pub mod order;
 pub mod pool;
@@ -59,8 +60,9 @@ pub use book::{
     BookBackend, DenseBook, MAX_RESTING_LIMIT, MarketConfig, PriceLevel, ValidatedMarketConfig,
 };
 pub use engine::{
-    AmendOutcome, CanceledOrder, FillEvent, FillSink, MakerCap, MakerRemoval, MatchingEngine,
-    NoCap, ObserveRemovals, OrderOutcome, RemovalReason, RestingEntry,
+    AmendOutcome, CanceledOrder, Command, CommandResult, FillEvent, FillSink, MakerCap,
+    MakerRemoval, MatchingEngine, NoCap, ObserveRemovals, OrderOutcome, RemovalReason,
+    RestingEntry,
 };
 pub use error::{RejectReason, TradingError};
 pub use idmap::IdMap;
