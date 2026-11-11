@@ -3,7 +3,7 @@
 //! so Oxide and matcher-rust are measured on identical command streams.
 //!
 //! ```text
-//! corpus <prefix> [--fold] [--block N] [--reps R] [--latency]
+//! corpus <prefix> [--fold] [--block N] [--reps R] [--latency] [--sink vec|count]
 //! ```
 //!
 //! Loads `<prefix>.setup.cmd.jsonl` (untimed) and `<prefix>.run.cmd.jsonl`
@@ -51,8 +51,8 @@ use primitives::fixed::{Price, Qty};
 use std::hint::black_box;
 use std::time::Instant;
 use trading::{
-    DenseBook, MarketConfig, MatchingEngine, NewOrder, OrderId, OrderOutcome, OrderType, Side,
-    StpMode, TimeInForce,
+    DenseBook, FillSink, MarketConfig, MatchingEngine, NewOrder, OrderId, OrderOutcome, OrderType,
+    Side, StpMode, TimeInForce,
 };
 
 /// Corpus mid price (vectorgen `MID`).
@@ -218,22 +218,130 @@ impl Resolver {
     }
 }
 
+/// Fill destination for the timed pass: the standard `Vec` sink, or a
+/// counting sink (`--sink count`) that never materializes the events,
+/// showing what a leaner sink buys.
+trait Probe: FillSink {
+    fn reset(&mut self);
+    fn count(&self) -> u64;
+}
+
+impl Probe for Vec<trading::FillEvent> {
+    #[inline(always)]
+    fn reset(&mut self) {
+        self.clear();
+    }
+    #[inline(always)]
+    fn count(&self) -> u64 {
+        self.len() as u64
+    }
+}
+
+#[derive(Default)]
+struct CountSink(u64);
+
+impl FillSink for CountSink {
+    #[inline(always)]
+    fn fill(&mut self, f: trading::FillEvent) {
+        self.0 = self.0.wrapping_add(f.qty.0);
+    }
+}
+
+impl Probe for CountSink {
+    #[inline(always)]
+    fn reset(&mut self) {}
+    #[inline(always)]
+    fn count(&self) -> u64 {
+        self.0
+    }
+}
+
 #[inline(always)]
-fn exec(e: &mut MatchingEngine, op: &Op, fills: &mut Vec<trading::FillEvent>) -> u64 {
-    fills.clear();
+fn exec<S: Probe>(e: &mut MatchingEngine, op: &Op, fills: &mut S) -> u64 {
+    fills.reset();
     match op {
         Op::Place(o) => {
-            black_box(e.place(*o, fills).unwrap());
+            black_box(e.place_into(*o, fills).unwrap());
         }
         Op::Cancel(id) => {
             let _ = black_box(e.cancel(*id));
         }
         Op::Replace(id, o) => {
             let _ = black_box(e.cancel(*id));
-            black_box(e.place(*o, fills).unwrap());
+            black_box(e.place_into(*o, fills).unwrap());
         }
     }
-    fills.len() as u64
+    fills.count()
+}
+
+struct Ctx<'a> {
+    max_orders: usize,
+    fold: bool,
+    block: usize,
+    reps: usize,
+    latency: bool,
+    tag: &'a str,
+    setup_ops: &'a [Op],
+    run_ops: &'a [Op],
+}
+
+fn replay<S: Probe>(c: &Ctx<'_>, sink: &mut S, lat: Option<&mut Vec<u64>>) -> f64 {
+    let mut e = make_engine(c.max_orders, c.fold);
+    for op in c.setup_ops {
+        exec(&mut e, op, sink);
+    }
+    let mut acc = 0u64;
+    let t0 = Instant::now();
+    let mut lat = lat;
+    for chunk in c.run_ops.chunks(c.block) {
+        for op in chunk {
+            if let Some(l) = lat.as_deref_mut() {
+                let t = Instant::now();
+                acc = acc.wrapping_add(exec(&mut e, op, sink));
+                l.push(t.elapsed().as_nanos() as u64);
+            } else {
+                acc = acc.wrapping_add(exec(&mut e, op, sink));
+            }
+        }
+        if c.fold {
+            e.settle_fold();
+            acc = acc.wrapping_add(u64::from(e.resting_fold()[0]));
+        }
+    }
+    let s = t0.elapsed().as_secs_f64();
+    black_box(acc);
+    s
+}
+
+fn measure<S: Probe>(c: &Ctx<'_>, sink: &mut S, sink_name: &str) {
+    let mode = if c.fold { "fold" } else { "nofold" };
+    replay(c, sink, None); // warmup
+    if c.latency {
+        let mut l = Vec::with_capacity(c.run_ops.len());
+        replay(c, sink, Some(&mut l));
+        l.sort_unstable();
+        println!(
+            "| {} | {mode} | {sink_name} | latency | p50 {} | p99 {} | p99.9 {} | max {} |",
+            c.tag,
+            pct(&l, 0.5),
+            pct(&l, 0.99),
+            pct(&l, 0.999),
+            l.last().unwrap()
+        );
+    } else {
+        let mut t: Vec<f64> = (0..c.reps).map(|_| replay(c, sink, None)).collect();
+        t.sort_by(f64::total_cmp);
+        let n = c.run_ops.len() as f64;
+        let med = t[t.len() / 2];
+        println!(
+            "| {} | {mode} | {sink_name} | {} | best {:.1}M/s | median {:.1}M/s | {:.1} ns/op |",
+            c.tag,
+            c.run_ops.len(),
+            n / t[0] / 1e6,
+            n / med / 1e6,
+            1e9 * med / n
+        );
+    }
 }
 
 fn pct(sorted: &[u64], p: f64) -> u64 {
@@ -287,69 +395,20 @@ fn main() {
     let run_ops = r.run(&mut scratch, &run, &mut fills);
     drop(scratch);
 
-    let replay = |fills: &mut Vec<trading::FillEvent>, lat: Option<&mut Vec<u64>>| -> f64 {
-        let mut e = make_engine(max_orders, fold);
-        for op in &setup_ops {
-            exec(&mut e, op, fills);
-        }
-        let mut acc = 0u64;
-        let t0 = Instant::now();
-        match lat {
-            None => {
-                for chunk in run_ops.chunks(block) {
-                    for op in chunk {
-                        acc = acc.wrapping_add(exec(&mut e, op, fills));
-                    }
-                    if fold {
-                        e.settle_fold();
-                        acc = acc.wrapping_add(u64::from(e.resting_fold()[0]));
-                    }
-                }
-            }
-            Some(l) => {
-                for chunk in run_ops.chunks(block) {
-                    for op in chunk {
-                        let t = Instant::now();
-                        acc = acc.wrapping_add(exec(&mut e, op, fills));
-                        l.push(t.elapsed().as_nanos() as u64);
-                    }
-                    if fold {
-                        e.settle_fold();
-                        acc = acc.wrapping_add(u64::from(e.resting_fold()[0]));
-                    }
-                }
-            }
-        }
-        let s = t0.elapsed().as_secs_f64();
-        black_box(acc);
-        s
+    let count_sink = args.iter().any(|a| a == "--sink") && args.iter().any(|a| a == "count");
+    let c = Ctx {
+        max_orders,
+        fold,
+        block,
+        reps,
+        latency,
+        tag: prefix.rsplit('/').next().unwrap(),
+        setup_ops: &setup_ops,
+        run_ops: &run_ops,
     };
-
-    let tag = prefix.rsplit('/').next().unwrap();
-    let mode = if fold { "fold" } else { "nofold" };
-    replay(&mut fills, None); // warmup
-    if latency {
-        let mut l = Vec::with_capacity(run_ops.len());
-        replay(&mut fills, Some(&mut l));
-        l.sort_unstable();
-        println!(
-            "| {tag} | {mode} | latency | p50 {} | p99 {} | p99.9 {} | max {} |",
-            pct(&l, 0.5),
-            pct(&l, 0.99),
-            pct(&l, 0.999),
-            l.last().unwrap()
-        );
+    if count_sink {
+        measure(&c, &mut CountSink::default(), "count");
     } else {
-        let mut t: Vec<f64> = (0..reps).map(|_| replay(&mut fills, None)).collect();
-        t.sort_by(f64::total_cmp);
-        let n = run_ops.len() as f64;
-        let med = t[t.len() / 2];
-        println!(
-            "| {tag} | {mode} | {} | best {:.1}M/s | median {:.1}M/s | {:.1} ns/op |",
-            run_ops.len(),
-            n / t[0] / 1e6,
-            n / med / 1e6,
-            1e9 * med / n
-        );
+        measure(&c, &mut fills, "vec");
     }
 }

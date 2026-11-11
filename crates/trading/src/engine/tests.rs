@@ -822,6 +822,42 @@ fn resting_fold_tracks_every_mutation() {
     assert_eq!(restored.resting_fold(), e.resting_fold());
 }
 
+/// `place_into` with a custom sink sees exactly the fills `place`
+/// pushes into a `Vec`, in the same order, with the same outcome.
+#[test]
+fn place_into_custom_sink_sees_identical_fills() {
+    struct Collect(Vec<(u64, u64, u64)>);
+    impl FillSink for Collect {
+        fn fill(&mut self, f: FillEvent) {
+            self.0.push((f.maker_order_id.0, f.price.0, f.qty.0));
+        }
+    }
+    let (mut a, mut b) = (engine(), engine());
+    let (mut va, mut sb) = (Vec::new(), Collect(Vec::new()));
+    for (i, (side, price, qty)) in [
+        (Side::Sell, 1_010_000_000, 3_000),
+        (Side::Sell, 1_011_000_000, 4_000),
+        (Side::Sell, 1_010_000_000, 2_000),
+        (Side::Buy, 1_011_000_000, 8_000),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let o = order(
+            side,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            price,
+            qty,
+            1 + u8::try_from(i).unwrap(),
+        );
+        assert_eq!(a.place(o, &mut va).unwrap(), b.place_into(o, &mut sb).unwrap());
+    }
+    let want: Vec<_> = va.iter().map(|f| (f.maker_order_id.0, f.price.0, f.qty.0)).collect();
+    assert_eq!(want, sb.0);
+    assert_eq!(want.len(), 3, "the buy sweeps three makers");
+}
+
 /// Deferred-fold differential: a seeded random stream (limit/market,
 /// GTC/IOC/FOK, every STP mode, cancels of live and dead ids) must
 /// keep the lazy `resting_fold` equal to the authoritative

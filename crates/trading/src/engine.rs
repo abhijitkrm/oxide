@@ -69,6 +69,27 @@ pub struct FillEvent {
     pub taker_side: Side,
 }
 
+/// Destination for the fills a sweep books, in match order.
+///
+/// `Vec<FillEvent>` is the standard sink (what [`MatchingEngine::place`]
+/// uses); a caller that only needs a digest, a count or a compact
+/// record implements this and calls [`MatchingEngine::place_into`], so
+/// the engine never materializes a `FillEvent` it would discard. The
+/// call is monomorphized and `#[inline]`d into the sweep — a trivial
+/// sink costs nothing.
+pub trait FillSink {
+    /// Receive one fill. Called once per maker touched, best price
+    /// first, FIFO within a level.
+    fn fill(&mut self, fill: FillEvent);
+}
+
+impl FillSink for Vec<FillEvent> {
+    #[inline]
+    fn fill(&mut self, fill: FillEvent) {
+        self.push(fill);
+    }
+}
+
 /// Per-maker fill gate consulted inside the sweep, before each fill
 /// is booked — caller policy enforced at the match decision, not as
 /// post-trade repair.
@@ -535,6 +556,19 @@ impl<B: BookBackend> MatchingEngine<B> {
         self.place_with_cap(req, fills, &mut NoCap)
     }
 
+    /// `place` into any [`FillSink`] instead of a `Vec` — the same
+    /// engine path, with the fill delivered to `sink` as it is booked.
+    ///
+    /// # Errors
+    /// Same contract as [`Self::place`].
+    pub fn place_into<F: FillSink>(
+        &mut self,
+        req: NewOrder,
+        sink: &mut F,
+    ) -> Result<OrderOutcome, TradingError> {
+        self.place_with_cap(req, sink, &mut NoCap)
+    }
+
     /// `place` with a [`MakerCap`] gate consulted per maker fill —
     /// the caller enforces policy (e.g. reduce-only cover) at the
     /// match decision, before the fill is booked, instead of
@@ -542,10 +576,10 @@ impl<B: BookBackend> MatchingEngine<B> {
     ///
     /// # Errors
     /// Same contract as [`Self::place`].
-    pub fn place_with_cap<C: MakerCap>(
+    pub fn place_with_cap<C: MakerCap, F: FillSink>(
         &mut self,
         req: NewOrder,
-        fills: &mut Vec<FillEvent>,
+        fills: &mut F,
         cap: &mut C,
     ) -> Result<OrderOutcome, TradingError> {
         // ── Validation: entirely before the match loop (plan §9.1) ──
@@ -877,13 +911,13 @@ impl<B: BookBackend> MatchingEngine<B> {
     /// mid-sweep (fills booked so far stand); `false` when the sweep
     /// ended normally — book empty, price bound reached, or the order
     /// fully filled.
-    fn sweep<C: MakerCap>(
+    fn sweep<C: MakerCap, F: FillSink>(
         &mut self,
         req: &NewOrder,
         taker_id: OrderId,
         limit_raw: Option<u64>,
         rem: &mut u64,
-        fills: &mut Vec<FillEvent>,
+        fills: &mut F,
         cap: &mut C,
     ) -> bool {
         'sweep: loop {
@@ -957,7 +991,7 @@ impl<B: BookBackend> MatchingEngine<B> {
                 }
                 // Fill against the FIFO head maker.
                 let fill = (*rem).min(m_qty).min(cap_qty);
-                fills.push(FillEvent {
+                fills.fill(FillEvent {
                     price: Price(opp),
                     qty: Qty(fill),
                     maker_order_id: m_id,

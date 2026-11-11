@@ -24134,3 +24134,15 @@ have almost no in-block churn so they under-state the dedup win for
 market-making flow. Pitfall for future benching: `CARGO_TARGET_DIR` set in
 one shell call does not persist to the next — a stale binary was measured
 once; always run the binary cargo just printed.
+
+### Matcher-parity, step 3: `FillSink` (measured, kept opt-in)
+
+`place_into(req, &mut impl FillSink)` delivers each fill to a caller sink as
+it is booked; `place`/`place_with_cap` are unchanged for callers (the `Vec`
+sink is the default impl, so exchange/perps needed no edits). The corpus bench
+gained `--sink count` (a sink that never stores the event). Measured, no fold:
+W1 40.5 → 40.5M/s, W2 30.3 → 33.2M, W4 28.2 → 28.8M, W5-1k 54.3 → 54.9M. So
+the 88-byte `FillEvent` costs ~1–2% on mixed flow and ≤10% on a sweep-only
+stream: **not** worth changing `FillEvent`'s shape and every consumer, which
+the first review had proposed. The seam stays for callers that only need a
+digest or a compact record.
