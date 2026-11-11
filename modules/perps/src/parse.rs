@@ -6,10 +6,10 @@
 //! is rejected here, before any state is read.
 
 use super::{
-    Address, CANCEL_BODY_LEN, FLAG_REDUCE_ONLY, FUNDING_BODY_LEN, LIST_MARKET_BODY_LEN,
-    MARGIN_BODY_LEN, MarketConfig, NewOrder, OrderId, PLACE_BODY_LEN, PerpsMarketConfig,
-    PerpsModule, Price, Qty, SET_MARK_BODY_LEN, decode_order_type, decode_side, decode_stp,
-    decode_tif,
+    AMEND_BODY_LEN, Address, CANCEL_BODY_LEN, FLAG_REDUCE_ONLY, FUNDING_BODY_LEN,
+    LIST_MARKET_BODY_LEN, MARGIN_BODY_LEN, MarketConfig, NewOrder, OrderId, PLACE_BODY_LEN,
+    PerpsMarketConfig, PerpsModule, Price, Qty, SET_MARK_BODY_LEN, decode_order_type, decode_side,
+    decode_stp, decode_tif,
 };
 
 impl PerpsModule {
@@ -53,6 +53,19 @@ impl PerpsModule {
         let market = msg[0];
         let order_id = u64::from_le_bytes(msg[1..9].try_into().ok()?);
         Some((market, OrderId(order_id)))
+    }
+
+    pub(crate) fn parse_amend(msg: &[u8]) -> Option<(u8, OrderId, Price, Qty, trading::StpMode)> {
+        if msg.len() != AMEND_BODY_LEN {
+            return None;
+        }
+        Some((
+            msg[0],
+            OrderId(u64::from_le_bytes(msg[1..9].try_into().ok()?)),
+            Price(u64::from_le_bytes(msg[9..17].try_into().ok()?)),
+            Qty(u64::from_le_bytes(msg[17..25].try_into().ok()?)),
+            decode_stp(msg[25])?,
+        ))
     }
 
     pub(crate) fn parse_list_market(msg: &[u8]) -> Option<PerpsMarketConfig> {

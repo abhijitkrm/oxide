@@ -164,36 +164,34 @@ impl PerpsModule {
         Ok(())
     }
 
-    /// Handle a place-order message (extracted from `handle` to keep
-    /// the dispatch function under the clippy line-count gate).
-    pub(crate) fn handle_place(
-        &self,
-        ctx: &TxContext,
-        body: &[u8],
-    ) -> Result<Vec<Event>, ExecError> {
-        let (market, mut order, flags) = Self::parse_place(body).ok_or(ExecError::Malformed)?;
-        order.owner = ctx.sender;
-        let reduce_only = flags & FLAG_REDUCE_ONLY != 0;
-
-        let mut inner = framework::lock_state(&self.inner);
-
-        // ── Initial-margin gate (plan.md §9.3, C7) ──
-        // An order must leave `equity >= total initial margin` after
-        // accounting for the exposure it could ADD. The reducible
-        // portion — the part of an opposite-side order that closes
-        // existing size — is free; only the tail beyond it is new
-        // exposure. A reduce-then-flip order is therefore charged on
-        // its flipped remainder, not skipped wholesale (the old
-        // `increases` test let a flip order through with no margin
-        // at all) and not over-charged on its covered part.
-        //
-        // `existing` now includes `total_open_order_im`: resting
-        // orders are potential exposure and must be margined as if
-        // filled — otherwise an account could stack unbacked orders
-        // that all later fill (C7).
-        Self::check_market_accepts_order(&inner, market, reduce_only)?;
+    /// Initial-margin gate (plan.md §9.3, C7) shared by place and
+    /// amend: the order must leave `equity >= total initial margin`
+    /// after accounting for the exposure it could ADD. `skip` names a
+    /// resting order whose reservation is being replaced (amend) and
+    /// is treated as already released.
+    fn initial_margin_gate(
+        inner: &Inner,
+        sender: Address,
+        market: u8,
+        order: &NewOrder,
+        reduce_only: bool,
+        skip: Option<OrderId>,
+    ) -> Result<(), ExecError> {
+        Self::check_market_accepts_order(inner, market, reduce_only)?;
         {
-            let acct = inner.accounts.get(&ctx.sender);
+            let acct = inner.accounts.get(&sender);
+            // An amend re-margins the order as if its old reservation
+            // were already gone (cancel-then-place semantics).
+            let trimmed;
+            let acct = match (acct, skip) {
+                (Some(a), Some(id)) if a.open_orders.contains_key(&(market, id.0)) => {
+                    let mut t = a.clone();
+                    t.open_orders.remove(&(market, id.0));
+                    trimmed = t;
+                    Some(&trimmed)
+                }
+                _ => acct,
+            };
             let pos = acct.and_then(|a| a.positions.get(&market));
             let pos_size = pos.map_or(SignedQty::ZERO, |p| p.size);
             // The position can only close once: closing capacity the
@@ -249,6 +247,37 @@ impl PerpsModule {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Handle a place-order message (extracted from `handle` to keep
+    /// the dispatch function under the clippy line-count gate).
+    pub(crate) fn handle_place(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+    ) -> Result<Vec<Event>, ExecError> {
+        let (market, mut order, flags) = Self::parse_place(body).ok_or(ExecError::Malformed)?;
+        order.owner = ctx.sender;
+        let reduce_only = flags & FLAG_REDUCE_ONLY != 0;
+
+        let mut inner = framework::lock_state(&self.inner);
+
+        // ── Initial-margin gate (plan.md §9.3, C7) ──
+        // An order must leave `equity >= total initial margin` after
+        // accounting for the exposure it could ADD. The reducible
+        // portion — the part of an opposite-side order that closes
+        // existing size — is free; only the tail beyond it is new
+        // exposure. A reduce-then-flip order is therefore charged on
+        // its flipped remainder, not skipped wholesale (the old
+        // `increases` test let a flip order through with no margin
+        // at all) and not over-charged on its covered part.
+        //
+        // `existing` now includes `total_open_order_im`: resting
+        // orders are potential exposure and must be margined as if
+        // filled — otherwise an account could stack unbacked orders
+        // that all later fill (C7).
+        Self::initial_margin_gate(&inner, ctx.sender, market, &order, reduce_only, None)?;
 
         let Inner { markets, fills, accounts, .. } = &mut *inner;
         let Some(engine) = markets[usize::from(market)].as_mut() else {
@@ -407,6 +436,171 @@ impl PerpsModule {
             data.extend_from_slice(&r.remaining.to_le_bytes());
             events.push(Event { module: "perps", kind, data });
         }
+    }
+
+    /// Handle an amend-order message (`docs/amend-spec.md`): resize or
+    /// re-price the sender's resting order under its own id.
+    ///
+    /// Semantics are cancel-then-place with one atomic admission: the
+    /// initial-margin gate (and the reduce-only cover check) run FIRST
+    /// with the old reservation treated as released, and nothing
+    /// mutates until every check has passed. Then the order re-crosses
+    /// through the engine exactly like a place (fills apply to
+    /// positions, makers and the amender are margin-checked) and its
+    /// reservation entry is replaced by the new remainder's.
+    #[allow(clippy::too_many_lines)] // one atomic admission → mutation sequence, kept linear for audit
+    pub(crate) fn handle_amend(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+    ) -> Result<Vec<Event>, ExecError> {
+        let (market, order_id, new_price, new_qty, stp) =
+            Self::parse_amend(body).ok_or(ExecError::Malformed)?;
+        let mut inner = framework::lock_state(&self.inner);
+        let Some(engine) = inner.markets.get(usize::from(market)).and_then(Option::as_ref) else {
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                format!("market {market} does not exist"),
+            ));
+        };
+        let Some(old) = engine.resting_order(order_id) else {
+            // Heal a dangling reservation the way cancel does.
+            inner.accounts.update(&ctx.sender, |acct| {
+                acct.open_orders.remove(&(market, order_id.0));
+            });
+            return Err(ExecError::rejected(RejectCategory::NotFound, "amend: order not found"));
+        };
+        if old.owner != ctx.sender {
+            return Err(ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "amend: not the order owner",
+            ));
+        }
+        let cfg = *engine.config();
+        let order = NewOrder {
+            side: old.side,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: new_price,
+            qty: new_qty,
+            owner: old.owner,
+            stp,
+        };
+        if order.validate(cfg.tick_size, cfg.lot_size, cfg.min_price, cfg.max_price).is_err() {
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                "amend: price/qty outside market config",
+            ));
+        }
+        // The reduce-only flag belongs to the order, not the request.
+        let reduce_only = inner
+            .accounts
+            .get(&ctx.sender)
+            .and_then(|a| a.open_orders.get(&(market, order_id.0)))
+            .is_some_and(|r| r.reduce_only);
+
+        // ── Admission: margin + cover, old reservation released ──
+        Self::initial_margin_gate(&inner, ctx.sender, market, &order, reduce_only, Some(order_id))?;
+        if reduce_only {
+            let acct = inner.accounts.get(&ctx.sender);
+            let pos_size =
+                acct.and_then(|a| a.positions.get(&market)).map_or(SignedQty::ZERO, |p| p.size);
+            let cover_booked: u128 = acct.map_or(0, |a| {
+                a.open_orders
+                    .iter()
+                    .filter(|((m, id), r)| {
+                        *m == market
+                            && *id != order_id.0
+                            && ((pos_size.is_long() && r.side == Side::Sell)
+                                || (pos_size.is_short() && r.side == Side::Buy))
+                    })
+                    .map(|(_, r)| u128::from(r.qty))
+                    .sum()
+            });
+            let reducible = u128::from(pos_size.abs_qty().0).saturating_sub(cover_booked);
+            if u128::from(new_qty.0) > reducible {
+                return Err(ExecError::rejected(
+                    RejectCategory::Precondition,
+                    "reduce-only amend exceeds reducible position",
+                ));
+            }
+        }
+
+        // ── Mutation: drop the old reservation, re-cross, re-reserve ──
+        inner.accounts.update(&ctx.sender, |acct| {
+            acct.open_orders.remove(&(market, order_id.0));
+        });
+        let Inner { markets, fills, accounts, .. } = &mut *inner;
+        let Some(engine) = markets[usize::from(market)].as_mut() else {
+            return Err(ExecError::Malformed);
+        };
+        fills.clear();
+        let mut cap =
+            ReduceOnlyCap { accounts, market, spent: BTreeMap::new(), removed: Vec::new() };
+        let result = engine.amend(order_id, new_price, new_qty, stp, fills, &mut cap);
+        let ReduceOnlyCap { removed, .. } = cap;
+        let outcome = match result {
+            Ok(trading::AmendOutcome::Reduced { qty }) => {
+                OrderOutcome::Resting { order_id, price: new_price, resting_qty: qty }
+            }
+            Ok(trading::AmendOutcome::Resting { price, resting_qty }) => {
+                OrderOutcome::Resting { order_id, price, resting_qty }
+            }
+            Ok(trading::AmendOutcome::Filled) => OrderOutcome::Filled,
+            Ok(trading::AmendOutcome::CanceledRemainder { filled_qty }) => {
+                OrderOutcome::CanceledRemainder { order_id, filled_qty }
+            }
+            Ok(trading::AmendOutcome::Rejected(_)) | Err(_) => {
+                // Unreachable after the pre-checks; the old reservation was
+                // already dropped, so restore it before failing closed.
+                Self::record_resting_reservation(
+                    &mut inner,
+                    market,
+                    ctx.sender,
+                    order_id,
+                    old.price,
+                    old.qty,
+                    old.side,
+                    reduce_only,
+                );
+                return Err(ExecError::rejected(RejectCategory::Internal, "amend: engine refused"));
+            }
+        };
+        let fills_owned: Vec<FillEvent> = std::mem::take(fills);
+        Self::release_removal_reservations(&mut inner, market, &removed);
+        if let OrderOutcome::Resting { order_id, price, resting_qty } = outcome {
+            Self::record_resting_reservation(
+                &mut inner,
+                market,
+                ctx.sender,
+                order_id,
+                price,
+                resting_qty,
+                order.side,
+                reduce_only,
+            );
+        }
+        let mut events = Vec::with_capacity(fills_owned.len() + 2);
+        for f in &fills_owned {
+            events.push(fill_event(*f));
+        }
+        for f in &fills_owned {
+            Self::apply_fill_to_position(&mut inner, market, f, &mut events);
+        }
+        Self::margin_check_trade_parties(&mut inner, ctx, market, &fills_owned, &mut events);
+        match outcome {
+            OrderOutcome::Resting { price, resting_qty, .. } => {
+                let mut data = Vec::with_capacity(1 + 8 + 8 + 8);
+                data.push(market);
+                data.extend_from_slice(&order_id.0.to_le_bytes());
+                data.extend_from_slice(&price.0.to_le_bytes());
+                data.extend_from_slice(&resting_qty.0.to_le_bytes());
+                events.push(Event { module: "perps", kind: "amended", data });
+            }
+            other => events.push(outcome_event(market, other)),
+        }
+        Self::emit_removal_events(market, &removed, &mut events);
+        Ok(events)
     }
 
     /// Handle a cancel-order message (extracted from `handle`).

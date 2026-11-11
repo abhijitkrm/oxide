@@ -2570,3 +2570,196 @@ mod golden_roots {
         assert_eq!(got, want.map(str::to_owned));
     }
 }
+
+// ── Amend (docs/amend-spec.md) ───────────────────────────────────────
+
+fn amend_fixture() -> (Arc<framework::MemoryBalances>, ExchangeModule) {
+    let ledger = Arc::new(framework::MemoryBalances::new());
+    let ex = ExchangeModule::with_ledger(ledger.clone());
+    ex.list_market(test_cfg()).unwrap();
+    for a in [1u8, 2, 3] {
+        ledger.mint(&addr(a), 10_000_000_000);
+    }
+    (ledger, ex)
+}
+
+fn book_entries(ex: &ExchangeModule) -> Vec<trading::RestingEntry> {
+    let inner = framework::lock_state(&ex.inner);
+    let mut v = Vec::new();
+    inner.markets[0].as_ref().unwrap().resting_entries(&mut v);
+    v
+}
+
+/// Quote + base conservation: minted = free ledger + resting-buy
+/// holds + base custody (free + held) + fee vault.
+fn assert_conserved(
+    ledger: &framework::MemoryBalances,
+    ex: &ExchangeModule,
+    minted: u64,
+    base_in: u64,
+) {
+    let buys: u64 = book_entries(ex)
+        .iter()
+        .filter(|e| e.side == Side::Buy)
+        .map(|e| u64::try_from(u128::from(e.price.0) * u128::from(e.qty.0) / 100_000_000).unwrap())
+        .sum();
+    let free: u64 = [1u8, 2, 3].iter().map(|a| ledger.balance(&addr(*a))).sum();
+    let base = total_base_custody(ex);
+    // Native backing base custody was debited at deposit.
+    assert_eq!(minted, free + buys + base + ex.fee_vault(0), "quote conservation");
+    assert_eq!(base, base_in, "base custody conservation");
+}
+
+#[test]
+fn amend_buy_decrease_keeps_priority_and_refunds_difference() {
+    let (ledger, ex) = amend_fixture();
+    ex.handle(&ctx(1), &msg::place(0, limit(Side::Buy, 100, 10, 1))).unwrap(); // id 0
+    ex.handle(&ctx(2), &msg::place(0, limit(Side::Buy, 100, 5, 2))).unwrap(); // id 1
+    let before = ledger.balance(&addr(1));
+    let new_qty = Qty(4_000);
+    let ev = ex
+        .handle(&ctx(1), &msg::amend(0, OrderId(0), Price(1_100_000_000), new_qty, StpMode::None))
+        .unwrap();
+    assert_eq!(ev.last().unwrap().kind, "amended");
+    // 6 lots × $11.00 refunded.
+    assert_eq!(ledger.balance(&addr(1)) - before, 6_000 * 1_100_000_000 / 100_000_000);
+    let e = book_entries(&ex);
+    assert_eq!((e[0].id, e[0].qty), (OrderId(0), new_qty), "id kept, still first in FIFO");
+    assert_eq!(e[1].id, OrderId(1));
+}
+
+#[test]
+fn amend_buy_cross_settles_like_a_taker() {
+    let (ledger, ex) = amend_fixture();
+    ledger.mint(&addr(3), 0);
+    deposit(&ex, 3, 5_000);
+    ex.handle(&ctx(3), &msg::place(0, limit(Side::Sell, 120, 5, 3))).unwrap(); // id 0 @ $12.20
+    ex.handle(&ctx(1), &msg::place(0, limit(Side::Buy, 100, 5, 1))).unwrap(); // id 1 @ $11.00
+    let minted = 30_000_000_000u64;
+    // Amend the buy up through the ask: fills 5 lots at the maker's price.
+    let ev = ex
+        .handle(
+            &ctx(1),
+            &msg::amend(0, OrderId(1), Price(1_220_000_000), Qty(5_000), StpMode::None),
+        )
+        .unwrap();
+    assert!(
+        ev.iter().any(|e| e.kind == "fill" || e.kind == "filled" || e.kind == "trade")
+            || ev.len() >= 2
+    );
+    assert!(book_entries(&ex).is_empty(), "both sides consumed");
+    assert_eq!(ex.base_balance(addr(1), 0), 5_000, "buyer received base");
+    assert_conserved(&ledger, &ex, minted, 5_000);
+}
+
+#[test]
+fn amend_sell_needs_custody_and_failure_moves_nothing() {
+    let (ledger, ex) = amend_fixture();
+    deposit(&ex, 2, 5_000);
+    ex.handle(&ctx(2), &msg::place(0, limit(Side::Sell, 150, 5, 2))).unwrap(); // id 0
+    let root = ex.state_root();
+    // 9 lots needs 9_000 base; only 5_000 held in total.
+    let err = ex
+        .handle(
+            &ctx(2),
+            &msg::amend(0, OrderId(0), Price(1_500_000_000), Qty(9_000), StpMode::None),
+        )
+        .unwrap_err();
+    assert!(!matches!(err, ExecError::Malformed), "{err:?}");
+    assert_eq!(ex.state_root(), root, "a rejected amend changes nothing");
+    // Shrinking works and returns base to free custody.
+    ex.handle(&ctx(2), &msg::amend(0, OrderId(0), Price(1_500_000_000), Qty(2_000), StpMode::None))
+        .unwrap();
+    assert_eq!(ex.base_balance(addr(2), 0), 3_000);
+    assert_conserved(&ledger, &ex, 30_000_000_000, 5_000);
+}
+
+#[test]
+fn amend_rejects_foreign_unknown_and_off_grid() {
+    let (_ledger, ex) = amend_fixture();
+    ex.handle(&ctx(1), &msg::place(0, limit(Side::Buy, 100, 5, 1))).unwrap();
+    let root = ex.state_root();
+    let mk = |p: u64, q: u64| msg::amend(0, OrderId(0), Price(p), Qty(q), StpMode::None);
+    assert!(ex.handle(&ctx(2), &mk(1_100_000_000, 1_000)).is_err(), "not the owner");
+    assert!(
+        ex.handle(
+            &ctx(1),
+            &msg::amend(0, OrderId(77), Price(1_100_000_000), Qty(1_000), StpMode::None)
+        )
+        .is_err()
+    );
+    assert!(ex.handle(&ctx(1), &mk(1_100_000_001, 1_000)).is_err(), "off tick");
+    assert!(ex.handle(&ctx(1), &mk(1_100_000_000, 1_500)).is_err(), "off lot");
+    assert!(ex.handle(&ctx(1), &mk(9_000_000_000, 1_000)).is_err(), "out of band");
+    assert_eq!(ex.state_root(), root);
+}
+
+/// Random places/amends/cancels (both sides, crossing amends, all STP
+/// modes): quote and base are conserved after every op and the book
+/// never crosses.
+#[test]
+fn amend_conserves_value_over_random_ops() {
+    let (ledger, ex) = amend_fixture();
+    let minted = 30_000_000_000u64;
+    let mut base_in = 0u64;
+    for a in [1u8, 2, 3] {
+        deposit(&ex, a, 50_000);
+        base_in += 50_000;
+    }
+    let mut seed = 0x5DEE_CE66_D1CE_4E5Bu64;
+    let mut rnd = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    for _ in 0..1500 {
+        let who = 1 + u8::try_from(rnd(3)).unwrap();
+        let stp = [
+            StpMode::None,
+            StpMode::CancelNewest,
+            StpMode::CancelOldest,
+            StpMode::DecrementAndCancel,
+        ][usize::try_from(rnd(4)).unwrap()];
+        let ticks = 90 + rnd(20);
+        let lots = 1 + rnd(8);
+        match rnd(10) {
+            0..=4 => {
+                let side = if rnd(2) == 0 { Side::Buy } else { Side::Sell };
+                let mut o = limit(side, ticks, lots, who);
+                o.stp = stp;
+                let _ = ex.handle(&ctx(who), &msg::place(0, o));
+            }
+            5..=8 => {
+                let es = book_entries(&ex);
+                if let Some(e) = es.get(usize::try_from(rnd(es.len() as u64 + 1)).unwrap()) {
+                    let _ = ex.handle(
+                        &ctx(e.owner.0[0]),
+                        &msg::amend(
+                            0,
+                            e.id,
+                            Price(1_000_000_000 + ticks * 1_000_000),
+                            Qty(lots * 1_000),
+                            stp,
+                        ),
+                    );
+                }
+            }
+            _ => {
+                let es = book_entries(&ex);
+                if let Some(e) = es.get(usize::try_from(rnd(es.len() as u64 + 1)).unwrap()) {
+                    let _ = ex.handle(&ctx(e.owner.0[0]), &msg::cancel(0, e.id));
+                }
+            }
+        }
+        assert_conserved(&ledger, &ex, minted, base_in);
+        let (bid, ask) = {
+            let inner = framework::lock_state(&ex.inner);
+            let e = inner.markets[0].as_ref().unwrap();
+            (e.best_bid(), e.best_ask())
+        };
+        if let (Some((b, _)), Some((a, _))) = (bid, ask) {
+            assert!(b < a, "book must never cross");
+        }
+    }
+}

@@ -9,7 +9,7 @@
 //! bytes or events ad hoc.
 
 use super::{
-    Address, CANCEL_BODY_LEN, CanceledOrder, Event, ExchangeModule, FillEvent,
+    AMEND_BODY_LEN, Address, CANCEL_BODY_LEN, CanceledOrder, Event, ExchangeModule, FillEvent,
     LIST_MARKET_BODY_LEN, MarketConfig, NewOrder, OrderId, OrderOutcome, OrderType, PLACE_BODY_LEN,
     Price, Qty, Side, StpMode, TimeInForce,
 };
@@ -55,6 +55,21 @@ impl ExchangeModule {
         let market = msg[0];
         let order_id = u64::from_le_bytes(msg[1..9].try_into().ok()?);
         Some((market, OrderId(order_id)))
+    }
+
+    /// Parse an amend-order body (tag already consumed):
+    /// `[market:1][order_id:8][price:8][qty:8][stp:1]`.
+    pub(crate) fn parse_amend(msg: &[u8]) -> Option<(u8, OrderId, Price, Qty, StpMode)> {
+        if msg.len() != AMEND_BODY_LEN {
+            return None;
+        }
+        Some((
+            msg[0],
+            OrderId(u64::from_le_bytes(msg[1..9].try_into().ok()?)),
+            Price(u64::from_le_bytes(msg[9..17].try_into().ok()?)),
+            Qty(u64::from_le_bytes(msg[17..25].try_into().ok()?)),
+            decode_stp(msg[25])?,
+        ))
     }
 
     /// Parse a list-market message body (tag already consumed).
@@ -175,6 +190,17 @@ pub(crate) fn removal_event(market: u8, r: trading::MakerRemoval) -> Event {
 }
 
 /// Encode a [`CanceledOrder`] as an event.
+/// Encode an in-place amend that left the order resting:
+/// `[market][order_id][price][qty]` (the new price and remaining qty).
+pub(crate) fn amended_event(market: u8, id: OrderId, price: Price, qty: Qty) -> Event {
+    let mut data = Vec::with_capacity(1 + 8 + 8 + 8);
+    data.push(market);
+    data.extend_from_slice(&id.0.to_le_bytes());
+    data.extend_from_slice(&price.0.to_le_bytes());
+    data.extend_from_slice(&qty.0.to_le_bytes());
+    Event { module: "exchange", kind: "amended", data }
+}
+
 pub(crate) fn cancel_event(market: u8, canceled: CanceledOrder) -> Event {
     let mut data = Vec::with_capacity(1 + 8 + 1 + 8 + 8 + 20);
     data.push(market);

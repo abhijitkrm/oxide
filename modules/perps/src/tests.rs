@@ -2937,3 +2937,175 @@ fn test_sweep_with_repeated_maker_settles_every_fill() {
     assert_eq!(perps.position(&addr(9), mid).size, -2_000);
     assert_eq!(perps.position(&addr(8), mid).size, -1_000);
 }
+
+// ── Amend (docs/amend-spec.md) ───────────────────────────────────────
+
+fn amend_setup() -> PerpsModule {
+    let perps = PerpsModule::new();
+    perps.list_market(test_cfg()).unwrap();
+    for a in [1u8, 2, 3] {
+        perps.handle(&ctx(a), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000_000)).unwrap();
+    }
+    perps
+}
+
+fn perps_book(perps: &PerpsModule) -> Vec<trading::RestingEntry> {
+    let inner = framework::lock_state(&perps.inner);
+    let mut v = Vec::new();
+    inner.markets[0].as_ref().unwrap().resting_entries(&mut v);
+    v
+}
+
+#[test]
+fn amend_resizes_in_place_and_updates_reservation() {
+    let perps = amend_setup();
+    perps.handle(&ctx(1), &msg::place(0, limit(Side::Buy, 400, 6, 1))).unwrap(); // id 0
+    let ev = perps
+        .handle(
+            &ctx(1),
+            &msg::amend(0, OrderId(0), Price(1_400_000_000), Qty(2_000), StpMode::None),
+        )
+        .unwrap();
+    assert_eq!(ev.last().unwrap().kind, "amended");
+    let inner = framework::lock_state(&perps.inner);
+    let resv = inner.accounts.get(&addr(1)).unwrap().open_orders.get(&(0, 0)).unwrap();
+    assert_eq!(resv.qty, 2_000, "reservation follows the new remaining qty");
+    drop(inner);
+    assert_eq!(perps_book(&perps)[0].qty, Qty(2_000));
+}
+
+#[test]
+fn amend_over_margin_is_rejected_and_moves_nothing() {
+    let ledger = Arc::new(framework::MemoryBalances::new());
+    ledger.mint(&addr(1), 1_000_000);
+    let perps = PerpsModule::with_ledger(ledger.clone());
+    perps.list_market(test_cfg()).unwrap();
+    perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 1_000_000)).unwrap();
+    perps.handle(&ctx(1), &msg::place(0, limit(Side::Buy, 400, 1, 1))).expect("small order fits");
+    let root = perps.state_root();
+    let huge = perps.handle(
+        &ctx(1),
+        &msg::amend(0, OrderId(0), Price(1_400_000_000), Qty(900_000_000), StpMode::None),
+    );
+    let err = huge.expect_err("an amend that exceeds initial margin must be rejected");
+    assert!(format!("{err:?}").contains("margin"), "{err:?}");
+    assert_eq!(perps.state_root(), root, "a rejected amend changes nothing");
+    // The same order can still be amended within its means.
+    perps
+        .handle(
+            &ctx(1),
+            &msg::amend(0, OrderId(0), Price(1_400_000_000), Qty(2_000), StpMode::None),
+        )
+        .expect("a small amend still works");
+}
+
+#[test]
+fn amend_rejects_foreign_unknown_off_grid() {
+    let perps = amend_setup();
+    perps.handle(&ctx(1), &msg::place(0, limit(Side::Buy, 400, 3, 1))).unwrap();
+    let root = perps.state_root();
+    let mk = |p: u64, q: u64| msg::amend(0, OrderId(0), Price(p), Qty(q), StpMode::None);
+    assert!(perps.handle(&ctx(2), &mk(1_400_000_000, 1_000)).is_err());
+    assert!(
+        perps
+            .handle(
+                &ctx(1),
+                &msg::amend(0, OrderId(9), Price(1_400_000_000), Qty(1_000), StpMode::None)
+            )
+            .is_err()
+    );
+    assert!(perps.handle(&ctx(1), &mk(1_400_000_001, 1_000)).is_err());
+    assert!(perps.handle(&ctx(1), &mk(1_400_000_000, 1_500)).is_err());
+    assert_eq!(perps.state_root(), root);
+}
+
+/// Differential against the path amend replaces: the same random
+/// flow on two modules — one amends, the other cancels and re-places
+/// (same-price decreases amend in both: that is the one place the
+/// two paths intentionally differ) — must leave identical books
+/// (side/price/qty/owner, FIFO) and identical margin and position
+/// state for every account after every op.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn amend_matches_cancel_then_place_on_margin_and_positions() {
+    let (a, b) = (amend_setup(), amend_setup());
+    let mut seed = 0xC0FF_EE12_3456_789Bu64;
+    let mut rnd = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    // logical order -> (id in a, id in b)
+    let mut live: Vec<(OrderId, OrderId)> = Vec::new();
+    let shapes = |m: &PerpsModule| -> Vec<(Side, u64, u64, u8)> {
+        perps_book(m).iter().map(|e| (e.side, e.price.0, e.qty.0, e.owner.0[0])).collect()
+    };
+    for step in 0..800u32 {
+        let who = 1 + u8::try_from(rnd(3)).unwrap();
+        let ticks = 480 + rnd(40);
+        let lots = 1 + rnd(5);
+        if rnd(10) < 5 || live.is_empty() {
+            let side = if rnd(2) == 0 { Side::Buy } else { Side::Sell };
+            let m = msg::place(0, limit(side, ticks, lots, who));
+            let (ra, rb) = (a.handle(&ctx(who), &m), b.handle(&ctx(who), &m));
+            assert_eq!(ra.is_ok(), rb.is_ok(), "place verdicts, step {step}");
+        } else {
+            // Amend one of the live book orders (resolve by position in book).
+            let (ba, bb) = (perps_book(&a), perps_book(&b));
+            assert_eq!(ba.len(), bb.len());
+            if ba.is_empty() {
+                continue;
+            }
+            let k = usize::try_from(rnd(ba.len() as u64)).unwrap();
+            let (ea, eb) = (ba[k], bb[k]);
+            let price = Price(1_000_000_000 + ticks * 1_000_000);
+            let qty = Qty(lots * 1_000);
+            let who = ea.owner.0[0];
+            let ra = a.handle(&ctx(who), &msg::amend(0, ea.id, price, qty, StpMode::None));
+            let rb = if price == ea.price && qty <= ea.qty {
+                // Priority-keeping path: amend on both.
+                b.handle(&ctx(who), &msg::amend(0, eb.id, price, qty, StpMode::None))
+            } else {
+                // Model: cancel, then place with the old side/owner. An
+                // over-margin place must leave the ORIGINAL order alone, so
+                // gate by trying the place on a failed path is not possible
+                // after cancel: compare only when amend succeeded.
+                if ra.is_err() {
+                    continue;
+                }
+                b.handle(&ctx(who), &msg::cancel(0, eb.id)).unwrap();
+                b.handle(
+                    &ctx(who),
+                    &msg::place(
+                        0,
+                        NewOrder {
+                            side: eb.side,
+                            order_type: OrderType::Limit,
+                            tif: TimeInForce::Gtc,
+                            price,
+                            qty,
+                            owner: eb.owner,
+                            stp: StpMode::None,
+                        },
+                    ),
+                )
+            };
+            assert_eq!(ra.is_ok(), rb.is_ok(), "verdicts, step {step}");
+            let _ = &mut live;
+        }
+        assert_eq!(shapes(&a), shapes(&b), "books, step {step}");
+        for w in [1u8, 2, 3] {
+            assert_eq!(
+                a.cross_margin(&addr(w)),
+                b.cross_margin(&addr(w)),
+                "margin {w} step {step}"
+            );
+            assert_eq!(
+                a.position(&addr(w), 0).size,
+                b.position(&addr(w), 0).size,
+                "position {w} step {step}"
+            );
+        }
+    }
+}

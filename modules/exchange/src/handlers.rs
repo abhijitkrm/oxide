@@ -16,7 +16,8 @@ use super::{
     qty_sub,
 };
 use crate::codec::{
-    cancel_event, decode_side, encode_side, fill_event, outcome_event, pair_event, removal_event,
+    amended_event, cancel_event, decode_side, encode_side, fill_event, outcome_event, pair_event,
+    removal_event,
 };
 use crate::settle::{
     BookSettlement, ConsumedMap, LegPlan, TakerCtx, consume_and_release, pair_hash,
@@ -110,6 +111,202 @@ impl ExchangeModule {
             }
             Err(e) => Err(ExecError::rejected(RejectCategory::Internal, format!("cancel: {e}"))),
         }
+    }
+
+    /// Handle an amend-order message (`docs/amend-spec.md`): resize or
+    /// re-price the sender's resting book order under its own id.
+    ///
+    /// Accounting is exactly cancel-then-place with the escrow netted:
+    /// the old resting hold (buys: `⌊price × qty / SCALE⌋` of quote;
+    /// sells: `min(hold, qty)` of base) is released and the new
+    /// order's full reservation taken, but as ONE net movement, and
+    /// every check that can fail (owner, market rules, funds / base
+    /// custody) runs BEFORE any ledger, custody or book mutation —
+    /// the C6 rule that nothing after the engine call may fail. After
+    /// the engine call the order is a taker in
+    /// [`BookSettlement::apply`]: re-cross fills settle, a surviving
+    /// remainder keeps `price × resting_qty` / `resting_qty` held,
+    /// the rest of the reservation is refunded.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn handle_amend(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        let (market, order_id, new_price, new_qty, stp) =
+            Self::parse_amend(body).ok_or(ExecError::Malformed)?;
+        let Inner { markets, fills, base_balances, base_holds, fee_vault, .. } = inner;
+        let Some(engine) = markets[usize::from(market)].as_mut() else {
+            return Err(ExecError::rejected(
+                RejectCategory::NotFound,
+                format!("market {market} does not exist"),
+            ));
+        };
+        let Some(old) = engine.resting_order(order_id) else {
+            return Err(ExecError::rejected(RejectCategory::NotFound, "amend: order not found"));
+        };
+        if old.owner != ctx.sender {
+            return Err(ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "amend: not the order owner",
+            ));
+        }
+        // Market rules (tick/lot/band) — same verdict the engine
+        // would reach, taken first so a rejected amend moves nothing.
+        let cfg = *engine.config();
+        let probe = trading::NewOrder {
+            side: old.side,
+            order_type: OrderType::Limit,
+            tif: trading::TimeInForce::Gtc,
+            price: new_price,
+            qty: new_qty,
+            owner: old.owner,
+            stp,
+        };
+        if probe.validate(cfg.tick_size, cfg.lot_size, cfg.min_price, cfg.max_price).is_err() {
+            return Err(ExecError::rejected(
+                RejectCategory::InvalidInput,
+                "amend: price/qty outside market config",
+            ));
+        }
+
+        // ── Net the escrow (all fallible steps before the book) ──
+        let mut reservation = 0u64;
+        let mut taker_base = Qty(0);
+        // (quote delta applied, direction) / (base released, base taken) for the undo below.
+        let mut quote_undo: Option<(u64, bool)> = None;
+        let mut base_undo: Option<(Qty, Qty)> = None;
+        if let Some(ledger) = &self.ledger {
+            match old.side {
+                Side::Buy => {
+                    let hold_of = |p: Price, q: Qty| {
+                        u64::try_from(u128::from(p.0) * u128::from(q.0) / PRICE_SCALE).map_err(
+                            |_| {
+                                ExecError::rejected(
+                                    RejectCategory::InvalidInput,
+                                    "amend: notional exceeds u64 quote range",
+                                )
+                            },
+                        )
+                    };
+                    let old_hold = hold_of(old.price, old.qty)?;
+                    let new_need = hold_of(new_price, new_qty)?;
+                    if new_need >= old_hold {
+                        let delta = new_need - old_hold;
+                        if delta > 0 {
+                            ledger.debit(&ctx.sender, delta).map_err(|_| {
+                                ExecError::rejected(
+                                    RejectCategory::InsufficientFunds,
+                                    "insufficient balance for amended buy order",
+                                )
+                            })?;
+                            quote_undo = Some((delta, true));
+                        }
+                    } else {
+                        let delta = old_hold - new_need;
+                        ledger.credit(&ctx.sender, delta).map_err(|_| {
+                            ExecError::rejected(RejectCategory::Internal, "amend refund failed")
+                        })?;
+                        quote_undo = Some((delta, false));
+                    }
+                    reservation = new_need;
+                }
+                Side::Sell => {
+                    let key = (ctx.sender, market);
+                    let held = base_holds.get(&key).copied().unwrap_or_default();
+                    let released = held.min(old.qty);
+                    let free = base_balances.get(&key).copied().unwrap_or_default();
+                    let available = qty_add(free, released).ok_or(ExecError::Malformed)?;
+                    if available < new_qty {
+                        return Err(ExecError::rejected(
+                            RejectCategory::InsufficientFunds,
+                            "insufficient base custody for amended sell order",
+                        ));
+                    }
+                    // The old hold returns to free custody, then the new
+                    // order's full qty leaves it into the taker side.
+                    if released.0 > 0 {
+                        base_holds
+                            .insert(key, qty_sub(held, released).ok_or(ExecError::Malformed)?);
+                    }
+                    base_balances
+                        .insert(key, qty_sub(available, new_qty).ok_or(ExecError::Malformed)?);
+                    taker_base = new_qty;
+                    base_undo = Some((released, new_qty));
+                }
+            }
+        }
+
+        fills.clear();
+        let mut removed: Vec<trading::MakerRemoval> = Vec::new();
+        let result = engine.amend(
+            order_id,
+            new_price,
+            new_qty,
+            stp,
+            fills,
+            &mut trading::ObserveRemovals { removed: &mut removed },
+        );
+        let outcome = match result {
+            Ok(trading::AmendOutcome::Reduced { qty }) => {
+                trading::OrderOutcome::Resting { order_id, price: new_price, resting_qty: qty }
+            }
+            Ok(trading::AmendOutcome::Resting { price, resting_qty }) => {
+                trading::OrderOutcome::Resting { order_id, price, resting_qty }
+            }
+            Ok(trading::AmendOutcome::Filled) => trading::OrderOutcome::Filled,
+            Ok(trading::AmendOutcome::CanceledRemainder { filled_qty }) => {
+                trading::OrderOutcome::CanceledRemainder { order_id, filled_qty }
+            }
+            Ok(trading::AmendOutcome::Rejected(_)) | Err(_) => {
+                // Unreachable after the pre-checks, but fail closed:
+                // the book is untouched, so put the escrow back.
+                if let (Some(ledger), Some((delta, debited))) = (&self.ledger, quote_undo) {
+                    let _ = if debited {
+                        ledger.credit(&ctx.sender, delta)
+                    } else {
+                        ledger.debit(&ctx.sender, delta)
+                    };
+                }
+                if let Some((released, taken)) = base_undo {
+                    let key = (ctx.sender, market);
+                    let free = base_balances.get(&key).copied().unwrap_or_default();
+                    base_balances.insert(key, qty_add(free, taken).ok_or(ExecError::Malformed)?);
+                    if released.0 > 0 {
+                        let held = base_holds.get(&key).copied().unwrap_or_default();
+                        base_holds
+                            .insert(key, qty_add(held, released).ok_or(ExecError::Malformed)?);
+                        let free = base_balances.get(&key).copied().unwrap_or_default();
+                        base_balances
+                            .insert(key, qty_sub(free, released).ok_or(ExecError::Malformed)?);
+                    }
+                }
+                return Err(ExecError::rejected(RejectCategory::Internal, "amend: engine refused"));
+            }
+        };
+
+        let mut events = Vec::with_capacity(fills.len() + 2);
+        for f in fills.iter() {
+            events.push(fill_event(*f));
+        }
+        if let Some(ledger) = &self.ledger {
+            BookSettlement { ledger, base_balances, base_holds, fee_vault, events: &mut events }
+                .apply(
+                    market,
+                    TakerCtx { price: new_price, owner: ctx.sender, reservation, base: taker_base },
+                    outcome,
+                    fills,
+                )?;
+        }
+        match outcome {
+            trading::OrderOutcome::Resting { price, resting_qty, .. } => {
+                events.push(amended_event(market, order_id, price, resting_qty));
+            }
+            other => events.push(outcome_event(market, other)),
+        }
+        self.release_maker_holds(market, &removed, base_balances, base_holds, &mut events)?;
+        Ok(events)
     }
 
     /// Handle a place-order message (extracted from `handle`).

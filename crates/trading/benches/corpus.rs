@@ -205,7 +205,14 @@ impl Resolver {
                     };
                     if self.native {
                         ops.push(Op::Amend(oid, order.price, order.qty));
-                        let out = e.amend(oid, order.price, order.qty, fills, &mut trading::NoCap);
+                        let out = e.amend(
+                            oid,
+                            order.price,
+                            order.qty,
+                            StpMode::None,
+                            fills,
+                            &mut trading::NoCap,
+                        );
                         self.absorb(fills);
                         if matches!(out, Ok(trading::AmendOutcome::Filled)) {
                             self.live[*id as usize] = None;
@@ -298,7 +305,7 @@ fn exec<S: Probe>(e: &mut MatchingEngine, op: &Op, fills: &mut S) -> u64 {
             black_box(e.place_into(*o, fills).unwrap());
         }
         Op::Amend(id, p, q) => {
-            let _ = black_box(e.amend(*id, *p, *q, fills, &mut trading::NoCap));
+            let _ = black_box(e.amend(*id, *p, *q, StpMode::None, fills, &mut trading::NoCap));
         }
     }
     fills.count()
@@ -477,7 +484,9 @@ fn main() {
             Op::Place(o) => vec![trading::Command::Place(o)],
             Op::Cancel(id) => vec![trading::Command::Cancel(id)],
             Op::Replace(id, o) => vec![trading::Command::Cancel(id), trading::Command::Place(o)],
-            Op::Amend(id, price, qty) => vec![trading::Command::Amend { id, price, qty }],
+            Op::Amend(id, price, qty) => {
+                vec![trading::Command::Amend { id, price, qty, stp: StpMode::None }]
+            }
         })
         .collect();
     let c = Ctx {

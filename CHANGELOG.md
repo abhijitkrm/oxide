@@ -31,6 +31,14 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     price without the cost of deleting and re-creating it; nothing on
     the chain uses this yet.
 
+- **Amend-order transaction** (`exchange` tag 15, `perps` tag 8; spec in
+  `docs/amend-spec.md`). A trader can change a resting order's price or size
+  in one transaction, keeping its id (and its queue position if the size only
+  shrinks), instead of cancelling and re-placing. Escrow and margin are netted
+  atomically and all checks run before any state changes.
+  - **In plain words:** editing an order is now one cheaper step that cannot
+    leave you half-way between the old order and the new one.
+
 - **New benchmark: `cargo bench -p trading --bench corpus`** replays the
   matcher-rust W1–W5 workloads through the engine so the two can be
   compared on identical commands.

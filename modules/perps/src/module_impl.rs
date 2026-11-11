@@ -8,8 +8,8 @@
 
 use super::{
     Address, Event, ExecError, FUNDING_PERIOD_BLOCKS, Hash, Height, LIQUIDATION_SWEEP_BUDGET,
-    Module, PerpsModule, RejectCategory, TAG_APPLY_FUNDING, TAG_CANCEL, TAG_DEPOSIT, TAG_LIQUIDATE,
-    TAG_LIST_MARKET, TAG_PLACE, TAG_SET_MARK, TAG_WITHDRAW, TxContext, module_id,
+    Module, PerpsModule, RejectCategory, TAG_AMEND, TAG_APPLY_FUNDING, TAG_CANCEL, TAG_DEPOSIT,
+    TAG_LIQUIDATE, TAG_LIST_MARKET, TAG_PLACE, TAG_SET_MARK, TAG_WITHDRAW, TxContext, module_id,
 };
 use crate::decode;
 use crate::{encode_perps_config, market_config_key};
@@ -49,6 +49,7 @@ impl Module for PerpsModule {
         match tag {
             TAG_PLACE => self.handle_place(ctx, body),
             TAG_CANCEL => self.handle_cancel(ctx, body),
+            TAG_AMEND => self.handle_amend(ctx, body),
             TAG_LIST_MARKET => self.handle_list_market(ctx, msg, body),
             TAG_DEPOSIT => self.handle_deposit(ctx, body),
             TAG_WITHDRAW => self.handle_withdraw(ctx, body),

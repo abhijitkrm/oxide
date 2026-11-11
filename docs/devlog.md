@@ -24306,3 +24306,28 @@ number, 63–67M cmds/s, is its ring machinery, not matching). It belongs to the
 off-chain matcher service roadmap, not the chain's `executor` lane (the chain
 already sequences through consensus): file as follow-ups — journal + replay
 recovery first, loom test of `ring.rs` second.
+
+### Amend adopted by exchange and perps
+
+`docs/amend-spec.md` defines the op; `exchange` tag 15 and `perps` tag 8 carry
+it. Engine change: `amend` now takes an `stp` mode (the resting order does not
+remember one) and returns `CanceledRemainder` when STP cancels the re-crossing
+order; `resting_order(id)` exposes a resting order's committed view for the
+modules' pre-checks.
+
+- **exchange:** escrow netted in one movement (buy: debit/credit the
+  difference of the floored holds; sell: old hold back to free custody, new qty
+  out), every failure point before the book is touched, then the order settles
+  as a taker through `BookSettlement`. Tests: priority kept on decrease,
+  crossing amend settles, insufficient base rejected with an unchanged
+  `state_root`, foreign/unknown/off-grid rejected, and a 1500-op random run
+  (all STP modes) asserting quote + base conservation and an uncrossed book
+  after every op.
+- **perps:** the initial-margin gate was extracted from `handle_place`
+  (`initial_margin_gate`, behavior-neutral: all 103 existing tests pass) and
+  takes the order being replaced as `skip`; reduce-only cover excludes the
+  order's own old quantity. Differential test: the same random flow on two
+  modules — amend vs cancel + re-place — leaves identical books, cross margin
+  and positions after every op.
+
+Existing state roots and golden vectors are unchanged (new tag, no new state).

@@ -71,6 +71,9 @@ const TAG_APPLY_FUNDING: u8 = 6;
 /// the audit called missing: liquidation used to exist only as a
 /// test/sim/bench entry point.
 const TAG_LIQUIDATE: u8 = 7;
+/// Amend-order message tag (`docs/amend-spec.md`). Body:
+/// `[market:1][order_id:8][price:8][qty:8][stp:1]` = 26 bytes.
+const TAG_AMEND: u8 = 8;
 
 // ── Message sizes (body, excluding the 1-byte tag) ───────────────────
 
@@ -84,6 +87,8 @@ const PLACE_BODY_LEN: usize = 22;
 const FLAG_REDUCE_ONLY: u8 = 0x01;
 /// `[market:1][order_id:8]` = 9.
 const CANCEL_BODY_LEN: usize = 9;
+/// Amend body: `[market:1][order_id:8][price:8][qty:8][stp:1]`.
+const AMEND_BODY_LEN: usize = 26;
 /// `[tick:8][lot:8][min:8][max:8][max_resting:4][max_leverage:2][mmr_base:2]` = 40.
 const LIST_MARKET_BODY_LEN: usize = 40;
 /// `[market:1][amount:8]` = 9.
@@ -1807,6 +1812,24 @@ pub mod msg {
         msg.push(super::TAG_CANCEL);
         msg.push(market);
         msg.extend_from_slice(&order_id.0.to_le_bytes());
+        msg
+    }
+
+    /// Build an amend-order message (`docs/amend-spec.md`).
+    pub fn amend(
+        market: u8,
+        order_id: OrderId,
+        price: primitives::fixed::Price,
+        qty: primitives::fixed::Qty,
+        stp: trading::StpMode,
+    ) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(1 + super::AMEND_BODY_LEN);
+        msg.push(super::TAG_AMEND);
+        msg.push(market);
+        msg.extend_from_slice(&order_id.0.to_le_bytes());
+        msg.extend_from_slice(&price.0.to_le_bytes());
+        msg.extend_from_slice(&qty.0.to_le_bytes());
+        msg.push(encode_stp(stp));
         msg
     }
 

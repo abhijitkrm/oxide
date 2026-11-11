@@ -933,7 +933,7 @@ fn amend_matches_cancel_place_model() {
                 let (ia, ib) = live[k];
                 let price = Price(1_000_000_000 + (1 + rnd(30)) * 1_000_000);
                 let qty = Qty((1 + rnd(9)) * 1_000);
-                let ra = amended.amend(ia, price, qty, &mut fa, &mut NoCap);
+                let ra = amended.amend(ia, price, qty, StpMode::None, &mut fa, &mut NoCap);
                 // Model: same-price decrease keeps priority (in-place);
                 // anything else is cancel + re-place with the old side/owner.
                 let entry = {
@@ -952,7 +952,9 @@ fn amend_matches_cancel_place_model() {
                             // (Rebuild B's book is not possible in place,
                             // so apply the same primitive through a
                             // second amend on B — the Reduced path.)
-                            let rb = model.amend(ib, price, qty, &mut fb, &mut NoCap).unwrap();
+                            let rb = model
+                                .amend(ib, price, qty, StpMode::None, &mut fb, &mut NoCap)
+                                .unwrap();
                             assert_eq!(rb, out);
                         } else {
                             let c = model.cancel(ib).unwrap();
@@ -1033,7 +1035,12 @@ fn apply_batch_matches_sequential() {
                 Command::Place(order(side, OrderType::Limit, tif, price, qty, 1 + rnd(3) as u8))
             }
             6..=7 => Command::Cancel(OrderId(rnd(1500))),
-            _ => Command::Amend { id: OrderId(rnd(1500)), price: Price(price), qty: Qty(qty) },
+            _ => Command::Amend {
+                id: OrderId(rnd(1500)),
+                price: Price(price),
+                qty: Qty(qty),
+                stp: StpMode::None,
+            },
         });
     }
     let (mut seq, mut bat) = (engine(), engine());
@@ -1046,8 +1053,8 @@ fn apply_batch_matches_sequential() {
         want.push(match *c {
             Command::Place(o) => CommandResult::Placed(seq.place_into(o, &mut fs)),
             Command::Cancel(id) => CommandResult::Canceled(seq.cancel(id)),
-            Command::Amend { id, price, qty } => {
-                CommandResult::Amended(seq.amend(id, price, qty, &mut fs, &mut NoCap))
+            Command::Amend { id, price, qty, stp } => {
+                CommandResult::Amended(seq.amend(id, price, qty, stp, &mut fs, &mut NoCap))
             }
         });
     }

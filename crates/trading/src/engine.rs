@@ -266,6 +266,13 @@ pub enum AmendOutcome {
     },
     /// The re-cross consumed the whole order; it is gone.
     Filled,
+    /// Self-trade prevention cancelled the order mid-re-cross (fills
+    /// booked so far stand); it is gone. Mirrors
+    /// [`OrderOutcome::CanceledRemainder`].
+    CanceledRemainder {
+        /// Quantity filled before the cancel.
+        filled_qty: Qty,
+    },
     /// The new price/quantity violate the market's rules; the order
     /// is untouched.
     Rejected(RejectReason),
@@ -286,6 +293,8 @@ pub enum Command {
         price: Price,
         /// New quantity.
         qty: Qty,
+        /// Self-trade-prevention mode for the re-cross.
+        stp: StpMode,
     },
 }
 
@@ -612,6 +621,14 @@ impl<B: BookBackend> MatchingEngine<B> {
         Some((Price(p), Qty(self.book.level_total(p))))
     }
 
+    /// A resting order's committed view, if `id` is resting (amend
+    /// and cancel pre-checks in the modules).
+    #[must_use]
+    pub fn resting_order(&self, id: OrderId) -> Option<RestingEntry> {
+        let slot = self.ids.get(id.0)?;
+        Some(self.node_entry(slot))
+    }
+
     /// Owner of a resting order (cancel authorization lookup).
     #[must_use]
     pub fn order_owner(&self, id: OrderId) -> Option<Address> {
@@ -830,6 +847,9 @@ impl<B: BookBackend> MatchingEngine<B> {
     ///   of its new level. Unlike cancel + `place`, the **order id is
     ///   preserved**, so the id map entry and the pool slot are
     ///   reused (no remove/insert, no free/alloc).
+    /// - `stp` is applied to the re-cross like an incoming order's
+    ///   (the resting order does not remember one). If it cancels
+    ///   the taker the order is gone ([`AmendOutcome::CanceledRemainder`]).
     /// - The order's side, owner and TIF (GTC) never change.
     ///
     /// The committed resting fold stays bit-identical to what a
@@ -843,6 +863,7 @@ impl<B: BookBackend> MatchingEngine<B> {
         id: OrderId,
         new_price: Price,
         new_qty: Qty,
+        stp: StpMode,
         fills: &mut F,
         cap: &mut C,
     ) -> Result<AmendOutcome, TradingError> {
@@ -858,7 +879,7 @@ impl<B: BookBackend> MatchingEngine<B> {
             price: new_price,
             qty: new_qty,
             owner,
-            stp: StpMode::None,
+            stp,
         };
         if let Err(reason) = req.validate(
             self.cfg.tick_size,
@@ -887,15 +908,18 @@ impl<B: BookBackend> MatchingEngine<B> {
         let mut rem = new_qty.0;
         let canceled = self.sweep(&req, id, Some(new_price.0), &mut rem, fills, cap);
         self.fold_hold = false;
-        debug_assert!(!canceled, "StpMode::None never cancels the taker");
-        if rem == 0 {
+        if canceled || rem == 0 {
             // Fully filled: the order is gone (slot and id released).
             // The fold log already holds this identity's baseline;
             // with the id unmapped its current state reads as absent.
             let _ = self.ids.remove(id.0);
             self.pool.release(slot);
             self.resting = self.resting.saturating_sub(1);
-            return Ok(AmendOutcome::Filled);
+            return Ok(if canceled {
+                AmendOutcome::CanceledRemainder { filled_qty: Qty(new_qty.0 - rem) }
+            } else {
+                AmendOutcome::Filled
+            });
         }
         {
             let n = &mut self.pool[slot];
@@ -939,8 +963,8 @@ impl<B: BookBackend> MatchingEngine<B> {
             let r = match *c {
                 Command::Place(o) => CommandResult::Placed(self.place_into(o, fills)),
                 Command::Cancel(id) => CommandResult::Canceled(self.cancel(id)),
-                Command::Amend { id, price, qty } => {
-                    CommandResult::Amended(self.amend(id, price, qty, fills, &mut NoCap))
+                Command::Amend { id, price, qty, stp } => {
+                    CommandResult::Amended(self.amend(id, price, qty, stp, fills, &mut NoCap))
                 }
             };
             out(i, r);
