@@ -626,10 +626,13 @@ pub fn xor_fold(acc: &mut Hash, leaf: Hash) {
 #[must_use]
 pub fn committed_leaf(map_tag: u64, preimage: &[u8]) -> Hash {
     use crypto::hash::{Domain, Hasher};
-    let mut h = Hasher::new(Domain::CommittedLeaf);
-    h.update(&map_tag.to_le_bytes());
-    h.update(preimage);
-    h.finalize()
+    // `hash_pair` is the single-shot form of the streaming
+    // `Hasher::new(domain); update(tag); update(preimage)` — the same
+    // `domain ‖ tag ‖ preimage` bytes, hashed with one `blake3::hash`
+    // call from a stack buffer instead of a `blake3::Hasher` plus two
+    // block-buffering `update`s. Bit-identical (pinned by the golden
+    // roots in `exchange`/`perps` and `committed_leaf_single_shot_*`).
+    Hasher::hash_pair(Domain::CommittedLeaf, &map_tag.to_le_bytes(), preimage)
 }
 
 /// A `BTreeMap` whose set-commitment root is maintained
@@ -1348,6 +1351,23 @@ pub fn stage_blob_snapshot<'a, S>(
 
 #[cfg(test)]
 mod tests {
+
+    /// `committed_leaf` moved from a streaming `Hasher` to the
+    /// single-shot `hash_pair`; every committed-map root depends on
+    /// the bytes staying identical, across the short/long boundary.
+    #[test]
+    fn committed_leaf_single_shot_equals_streaming() {
+        use crypto::hash::{Domain, Hasher};
+        for len in [0usize, 1, 45, 55, 98, 247, 248, 255, 256, 300, 1000] {
+            let pre: Vec<u8> = (0..len).map(|i| u8::try_from((i * 7 + 3) % 256).unwrap()).collect();
+            for tag in [0u64, 6, u64::MAX] {
+                let mut h = Hasher::new(Domain::CommittedLeaf);
+                h.update(&tag.to_le_bytes());
+                h.update(&pre);
+                assert_eq!(committed_leaf(tag, &pre), h.finalize(), "len {len} tag {tag}");
+            }
+        }
+    }
     use super::*;
     use executor::{Event, ExecError};
     use primitives::Height;

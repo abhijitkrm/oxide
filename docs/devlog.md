@@ -24079,3 +24079,58 @@ unprompted; the jobs themselves are unchanged and can still be run from
 the Actions tab. Each file carries a comment with the exact triggers to
 restore. Until CI is re-enabled the fmt + clippy + test gates are
 local-only: run them before merging.
+
+### Matcher-parity, steps 1–2: corpus bench + deferred resting fold
+
+**Why.** matcher-rust (the standalone book, ~115M ops/s headline) was the
+reference for what the engine could do. Step 1 replaces the headline
+comparison with a like-for-like one; step 2 attacks what it found.
+
+**Step 1 — `crates/trading/benches/corpus.rs`.** Replays matcher-rust's
+W1–W5 corpora (`vectorgen`, `spec/BENCH.md`) through `MatchingEngine`. Oxide
+assigns order ids itself, so an untimed resolve pass runs the corpus once to
+learn each command's engine id and the timed pass replays fully resolved ops
+(no id translation in the loop). `Replace` = `cancel` + `place` (Oxide has no
+native replace yet). `--fold` enables the production leaf
+(`exchange::book_resting_leaf`) and simulates block boundaries every
+`--block` ops (settle, then read). Result on an M1, one core, same commands:
+
+| workload | matcher-rust | Oxide, no fold | Oxide, fold (before) |
+|---|---|---|---|
+| W1 build 1M | 42.4M/s | 41.6M | 6.4M |
+| W2 sweep | 28.8M | 31.9M | 5.6M |
+| W3 churn | 21.3M | 22.0M | 4.4M |
+| W4 mixed, 100k book | 22.8M | 25.3M | 5.0M |
+| W5, 1k book | 103.5M | 47.9M | 9.2M |
+| W5, 100k book | 23.1M | 26.1M | 5.0M |
+
+Finding: with the book layout alone Oxide is at parity with matcher-rust at
+100k live orders (the layout hypothesis in the first review was wrong for
+deep books); matcher's ~100M figure is the cache-resident 1k book. The
+resting fold (one BLAKE3 leaf per resting mutation) made the *consensus*
+configuration ~5x slower than either.
+
+**Step 2 — deferred fold.** `resting_fold` was XOR-maintained with a leaf hash
+per mutation (2 hashes per partial fill). It is now lazy: each order identity
+touched in a window gets ONE net-change record (baseline = the entry as the
+settled base counts it; `dirty` flag on the pool node dedups repeats), and
+`resting_fold(&self)` corrects the settled base by the log without mutating
+(so it is always current — no caller discipline needed). `settle_fold(&mut)`
+commits the log at block end; the log also settles itself at `FOLD_LOG_CAP`
+(4096 records; early settling only costs dedup, never correctness). An order
+placed and removed in one window never hashes; one filled N times hashes
+twice. The value is bit-identical (golden roots in `exchange`/`perps`
+unchanged; `deferred_fold_matches_recompute_under_random_ops` compares to a
+full recompute after every op, with caps 1/2/3/7/default and random settles;
+a mutation test (dropping the sweep's touch) is caught).
+`framework::committed_leaf` also moved from a streaming `Hasher` to the
+single-shot `hash_pair` (same bytes; pinned by
+`committed_leaf_single_shot_equals_streaming`).
+
+Fold-on, same corpora, after: W1 8.2M, W2 16.4M, W3 8.3M, W4 11.6M, W5-1k
+22.2M, W5-100k 11.7M (1.5–3x). What remains is the leaf hash itself
+(~90 ns/call, `corpus --leaf`) at one hash per net-changed order; corpora
+have almost no in-block churn so they under-state the dedup win for
+market-making flow. Pitfall for future benching: `CARGO_TARGET_DIR` set in
+one shell call does not persist to the next — a stale binary was measured
+once; always run the binary cargo just printed.

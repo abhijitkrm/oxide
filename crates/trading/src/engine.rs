@@ -274,11 +274,47 @@ pub struct MatchingEngine<B: BookBackend = DenseBook> {
     /// disables the fold — matcher and test engines pay nothing.
     /// The function pointer keeps this crate dependency-free.
     fold_leaf: Option<fn(&RestingEntry) -> [u8; 32]>,
-    /// `⊕ fold_leaf(entry)` over all resting orders — insertion and
-    /// removal are the same operation under XOR, so the fold is
-    /// maintained in O(1) per mutation and always equals the fold
-    /// of exactly the live resting set.
-    resting_fold: [u8; 32],
+    /// `⊕ fold_leaf(entry)` over the resting set *as of the last
+    /// settle*. The live fold is this value corrected by the pending
+    /// [`Self::fold_log`] (see [`Self::resting_fold`]).
+    fold_base: [u8; 32],
+    /// Net-change log since the last settle: one record per order
+    /// identity touched, holding the entry exactly as `fold_base`
+    /// accounts for it (`None` = not resting then). Hashing is
+    /// deferred to a read, so an order placed and canceled inside one
+    /// window never hashes, and one filled N times hashes twice, not
+    /// 2N. Bounded by `fold_log_cap`; reaching it settles.
+    fold_log: Vec<FoldRecord>,
+    /// Settle threshold for `fold_log`.
+    fold_log_cap: usize,
+}
+
+/// Default bound on the pending fold log — records, not mutations.
+///
+/// Unit: records (one per order identity touched per window).
+/// Origin: plan.md §9.1 + hft-audit F-12 (resting-fold tax). The log
+/// is reserved eagerly (`56 B` per record → ~224 KiB per fold-enabled
+/// market) so a push never allocates. Raising it widens the dedup
+/// window (fewer hashes per block, more memory); lowering it settles
+/// sooner (more hashes, less memory). Settling early is always
+/// correct — only the amount of deduplication changes.
+pub const FOLD_LOG_CAP: usize = 4096;
+
+/// `dst ^= src` — the fold's combine step.
+#[inline]
+fn xor_into(dst: &mut [u8; 32], src: &[u8; 32]) {
+    for (a, b) in dst.iter_mut().zip(src.iter()) {
+        *a ^= *b;
+    }
+}
+
+/// One pending net-change record of the resting fold.
+#[derive(Debug, Clone, Copy)]
+struct FoldRecord {
+    id: OrderId,
+    /// The entry as the settled base counts it; `None` if the order
+    /// was not resting at the last settle.
+    baseline: Option<RestingEntry>,
 }
 
 impl<B: BookBackend> MatchingEngine<B> {
@@ -300,7 +336,9 @@ impl<B: BookBackend> MatchingEngine<B> {
             next_id: 0,
             resting: 0,
             fold_leaf: None,
-            resting_fold: [0; 32],
+            fold_base: [0; 32],
+            fold_log: Vec::new(),
+            fold_log_cap: FOLD_LOG_CAP,
         })
     }
 
@@ -310,29 +348,80 @@ impl<B: BookBackend> MatchingEngine<B> {
     /// already-resting entries are folded in one pass — O(resting),
     /// the same cost the walk it replaces already pays.
     ///
-    /// Measured budget: the fold costs ~one domain-separated hash
-    /// per resting-order mutation — ~160 ns on the dev bench, a
-    /// real but bounded hot-path tax gated by the
-    /// `rest_cancel_pair_folded`/`mixed_workload_folded` rows
-    /// (both inside the match gates).
+    /// Cost model: hashing is *deferred*. A resting mutation appends
+    /// at most one net-change record (no hash); the hashes are paid
+    /// when the fold is read ([`Self::resting_fold`]) or settled
+    /// ([`Self::settle_fold`], also automatic at `FOLD_LOG_CAP`
+    /// records), and only for the orders whose committed view
+    /// changed — two leaves per net-changed order, none for an order
+    /// placed and removed in the same window. The value is
+    /// bit-identical to hashing every mutation eagerly.
     pub fn enable_resting_fold(&mut self, leaf: fn(&RestingEntry) -> [u8; 32]) {
+        // Clear markers left by an earlier enable before dropping the log.
+        self.clear_fold_markers();
+        self.fold_log.clear();
         self.fold_leaf = Some(leaf);
-        self.resting_fold = [0; 32];
+        self.fold_base = [0; 32];
+        self.fold_log.reserve_exact(self.fold_log_cap);
         // Fold the already-resting set once — snapshot installs
         // arrive populated, and an enabled fold must equal the
         // fold of exactly the live set.
         let mut entries = Vec::with_capacity(self.resting as usize);
         self.resting_entries(&mut entries);
         for e in &entries {
-            self.fold_entry(e);
+            xor_into(&mut self.fold_base, &leaf(e));
         }
     }
 
-    /// The maintained resting-fold — `⊕ leaf(entry)` over every
-    /// resting order (`[0; 32]` while the fold is disabled).
+    /// The resting fold — `⊕ leaf(entry)` over every resting order
+    /// (`[0; 32]` while the fold is disabled).
+    ///
+    /// Read-only: it corrects the settled base by the pending
+    /// net-change log without mutating it, so it is always current
+    /// whatever the caller did before. O(pending records) hashes;
+    /// call [`Self::settle_fold`] at block end to bound the log and
+    /// make repeat reads O(1).
     #[must_use]
     pub fn resting_fold(&self) -> [u8; 32] {
-        self.resting_fold
+        let Some(leaf) = self.fold_leaf else { return [0; 32] };
+        let mut out = self.fold_base;
+        for rec in &self.fold_log {
+            if let Some(b) = &rec.baseline {
+                xor_into(&mut out, &leaf(b));
+            }
+            if let Some(slot) = self.ids.get(rec.id.0) {
+                xor_into(&mut out, &leaf(&self.node_entry(slot)));
+            }
+        }
+        out
+    }
+
+    /// Commit the pending net-change log into the settled base. Call
+    /// at block end; the engine also calls it when the log fills.
+    /// Never changes [`Self::resting_fold`]'s value.
+    pub fn settle_fold(&mut self) {
+        if self.fold_leaf.is_none() || self.fold_log.is_empty() {
+            return;
+        }
+        self.fold_base = self.resting_fold();
+        self.clear_fold_markers();
+        self.fold_log.clear();
+    }
+
+    /// Reset the `dirty` marker of every still-resting logged order.
+    fn clear_fold_markers(&mut self) {
+        for rec in &self.fold_log {
+            if let Some(slot) = self.ids.get(rec.id.0) {
+                self.pool[slot].dirty = false;
+            }
+        }
+    }
+
+    /// Override the pending-log bound (tests only — forces early
+    /// settles so the cap path is exercised).
+    #[cfg(test)]
+    pub(crate) fn set_fold_log_cap(&mut self, cap: usize) {
+        self.fold_log_cap = cap.max(1);
     }
 
     /// The pool node's committed view — the same `(id, side,
@@ -348,26 +437,36 @@ impl<B: BookBackend> MatchingEngine<B> {
         }
     }
 
-    /// XOR `leaf(entry)` into `resting_fold` — insertion and
-    /// removal are the same operation under XOR. No-op while the
-    /// fold is disabled.
+    /// Log a freshly rested order (baseline `None`). Call after the
+    /// node is allocated and *before* `ids.insert` is irrelevant —
+    /// the log never reads the new order until a later read.
     #[inline]
-    fn fold_entry(&mut self, e: &RestingEntry) {
-        if let Some(leaf) = self.fold_leaf {
-            let h = leaf(e);
-            for (a, b) in self.resting_fold.iter_mut().zip(h.iter()) {
-                *a ^= *b;
-            }
+    fn fold_note_new(&mut self, slot: u32) {
+        if self.fold_leaf.is_none() {
+            return;
         }
+        if self.fold_log.len() >= self.fold_log_cap {
+            self.settle_fold();
+        }
+        let node = &mut self.pool[slot];
+        node.dirty = true;
+        let id = node.id;
+        self.fold_log.push(FoldRecord { id, baseline: None });
     }
 
-    /// Replace `old`'s leaf with `new`'s in one call — the
-    /// partial-fill/STP-decrement path where a resting order keeps
-    /// its slot but changes quantity.
+    /// Log the pre-mutation state of an existing order, once per
+    /// window. Call *before* changing its qty or removing it.
     #[inline]
-    fn fold_replace(&mut self, old: &RestingEntry, new: &RestingEntry) {
-        self.fold_entry(old);
-        self.fold_entry(new);
+    fn fold_note_touch(&mut self, slot: u32) {
+        if self.fold_leaf.is_none() || self.pool[slot].dirty {
+            return;
+        }
+        if self.fold_log.len() >= self.fold_log_cap {
+            self.settle_fold();
+        }
+        let entry = self.node_entry(slot);
+        self.pool[slot].dirty = true;
+        self.fold_log.push(FoldRecord { id: entry.id, baseline: Some(entry) });
     }
 
     /// The market's configuration (tick/lot/band rules).
@@ -551,11 +650,11 @@ impl<B: BookBackend> MatchingEngine<B> {
                     req.tif,
                 ));
                 self.book.append(slot, &mut self.pool);
-                // Fold right after append: the fold tracks book
+                // Log right after append: the fold tracks book
                 // membership — `resting_entries` (what staged verify
                 // re-folds) emits whatever the book holds, even if a
                 // later step below returns early.
-                self.fold_entry(&self.node_entry(slot));
+                self.fold_note_new(slot);
                 // IdMap is sized ≥ max_resting at ≤0.5 load, so insert
                 // cannot fail after the capacity check above.
                 self.ids.insert(taker_id.0, slot)?;
@@ -580,7 +679,7 @@ impl<B: BookBackend> MatchingEngine<B> {
             let node = &self.pool[slot];
             (node.side, node.price, node.qty, node.owner)
         };
-        self.fold_entry(&self.node_entry(slot));
+        self.fold_note_touch(slot);
         self.book.unlink(slot, &mut self.pool);
         self.pool.release(slot);
         self.resting = self.resting.saturating_sub(1);
@@ -752,8 +851,8 @@ impl<B: BookBackend> MatchingEngine<B> {
         let slot =
             self.pool.alloc(fresh_node(e.id, e.side, e.price, e.qty, e.owner, TimeInForce::Gtc));
         self.book.append(slot, &mut self.pool);
-        self.fold_entry(&self.node_entry(slot));
         self.ids.insert(e.id.0, slot)?;
+        self.fold_note_new(slot);
         self.resting += 1;
         Ok(())
     }
@@ -868,11 +967,9 @@ impl<B: BookBackend> MatchingEngine<B> {
                     taker_side: req.side,
                 });
                 {
-                    let old = self.node_entry(head);
+                    self.fold_note_touch(head);
                     self.pool[head].qty = Qty(m_qty - fill);
                     self.book.reduce_total_at(opp_idx, fill);
-                    let new = self.node_entry(head);
-                    self.fold_replace(&old, &new);
                 }
                 *rem -= fill;
 
@@ -976,11 +1073,9 @@ impl<B: BookBackend> MatchingEngine<B> {
                         reason: RemovalReason::SelfTrade,
                     });
                     {
-                        let old = self.node_entry(head);
+                        self.fold_note_touch(head);
                         self.pool[head].qty = Qty(new_qty);
                         self.book.reduce_total_at(opp_idx, *rem);
-                        let new = self.node_entry(head);
-                        self.fold_replace(&old, &new);
                     }
                     *rem = 0;
                     StpAction::TakerConsumed
@@ -1007,7 +1102,7 @@ impl<B: BookBackend> MatchingEngine<B> {
     /// state) rather than panicking — a panic here would let a
     /// corrupted `IdMap` kill the validator (`DoS` vector).
     fn remove_maker_at(&mut self, slot: u32, id: OrderId, idx: u32) {
-        self.fold_entry(&self.node_entry(slot));
+        self.fold_note_touch(slot);
         self.book.unlink_at(slot, idx, &mut self.pool);
         match self.ids.remove(id.0) {
             Ok(unmapped) => {

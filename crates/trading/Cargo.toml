@@ -41,5 +41,9 @@ exchange = { workspace = true }
 name = "matching"
 harness = false
 
+[[bench]]
+name = "corpus"
+harness = false
+
 [lints]
 workspace = true

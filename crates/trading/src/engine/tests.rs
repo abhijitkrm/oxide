@@ -822,6 +822,64 @@ fn resting_fold_tracks_every_mutation() {
     assert_eq!(restored.resting_fold(), e.resting_fold());
 }
 
+/// Deferred-fold differential: a seeded random stream (limit/market,
+/// GTC/IOC/FOK, every STP mode, cancels of live and dead ids) must
+/// keep the lazy `resting_fold` equal to the authoritative
+/// recomputation after EVERY op, with the pending-log cap forced to
+/// 1, 2, 3, 7 and the default (exercising the mid-op settle path) and
+/// with explicit `settle_fold` calls sprinkled in.
+#[test]
+#[allow(clippy::cast_possible_truncation)] // rnd(n) < n ≤ 4: fits u8/usize
+fn deferred_fold_matches_recompute_under_random_ops() {
+    for cap in [1usize, 2, 3, 7, FOLD_LOG_CAP] {
+        let mut e = engine();
+        e.set_fold_log_cap(cap);
+        e.enable_resting_fold(test_leaf);
+        let mut fills = Vec::new();
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ cap as u64;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for step in 0..4000u32 {
+            fills.clear();
+            match rnd(10) {
+                0..=6 => {
+                    let side = if rnd(2) == 0 { Side::Buy } else { Side::Sell };
+                    let (ot, tif) = match rnd(8) {
+                        0 => (OrderType::Market, TimeInForce::Ioc),
+                        1 => (OrderType::Limit, TimeInForce::Ioc),
+                        2 => (OrderType::Limit, TimeInForce::Fok),
+                        _ => (OrderType::Limit, TimeInForce::Gtc),
+                    };
+                    let mut o = order(
+                        side,
+                        ot,
+                        tif,
+                        1_000_000_000 + (1 + rnd(40)) * 1_000_000,
+                        (1 + rnd(9)) * 1_000,
+                        1 + rnd(4) as u8,
+                    );
+                    o.stp = [
+                        StpMode::None,
+                        StpMode::CancelNewest,
+                        StpMode::CancelOldest,
+                        StpMode::DecrementAndCancel,
+                    ][rnd(4) as usize];
+                    e.place(o, &mut fills).unwrap();
+                }
+                7..=8 => {
+                    let _ = e.cancel(OrderId(rnd(u64::from(step) + 2)));
+                }
+                _ => e.settle_fold(),
+            }
+            assert_eq!(e.resting_fold(), recompute_fold(&e), "cap {cap} step {step}");
+        }
+    }
+}
+
 /// F-22 regression: the bitboard `capped_fillable` and the retained
 /// linear-scan baseline must agree on every book shape. The scan is
 /// the FOK pre-scan — a divergence here accepts an unfillable FOK or

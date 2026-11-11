@@ -10,6 +10,18 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ## [Unreleased]
 
+### Performance
+
+- **Matching engine: the committed-state fold is computed lazily**
+  (`trading`, `framework`). Resting-order changes no longer hash on
+  every mutation; the hashes are paid once per net-changed order when
+  the block's root is read. The state root is bit-identical. On the
+  shared matcher corpora the fold-enabled engine goes from 4.4–9.2M to
+  8.3–22.2M ops/s per core.
+  - **In plain words:** an order that is placed and cancelled inside
+    the same block now costs no hashing at all, and the matching engine
+    with consensus bookkeeping on runs 1.5–3x faster.
+
 ### Documentation
 
 - **Settlement benchmark docs describe the current code and flag the

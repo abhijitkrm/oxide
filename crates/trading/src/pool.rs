@@ -75,6 +75,13 @@ pub struct OrderNode {
     pub side: Side,
     /// Time in force (only the resting remainder's policy matters).
     pub tif: TimeInForce,
+    /// Fold-log marker: `true` while this order already has a record
+    /// in the engine's pending resting-fold log, so a repeat mutation
+    /// within the same settle window skips logging (net-change
+    /// dedup). Only the engine's fold bookkeeping reads or writes it;
+    /// it is not part of the committed view. Fits in the 10 spare
+    /// bytes of the cache line (the size assertion below pins that).
+    pub dirty: bool,
 }
 
 // Static layout claim: one node per cache line. If a field is ever
@@ -226,7 +233,7 @@ pub fn fresh_node(
     owner: Address,
     tif: TimeInForce,
 ) -> OrderNode {
-    OrderNode { qty, price, id, owner, prev: NIL, next: NIL, side, tif }
+    OrderNode { qty, price, id, owner, prev: NIL, next: NIL, side, tif, dirty: false }
 }
 
 #[cfg(test)]
