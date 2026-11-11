@@ -64,6 +64,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod balance;
+pub mod cmdlog;
 pub mod fix;
 pub mod journal;
 pub mod jsonrpc;
@@ -1574,5 +1575,7 @@ pub struct MatcherStats {
     pub pending_settlements: usize,
 }
 
+#[cfg(test)]
+mod journal_wiring_tests;
 #[cfg(test)]
 mod tests;

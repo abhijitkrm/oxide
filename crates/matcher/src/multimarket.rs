@@ -18,6 +18,8 @@ use trading::{
     StpMode, TimeInForce,
 };
 
+use crate::cmdlog::{self, AckPolicy, JournalConfig, Op, RecoveryReport};
+use crate::journal::{Journal, JournalStats, ReadMode};
 use crate::protocol::{
     self, ActionRequest, OrderAction, OrderRequest, OrderResponse, RejectReason,
 };
@@ -87,6 +89,8 @@ pub(crate) struct WorkerStats {
     pub(crate) auth_rejections: u64,
     pub(crate) resting_count: u32,
     pub(crate) pending_settlements: usize,
+    /// Journal health (all zeros when journaling is off).
+    pub(crate) journal: JournalStats,
 }
 
 /// A multi-market parallel matcher: one worker thread per market,
@@ -142,6 +146,9 @@ pub(crate) struct WorkerStats {
 /// `Seal` command to every worker, collects all batches, and
 /// concatenates them. This is lock-free on the hot path.
 pub struct MultiMarketMatcher {
+    /// What each worker found in its journal at start (empty reports
+    /// when journaling is off).
+    recovery: Vec<RecoveryReport>,
     /// One sender per market: protocol handlers push `MarketMessage`
     /// items here (either `Work` or `Seal`/`Stats` control commands).
     /// `mpsc::Sender` is cloneable, so multiple connections can feed
@@ -246,10 +253,51 @@ impl MultiMarketMatcher {
         risk_config: crate::RiskConfig,
         worker_base_core: Option<u32>,
     ) -> Self {
+        Self::with_journal_options(
+            configs,
+            balances,
+            clock,
+            chain_id,
+            nonce_store_path,
+            risk_config,
+            worker_base_core,
+            None,
+        )
+        .expect("matcher start without a journal cannot fail")
+    }
+
+    /// [`Self::with_options`] plus an optional command journal
+    /// (`crate::cmdlog`). With `Some(journal)` every worker first
+    /// recovers its book from `journal.dir/market-{id}/` (newest valid
+    /// checkpoint + journal tail), and only then starts accepting
+    /// work; [`Self::recovery_reports`] says what each one found.
+    ///
+    /// # Errors
+    ///
+    /// A worker's journal or checkpoint is unreadable or corrupt
+    /// somewhere other than a repairable torn tail. Nothing is
+    /// started in that case: replaying past damage would diverge the
+    /// book.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::with_options`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_journal_options(
+        configs: Vec<MarketConfig>,
+        balances: Arc<AtomicBalanceCache>,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+        chain_id: u64,
+        nonce_store_path: Option<std::path::PathBuf>,
+        risk_config: crate::RiskConfig,
+        worker_base_core: Option<u32>,
+        journal: Option<JournalConfig>,
+    ) -> Result<Self, String> {
         assert!(!configs.is_empty(), "must have at least one market");
         let num_markets = configs.len();
         let mut market_senders = Vec::with_capacity(num_markets);
         let mut threads = Vec::with_capacity(num_markets);
+        let mut ready_rxs = Vec::with_capacity(num_markets);
         // The nonce tracker is SHARED across workers: nonces are
         // per-account, not per-market, so a replayed nonce must be
         // rejected no matter which market it lands on. A short Mutex
@@ -276,16 +324,44 @@ impl MultiMarketMatcher {
             // the online set is caught by startup validation.
             let actor = format!("market-worker-{}", cfg.market_id);
             let pin = worker_base_core.map(|base| base + u32::try_from(i).unwrap_or(u32::MAX));
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let jcfg = journal.clone();
             let thread =
                 primitives::supervision::spawn_supervised_pinned(&actor, false, pin, move || {
-                    MarketWorker::run(cfg, balances, nonces, clock, rx, risk_config);
+                    MarketWorker::run(
+                        cfg,
+                        balances,
+                        nonces,
+                        clock,
+                        rx,
+                        risk_config,
+                        jcfg,
+                        ready_tx,
+                    );
                 })
                 .expect("spawn market worker thread");
             market_senders.push(tx);
             threads.push(thread);
+            ready_rxs.push(ready_rx);
+        }
+        // Wait for every worker to finish recovery before returning.
+        let mut recovery = Vec::with_capacity(num_markets);
+        for rx in ready_rxs {
+            match rx.recv() {
+                Ok(Ok(r)) => recovery.push(r),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err("market worker died during recovery".to_owned()),
+            }
         }
 
-        Self { market_senders, _threads: threads, num_markets, nonces, chain_id }
+        Ok(Self { market_senders, _threads: threads, num_markets, nonces, chain_id, recovery })
+    }
+
+    /// What each market worker recovered from its journal at start,
+    /// in market order.
+    #[must_use]
+    pub fn recovery_reports(&self) -> &[RecoveryReport] {
+        &self.recovery
     }
 
     /// The chain ID order signatures are verified against —
@@ -578,6 +654,22 @@ impl MultiMarketMatcher {
         total
     }
 
+    /// Journal health per market, in market order (durable lag, queue
+    /// depth, fsync count and time). All zeros for a market whose
+    /// journal is off or whose worker has died.
+    pub fn journal_stats(&self) -> Vec<JournalStats> {
+        self.market_senders
+            .iter()
+            .map(|tx| {
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                if tx.send(MarketMessage::Stats(reply_tx)).is_err() {
+                    return JournalStats::default();
+                }
+                reply_rx.recv().map(|s| s.journal).unwrap_or_default()
+            })
+            .collect()
+    }
+
     /// Number of markets.
     #[must_use]
     pub fn num_markets(&self) -> usize {
@@ -652,12 +744,28 @@ pub(crate) struct MarketWorker {
     /// [`MatchingServer`] keeps so fills carry the on-chain
     /// `(owner, client_id)` authorization key.
     order_client_ids: HashMap<u64, u64>,
+    /// Command journal, if configured (see `crate::cmdlog`).
+    journal: Option<WorkerJournal>,
+}
+
+/// A worker's journal and its bookkeeping.
+struct WorkerJournal {
+    journal: Journal,
+    cfg: JournalConfig,
+    dir: std::path::PathBuf,
+    /// Sequence of the last checkpoint taken (or recovered from).
+    last_checkpoint: u64,
+    /// Set after any journal failure: nothing more is applied, because
+    /// in-memory state could otherwise run ahead of the log.
+    failed: bool,
+    scratch: Vec<u8>,
 }
 
 impl MarketWorker {
     /// The worker loop: receive messages (work or control), process
     /// them. Blocks on the single channel — no polling, no missed
     /// control commands.
+    #[allow(clippy::too_many_arguments)] // worker wiring: one value per collaborator
     pub(crate) fn run(
         cfg: MarketConfig,
         balances: Arc<AtomicBalanceCache>,
@@ -665,11 +773,14 @@ impl MarketWorker {
         clock: Arc<dyn Fn() -> u64 + Send + Sync>,
         rx: std::sync::mpsc::Receiver<MarketMessage>,
         risk_config: crate::RiskConfig,
+        journal: Option<JournalConfig>,
+        ready: std::sync::mpsc::Sender<Result<RecoveryReport, String>>,
     ) {
         let vcfg = cfg.validated().expect("market config must be valid");
         let engine = MatchingEngine::new(vcfg, DenseBook::new(vcfg).expect("book creation"))
             .expect("engine creation");
         let mut worker = MarketWorker {
+            journal: None,
             engine,
             balances,
             nonces,
@@ -688,14 +799,28 @@ impl MarketWorker {
             auth_rejections: 0,
         };
 
+        // Recover from the journal (if configured) BEFORE accepting
+        // work, and tell the constructor how it went.
+        let report = match journal {
+            Some(jcfg) => worker.recover(jcfg),
+            None => Ok(RecoveryReport { market: cfg.market_id, ..RecoveryReport::default() }),
+        };
+        let failed = report.is_err();
+        let _ = ready.send(report);
+        if failed {
+            return;
+        }
+
         loop {
             match rx.recv() {
                 Ok(MarketMessage::Work(work)) => {
                     let responses = worker.process_batch(&work.orders);
+                    let responses = worker.release(responses);
                     let _ = work.response_tx.send(responses);
                 }
                 Ok(MarketMessage::Action(action_work)) => {
                     let resp = worker.submit_verified_action(action_work.action);
+                    let resp = worker.release(vec![resp]).remove(0);
                     let _ = action_work.response_tx.send(resp);
                 }
                 Ok(MarketMessage::Seal(reply)) => {
@@ -705,6 +830,11 @@ impl MarketWorker {
                     worker.cost_acc.legs.clear();
                     let batch =
                         crate::settlement::take_presized_batch(&mut worker.settlement_batch);
+                    // The seal marker must be DURABLE before the batch is
+                    // handed off: if the marker were lost, recovery would
+                    // re-queue fills the settler already holds.
+                    worker.log_seal_durably();
+                    worker.maybe_checkpoint();
                     let _ = reply.send(batch);
                 }
                 Ok(MarketMessage::Stats(reply)) => {
@@ -717,10 +847,225 @@ impl MarketWorker {
                         auth_rejections: worker.auth_rejections,
                         resting_count: worker.engine.resting_count(),
                         pending_settlements: worker.settlement_batch.len(),
+                        journal: worker
+                            .journal
+                            .as_ref()
+                            .map(|j| j.journal.stats())
+                            .unwrap_or_default(),
                     };
                     let _ = reply.send(stats);
                 }
                 Err(_) => break, // All senders dropped — shutdown.
+            }
+        }
+    }
+
+    // ── Journal (docs: `crate::cmdlog`) ───────────────────────────
+
+    /// Append `op` to the journal BEFORE it is applied. `true` means
+    /// "go ahead" (also when journaling is off); `false` means the
+    /// journal has failed and the operation must NOT be applied.
+    fn log(&mut self, op: &Op) -> bool {
+        let Some(w) = self.journal.as_mut() else { return true };
+        if w.failed {
+            return false;
+        }
+        w.scratch.clear();
+        op.encode(&mut w.scratch);
+        if w.journal.append(&w.scratch).is_err() {
+            w.failed = true;
+            return false;
+        }
+        true
+    }
+
+    /// Log the seal marker and wait until it is durable.
+    fn log_seal_durably(&mut self) {
+        if self.journal.is_none() {
+            return;
+        }
+        if self.log(&Op::Seal)
+            && let Some(w) = self.journal.as_mut()
+            && (w.journal.flush().is_err() || !w.journal.wait_durable(w.journal.seq()))
+        {
+            w.failed = true;
+        }
+    }
+
+    /// End of a batch: hand the journal's partial chunk to its I/O
+    /// thread and, under [`AckPolicy::Durable`], hold the responses
+    /// until the batch is durable. A journal failure replaces every
+    /// response with an engine error — the batch's effects are already
+    /// in memory, so the worker refuses all further work (see
+    /// `WorkerJournal::failed`) and the operator restarts it; recovery
+    /// then reflects exactly what became durable.
+    fn release(&mut self, responses: Vec<OrderResponse>) -> Vec<OrderResponse> {
+        let Some(w) = self.journal.as_mut() else { return responses };
+        let mut ok = !w.failed && w.journal.flush().is_ok();
+        if ok && w.cfg.ack == AckPolicy::Durable {
+            ok = w.journal.wait_durable(w.journal.seq());
+        }
+        if !ok {
+            w.failed = true;
+            return responses
+                .iter()
+                .map(|_| OrderResponse::rejected(RejectReason::EngineError))
+                .collect();
+        }
+        responses
+    }
+
+    /// Take a checkpoint if enough records accumulated since the last
+    /// one. Only called right after a seal, when the pending batch and
+    /// the cost accumulator are empty by construction.
+    fn maybe_checkpoint(&mut self) {
+        let Some(w) = self.journal.as_mut() else { return };
+        let every = w.cfg.checkpoint_after_records;
+        if w.failed || every == 0 || w.journal.seq() < w.last_checkpoint + every {
+            return;
+        }
+        let Ok(cut) = w.journal.rotate() else {
+            w.failed = true;
+            return;
+        };
+        if !w.journal.wait_durable(cut) {
+            w.failed = true;
+            return;
+        }
+        let (mut engine, mut scratch) = (Vec::new(), Vec::new());
+        self.engine.write_canonical_state(&mut engine, &mut scratch);
+        let mut client_ids: Vec<(u64, u64)> =
+            self.order_client_ids.iter().map(|(a, b)| (*a, *b)).collect();
+        client_ids.sort_unstable(); // deterministic bytes
+        let ckpt = cmdlog::Checkpoint { seq: cut, engine, client_ids };
+        if cmdlog::write_checkpoint(&w.dir, &ckpt).is_err() {
+            // Not fatal: the journal still holds everything.
+            return;
+        }
+        w.last_checkpoint = cut;
+        let _ = w.journal.truncate_through(cut);
+    }
+
+    /// Rebuild this worker from its journal: newest valid checkpoint,
+    /// then every later record. Replay applies the engine operation and
+    /// the bookkeeping that depends on it (resting counts, client ids,
+    /// the pending settlement batch) and touches NO balances.
+    fn recover(&mut self, jcfg: JournalConfig) -> Result<RecoveryReport, String> {
+        let market = self.engine.config().market_id;
+        let dir = jcfg.market_dir(market);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("journal dir: {e}"))?;
+        let mut report = RecoveryReport { market, ..RecoveryReport::default() };
+
+        if let Some(c) = cmdlog::latest_checkpoint(&dir).map_err(|e| format!("checkpoint: {e}"))? {
+            self.engine =
+                MatchingEngine::from_canonical_state(&c.engine, |cfg| DenseBook::new(*cfg))
+                    .map_err(|e| format!("checkpoint state: {e}"))?;
+            self.order_client_ids = c.client_ids.into_iter().collect();
+            let mut resting = Vec::new();
+            self.engine.resting_entries(&mut resting);
+            for e in &resting {
+                self.risk.inc_resting(&e.owner);
+            }
+            report.checkpoint_seq = c.seq;
+        }
+
+        // A torn final record is repaired (it was never acknowledged
+        // as durable); anything else stops the start.
+        let tail = crate::journal::read_from(&dir, ReadMode::Repair, report.checkpoint_seq + 1)
+            .map_err(|e| format!("journal: {e}"))?;
+        for (seq, payload) in tail {
+            let op =
+                Op::decode(&payload).ok_or_else(|| format!("journal: bad record at seq {seq}"))?;
+            self.replay(op);
+            report.replayed += 1;
+            report.last_seq = seq;
+        }
+        report.last_seq = report.last_seq.max(report.checkpoint_seq);
+
+        let mut resting = Vec::new();
+        self.engine.resting_entries(&mut resting);
+        report.resting = u32::try_from(resting.len()).unwrap_or(u32::MAX);
+        report.pending_fills = self.settlement_batch.len();
+        let mut per_owner: std::collections::BTreeMap<primitives::Address, u64> =
+            std::collections::BTreeMap::new();
+        for e in resting.iter().filter(|e| e.side == Side::Buy) {
+            let q = u64::try_from(u128::from(e.price.0) * u128::from(e.qty.0) / PRICE_SCALE)
+                .unwrap_or(u64::MAX);
+            let slot = per_owner.entry(e.owner).or_insert(0);
+            *slot = slot.saturating_add(q);
+        }
+        report.buy_reservations = per_owner.into_iter().collect();
+
+        let journal = Journal::open(&dir).map_err(|e| format!("journal open: {e}"))?;
+        self.journal = Some(WorkerJournal {
+            last_checkpoint: report.checkpoint_seq,
+            journal,
+            cfg: jcfg,
+            dir,
+            failed: false,
+            scratch: Vec::with_capacity(64),
+        });
+        Ok(report)
+    }
+
+    /// Apply one journaled operation to the in-memory state (replay).
+    fn replay(&mut self, op: Op) {
+        match op {
+            Op::Place { side, order_type, tif, price, qty, owner, client_id } => {
+                let order =
+                    NewOrder { side, order_type, tif, price, qty, owner, stp: StpMode::None };
+                self.fills.clear();
+                self.removed.clear();
+                let Ok(outcome) = self.engine.place_with_cap(
+                    order,
+                    &mut self.fills,
+                    &mut trading::ObserveRemovals { removed: &mut self.removed },
+                ) else {
+                    return;
+                };
+                let market = self.engine.config().market_id;
+                for f in &self.fills {
+                    self.fills_produced += 1;
+                    let (buyer, seller, buyer_id, seller_id) =
+                        fill_parties(f, client_id, &self.order_client_ids);
+                    let quote_amount = self.cost_acc.add(
+                        LegId::new(market, f.price.0, buyer, buyer_id, seller, seller_id),
+                        f.qty.0,
+                    );
+                    self.settlement_batch.push(SettledFill {
+                        market,
+                        price: f.price,
+                        qty: f.qty,
+                        buyer,
+                        buyer_id,
+                        seller,
+                        seller_id,
+                        quote_amount,
+                    });
+                }
+                for gone in gone_makers(&self.engine, &self.removed, &self.fills) {
+                    self.risk.dec_resting(&gone);
+                }
+                evict_gone_client_ids(
+                    &self.engine,
+                    &self.fills,
+                    &self.removed,
+                    &mut self.order_client_ids,
+                );
+                if let OrderOutcome::Resting { order_id, .. } = outcome {
+                    self.risk.inc_resting(&owner);
+                    self.order_client_ids.insert(order_id.0, client_id);
+                }
+            }
+            Op::Cancel { order_id } => {
+                if let Ok(c) = self.engine.cancel(trading::OrderId(order_id)) {
+                    self.risk.dec_resting(&c.owner);
+                    self.order_client_ids.remove(&order_id);
+                }
+            }
+            Op::Seal => {
+                self.cost_acc.legs.clear();
+                let _ = crate::settlement::take_presized_batch(&mut self.settlement_batch);
             }
         }
     }
@@ -764,6 +1109,7 @@ impl MarketWorker {
     /// reserve → match → settle. Private — also used by the internal
     /// amend/replace resubmits (authenticated by their enclosing
     /// signed action).
+    #[allow(clippy::too_many_lines)] // one admission → match → settle sequence, kept linear for audit
     pub(crate) fn execute_order(&mut self, req: &OrderRequest) -> OrderResponse {
         // ── Risk-engine checks ───────────────────────────────────
         // Per-market risk engine: rate limit, size cap, price band,
@@ -818,6 +1164,24 @@ impl MarketWorker {
         // `ObserveRemovals` reports non-fill removals for the
         // resting-count bookkeeping below — same as the
         // single-market server.
+        // Journal-before-apply: the record is appended before the
+        // engine sees the order. If the journal has failed the order is
+        // not applied and its reservation comes straight back.
+        if !self.log(&Op::Place {
+            side: order.side,
+            order_type: order.order_type,
+            tif: order.tif,
+            price: order.price,
+            qty: order.qty,
+            owner: order.owner,
+            client_id: req.nonce,
+        }) {
+            self.engine_rejections += 1;
+            if reservation > 0 {
+                self.balances.credit(&req.owner, reservation);
+            }
+            return OrderResponse::rejected(RejectReason::EngineError);
+        }
         self.fills.clear();
         self.removed.clear();
         let Ok(outcome) = self.engine.place_with_cap(
@@ -960,6 +1324,10 @@ impl MarketWorker {
                 return OrderResponse::rejected(RejectReason::OrderNotFound);
             }
         }
+        if !self.log(&Op::Cancel { order_id }) {
+            self.engine_rejections += 1;
+            return OrderResponse::rejected(RejectReason::EngineError);
+        }
         let Ok(canceled) = self.engine.cancel(trading::OrderId(order_id)) else {
             self.engine_rejections += 1;
             return OrderResponse::rejected(RejectReason::OrderNotFound);
@@ -990,6 +1358,10 @@ impl MarketWorker {
                 self.engine_rejections += 1;
                 return OrderResponse::rejected(RejectReason::OrderNotFound);
             }
+        }
+        if !self.log(&Op::Cancel { order_id }) {
+            self.engine_rejections += 1;
+            return OrderResponse::rejected(RejectReason::EngineError);
         }
         let Ok(canceled) = self.engine.cancel(trading::OrderId(order_id)) else {
             self.engine_rejections += 1;
@@ -1033,6 +1405,10 @@ impl MarketWorker {
                 self.engine_rejections += 1;
                 return OrderResponse::rejected(RejectReason::OrderNotFound);
             }
+        }
+        if !self.log(&Op::Cancel { order_id }) {
+            self.engine_rejections += 1;
+            return OrderResponse::rejected(RejectReason::EngineError);
         }
         let Ok(canceled) = self.engine.cancel(trading::OrderId(order_id)) else {
             self.engine_rejections += 1;

@@ -24367,3 +24367,53 @@ tokio `Notify` and padded atomics in the same struct as the SPSC core, so a
 faithful loom test first needs the core (`slots/head/tail`) extracted behind a
 `sync` shim and a pinned `loom` dev-dependency (new-dependency rules: ≥7 days
 old, exact pin, `cargo deny`). Both are follow-ups.
+
+### Journal wired into the market workers (`cmdlog`, `with_journal_options`)
+
+Opt-in per deployment (`JournalConfig` → `MultiMarketMatcher::with_journal_options`;
+`with_options` is unchanged and journals nothing).
+
+- **What is journaled:** engine operations, appended *after* admission
+  (signature, nonce, risk, reservation) and *before* the engine runs: `Place`
+  (side, type, tif, price, qty, owner, client id), `Cancel(order id)`, `Seal`.
+  Amend/replace are the cancel + place the worker already performs. Replay
+  therefore needs no clock and no balances: a wall-clock rate-limit rejection
+  is never in the log. A journal failure stops the worker applying anything
+  (reservation refunded, `EngineError`) so memory cannot run ahead of the log.
+- **Ack policy:** `Queued` (default; flush at batch end, durable within one
+  group commit, loss window = `JournalStats::lag`) or `Durable` (responses held
+  until the batch is fsynced). Seal markers are always made durable BEFORE the
+  batch is handed to the settler.
+- **Checkpoint + truncation:** at a seal (pending batch and cost accumulator
+  empty by construction) once `checkpoint_after_records` accumulated: rotate
+  the journal, wait durable, write `checkpoint-{seq}.snap` (engine canonical
+  state + book-id → client-id map, CRC-32C, tmp+fsync+rename+dir fsync), delete
+  whole segments ≤ seq, keep one checkpoint. Recovery falls back to older
+  checkpoints / the empty book if the newest is corrupt.
+- **Recovery:** newest valid checkpoint, then every later record (torn tail
+  repaired, mid-file damage refuses to start). Replay applies the engine op and
+  its bookkeeping (resting counts, client ids, the unsealed settlement batch,
+  marginal-cost accumulator) and never touches balances. Constructor blocks
+  until every worker has recovered; `recovery_reports()` says what each found,
+  including `buy_reservations` — the quote the recovered resting buys imply —
+  for the service to re-apply after reloading its (chain-derived) balances.
+  That reload/re-reserve step is the service's and is NOT done here.
+- **Metrics:** `journal_stats()` per market: appended, durable, lag, queue
+  depth, fsync count/total/max.
+- **Tests (all in `journal_wiring_tests`):** recovered state == an unjournaled
+  run of the same 400-step flow (resting count and the unsealed fills, fill for
+  fill); same with 600 steps, checkpoints every 25 records and truncation
+  (exactly one checkpoint kept, early segments gone, recovery starts from it);
+  reservation report; both ack policies + metrics; torn tail repaired / hole
+  refuses start; and a real crash test — a child process acknowledging orders
+  under `Durable` is `SIGKILL`ed after 300 acks and every acknowledged order is
+  resting after recovery (5/5 runs).
+- **Overhead** (M1, release, 20k pre-signed orders in batches of 256,
+  signature verification dominates): off 46.2k orders/s, queued 45.6k (-1.3%),
+  durable 33.7k (-27%: one ~2 ms fsync per batch).
+
+Known gaps: balances/reservations are reported, not reapplied; no automatic
+idle flush (a quiet matcher with `Queued` flushes at each batch end, which
+covers every submit path, but nothing flushes a partially filled chunk on a
+timer); single-writer per market means no cross-market total order — recovery
+is per market, matching how the books are independent.
