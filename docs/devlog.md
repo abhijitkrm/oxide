@@ -24146,3 +24146,29 @@ the 88-byte `FillEvent` costs ~1–2% on mixed flow and ≤10% on a sweep-only
 stream: **not** worth changing `FillEvent`'s shape and every consumer, which
 the first review had proposed. The seam stays for callers that only need a
 digest or a compact record.
+
+### Matcher-parity, step 4: native `amend`
+
+`MatchingEngine::amend(id, price, qty, fills, cap)`: same-price decrease
+resizes in place and keeps FIFO priority; anything else leaves the queue,
+re-crosses at the new price as a GTC limit with `StpMode::None`, and rests the
+remainder at the back under the SAME id — the id-map entry and pool slot are
+reused instead of remove/insert + free/alloc. Rejects (tick/lot/band) leave
+the order untouched. Engine-level only: no module wire tag was added and the
+modules' cancel + re-place (`crates/matcher::amend_order`/`replace_order`,
+which also do balance refunds/reservations around it) are untouched, so there
+is no protocol change; wiring a module to it is a separate, spec-first change
+(reservation accounting is C6-sensitive).
+
+Fold interaction: an amended order is logged once with its pre-amend baseline;
+while it is unlinked-but-mapped an automatic settle would read its stale node,
+so `fold_hold` suspends auto-settle for the duration of the amend (the log cap
+is soft by that call's fills). Tests: `amend_matches_cancel_place_model`
+(6000-op random stream × log caps 1/3/default vs cancel + place: identical
+fills, identical FIFO books, fold == recompute after every op, id preserved);
+two mutations (skipping the touch on the in-place path; leaving the hold off)
+are both caught.
+
+Corpus bench (`--replace native`), M1 single core, median: W3 19.1 → 27.5M/s,
+W4 27.5 → 37.1M, W5-1k 49.6 → 57.8M, W5-100k 27.1 → 37.1M; with the fold on
+W4 11.6 → 14.8M.

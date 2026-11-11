@@ -3,7 +3,7 @@
 //! so Oxide and matcher-rust are measured on identical command streams.
 //!
 //! ```text
-//! corpus <prefix> [--fold] [--block N] [--reps R] [--latency] [--sink vec|count]
+//! corpus <prefix> [--fold] [--block N] [--reps R] [--latency] [--sink vec|count] [--replace cancel|native]
 //! ```
 //!
 //! Loads `<prefix>.setup.cmd.jsonl` (untimed) and `<prefix>.run.cmd.jsonl`
@@ -68,6 +68,8 @@ enum Op {
     Place(NewOrder),
     Cancel(OrderId),
     Replace(OrderId, NewOrder),
+    /// Native amend (`--replace native`): same id, priority kept on a same-price decrease.
+    Amend(OrderId, Price, Qty),
 }
 
 fn get<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -155,6 +157,7 @@ fn make_engine(max_orders: usize, fold: bool) -> MatchingEngine {
 /// Resolve corpus commands to engine ops (untimed) while executing
 /// them, so the engine ends in the post-state of the stream.
 struct Resolver {
+    native: bool,
     /// corpus id -> (engine id, side, order type) of a live resting order.
     live: Vec<Option<(OrderId, Side, OrderType, TimeInForce)>>,
 }
@@ -196,6 +199,14 @@ impl Resolver {
                         owner: Address([(*id % 251) as u8 + 1; 20]),
                         stp: StpMode::None,
                     };
+                    if self.native {
+                        ops.push(Op::Amend(oid, order.price, order.qty));
+                        let out = e.amend(oid, order.price, order.qty, fills, &mut trading::NoCap);
+                        if matches!(out, Ok(trading::AmendOutcome::Filled)) {
+                            self.live[*id as usize] = None;
+                        }
+                        continue;
+                    }
                     self.live[*id as usize] = None;
                     ops.push(Op::Replace(oid, order));
                     let _ = e.cancel(oid);
@@ -269,6 +280,9 @@ fn exec<S: Probe>(e: &mut MatchingEngine, op: &Op, fills: &mut S) -> u64 {
         Op::Replace(id, o) => {
             let _ = black_box(e.cancel(*id));
             black_box(e.place_into(*o, fills).unwrap());
+        }
+        Op::Amend(id, p, q) => {
+            let _ = black_box(e.amend(*id, *p, *q, fills, &mut trading::NoCap));
         }
     }
     fills.count()
@@ -390,7 +404,8 @@ fn main() {
 
     // Resolve pass (untimed): scratch engine learns each command's engine ids.
     let mut scratch = make_engine(max_orders, fold);
-    let mut r = Resolver { live: Vec::new() };
+    let native = args.iter().any(|a| a == "--replace") && args.iter().any(|a| a == "native");
+    let mut r = Resolver { native, live: Vec::new() };
     let setup_ops = r.run(&mut scratch, &setup, &mut fills);
     let run_ops = r.run(&mut scratch, &run, &mut fills);
     drop(scratch);

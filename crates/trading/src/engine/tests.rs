@@ -858,6 +858,157 @@ fn place_into_custom_sink_sees_identical_fills() {
     assert_eq!(want.len(), 3, "the buy sweeps three makers");
 }
 
+/// `amend` vs the cancel + place it replaces, over a seeded random
+/// stream: identical fills (ids aside), identical resting books
+/// (side/price/qty/owner in FIFO order), the amended engine's fold
+/// equal to a full recompute after every op (caps 1/3/default), and
+/// the order id preserved across a re-queue. Same-price decreases are
+/// the one deliberate difference — they keep priority — so the model
+/// engine applies them as an in-place qty change too (cancel + place
+/// would move the order to the back).
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::many_single_char_names
+)]
+fn amend_matches_cancel_place_model() {
+    type Shape = (u64, u64, u64, Side, u8);
+    fn shapes(e: &MatchingEngine) -> Vec<(Side, u64, u64, u8)> {
+        let mut v = Vec::new();
+        e.resting_entries(&mut v);
+        v.iter().map(|r| (r.side, r.price.0, r.qty.0, r.owner.0[0])).collect()
+    }
+    fn fshape(f: &FillEvent) -> Shape {
+        (f.price.0, f.qty.0, f.maker_owner.0[0] as u64, f.taker_side, f.taker_owner.0[0])
+    }
+    for cap in [1usize, 3, FOLD_LOG_CAP] {
+        let (mut amended, mut model) = (engine(), engine());
+        amended.set_fold_log_cap(cap);
+        amended.enable_resting_fold(test_leaf);
+        // Logical orders: (id in A, id in B).
+        let mut live: Vec<(OrderId, OrderId)> = Vec::new();
+        let (mut fa, mut fb) = (Vec::new(), Vec::new());
+        let mut seed: u64 = 0xD1B5_4A32_D192_ED03 ^ cap as u64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for step in 0..6000u32 {
+            fa.clear();
+            fb.clear();
+            if rnd(10) < 5 || live.is_empty() {
+                let side = if rnd(2) == 0 { Side::Buy } else { Side::Sell };
+                let o = order(
+                    side,
+                    OrderType::Limit,
+                    TimeInForce::Gtc,
+                    1_000_000_000 + (1 + rnd(30)) * 1_000_000,
+                    (1 + rnd(9)) * 1_000,
+                    1 + rnd(3) as u8,
+                );
+                let (ra, rb) =
+                    (amended.place(o, &mut fa).unwrap(), model.place(o, &mut fb).unwrap());
+                // Ids drift between the engines (a model re-place burns an
+                // id that `amend` keeps), so compare outcomes by shape.
+                let shape = |o: OrderOutcome| match o {
+                    OrderOutcome::Resting { price, resting_qty, .. } => (1, price.0, resting_qty.0),
+                    OrderOutcome::Filled => (2, 0, 0),
+                    OrderOutcome::Rejected(_) => (3, 0, 0),
+                    other => panic!("unexpected outcome {other:?}"),
+                };
+                assert_eq!(shape(ra), shape(rb));
+                if let (
+                    OrderOutcome::Resting { order_id: ia, .. },
+                    OrderOutcome::Resting { order_id: ib, .. },
+                ) = (ra, rb)
+                {
+                    live.push((ia, ib));
+                }
+            } else {
+                let k = rnd(live.len() as u64) as usize;
+                let (ia, ib) = live[k];
+                let price = Price(1_000_000_000 + (1 + rnd(30)) * 1_000_000);
+                let qty = Qty((1 + rnd(9)) * 1_000);
+                let ra = amended.amend(ia, price, qty, &mut fa, &mut NoCap);
+                // Model: same-price decrease keeps priority (in-place);
+                // anything else is cancel + re-place with the old side/owner.
+                let entry = {
+                    let mut v = Vec::new();
+                    model.resting_entries(&mut v);
+                    v.into_iter().find(|r| r.id == ib)
+                };
+                match (ra, entry) {
+                    (Err(_), None) => {
+                        live.swap_remove(k);
+                    }
+                    (Ok(out), Some(en)) => {
+                        if price == en.price && qty <= en.qty {
+                            assert_eq!(out, AmendOutcome::Reduced { qty });
+                            // In-place model: replace qty without moving.
+                            // (Rebuild B's book is not possible in place,
+                            // so apply the same primitive through a
+                            // second amend on B — the Reduced path.)
+                            let rb = model.amend(ib, price, qty, &mut fb, &mut NoCap).unwrap();
+                            assert_eq!(rb, out);
+                        } else {
+                            let c = model.cancel(ib).unwrap();
+                            let o = order(
+                                c.side,
+                                OrderType::Limit,
+                                TimeInForce::Gtc,
+                                price.0,
+                                qty.0,
+                                c.owner.0[0],
+                            );
+                            let rb = model.place(o, &mut fb).unwrap();
+                            match (out, rb) {
+                                (
+                                    AmendOutcome::Resting { price: p, resting_qty: q },
+                                    OrderOutcome::Resting {
+                                        order_id: nb,
+                                        price: pb,
+                                        resting_qty: qb,
+                                    },
+                                ) => {
+                                    assert_eq!((p, q), (pb, qb));
+                                    assert_eq!(
+                                        amended.order_owner(ia),
+                                        Some(c.owner),
+                                        "id preserved"
+                                    );
+                                    live[k] = (ia, nb);
+                                }
+                                (AmendOutcome::Filled, OrderOutcome::Filled) => {
+                                    live.swap_remove(k);
+                                }
+                                other => panic!("diverged: {other:?}"),
+                            }
+                        }
+                    }
+                    (Err(_), Some(_)) | (Ok(_), None) => {
+                        panic!("amend and model disagree on liveness at step {step}")
+                    }
+                }
+            }
+            assert_eq!(
+                fa.iter().map(fshape).collect::<Vec<_>>(),
+                fb.iter().map(fshape).collect::<Vec<_>>(),
+                "fills, cap {cap} step {step}"
+            );
+            assert_eq!(shapes(&amended), shapes(&model), "book, cap {cap} step {step}");
+            assert_eq!(
+                amended.resting_fold(),
+                recompute_fold(&amended),
+                "fold, cap {cap} step {step}"
+            );
+        }
+    }
+}
+
 /// Deferred-fold differential: a seeded random stream (limit/market,
 /// GTC/IOC/FOK, every STP mode, cancels of live and dead ids) must
 /// keep the lazy `resting_fold` equal to the authoritative

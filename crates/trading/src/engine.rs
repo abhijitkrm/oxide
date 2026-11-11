@@ -245,6 +245,32 @@ pub enum OrderOutcome {
     Rejected(RejectReason),
 }
 
+/// Result of [`MatchingEngine::amend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmendOutcome {
+    /// Same price, quantity not increased: the order was resized in
+    /// place and **kept its time priority**. `qty` is the new
+    /// remaining quantity.
+    Reduced {
+        /// Remaining quantity after the resize.
+        qty: Qty,
+    },
+    /// The order left its queue, crossed the book at the new price
+    /// (fills went to the sink) and the remainder rests at the back
+    /// of its new level under the **same order id**.
+    Resting {
+        /// New resting price.
+        price: Price,
+        /// Remaining quantity.
+        resting_qty: Qty,
+    },
+    /// The re-cross consumed the whole order; it is gone.
+    Filled,
+    /// The new price/quantity violate the market's rules; the order
+    /// is untouched.
+    Rejected(RejectReason),
+}
+
 /// A successfully canceled resting order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanceledOrder {
@@ -308,6 +334,12 @@ pub struct MatchingEngine<B: BookBackend = DenseBook> {
     fold_log: Vec<FoldRecord>,
     /// Settle threshold for `fold_log`.
     fold_log_cap: usize,
+    /// `true` while an `amend` has an order unlinked from the book
+    /// but still in `ids`: an automatic settle then would read that
+    /// order's pre-amend node as its settled state. The log cap is
+    /// soft for the duration (it may exceed `fold_log_cap` by the
+    /// amend's fills).
+    fold_hold: bool,
 }
 
 /// Default bound on the pending fold log — records, not mutations.
@@ -360,6 +392,7 @@ impl<B: BookBackend> MatchingEngine<B> {
             fold_base: [0; 32],
             fold_log: Vec::new(),
             fold_log_cap: FOLD_LOG_CAP,
+            fold_hold: false,
         })
     }
 
@@ -466,7 +499,7 @@ impl<B: BookBackend> MatchingEngine<B> {
         if self.fold_leaf.is_none() {
             return;
         }
-        if self.fold_log.len() >= self.fold_log_cap {
+        if self.fold_log.len() >= self.fold_log_cap && !self.fold_hold {
             self.settle_fold();
         }
         let node = &mut self.pool[slot];
@@ -482,7 +515,7 @@ impl<B: BookBackend> MatchingEngine<B> {
         if self.fold_leaf.is_none() || self.pool[slot].dirty {
             return;
         }
-        if self.fold_log.len() >= self.fold_log_cap {
+        if self.fold_log.len() >= self.fold_log_cap && !self.fold_hold {
             self.settle_fold();
         }
         let entry = self.node_entry(slot);
@@ -718,6 +751,102 @@ impl<B: BookBackend> MatchingEngine<B> {
         self.pool.release(slot);
         self.resting = self.resting.saturating_sub(1);
         Ok(CanceledOrder { order_id: id, side, price, qty, owner })
+    }
+
+    /// Amend a resting order in place of cancel + re-place.
+    ///
+    /// Semantics (the contract this op adds; it is engine-level only —
+    /// no module wire tag exposes it yet, so the chain's protocol is
+    /// unchanged):
+    ///
+    /// - The new `(price, qty)` is validated as a GTC limit remainder
+    ///   of this market (tick/lot/band). Violations return
+    ///   [`AmendOutcome::Rejected`] and leave the order untouched.
+    /// - **Same price, `new_qty <= remaining`:** resized in place,
+    ///   FIFO position kept ([`AmendOutcome::Reduced`]). Equal
+    ///   quantity is a no-op.
+    /// - **Otherwise (price change or size increase):** the order
+    ///   loses priority. It leaves its queue, crosses the opposite
+    ///   side at the new price exactly like an incoming GTC limit
+    ///   with `StpMode::None` (fills go to `fills`, `cap` is
+    ///   consulted per maker), and any remainder rests at the *back*
+    ///   of its new level. Unlike cancel + `place`, the **order id is
+    ///   preserved**, so the id map entry and the pool slot are
+    ///   reused (no remove/insert, no free/alloc).
+    /// - The order's side, owner and TIF (GTC) never change.
+    ///
+    /// The committed resting fold stays bit-identical to what a
+    /// cancel followed by an insert of the same order would leave
+    /// (same `(id, side, price, qty, owner)` set).
+    ///
+    /// # Errors
+    /// [`TradingError::OrderNotFound`] if `id` is not resting.
+    pub fn amend<C: MakerCap, F: FillSink>(
+        &mut self,
+        id: OrderId,
+        new_price: Price,
+        new_qty: Qty,
+        fills: &mut F,
+        cap: &mut C,
+    ) -> Result<AmendOutcome, TradingError> {
+        let slot = self.ids.get(id.0).ok_or(TradingError::OrderNotFound)?;
+        let (side, old_price, old_qty, owner) = {
+            let n = &self.pool[slot];
+            (n.side, n.price, n.qty, n.owner)
+        };
+        let req = NewOrder {
+            side,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: new_price,
+            qty: new_qty,
+            owner,
+            stp: StpMode::None,
+        };
+        if let Err(reason) = req.validate(
+            self.cfg.tick_size,
+            self.cfg.lot_size,
+            self.cfg.min_price,
+            self.cfg.max_price,
+        ) {
+            return Ok(AmendOutcome::Rejected(reason));
+        }
+
+        // Same price, not larger: resize in place, keep priority.
+        if new_price == old_price && new_qty <= old_qty {
+            if new_qty < old_qty {
+                self.fold_note_touch(slot);
+                self.pool[slot].qty = new_qty;
+                self.book.reduce_total(old_price.0, old_qty.0 - new_qty.0);
+            }
+            return Ok(AmendOutcome::Reduced { qty: new_qty });
+        }
+
+        // Lose priority: leave the queue (id and slot stay allocated),
+        // re-cross at the new price, rest the remainder at the back.
+        self.fold_note_touch(slot);
+        self.book.unlink(slot, &mut self.pool);
+        self.fold_hold = true;
+        let mut rem = new_qty.0;
+        let canceled = self.sweep(&req, id, Some(new_price.0), &mut rem, fills, cap);
+        self.fold_hold = false;
+        debug_assert!(!canceled, "StpMode::None never cancels the taker");
+        if rem == 0 {
+            // Fully filled: the order is gone (slot and id released).
+            // The fold log already holds this identity's baseline;
+            // with the id unmapped its current state reads as absent.
+            let _ = self.ids.remove(id.0);
+            self.pool.release(slot);
+            self.resting = self.resting.saturating_sub(1);
+            return Ok(AmendOutcome::Filled);
+        }
+        {
+            let n = &mut self.pool[slot];
+            n.price = new_price;
+            n.qty = Qty(rem);
+        }
+        self.book.append(slot, &mut self.pool);
+        Ok(AmendOutcome::Resting { price: new_price, resting_qty: Qty(rem) })
     }
 
     /// Materialize every resting order in deterministic order (level

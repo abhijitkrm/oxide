@@ -59,8 +59,8 @@ pub use book::{
     BookBackend, DenseBook, MAX_RESTING_LIMIT, MarketConfig, PriceLevel, ValidatedMarketConfig,
 };
 pub use engine::{
-    CanceledOrder, FillEvent, FillSink, MakerCap, MakerRemoval, MatchingEngine, NoCap,
-    ObserveRemovals, OrderOutcome, RemovalReason, RestingEntry,
+    AmendOutcome, CanceledOrder, FillEvent, FillSink, MakerCap, MakerRemoval, MatchingEngine,
+    NoCap, ObserveRemovals, OrderOutcome, RemovalReason, RestingEntry,
 };
 pub use error::{RejectReason, TradingError};
 pub use idmap::IdMap;
