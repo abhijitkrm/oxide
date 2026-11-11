@@ -305,6 +305,30 @@ pub(crate) fn latest_checkpoint(dir: &Path) -> io::Result<Option<Checkpoint>> {
     Ok(None)
 }
 
+/// Re-debit the quote that recovered resting buys hold from a freshly
+/// loaded balance cache, so recovered orders are backed exactly as the
+/// live ones were (a later cancel refunds them, a fill pays out of
+/// them). The cache must hold balances BEFORE reservations; a cache
+/// that already nets them would be debited twice.
+///
+/// Returns `(market, owner, quote)` for every reservation the cache
+/// could not cover (the debit is skipped, never partial); the caller
+/// decides how loudly to report it.
+pub fn reapply_reservations(
+    balances: &crate::AtomicBalanceCache,
+    reports: &[RecoveryReport],
+) -> Vec<(u16, Address, u64)> {
+    let mut failed = Vec::new();
+    for r in reports {
+        for (owner, quote) in &r.buy_reservations {
+            if !balances.check_and_debit(owner, *quote) {
+                failed.push((r.market, *owner, *quote));
+            }
+        }
+    }
+    failed
+}
+
 /// What a market worker found when it started from its journal.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveryReport {

@@ -46,9 +46,19 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   the batch of fills not yet handed to settlement. Responses can be released
   immediately (`Queued`) or only once the order is on disk (`Durable`).
   Metrics report durable lag, queue depth and fsync time.
+  `oxide-matcher --mode multi` enables it with `--journal-dir`,
+  `--journal-ack queued|durable` and `--journal-checkpoint-records`; on
+  restart the funds held by recovered resting buy orders are re-reserved.
   - **In plain words:** if the matching server is killed mid-trading it
     comes back with the same order books, and in `Durable` mode no order it
     ever confirmed to a trader can be lost.
+
+- **Model-checked order ring** (`cargo test -p matcher --features loom --lib
+  loom_`). The lock-free queue that carries orders to the matching thread is
+  now tested against every legal thread interleaving, and the test is shown to
+  fail if the queue's memory ordering is weakened.
+  - **In plain words:** the one piece of delicate threading code in the matcher
+    is now proven by a tool, not just by stress tests.
 
 - **New benchmark: `cargo bench -p trading --bench corpus`** replays the
   matcher-rust W1–W5 workloads through the engine so the two can be

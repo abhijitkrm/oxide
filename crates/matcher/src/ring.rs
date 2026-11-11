@@ -43,11 +43,51 @@
 //! production crash bug (the value was moved into `push`, dropped on
 //! failure, and the next `take()` panicked on `None`).
 
-use std::cell::UnsafeCell;
+use self::sync::{AtomicBool, AtomicUsize, Cell, Ordering, fence};
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
+
+/// Concurrency primitives the ring's protocol is built from, behind
+/// one seam so the SAME code can be model-checked: by default they are
+/// `std`'s; with the `loom` feature they are loom's, and
+/// `cargo test -p matcher --features loom --lib loom_` explores every
+/// legal interleaving and memory-ordering outcome of the push/pop
+/// protocol (see `loom_tests` below).
+#[cfg(not(feature = "loom"))]
+mod sync {
+    pub(super) use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
+
+    /// A slot cell. `with_mut` hands a raw pointer to the closure; the
+    /// loom flavour tracks the access so a data race is a test failure.
+    pub(super) struct Cell<T>(std::cell::UnsafeCell<T>);
+
+    impl<T> Cell<T> {
+        pub(super) fn new(v: T) -> Self {
+            Self(std::cell::UnsafeCell::new(v))
+        }
+        #[inline]
+        pub(super) fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
+            f(self.0.get())
+        }
+    }
+}
+
+#[cfg(feature = "loom")]
+mod sync {
+    pub(super) use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
+
+    pub(super) struct Cell<T>(loom::cell::UnsafeCell<T>);
+
+    impl<T> Cell<T> {
+        pub(super) fn new(v: T) -> Self {
+            Self(loom::cell::UnsafeCell::new(v))
+        }
+        pub(super) fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
+            self.0.with_mut(f)
+        }
+    }
+}
 
 /// One ring slot — an uninitialised cell the producer writes before
 /// publishing `tail` and the consumer reads after observing it.
@@ -55,7 +95,47 @@ use std::time::Duration;
 /// `UnsafeCell` is the arena primitive here: a fixed slab of slots
 /// recycled by index arithmetic (production-rust §4 confines unsafe
 /// to arenas — this IS the arena). See `Ring`'s SAFETY notes.
-struct Slot<T>(UnsafeCell<MaybeUninit<T>>);
+struct Slot<T>(Cell<MaybeUninit<T>>);
+
+impl<T> Slot<T> {
+    fn new() -> Self {
+        Slot(Cell::new(MaybeUninit::uninit()))
+    }
+
+    /// Write `value` into the (uninitialised) slot.
+    ///
+    /// # Safety
+    /// The caller must be the slot's only accessor and the slot must be
+    /// uninitialised (the producer owns it between consumption and
+    /// publication).
+    #[allow(unsafe_code)]
+    #[inline]
+    unsafe fn write(&self, value: T) {
+        self.0.with_mut(|p| unsafe { p.cast::<T>().write(value) });
+    }
+
+    /// Move the value out of the slot.
+    ///
+    /// # Safety
+    /// The slot must be initialised and published, and the caller must
+    /// be the only reader (single consumer); the slot is logically
+    /// uninitialised afterwards.
+    #[allow(unsafe_code)]
+    #[inline]
+    unsafe fn read(&self) -> T {
+        self.0.with_mut(|p| unsafe { p.cast::<T>().read() })
+    }
+
+    /// Drop the value in place.
+    ///
+    /// # Safety
+    /// The slot must be initialised and not accessed concurrently.
+    #[allow(unsafe_code)]
+    #[inline]
+    unsafe fn drop_value(&self) {
+        self.0.with_mut(|p| unsafe { p.cast::<T>().drop_in_place() });
+    }
+}
 
 /// The shared ring body. Fields are split by owner across cache
 /// lines so the producer's `tail` stores never invalidate the line
@@ -136,7 +216,7 @@ impl<T> Drop for Ring<T> {
             // initialized by a completed `push` and never consumed.
             #[allow(unsafe_code)]
             unsafe {
-                slot.0.get().cast::<T>().drop_in_place();
+                slot.drop_value();
             };
             idx += 1;
         }
@@ -543,7 +623,7 @@ fn spsc_ring_inner<T>(capacity: usize, wake: WakeTarget) -> (SpscSender<T>, Spsc
         _ => Arc::new(tokio::sync::Notify::new()),
     };
     let ring = Arc::new(Ring {
-        slots: (0..capacity).map(|_| Slot(UnsafeCell::new(MaybeUninit::uninit()))).collect(),
+        slots: (0..capacity).map(|_| Slot::new()).collect(),
         mask: capacity - 1,
         tail: CacheLine::new(AtomicUsize::new(0)),
         head: CacheLine::new(AtomicUsize::new(0)),
@@ -625,7 +705,7 @@ impl<T> SpscSender<T> {
         // thread can be writing it (single producer).
         #[allow(unsafe_code)]
         unsafe {
-            ring.slots[tail & ring.mask].0.get().cast::<T>().write(value);
+            ring.slots[tail & ring.mask].write(value);
         }
         // Release: publishes the slot write to any consumer that
         // observes the new tail.
@@ -697,7 +777,7 @@ impl<T> SpscSender<T> {
             tokio::pin!(notified);
             notified.as_mut().enable();
             self.ring.space_waiter.value.store(true, Ordering::Relaxed);
-            std::sync::atomic::fence(Ordering::SeqCst);
+            fence(Ordering::SeqCst);
             match self.push(pending) {
                 Ok(()) => return Ok(()),
                 Err(PushError::Disconnected(v)) => return Err(v),
@@ -770,7 +850,7 @@ impl<T> SpscReceiver<T> {
         // initialized by the producer's release-published write, and
         // the consumer is the only reader (single consumer).
         #[allow(unsafe_code)]
-        let value = unsafe { ring.slots[head & ring.mask].0.get().cast::<T>().read() };
+        let value = unsafe { ring.slots[head & ring.mask].read() };
         // Release: publishes slot reclamation to the producer's
         // acquire load of `head`.
         ring.head.value.store(head + 1, Ordering::Release);
@@ -780,7 +860,7 @@ impl<T> SpscReceiver<T> {
         // store could sit in the store buffer while we read a stale
         // `false`, and a producer re-checking `head` at that moment
         // would park forever.
-        std::sync::atomic::fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         if ring.space_waiter.value.load(Ordering::Relaxed)
             && ring.space_waiter.value.swap(false, Ordering::AcqRel)
         {
@@ -871,7 +951,7 @@ impl<T> Drop for SpscReceiver<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
     use std::thread;
@@ -1185,5 +1265,105 @@ mod tests {
         drop(rx);
         drop(tx); // ring body drops with the last half
         assert_eq!(DROPS.load(Ordering::Relaxed), 3);
+    }
+}
+
+/// Model checks of the push/pop protocol under loom: every interleaving
+/// and every outcome the memory model allows for the ring's
+/// release/acquire hand-off, with slot accesses tracked so a data race
+/// or a read of an unpublished slot fails the test. Run with
+/// `cargo test -p matcher --features loom --lib loom_` (see the
+/// `loom` feature in `Cargo.toml`).
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::*;
+    use loom::sync::atomic::AtomicUsize as LoomCounter;
+    use std::sync::Arc as StdArc;
+
+    /// A value that counts its drops, to prove none leaks or doubles.
+    struct Tracked(u32, StdArc<LoomCounter>);
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.1.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Producer pushes 3 values through a 2-slot ring (so it wraps and
+    /// hits `Full`); the consumer must see them in order, exactly once.
+    #[test]
+    fn loom_spsc_delivers_in_order_exactly_once() {
+        loom::model(|| {
+            let (tx, rx) = spsc_ring::<u32>(2);
+            let producer = loom::thread::spawn(move || {
+                for i in 0..3u32 {
+                    let mut v = i;
+                    loop {
+                        match tx.push(v) {
+                            Ok(()) => break,
+                            Err(PushError::Full(back)) => {
+                                v = back;
+                                loom::thread::yield_now();
+                            }
+                            Err(PushError::Disconnected(_)) => panic!("consumer alive"),
+                        }
+                    }
+                }
+            });
+            let mut got = Vec::new();
+            while got.len() < 3 {
+                match rx.pop() {
+                    Some(v) => got.push(v),
+                    None => loom::thread::yield_now(),
+                }
+            }
+            producer.join().unwrap();
+            assert_eq!(got, vec![0, 1, 2]);
+        });
+    }
+
+    /// Whatever interleaving: every pushed value is dropped exactly once
+    /// — popped ones by the consumer, unconsumed ones by the ring's drop.
+    #[test]
+    fn loom_every_value_is_dropped_exactly_once() {
+        loom::model(|| {
+            let drops = StdArc::new(LoomCounter::new(0));
+            let (tx, rx) = spsc_ring::<Tracked>(2);
+            let d = StdArc::clone(&drops);
+            let producer = loom::thread::spawn(move || {
+                let mut sent = 0;
+                for i in 0..2u32 {
+                    if tx.push(Tracked(i, StdArc::clone(&d))).is_ok() {
+                        sent += 1;
+                    }
+                }
+                sent
+            });
+            // Consume at most one, concurrently with the pushes.
+            let popped = rx.pop().map(|t| t.0);
+            let sent = producer.join().unwrap();
+            assert!(sent <= 2);
+            if let Some(first) = popped {
+                assert_eq!(first, 0, "FIFO: the first value out is the first in");
+            }
+            drop(rx); // drops the ring: remaining slots are drained
+            assert_eq!(drops.load(Ordering::SeqCst), sent, "each pushed value dropped once");
+        });
+    }
+
+    /// A pop racing a push never observes a half-written or stale slot:
+    /// the payload read back is the one written.
+    #[test]
+    fn loom_pop_never_sees_an_unpublished_slot() {
+        loom::model(|| {
+            let (tx, rx) = spsc_ring::<[u64; 4]>(1);
+            let producer = loom::thread::spawn(move || {
+                let _ = tx.push([7, 7, 7, 7]);
+            });
+            if let Some(v) = rx.pop() {
+                assert_eq!(v, [7, 7, 7, 7]);
+            }
+            producer.join().unwrap();
+        });
     }
 }

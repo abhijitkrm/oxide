@@ -748,6 +748,12 @@ pub(crate) struct MarketWorker {
     journal: Option<WorkerJournal>,
 }
 
+/// How long a journaled worker may sit idle with an unflushed chunk.
+/// Unit: wall-clock time. Origin: matches the order of magnitude of one
+/// group commit; shorter wakes the thread more often, longer widens the
+/// window an unflushed record can wait if nothing else triggers a flush.
+const IDLE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// A worker's journal and its bookkeeping.
 struct WorkerJournal {
     journal: Journal,
@@ -812,7 +818,24 @@ impl MarketWorker {
         }
 
         loop {
-            match rx.recv() {
+            // With a journal the wait is bounded so a partially filled
+            // chunk is handed to the I/O thread within
+            // `IDLE_FLUSH_INTERVAL` even if no further message arrives
+            // (every submit path already flushes at its end; this is
+            // the backstop for records logged outside one).
+            let msg = if worker.journal.is_some() {
+                match rx.recv_timeout(IDLE_FLUSH_INTERVAL) {
+                    Ok(m) => Ok(m),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        worker.idle_flush();
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                rx.recv()
+            };
+            match msg {
                 Ok(MarketMessage::Work(work)) => {
                     let responses = worker.process_batch(&work.orders);
                     let responses = worker.release(responses);
@@ -877,6 +900,17 @@ impl MarketWorker {
             return false;
         }
         true
+    }
+
+    /// Timer backstop: hand any partially filled chunk to the I/O
+    /// thread. A failure latches the journal as failed, like any other.
+    fn idle_flush(&mut self) {
+        if let Some(w) = self.journal.as_mut()
+            && !w.failed
+            && w.journal.flush().is_err()
+        {
+            w.failed = true;
+        }
     }
 
     /// Log the seal marker and wait until it is durable.

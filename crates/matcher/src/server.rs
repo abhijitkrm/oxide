@@ -1030,6 +1030,15 @@ pub struct ServerConfig {
     /// (hft-audit-2 M-2): spin for a bounded window before parking
     /// (default) or park at once. `run_server_ring` only.
     pub sequencer_idle: crate::SequencerIdle,
+    /// Command journal for crash recovery (`run_server_multi` only —
+    /// see [`crate::cmdlog`]). `None` (default) journals nothing.
+    /// With `Some`, each market worker recovers its book from the
+    /// journal before the server accepts a connection, and the quote
+    /// reserved by recovered resting buys is re-debited from the
+    /// supplied balance cache. That re-debit assumes the cache holds
+    /// balances BEFORE reservations (freshly funded, or loaded as free
+    /// balance); a cache that already nets them would be debited twice.
+    pub journal: Option<crate::cmdlog::JournalConfig>,
 }
 
 impl Default for ServerConfig {
@@ -1048,6 +1057,7 @@ impl Default for ServerConfig {
             sequencer_core: None,
             worker_base_core: None,
             sequencer_idle: crate::SequencerIdle::default(),
+            journal: None,
         }
     }
 }
@@ -1692,6 +1702,11 @@ pub async fn run_websocket_server_multi(
 /// - `config`: server configuration (ports, batch interval,
 ///   settlement key/outbox).
 /// - `sender`: the matcher operator's address (for settlement txs).
+///
+/// # Panics
+/// If `config.journal` is set and a market's journal or checkpoint is
+/// unreadable or corrupt (beyond a repairable torn tail): serving on a
+/// book that does not match the log would be worse than not starting.
 pub async fn run_server_multi(
     configs: Vec<MarketConfig>,
     balances: Arc<crate::ShardedBalanceCache>,
@@ -1700,15 +1715,60 @@ pub async fn run_server_multi(
     config: ServerConfig,
     sender: primitives::Address,
 ) {
-    let matcher = Arc::new(crate::MultiMarketMatcher::with_options(
-        configs,
-        balances,
-        Arc::new(crate::wall_clock_ms),
-        config.chain_id,
-        config.nonce_state_path.clone(),
-        config.risk,
-        config.worker_base_core,
-    ));
+    let journaling = config.journal.is_some();
+    // Startup is the one place a journal problem is fatal: replaying
+    // past damage would diverge the book, so refuse to serve.
+    let matcher = Arc::new(
+        crate::MultiMarketMatcher::with_journal_options(
+            configs,
+            Arc::clone(&balances),
+            Arc::new(crate::wall_clock_ms),
+            config.chain_id,
+            config.nonce_state_path.clone(),
+            config.risk,
+            config.worker_base_core,
+            config.journal.clone(),
+        )
+        .unwrap_or_else(|e| panic!("matcher journal recovery failed: {e}")),
+    );
+    if journaling {
+        for r in matcher.recovery_reports() {
+            eprintln!(
+                "oxide-matcher: market {} recovered: checkpoint seq {}, {} ops replayed, \
+                 {} resting, {} unsealed fills",
+                r.market, r.checkpoint_seq, r.replayed, r.resting, r.pending_fills
+            );
+        }
+        for (market, owner, quote) in
+            crate::cmdlog::reapply_reservations(&balances, matcher.recovery_reports())
+        {
+            eprintln!(
+                "oxide-matcher: market {market} recovery: could not re-reserve {quote} for \
+                 resting-buy owner {owner:?} (insufficient balance)"
+            );
+        }
+        let m = Arc::clone(&matcher);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                tick.tick().await;
+                let stats = m.journal_stats();
+                for (i, s) in stats.iter().enumerate() {
+                    let avg_us = s.fsync_ns_total.checked_div(s.fsyncs).unwrap_or(0) / 1_000;
+                    eprintln!(
+                        "oxide-matcher: journal market={i} appended={} durable={} lag={} \
+                         in_flight={} fsyncs={} fsync_avg_us={avg_us} fsync_max_us={}",
+                        s.appended,
+                        s.durable,
+                        s.lag,
+                        s.chunks_in_flight,
+                        s.fsyncs,
+                        s.fsync_ns_max / 1_000
+                    );
+                }
+            }
+        });
+    }
 
     // Batch settler seals from ALL markets via the control channel.
     let sealer: Arc<dyn crate::BatchSealer> = Arc::clone(&matcher) as Arc<dyn crate::BatchSealer>;

@@ -24417,3 +24417,43 @@ idle flush (a quiet matcher with `Queued` flushes at each batch end, which
 covers every submit path, but nothing flushes a partially filled chunk on a
 timer); single-writer per market means no cross-market total order — recovery
 is per market, matching how the books are independent.
+
+### Journal: server wiring and the four open limits closed
+
+- **Enabled in the server.** `ServerConfig.journal` + `oxide-matcher` flags
+  `--journal-dir`, `--journal-ack queued|durable`, `--journal-checkpoint-records N`
+  (multi mode only; a typo or another mode is a startup error). `run_server_multi`
+  recovers every market before serving (a corrupt journal panics at start — serving
+  a book that disagrees with the log is worse), logs each market's recovery, and
+  prints per-market journal health every 10 s (appended/durable/lag/in-flight/
+  fsyncs/fsync avg+max).
+- **Balances re-applied.** `cmdlog::reapply_reservations` re-debits the quote the
+  recovered resting buys hold from the supplied balance cache and returns any it
+  could not cover (never a partial debit); `run_server_multi` calls it and logs
+  failures. Assumption (documented on `ServerConfig::journal`): the cache holds
+  balances *before* reservations — fresh funding or free balances. A cache that
+  already nets reservations would be debited twice. Test: a fresh cache ends equal
+  to the live one.
+- **Timer flush.** Journaled workers wait with a 5 ms timeout and hand any partly
+  filled chunk to the I/O thread when idle (every submit path already flushed at its
+  end; this is the backstop for anything logged outside one).
+- **Per-market recovery.** Not a gap to close but a property to state: the only
+  cross-market state is balances (re-applied above) and the nonce gate (its own
+  durable store), neither of which replay touches; books are independent state
+  machines. `markets_recover_independently` journals two markets and checks each
+  report is its own market's.
+- **Loom model check of the SPSC ring.** The ring's atomics, fence and slot cell now
+  sit behind a `sync` seam in `ring.rs` (std by default, loom with the `loom`
+  feature; slot reads/writes go through tracked `Slot::{write,read,drop_value}`),
+  so loom checks the real push/pop code. Run:
+  `cargo test -p matcher --features loom --lib loom_ --release` (~50 s build, <1 s
+  run; with the feature on, only the `loom_` tests are meaningful). Three models:
+  in-order exactly-once delivery across a wrapping 2-slot ring with `Full`;
+  every value dropped exactly once (popped or drained by the ring's drop); a pop
+  racing a push never sees an unpublished slot. Mutation check: weakening the
+  `tail` store (producer publish) or the `head` store (consumer reclamation) from
+  Release to Relaxed makes the in-order model fail in both cases. `loom` is an
+  optional dependency pinned `=0.7.2` (0.7.3 is under the 7-day policy window; MIT);
+  `cargo deny check` licenses/bans/sources pass. `cargo deny check advisories`
+  fails on RUSTSEC-2026-0387 and -0418 — present before this change (verified on a
+  clean tree), unrelated, still open.

@@ -113,6 +113,7 @@ struct CliConfig {
     sequencer_core: Option<u32>,
     worker_base_core: Option<u32>,
     sequencer_idle: matcher::SequencerIdle,
+    journal: Option<matcher::cmdlog::JournalConfig>,
 }
 
 /// Parse CLI flags into a `CliConfig`.
@@ -186,6 +187,12 @@ fn parse_cli() -> CliConfig {
         // sleeps at once, for hosts where a briefly burning core
         // matters more than latency. A typo is a startup error, not a
         // silent fallback.
+        // Command journal (multi mode): `--journal-dir` turns it on.
+        // `--journal-ack queued|durable` (default queued) picks when
+        // responses are released; `--journal-checkpoint-records N`
+        // (default 100000, 0 = never) is how often a checkpoint is
+        // taken at a settlement seal. Typos are startup errors.
+        journal: parse_journal(),
         sequencer_idle: parse_flag_opt::<String>("--sequencer-idle").map_or_else(
             matcher::SequencerIdle::default,
             |v| {
@@ -268,7 +275,25 @@ fn build_server_config(cli: &CliConfig) -> ServerConfig {
         sequencer_core: cli.sequencer_core,
         worker_base_core: cli.worker_base_core,
         sequencer_idle: cli.sequencer_idle,
+        journal: cli.journal.clone(),
     }
+}
+
+/// Parse the `--journal-*` flags.
+fn parse_journal() -> Option<matcher::cmdlog::JournalConfig> {
+    use matcher::cmdlog::{AckPolicy, JournalConfig};
+    let dir = parse_flag_opt::<String>("--journal-dir")?;
+    let mut cfg = JournalConfig::new(dir);
+    cfg.ack = match parse_flag_opt::<String>("--journal-ack").as_deref() {
+        None | Some("queued") => AckPolicy::Queued,
+        Some("durable") => AckPolicy::Durable,
+        Some(other) => {
+            eprintln!("error: --journal-ack: '{other}' (use queued or durable)");
+            std::process::exit(1);
+        }
+    };
+    cfg.checkpoint_after_records = parse_flag("--journal-checkpoint-records", 100_000u64);
+    Some(cfg)
 }
 
 /// Fund `n` accounts in a sharded balance cache, each with `DEFAULT_BALANCE`.
@@ -431,6 +456,10 @@ fn main() {
         }
     });
 
+    if cli.journal.is_some() && cli.mode != "multi" {
+        eprintln!("oxide-matcher: --journal-dir is supported in multi mode only");
+        std::process::exit(1);
+    }
     match cli.mode.as_str() {
         "multi" => {
             println!(

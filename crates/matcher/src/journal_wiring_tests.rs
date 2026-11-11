@@ -432,3 +432,88 @@ fn journal_overhead() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Recovery re-reserves what resting buys hold, so a fresh cache ends
+/// up exactly where the live one was.
+#[test]
+fn reservations_are_reapplied_to_a_fresh_balance_cache() {
+    let dir = tmp("rereserve");
+    let (balances, accts) = funded();
+    let jc = JournalConfig::new(&dir);
+    let live = start(&balances, Some(jc.clone())).unwrap();
+    let _ = live.submit_one(order(&accts[0].0, Side::Buy, 0, 100, 4));
+    let _ = live.submit_one(order(&accts[1].0, Side::Buy, 0, 120, 2));
+    let live_balances = [balances.get(&accts[0].1), balances.get(&accts[1].1)];
+    settle(&live);
+    drop(live);
+
+    let (fresh, _) = funded();
+    assert_ne!(fresh.get(&accts[0].1), live_balances[0], "fresh cache has no reservations");
+    let rec = start(&fresh, Some(jc)).unwrap();
+    let failed = crate::cmdlog::reapply_reservations(&fresh, rec.recovery_reports());
+    assert!(failed.is_empty(), "{failed:?}");
+    assert_eq!([fresh.get(&accts[0].1), fresh.get(&accts[1].1)], live_balances);
+    // A cache that cannot cover a reservation is reported, not half-debited.
+    let (poor, _) = funded();
+    poor.set(&accts[0].1, 1);
+    let failed = crate::cmdlog::reapply_reservations(&poor, rec.recovery_reports());
+    assert_eq!(failed.len(), 1);
+    assert_eq!(poor.get(&accts[0].1), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two markets journal and recover independently; each report is its
+/// own market's.
+#[test]
+fn markets_recover_independently() {
+    let dir = tmp("two");
+    let (balances, accts) = funded();
+    let jc = JournalConfig::new(&dir);
+    let cfgs = |n: u16| -> Vec<MarketConfig> {
+        (0..n).map(|m| MarketConfig { market_id: m, ..cfg() }).collect()
+    };
+    let start2 = |b: &Arc<AtomicBalanceCache>| {
+        MultiMarketMatcher::with_journal_options(
+            cfgs(2),
+            Arc::clone(b),
+            Arc::new(|| 0),
+            crate::protocol::CHAIN_ID,
+            None,
+            RiskConfig::default(),
+            None,
+            Some(jc.clone()),
+        )
+        .unwrap()
+    };
+    let live = start2(&balances);
+    let mut n = 0;
+    for (market, count) in [(0u8, 3u64), (1, 5)] {
+        for i in 0..count {
+            let mut o = order(&accts[0].0, Side::Buy, n, 100 + i, 1);
+            o.market = market;
+            crate::protocol::sign_order(&mut o, &accts[0].0);
+            assert!(!live.submit_one(o).rejected);
+            n += 1;
+        }
+    }
+    settle(&live);
+    drop(live);
+    let (b2, _) = funded();
+    let rec = start2(&b2);
+    let r = rec.recovery_reports();
+    assert_eq!((r[0].market, r[0].resting, r[1].market, r[1].resting), (0, 3, 1, 5));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A record logged outside any submit path still reaches disk without
+/// further traffic: the worker's timer flush hands it over.
+#[test]
+fn idle_flush_makes_a_lone_record_durable() {
+    let dir = tmp("idle");
+    let (balances, accts) = funded();
+    let m = start(&balances, Some(JournalConfig::new(&dir))).unwrap();
+    let _ = m.submit_one(order(&accts[0].0, Side::Buy, 0, 100, 1));
+    settle(&m); // returns only once the journal caught up with no more traffic
+    assert_eq!(m.journal_stats()[0].durable, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
