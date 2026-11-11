@@ -24172,3 +24172,31 @@ are both caught.
 Corpus bench (`--replace native`), M1 single core, median: W3 19.1 → 27.5M/s,
 W4 27.5 → 37.1M, W5-1k 49.6 → 57.8M, W5-100k 27.1 → 37.1M; with the fold on
 W4 11.6 → 14.8M.
+
+### Matcher-parity, step 5: tagged id map, hash mixing, inlining — measured, nothing kept
+
+Each candidate from the matcher-rust comparison was tried against the corpus
+bench (M1, single core, `--replace native`, medians) and dropped:
+
+- **Tagged id map / hash-mixed keys.** matcher-rust's tag array speeds the
+  duplicate-id check on every New. Oxide has no such check (ids are
+  engine-assigned), `IdMap` is only probed on cancel/amend/removal, and its
+  keys are sequential — ideal for `key & mask` and *worse* under a mixing
+  hash. Not applicable; no experiment needed.
+- **`#[inline]` on `IdMap::insert/remove`, `OrderPool::alloc/release`, the
+  `DenseBook` append/unlink/detach family.** W1/W2/W4/W5-1k within ±2% of
+  baseline (noise). LLVM already inlines these within the crate.
+- **Fat LTO** (workspace is `lto = "thin"`): W1 39.8→39.0, W2 30.4→31.1,
+  W4 36.6→37.1, W5-1k 58.1→59.7M/s. Within noise; not worth slower builds.
+- **Exact division by multiplication** for tick/lot validation and
+  `level_index` (Granlund–Montgomery `ExactDiv`, bit-exact for all u64): W1
+  -2%, W2 -1..-9%, W4/W5 ±0. Apple's divider is ~2–3 cycles, so the divides
+  were never the cost here. Reverted. Worth re-measuring on the x86_64 rig,
+  where a 64-bit `div` is 10–40+ cycles; the implementation and its
+  exhaustive tests are in git history of this branch only as this note —
+  recreate from the description if the rig shows a win.
+
+Conclusion: after steps 2–4 the remaining gap to matcher-rust's cache-resident
+~100M/s number is not a single removable thing in the matching loop (W5-1k
+58M vs 103M); the 100k-book numbers are at parity or ahead. See the
+benchmark entry for the final table.
