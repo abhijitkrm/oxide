@@ -517,3 +517,61 @@ fn idle_flush_makes_a_lone_record_durable() {
     assert_eq!(m.journal_stats()[0].durable, 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Restart time versus journal size, with and without checkpoints
+/// (run with `--release -- --ignored --nocapture`; `OXIDE_RECOVERY_N`
+/// sets the order count, default 200 000).
+#[test]
+#[ignore = "measurement, not a correctness test"]
+#[allow(
+    clippy::many_single_char_names,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation
+)]
+fn journal_recovery_time() {
+    let n: u64 =
+        std::env::var("OXIDE_RECOVERY_N").ok().and_then(|v| v.parse().ok()).unwrap_or(200_000);
+    let (_, accts) = funded();
+    for (name, ckpt) in [("no checkpoint", 0u64), ("checkpoint /50k", 50_000)] {
+        let dir = tmp("rectime");
+        let (balances, _) = funded();
+        let mut jc = JournalConfig::new(&dir);
+        jc.checkpoint_after_records = ckpt;
+        let m = start(&balances, Some(jc.clone())).unwrap();
+        let mut k = 0u64;
+        while k < n {
+            let batch: Vec<OrderRequest> = (0..256u64.min(n - k))
+                .map(|i| {
+                    let nonce = k + i;
+                    let side = if nonce.is_multiple_of(3) { Side::Sell } else { Side::Buy };
+                    order(&accts[(nonce % 3) as usize].0, side, nonce / 3, 400 + nonce % 150, 1)
+                })
+                .collect();
+            k += batch.len() as u64;
+            let _ = m.submit_batch(batch);
+            if k.is_multiple_of(10_240) {
+                let _ = m.seal_batch(); // checkpoints happen at seals
+            }
+        }
+        settle(&m);
+        drop(m);
+        let bytes: u64 = std::fs::read_dir(jc.market_dir(0))
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        let (fresh, _) = funded();
+        let t = std::time::Instant::now();
+        let rec = start(&fresh, Some(jc)).unwrap();
+        let r = &rec.recovery_reports()[0];
+        println!(
+            "{name:16} n={n} on-disk={:.1} MiB  restart={:.0} ms  (checkpoint seq {}, replayed {}, resting {})",
+            bytes as f64 / 1_048_576.0,
+            t.elapsed().as_secs_f64() * 1000.0,
+            r.checkpoint_seq,
+            r.replayed,
+            r.resting
+        );
+        drop(rec);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

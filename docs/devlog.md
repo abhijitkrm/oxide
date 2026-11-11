@@ -24457,3 +24457,37 @@ is per market, matching how the books are independent.
   `cargo deny check` licenses/bans/sources pass. `cargo deny check advisories`
   fails on RUSTSEC-2026-0387 and -0418 — present before this change (verified on a
   clean tree), unrelated, still open.
+
+### Rig plan: `scripts/rig-bench.sh`
+
+One command for the dedicated-box session (`SECTIONS="env corpus fold journal
+scaling"` by default; `devnet` and `soak` opt-in; `QUICK=1` smoke-tests the
+script itself in ~2 min per section). Writes `rig-results/<host>-<sha>-<time>/`
+with `env.txt` (CPU, governor, SMT, isolation, disk + mount, toolchain, SHA),
+`session.log`, and one file per measurement:
+
+- **corpus**: Oxide vs matcher-rust W1–W5 at 1k/100k/600k books, fold off/on ×
+  `--replace cancel|native`, `--batch` default vs `--features prefetch`,
+  `corpus --leaf` hash cost, `perf stat` (cycles, instructions, cache/dTLB/branch
+  misses) on the deepest book for both engines, and an automatic **digest
+  differential** (builds `scripts/rig/matcher_digest.rs` against the matcher-rust
+  checkout and prints MATCH/MISMATCH per workload — any mismatch invalidates the
+  session).
+- **fold**: block-size sweep (256…16384) and a `FOLD_LOG_CAP` sweep
+  (1k…64k, rebuilt in a throw-away git worktree).
+- **journal**: off/queued/durable overhead ×3, 200-iteration SIGKILL loop,
+  restart time vs journal size with/without checkpoints (`OXIDE_RECOVERY_N`
+  200k/1M/5M), `CHUNK_BYTES` 64K/256K/1M sweep, raw `fio` fdatasync cost.
+  Put `JOURNAL_DIR` on the NVMe under test.
+- **scaling**: parallel-EVM bench at 1/2/4/8/16/32 cores (`taskset`), the
+  multi-market/balance/nonce/ring/alloc matcher benches, hash/BLS/tx-recover
+  benches, block pipeline.
+- **devnet**: `measure-admission.sh` at 4/7/16 validators.
+
+Validated here (M1): env, corpus (incl. digests: all six MATCH), fold sweeps,
+journal (crash loop 5/5, ack, chunk sweep). `scaling`, `devnet`, `soak`, `perf`
+and `fio` paths were only syntax-checked — they need the Linux box. Not
+scripted: the `ExactDiv` A/B (the patch was reverted and lives only as the
+description in the step-5 entry; recreate it if the rig shows division cost) and
+`tc netem` latency injection (`scripts/inject-latency.sh` exists; run it by hand,
+then re-run `devnet`).
