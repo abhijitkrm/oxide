@@ -20,7 +20,20 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   8.3–22.2M ops/s per core.
   - **In plain words:** an order that is placed and cancelled inside
     the same block now costs no hashing at all, and the matching engine
-    with consensus bookkeeping on runs 1.5–3x faster.
+    with consensus bookkeeping on runs 1.5–3.6x faster.
+
+- **Matching engine: `amend` and `FillSink`** (`trading`, engine-level
+  API; no wire change). `amend` resizes an order in place (keeping its
+  queue position on a same-price decrease) or re-queues it under the
+  same id, and is ~30% faster than cancel + re-place on amend-heavy
+  flow. `place_into` lets a caller take fills without a `Vec`.
+  - **In plain words:** the engine can now change an order's size or
+    price without the cost of deleting and re-creating it; nothing on
+    the chain uses this yet.
+
+- **New benchmark: `cargo bench -p trading --bench corpus`** replays the
+  matcher-rust W1–W5 workloads through the engine so the two can be
+  compared on identical commands.
 
 ### Documentation
 

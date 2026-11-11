@@ -24200,3 +24200,34 @@ Conclusion: after steps 2–4 the remaining gap to matcher-rust's cache-resident
 ~100M/s number is not a single removable thing in the matching loop (W5-1k
 58M vs 103M); the 100k-book numbers are at parity or ahead. See the
 benchmark entry for the final table.
+
+### Matcher-parity: benchmark after steps 1–5
+
+Same machine (Apple M1, one core), same W1–W5 corpora, medians of 5 reps,
+single-threaded, `corpus` bench (`cargo bench -p trading --bench corpus --
+<prefix> [--fold] [--replace cancel|native]`) vs `matcher_bench --mode
+throughput`. M ops/s.
+
+| workload | matcher-rust | Oxide before: no fold | Oxide before: fold | Oxide after: fold | after, native amend: no fold | after, native amend: fold |
+|---|---|---|---|---|---|---|
+| W1 build 1M | 41.9 | 41.4 | 6.4 | 8.1 | — | — |
+| W2 sweep | 27.8 | 31.4 | 5.5 | 19.6 | — | — |
+| W3 churn | 21.2 | 22.9 | 4.3 | 7.9 | 27.1 | 8.7 |
+| W4 mixed, 100k | 23.8 | 26.0 | 4.9 | 11.1 | 36.5 | 14.6 |
+| W5, 1k book | **102.8** | 50.1 | 9.2 | 21.2 | 57.3 | 25.3 |
+| W5, 100k book | 22.6 | 25.4 | 4.8 | 10.6 | 36.6 | 14.1 |
+
+(no-fold, cancel+place: unchanged by steps 2–5 within noise: W1 39.9, W2 30.3,
+W3 22.1, W4 25.5, W5-1k 47.3, W5-100k 24.8.)
+
+In plain words: the chain-configured engine (state fold on) is 1.7–3.6x faster
+than before on the same commands (sweeps 3.6x, since a filled maker's
+touch+removal now hashes nothing; pure inserts only 1.3x because every new
+resting order still needs one leaf hash). Orders that are amended natively add
+another ~30%. On deep books (100k live) the bare engine matches matcher-rust
+(22.6M vs 25.4M; ahead with native amend, 36.6M, which matcher-rust gets from
+its own native replace). The only workload where matcher-rust is still ahead
+is its headline one — a 1k-order, fully cache-resident book at 103M/s vs
+Oxide's 57M; nothing identifiable in the matching loop explains that gap (step
+5), and the fold-on number for that same book is leaf-hash-bound (~95 ns/hash
+vs ~10 ns of matching per op).
