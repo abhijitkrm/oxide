@@ -158,6 +158,9 @@ fn make_engine(max_orders: usize, fold: bool) -> MatchingEngine {
 /// them, so the engine ends in the post-state of the stream.
 struct Resolver {
     native: bool,
+    /// `--digest`: FNV-1a over every fill's `(tick, qty-in-lots)` plus the count.
+    digest: u64,
+    trades: u64,
     /// corpus id -> (engine id, side, order type) of a live resting order.
     live: Vec<Option<(OrderId, Side, OrderType, TimeInForce)>>,
 }
@@ -176,6 +179,7 @@ impl Resolver {
                 Cmd::New { id, order } => {
                     ops.push(Op::Place(*order));
                     let out = e.place(*order, fills).unwrap();
+                    self.absorb(fills);
                     self.note(*id, order, out);
                 }
                 Cmd::Cancel { id } => {
@@ -202,6 +206,7 @@ impl Resolver {
                     if self.native {
                         ops.push(Op::Amend(oid, order.price, order.qty));
                         let out = e.amend(oid, order.price, order.qty, fills, &mut trading::NoCap);
+                        self.absorb(fills);
                         if matches!(out, Ok(trading::AmendOutcome::Filled)) {
                             self.live[*id as usize] = None;
                         }
@@ -211,11 +216,22 @@ impl Resolver {
                     ops.push(Op::Replace(oid, order));
                     let _ = e.cancel(oid);
                     let out = e.place(order, fills).unwrap();
+                    self.absorb(fills);
                     self.note(*id, &order, out);
                 }
             }
         }
         ops
+    }
+
+    fn absorb(&mut self, fills: &[trading::FillEvent]) {
+        for f in fills {
+            let tick = (f.price.0 - MIN_PRICE) / TICK + (MID - BAND_TICKS) as u64;
+            for w in [tick, f.qty.0 / LOT] {
+                self.digest = (self.digest ^ w).wrapping_mul(0x0100_0000_01B3);
+            }
+            self.trades += 1;
+        }
     }
 
     fn note(&mut self, id: u64, order: &NewOrder, out: OrderOutcome) {
@@ -421,9 +437,36 @@ fn main() {
     // Resolve pass (untimed): scratch engine learns each command's engine ids.
     let mut scratch = make_engine(max_orders, fold);
     let native = args.iter().any(|a| a == "--replace") && args.iter().any(|a| a == "native");
-    let mut r = Resolver { native, live: Vec::new() };
+    let mut r = Resolver { native, digest: 0xCBF2_9CE4_8422_2325, trades: 0, live: Vec::new() };
     let setup_ops = r.run(&mut scratch, &setup, &mut fills);
     let run_ops = r.run(&mut scratch, &run, &mut fills);
+    if args.iter().any(|a| a == "--digest") {
+        // Final book in the matcher's canonical order: (side, tick) ascending,
+        // FIFO within a level (the sort is stable).
+        let mut es = Vec::new();
+        scratch.resting_entries(&mut es);
+        let mut book: Vec<(u8, u64, u64)> = es
+            .iter()
+            .map(|e| {
+                let tick = (e.price.0 - MIN_PRICE) / TICK + (MID - BAND_TICKS) as u64;
+                (u8::from(e.side == Side::Sell), tick, e.qty.0 / LOT)
+            })
+            .collect();
+        book.sort_by_key(|&(s, t, _)| (s, t));
+        let mut bd = 0xCBF2_9CE4_8422_2325u64;
+        for (s, t, q) in &book {
+            for w in [u64::from(*s), *t, *q] {
+                bd = (bd ^ w).wrapping_mul(0x0100_0000_01B3);
+            }
+        }
+        println!(
+            "trades={} trade_digest={:016x} resting={} book_digest={bd:016x}",
+            r.trades,
+            r.digest,
+            book.len()
+        );
+        return;
+    }
     drop(scratch);
 
     let count_sink = args.iter().any(|a| a == "--sink") && args.iter().any(|a| a == "count");

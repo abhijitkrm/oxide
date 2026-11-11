@@ -24255,3 +24255,54 @@ batch path is worth it only on genuinely deep books (≥ ~500k resting) and
 only with the real prefetch; the feature is therefore OFF by default and the
 single-command path stays the default for the chain (typical books are far
 shallower). No consumer calls `apply_batch` yet.
+
+### Matcher-parity: independent differential against matcher-rust
+
+`corpus --replace native --digest` replays a corpus through the engine and
+prints `trades / trade_digest / resting / book_digest`: an FNV-1a over every
+fill's `(tick, qty-in-lots)` in order, and over the final book as
+`(side, tick, qty)` with FIFO preserved within a level. A 25-line
+matcher-rust program (an `OrderBook` + a `Sink` that hashes `Trade{price,qty}`;
+final book from `resting_orders()` stably sorted by `(side, price)`) prints
+the same. Result on W1, W2, W3, W4, W5-1k, W5-100k (1M+ commands each,
+~95–165k trades each): **all six digests are identical between matcher-rust
+and the Oxide engine, with the resting fold off and on** — i.e. the
+deferred fold, `amend` (same-price decrease keeps priority, else re-queue at
+the back, re-cross on the way) and the engine's FIFO/price-time behavior agree
+byte-for-byte with an independent implementation. (The one semantic the two
+share by construction here is `Replace` ≡ `amend`; Oxide's cancel + place
+differs by design on a same-price decrease.)
+
+### Matcher-parity, step 7 (chunked per-level storage): deferred, with numbers
+
+Not started. The remaining layout-attributable gap is on very deep books only
+(600k resting: Oxide 9.8M/s, 13.9M with the prefetch feature, vs matcher-rust
+12.9M / 19.8M). With the consensus fold on, the same 600k book runs 5.7M/s
+(`--fold --batch`, prefetch feature) — the leaf hash (~95 ns per net-changed
+order) is ~70% of the per-op cost, so even a matcher-grade layout (maybe 1.4x
+on the bare book) moves the chain-configured number by single digits of
+percent. The change itself touches `OrderPool`, `DenseBook`, the canonical
+state encoding/decoding, `resting_entries`, snapshot restore, and every golden
+root, for a consensus-critical engine. Revisit if (a) the fold gets cheaper
+(batched/SIMD leaf hashing across a settle's records — BLAKE3's multi-buffer
+hashing is the lever) or (b) markets with ≥ 500k resting orders and the
+off-chain matcher (no fold) become a target.
+
+### Matcher-parity, step 8 (orderer-rust pipeline ideas): assessment
+
+What `crates/matcher` already has that orderer-rust also has: a hand-written
+SPSC ring (hft-audit F-03), one worker thread per market (single-writer
+books), authentication/risk/nonce gate before the book. What orderer-rust adds
+that `crates/matcher` lacks, in descending value: (1) a **command journal with
+journal-before-apply and off-thread group-commit fsync** + checkpoint +
+byte-identical replay recovery (today the matcher persists only a nonce
+checkpoint and the settlement outbox; the book itself is not recoverable from a
+log); (2) a **loom model-check of the ring's memory orderings** (it asserts
+that weakening a Release breaks the test) and a no-alloc `GlobalAlloc` test;
+(3) a total-order ingress stamp (`iseq`) across partitions with controls
+(barrier/snapshot) cut at the same ingress position; (4) wait-strategy choice
+per consumer. None of it is a book-speed lever (orderer's pipeline-alone
+number, 63–67M cmds/s, is its ring machinery, not matching). It belongs to the
+off-chain matcher service roadmap, not the chain's `executor` lane (the chain
+already sequences through consensus): file as follow-ups — journal + replay
+recovery first, loom test of `ring.rs` second.
