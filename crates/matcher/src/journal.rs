@@ -33,9 +33,12 @@
 //!
 //! ## Files
 //!
-//! Segments are `cmd-{NNNNNNNN}.journal` in one directory, rotated at
-//! [`SEGMENT_BYTES`]. Sequence numbers count records from 1 across
-//! segments in order.
+//! Segments are `cmd-{first_seq:016}.journal` in one directory, named
+//! by the sequence number of their first record and rotated at
+//! [`SEGMENT_BYTES`] or at a [`Journal::rotate`] (checkpoint). Sequence
+//! numbers count records from 1 across segments in order. A checkpoint
+//! rotates, then [`Journal::truncate_through`] deletes whole segments
+//! that a snapshot has made redundant — never the newest one.
 //!
 //! This module is self-contained and not yet wired into the market
 //! workers (see `docs/devlog.md`): wiring decides *which* commands are
@@ -49,6 +52,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 /// Bytes of one record header (`len` + `crc`).
 pub const HEADER_BYTES: usize = 8;
@@ -152,11 +156,11 @@ impl From<io::Error> for JournalError {
     }
 }
 
-fn segment_path(dir: &Path, n: u64) -> PathBuf {
-    dir.join(format!("cmd-{n:08}.journal"))
+fn segment_path(dir: &Path, first_seq: u64) -> PathBuf {
+    dir.join(format!("cmd-{first_seq:016}.journal"))
 }
 
-/// Segment numbers present in `dir`, ascending.
+/// First-record sequence numbers of the segments in `dir`, ascending.
 fn segments(dir: &Path) -> io::Result<Vec<u64>> {
     let mut v = Vec::new();
     for e in fs::read_dir(dir)? {
@@ -214,20 +218,53 @@ fn scan(bytes: &[u8]) -> (Vec<(usize, usize)>, Option<Bad>) {
     (out, None)
 }
 
-/// Read every record in `dir`, in order.
+/// Read every record in `dir`, in order (payloads only).
+///
+/// # Errors
+/// As [`read_from`].
+pub fn read_dir(dir: &Path, mode: ReadMode) -> Result<Vec<Vec<u8>>, JournalError> {
+    Ok(read_from(dir, mode, 1)?.into_iter().map(|(_, p)| p).collect())
+}
+
+/// Read the records with sequence `>= from_seq`, as `(seq, payload)`.
+///
+/// Segments wholly before `from_seq` are skipped without being read.
+/// Segments must be gapless: a non-final segment holding a different
+/// number of records than its successor's first sequence implies (a
+/// lost or truncated middle segment) is corruption, in every mode.
 ///
 /// # Errors
 /// [`JournalError::Corrupt`] for damage that is not a repairable torn
 /// tail (always in `Strict` mode); [`JournalError::Io`] otherwise.
-pub fn read_dir(dir: &Path, mode: ReadMode) -> Result<Vec<Vec<u8>>, JournalError> {
+pub fn read_from(
+    dir: &Path,
+    mode: ReadMode,
+    from_seq: u64,
+) -> Result<Vec<(u64, Vec<u8>)>, JournalError> {
     let segs = segments(dir)?;
     let mut out = Vec::new();
-    for (i, n) in segs.iter().enumerate() {
-        let path = segment_path(dir, *n);
+    for (i, first) in segs.iter().enumerate() {
+        let next_first = segs.get(i + 1).copied();
+        let path = segment_path(dir, *first);
+        if let Some(nf) = next_first
+            && nf <= from_seq
+        {
+            continue; // every record here is below `from_seq`
+        }
         let mut bytes = Vec::new();
         File::open(&path)?.read_to_end(&mut bytes)?;
         let (ranges, bad) = scan(&bytes);
-        out.extend(ranges.iter().map(|&(a, b)| bytes[a..b].to_vec()));
+        if let Some(nf) = next_first
+            && ranges.len() as u64 != nf - first
+        {
+            return Err(JournalError::Corrupt { file: path, offset: 0 });
+        }
+        for (k, &(a, b)) in ranges.iter().enumerate() {
+            let seq = first + k as u64;
+            if seq >= from_seq {
+                out.push((seq, bytes[a..b].to_vec()));
+            }
+        }
         if let Some(bad) = bad {
             let last = i + 1 == segs.len();
             if mode == ReadMode::Repair && last && bad.torn_tail {
@@ -242,12 +279,44 @@ pub fn read_dir(dir: &Path, mode: ReadMode) -> Result<Vec<Vec<u8>>, JournalError
     Ok(out)
 }
 
+/// Highest sequence present in `dir` (0 if empty), reading only the
+/// newest segment.
+fn last_seq(dir: &Path, mode: ReadMode) -> Result<u64, JournalError> {
+    let segs = segments(dir)?;
+    let Some(&first) = segs.last() else { return Ok(0) };
+    let n = read_from(dir, mode, first)?.len() as u64;
+    Ok(first - 1 + n)
+}
+
 /// What the engine side hands the I/O thread.
 enum Msg {
-    /// An encoded chunk (whole records) to append.
-    Chunk(Vec<u8>, u64),
+    /// An encoded chunk (whole records) covering sequences
+    /// `first..=last`.
+    Chunk { bytes: Vec<u8>, first: u64, last: u64 },
+    /// Close the current segment after syncing it; the next chunk
+    /// starts a new one (checkpoint boundary).
+    Rotate,
     /// Stop after draining.
     Shutdown,
+}
+
+/// Point-in-time journal health, for the service's metrics endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JournalStats {
+    /// Records encoded (the last sequence number handed out).
+    pub appended: u64,
+    /// Records covered by a completed `fsync`.
+    pub durable: u64,
+    /// `appended - durable`: the loss window if the process died now.
+    pub lag: u64,
+    /// Chunks queued for the I/O thread and not yet written.
+    pub chunks_in_flight: u64,
+    /// Completed group commits.
+    pub fsyncs: u64,
+    /// Total time spent in `fsync`, nanoseconds.
+    pub fsync_ns_total: u64,
+    /// Slowest single `fsync`, nanoseconds.
+    pub fsync_ns_max: u64,
 }
 
 /// State shared between the engine side and the I/O thread.
@@ -256,6 +325,11 @@ struct Shared {
     durable: AtomicU64,
     /// Set if the I/O thread hit an error; appends then fail.
     failed: AtomicBool,
+    /// Chunks sent and not yet received by the I/O thread.
+    in_flight: AtomicU64,
+    fsyncs: AtomicU64,
+    fsync_ns_total: AtomicU64,
+    fsync_ns_max: AtomicU64,
     /// Wakes [`Journal::wait_durable`] callers.
     gate: Mutex<()>,
     cv: Condvar,
@@ -265,10 +339,12 @@ struct Shared {
 /// one engine thread owns the writer, which is what keeps the hot path
 /// lock-free.
 pub struct Journal {
+    dir: PathBuf,
     chunk: Vec<u8>,
-    /// Records encoded so far (the next record's sequence is `seq + 1`).
+    /// Sequence of the first record in the current chunk.
+    chunk_first: u64,
+    /// Last sequence handed out.
     seq: u64,
-    /// Sequence covered by the chunk currently being filled.
     tx: SyncSender<Msg>,
     shared: Arc<Shared>,
     io: Option<JoinHandle<()>>,
@@ -278,18 +354,24 @@ impl Journal {
     /// Open (creating `dir` if needed) and continue after the records
     /// already on disk. Existing damage must be repaired first
     /// ([`read_dir`] with [`ReadMode::Repair`]); a damaged journal is an
-    /// error here too, so appends never follow a hole.
+    /// error here too, so appends never follow a hole. The first chunk
+    /// written after opening always starts a fresh segment.
     ///
     /// # Errors
     /// I/O failure or a corrupt existing journal.
     pub fn open(dir: &Path) -> Result<Journal, JournalError> {
         fs::create_dir_all(dir)?;
-        let existing = read_dir(dir, ReadMode::Strict)?.len() as u64;
-        let segs = segments(dir)?;
-        let next = segs.last().map_or(0, |n| n + 1);
+        // A strict read validates the whole directory (including
+        // segment continuity) before anything is appended.
+        let _ = read_from(dir, ReadMode::Strict, 1)?;
+        let existing = last_seq(dir, ReadMode::Strict)?;
         let shared = Arc::new(Shared {
             durable: AtomicU64::new(existing),
             failed: AtomicBool::new(false),
+            in_flight: AtomicU64::new(0),
+            fsyncs: AtomicU64::new(0),
+            fsync_ns_total: AtomicU64::new(0),
+            fsync_ns_max: AtomicU64::new(0),
             gate: Mutex::new(()),
             cv: Condvar::new(),
         });
@@ -299,16 +381,24 @@ impl Journal {
             let dir = dir.to_path_buf();
             std::thread::Builder::new()
                 .name("journal-io".into())
-                .spawn(move || io_loop(&dir, next, &rx, &shared))
+                .spawn(move || io_loop(&dir, &rx, &shared))
                 .map_err(JournalError::Io)?
         };
         Ok(Journal {
+            dir: dir.to_path_buf(),
             chunk: Vec::with_capacity(CHUNK_BYTES + HEADER_BYTES),
+            chunk_first: existing + 1,
             seq: existing,
             tx,
             shared,
             io: Some(io),
         })
+    }
+
+    /// Last sequence number handed out (0 if none).
+    #[must_use]
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 
     /// Encode one record and return its sequence number. No syscall; at
@@ -348,17 +438,77 @@ impl Journal {
         if self.chunk.is_empty() {
             return Ok(());
         }
-        let chunk =
+        let bytes =
             std::mem::replace(&mut self.chunk, Vec::with_capacity(CHUNK_BYTES + HEADER_BYTES));
+        let (first, last) = (self.chunk_first, self.seq);
+        self.chunk_first = self.seq + 1;
+        self.shared.in_flight.fetch_add(1, Ordering::AcqRel);
+        self.tx.send(Msg::Chunk { bytes, first, last }).map_err(|_| {
+            self.shared.in_flight.fetch_sub(1, Ordering::AcqRel);
+            io::Error::new(io::ErrorKind::BrokenPipe, "journal i/o stopped")
+        })
+    }
+
+    /// Flush, then end the current segment: records appended after this
+    /// call land in a new segment. Returns the last sequence in the
+    /// closed segment — the cut a checkpoint snapshots through.
+    ///
+    /// # Errors
+    /// `BrokenPipe` if the I/O thread has stopped.
+    pub fn rotate(&mut self) -> io::Result<u64> {
+        self.flush()?;
         self.tx
-            .send(Msg::Chunk(chunk, self.seq))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "journal i/o stopped"))
+            .send(Msg::Rotate)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "journal i/o stopped"))?;
+        Ok(self.seq)
+    }
+
+    /// Delete every segment whose records are all `<= seq` (a snapshot
+    /// through `seq` has made them redundant). The newest segment is
+    /// never deleted, so the journal always knows where it is. Returns
+    /// the number of segments removed.
+    ///
+    /// Only call with a `seq` that is durable AND covered by a durable
+    /// snapshot — recovery will start from the snapshot, not from these
+    /// files.
+    ///
+    /// # Errors
+    /// I/O failure while deleting.
+    pub fn truncate_through(&self, seq: u64) -> io::Result<usize> {
+        let segs = segments(&self.dir)?;
+        let mut removed = 0;
+        for w in segs.windows(2) {
+            // `w[1] - 1` is the last sequence of segment `w[0]`.
+            if w[1] - 1 <= seq {
+                fs::remove_file(segment_path(&self.dir, w[0]))?;
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            File::open(&self.dir)?.sync_all()?;
+        }
+        Ok(removed)
     }
 
     /// Records covered by a completed `fsync`.
     #[must_use]
     pub fn durable(&self) -> u64 {
         self.shared.durable.load(Ordering::Acquire)
+    }
+
+    /// Health snapshot (cheap: relaxed atomic loads).
+    #[must_use]
+    pub fn stats(&self) -> JournalStats {
+        let durable = self.durable();
+        JournalStats {
+            appended: self.seq,
+            durable,
+            lag: self.seq.saturating_sub(durable),
+            chunks_in_flight: self.shared.in_flight.load(Ordering::Relaxed),
+            fsyncs: self.shared.fsyncs.load(Ordering::Relaxed),
+            fsync_ns_total: self.shared.fsync_ns_total.load(Ordering::Relaxed),
+            fsync_ns_max: self.shared.fsync_ns_max.load(Ordering::Relaxed),
+        }
     }
 
     /// Block until record `seq` is durable. Returns `false` if the I/O
@@ -409,14 +559,23 @@ impl Drop for Journal {
 
 /// The I/O thread: write each queued chunk, then group-commit — drain
 /// everything already queued before the single `fsync`.
-fn io_loop(dir: &Path, first_segment: u64, rx: &Receiver<Msg>, shared: &Shared) {
-    let mut seg = first_segment;
+fn io_loop(dir: &Path, rx: &Receiver<Msg>, shared: &Shared) {
     let mut file: Option<(File, u64)> = None;
+    let mut rotate = false;
     let mut written_seq = shared.durable.load(Ordering::Acquire);
     let fail = |shared: &Shared| {
         shared.failed.store(true, Ordering::Release);
         let _g = shared.gate.lock().unwrap_or_else(PoisonError::into_inner);
         shared.cv.notify_all();
+    };
+    let sync = |f: &File, shared: &Shared| -> bool {
+        let t = Instant::now();
+        let ok = f.sync_data().is_ok();
+        let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        shared.fsyncs.fetch_add(1, Ordering::Relaxed);
+        shared.fsync_ns_total.fetch_add(ns, Ordering::Relaxed);
+        shared.fsync_ns_max.fetch_max(ns, Ordering::Relaxed);
+        ok
     };
     let mut stop = false;
     while !stop {
@@ -428,35 +587,38 @@ fn io_loop(dir: &Path, first_segment: u64, rx: &Receiver<Msg>, shared: &Shared) 
         for m in batch {
             match m {
                 Msg::Shutdown => stop = true,
-                Msg::Chunk(bytes, upto) => {
-                    if file.as_ref().is_none_or(|(_, len)| *len >= SEGMENT_BYTES) {
+                Msg::Rotate => rotate = true,
+                Msg::Chunk { bytes, first, last } => {
+                    shared.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    let full = file.as_ref().is_none_or(|(_, len)| *len >= SEGMENT_BYTES);
+                    if full || rotate {
+                        rotate = false;
                         if let Some((f, _)) = file.take()
-                            && f.sync_data().is_err()
+                            && !sync(&f, shared)
                         {
                             return fail(shared);
                         }
                         match OpenOptions::new()
                             .create(true)
                             .append(true)
-                            .open(segment_path(dir, seg))
+                            .open(segment_path(dir, first))
                         {
                             Ok(f) => file = Some((f, 0)),
                             Err(_) => return fail(shared),
                         }
-                        seg += 1;
                     }
                     let Some((f, len)) = file.as_mut() else { return fail(shared) };
                     if f.write_all(&bytes).is_err() {
                         return fail(shared);
                     }
                     *len += bytes.len() as u64;
-                    written_seq = upto;
+                    written_seq = last;
                 }
             }
         }
         // One fsync covers every chunk written above (group commit).
         if let Some((f, _)) = file.as_ref()
-            && f.sync_data().is_err()
+            && !sync(f, shared)
         {
             return fail(shared);
         }
@@ -529,7 +691,7 @@ mod tests {
             j.append(&[i; 20]).unwrap();
         }
         j.close().unwrap();
-        let path = segment_path(&dir, 0);
+        let path = segment_path(&dir, 1);
         let full = fs::read(&path).unwrap();
         // Tear the last record at every possible byte.
         let rec = HEADER_BYTES + 20;
@@ -553,7 +715,7 @@ mod tests {
             j.append(&[i; 16]).unwrap();
         }
         j.close().unwrap();
-        let path = segment_path(&dir, 0);
+        let path = segment_path(&dir, 1);
         let mut bytes = fs::read(&path).unwrap();
         let n = bytes.len();
         bytes[n - 1] ^= 0xFF;
@@ -570,7 +732,7 @@ mod tests {
             j.append(&[i; 16]).unwrap();
         }
         j.close().unwrap();
-        let path = segment_path(&dir, 0);
+        let path = segment_path(&dir, 1);
         let mut bytes = fs::read(&path).unwrap();
         bytes[HEADER_BYTES + 3] ^= 0xFF; // inside record 0's payload
         fs::write(&path, &bytes).unwrap();
@@ -590,6 +752,83 @@ mod tests {
         let mut j = Journal::open(&dir).unwrap();
         let err = j.append(&vec![0u8; MAX_PAYLOAD_BYTES + 1]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        j.close().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rotate_truncate_and_read_from() {
+        let dir = tmp("trunc");
+        let mut j = Journal::open(&dir).unwrap();
+        for i in 0..10u8 {
+            j.append(&[i]).unwrap();
+        }
+        let cut1 = j.rotate().unwrap();
+        assert_eq!(cut1, 10);
+        for i in 10..20u8 {
+            j.append(&[i]).unwrap();
+        }
+        let cut2 = j.rotate().unwrap();
+        assert_eq!(cut2, 20);
+        for i in 20..25u8 {
+            j.append(&[i]).unwrap();
+        }
+        j.flush().unwrap();
+        assert!(j.wait_durable(25));
+        assert_eq!(segments(&dir).unwrap(), vec![1, 11, 21]);
+        // Reading from a sequence skips earlier segments and returns exact seqs.
+        let tail = read_from(&dir, ReadMode::Strict, 18).unwrap();
+        assert_eq!(tail.first().map(|(s, _)| *s), Some(18));
+        assert_eq!(tail.len(), 8);
+        assert_eq!(tail[2], (20, vec![19]));
+        // Truncating through 10 drops only the first segment; through 25
+        // would drop the second but never the newest.
+        assert_eq!(j.truncate_through(10).unwrap(), 1);
+        assert_eq!(segments(&dir).unwrap(), vec![11, 21]);
+        assert_eq!(j.truncate_through(25).unwrap(), 1);
+        assert_eq!(segments(&dir).unwrap(), vec![21]);
+        j.close().unwrap();
+        // Reopen continues after the surviving tail.
+        let mut j = Journal::open(&dir).unwrap();
+        assert_eq!(j.append(b"x").unwrap(), 26);
+        j.close().unwrap();
+        let all = read_from(&dir, ReadMode::Strict, 1).unwrap();
+        assert_eq!(all.first().map(|(s, _)| *s), Some(21));
+        assert_eq!(all.last().unwrap(), &(26, b"x".to_vec()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_middle_segment_is_corruption() {
+        let dir = tmp("gap");
+        let mut j = Journal::open(&dir).unwrap();
+        for _ in 0..3 {
+            j.append(b"a").unwrap();
+            j.rotate().unwrap();
+        }
+        j.append(b"b").unwrap();
+        j.close().unwrap();
+        assert_eq!(segments(&dir).unwrap(), vec![1, 2, 3, 4]);
+        fs::remove_file(segment_path(&dir, 2)).unwrap();
+        assert!(matches!(read_from(&dir, ReadMode::Strict, 1), Err(JournalError::Corrupt { .. })));
+        assert!(Journal::open(&dir).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stats_report_durable_lag_and_fsync_time() {
+        let dir = tmp("stats");
+        let mut j = Journal::open(&dir).unwrap();
+        for _ in 0..100 {
+            j.append(b"payload").unwrap();
+        }
+        let before = j.stats();
+        assert_eq!((before.appended, before.lag > 0 || before.durable == 100), (100, true));
+        j.flush().unwrap();
+        assert!(j.wait_durable(100));
+        let s = j.stats();
+        assert_eq!((s.appended, s.durable, s.lag, s.chunks_in_flight), (100, 100, 0, 0));
+        assert!(s.fsyncs >= 1 && s.fsync_ns_total >= s.fsync_ns_max && s.fsync_ns_max > 0);
         j.close().unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
