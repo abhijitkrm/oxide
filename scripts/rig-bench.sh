@@ -8,6 +8,7 @@
 # Usage:
 #   scripts/rig-bench.sh [sections...]
 #   SECTIONS="env corpus journal"  scripts/rig-bench.sh
+#   SECTIONS="profile" PROFILE_SECS=20 scripts/rig-bench.sh   # needs perf (+ optional tools below)
 #
 # Sections (default: env corpus fold journal scaling):
 #   env      machine + toolchain capture (always runs first)
@@ -17,10 +18,20 @@
 #   journal  ack policy overhead (off/queued/durable), CHUNK_BYTES sweep,
 #            crash-test loop, recovery time vs journal size
 #   scaling  parallel-EVM, multi-market matcher, ring, hashing benches
-#   devnet   multi-validator local devnet (scripts/measure-admission.sh)
-#   soak     scripts/soak-test.sh (long; never in the default set)
+#   profile  CPU flamegraphs + top-function tables (perf record, frame pointers),
+#            peak RSS/page-faults/ctx-switches per run (/usr/bin/time), heap
+#            profiles (heaptrack), off-CPU and lock time (perf sched/lock, bcc),
+#            I/O (iostat, strace -c, blktrace) for every bench in the workspace
+#            plus the journal worker
+#   devnet   multi-validator local devnet (scripts/measure-admission.sh) with a
+#            per-process CPU/RSS/threads/FDs/ctx-switch/fault time series and an
+#            in-situ perf record of the live validators
+#   soak     scripts/soak-test.sh (long; never in the default set) with the same
+#            per-process sampler and `docker stats` series; flags RSS leak slopes
 #
 # Environment:
+#   PROFILE_SECS    seconds each profiled bench runs under perf (default: 15)
+#   PROFILE_SPECS   space-separated pkg:bench list to profile (default: every bench)
 #   OUT             results directory
 #   CORES           CPU list to pin single-thread runs to (default: 2)
 #   REPS            repetitions per corpus run (default: 7)
@@ -68,8 +79,31 @@ bench_bin() { # bench_bin <package> <bench> [extra cargo args...]
         sed -n 's/.*Executable .*(\(.*\))/\1/p' | tail -1
 }
 
-SECTIONS="${SECTIONS:-${*:-env corpus fold journal scaling}}"
+SECTIONS="${SECTIONS:-${*:-env corpus fold journal scaling profile}}"
 want() { case " $SECTIONS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+
+have() { command -v "$1" >/dev/null 2>&1; }
+SAMPLER="$ROOT/scripts/rig/sampler.py"
+# sampler_start <name> <match>... ; sampler_stop — per-process time series
+SAMPLER_PID=""
+sampler_start() {
+    local name="$1"; shift
+    local args=(); for m in "$@"; do args+=(--match "$m"); done
+    python3 "$SAMPLER" "$OUT/proc_$name.csv" --interval "${SAMPLE_SECS:-5}" "${args[@]}" \
+        >"$OUT/proc_$name.summary.txt" 2>&1 &
+    SAMPLER_PID=$!
+}
+sampler_stop() {
+    [ -n "$SAMPLER_PID" ] && { kill "$SAMPLER_PID" 2>/dev/null || true; wait "$SAMPLER_PID" 2>/dev/null || true; }
+    SAMPLER_PID=""
+}
+# iostat_start <name> ; iostat_stop — block-device utilisation, queue depth, await
+IOSTAT_PID=""
+iostat_start() {
+    if have iostat; then iostat -x -t 1 >"$OUT/iostat_$1.txt" 2>&1 & IOSTAT_PID=$!; fi
+}
+iostat_stop() { [ -n "$IOSTAT_PID" ] && { kill "$IOSTAT_PID" 2>/dev/null || true; wait "$IOSTAT_PID" 2>/dev/null || true; }; IOSTAT_PID=""; }
 
 # ── env ─────────────────────────────────────────────────────────────
 {
@@ -89,6 +123,13 @@ want() { case " $SECTIONS " in *" $1 "*) return 0 ;; esac; return 1; }
     echo "journal disk: $(df -h "$JOURNAL_DIR" | tail -1)"
     mount | grep -F "$(df "$JOURNAL_DIR" | tail -1 | awk '{print $1}')" || true
     echo "pin cores: $CORES  reps: $REPS  matcher-rust: ${MATCHER_RUST:-none}"
+    echo "profiling tools:"
+    for t in perf heaptrack heaptrack_print inferno-collapse-perf inferno-flamegraph flamegraph.pl \
+             stackcollapse-perf.pl iostat strace blktrace fio pidstat offcputime-bpfcc docker; do
+        if have "$t"; then echo "  [x] $t"; else echo "  [ ] $t (missing)"; fi
+    done
+    echo "  hint (Debian/Ubuntu): apt install linux-tools-common linux-tools-generic heaptrack sysstat strace blktrace fio bpfcc-tools;"
+    echo "                        cargo install inferno   # flamegraphs from perf script"
 } | tee "$OUT/env.txt"
 
 # ── corpus ──────────────────────────────────────────────────────────
@@ -206,9 +247,11 @@ fi
 if want journal; then
     log "journal: ack policy overhead (off/queued/durable) on $JOURNAL_DIR"
     export TMPDIR="$JOURNAL_DIR"
+    iostat_start journal; sampler_start journal "matcher-"
     for i in 1 2 3; do
         run journal_ack.txt cargo test -p matcher --release --lib journal_overhead -- --ignored --nocapture
     done
+    sampler_stop; iostat_stop
     log "journal: crash-test loop (SIGKILL under Durable)"
     ITER=$([ "$QUICK" = 1 ] && echo 5 || echo 200)
     fails=0
@@ -264,20 +307,162 @@ if want scaling; then
     run scaling_pipeline.txt cargo bench -p executor --bench block_pipeline
 fi
 
+# ── profile ─────────────────────────────────────────────────────────
+if want profile; then
+    PROF="$OUT/prof"; mkdir -p "$PROF"
+    PSECS="${PROFILE_SECS:-15}"
+    log "profile: building the workspace benches with frame pointers (own target dir)"
+    pb() { RUSTFLAGS="${RUSTFLAGS:-} -C force-frame-pointers=yes" CARGO_TARGET_DIR="$OUT/target-prof" bench_bin "$@"; }
+
+    # flame_svg <perf.data> <out.svg>: inferno, else FlameGraph scripts, else none
+    flame_svg() {
+        if have inferno-collapse-perf && have inferno-flamegraph; then
+            perf script -i "$1" 2>/dev/null | inferno-collapse-perf | inferno-flamegraph >"$2" 2>/dev/null
+        elif have stackcollapse-perf.pl && have flamegraph.pl; then
+            perf script -i "$1" 2>/dev/null | stackcollapse-perf.pl | flamegraph.pl >"$2" 2>/dev/null
+        fi
+    }
+    # profile_one <name> <cmd...>
+    profile_one() {
+        local name="$1"; shift
+        log "profile: $name"
+        # (1) totals: wall, user/sys CPU, MAX RSS, page faults, context switches
+        if [ "$(uname)" = Linux ] && [ -x /usr/bin/time ]; then
+            /usr/bin/time -v -o "$PROF/$name.time.txt" "$@" >"$PROF/$name.out.txt" 2>&1 || true
+        elif [ -x /usr/bin/time ]; then
+            /usr/bin/time -l -o "$PROF/$name.time.txt" "$@" >"$PROF/$name.out.txt" 2>&1 || true
+        fi
+        # (2) CPU: sampled call graphs -> top functions + flamegraph
+        if have perf; then
+            perf record -F 999 -g -o "$PROF/$name.perf.data" -- "$@" >/dev/null 2>&1 || true
+            if [ -s "$PROF/$name.perf.data" ]; then
+                perf report --stdio --no-children --percent-limit 0.5 -i "$PROF/$name.perf.data" \
+                    >"$PROF/$name.top.txt" 2>/dev/null || true
+                flame_svg "$PROF/$name.perf.data" "$PROF/$name.svg"
+            fi
+        fi
+        # (3) heap: who allocates, how much, peak vs steady state
+        if have heaptrack; then
+            heaptrack -o "$PROF/$name.heaptrack" "$@" >/dev/null 2>&1 || true
+            local hf; hf="$(ls -t "$PROF/$name.heaptrack"* 2>/dev/null | head -1)"
+            [ -n "$hf" ] && have heaptrack_print && heaptrack_print -n 25 "$hf" >"$PROF/$name.heap.txt" 2>/dev/null || true
+        fi
+    }
+
+    # the workload binaries: every bench that exists, built with symbols
+    PROFILE_SPECS="${PROFILE_SPECS:-trading:matching matcher:matcher_throughput matcher:balance_contention \
+        matcher:nonce_contention matcher:ring executor:block_pipeline executor:uniswap_transfer consensus:engine \
+        mempool:pool storage:backend storage:journal storage:mmr p2p:transport broadcast:dissemination codec:wire \
+        node:sustained_throughput exchange:settlement evm:breakdown evm:contract_mix crypto:hash crypto:bls \
+        crypto:tx_recover}"
+    for spec in $PROFILE_SPECS; do
+        pkg="${spec%%:*}"; b="${spec##*:}"
+        bin="$(pb "$pkg" "$b" 2>/dev/null || true)"
+        if [ -x "$bin" ]; then
+            # criterion benches take --profile-time (no analysis); others ignore extra args
+            profile_one "$pkg-$b" "$bin" --bench --profile-time "$PSECS"
+        else
+            echo "skip $pkg:$b (no such bench / did not build)" | tee -a "$OUT/session.log"
+        fi
+    done
+
+    # the matching engine on the corpus, fold on/off, shallow and deep
+    CORPUS="${CORPUS:-$OUT/corpus}"
+    if [ -d "$CORPUS" ]; then
+        PCB="$(pb trading corpus 2>/dev/null || true)"
+        deep="$(ls "$CORPUS"/w5_*.run.cmd.jsonl 2>/dev/null | sed 's/.run.cmd.jsonl//' | sort -t_ -k2 -n | tail -1)"
+        for fold in "" "--fold"; do
+            tag="${fold:+fold}"; tag="${tag:-nofold}"
+            [ -x "$PCB" ] && [ -n "$deep" ] && profile_one "corpus-w5deep-$tag" "$PCB" "$deep" $fold --replace native --reps 3
+            [ -x "$PCB" ] && [ -f "$CORPUS/w4.run.cmd.jsonl" ] && profile_one "corpus-w4-$tag" "$PCB" "$CORPUS/w4" $fold --replace native --reps 3
+        done
+    else
+        echo "no corpus data: run the corpus section first to profile the engine on W4/W5" | tee -a "$OUT/session.log"
+    fi
+
+    # the journal worker (writer thread + I/O thread), with disk + syscall views
+    JT="$(RUSTFLAGS="${RUSTFLAGS:-} -C force-frame-pointers=yes" CARGO_TARGET_DIR="$OUT/target-prof" \
+        cargo test -p matcher --release --lib --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\))/\1/p' | tail -1)"
+    if [ -x "$JT" ]; then
+        export TMPDIR="$JOURNAL_DIR"
+        iostat_start profile
+        profile_one journal-worker "$JT" journal_overhead --ignored --nocapture
+        iostat_stop
+        if have strace; then   # fsync/write counts and time, per thread
+            strace -c -f -e trace=fsync,fdatasync,write,pwrite64 -o "$PROF/journal-strace.txt" \
+                "$JT" journal_overhead --ignored --nocapture >/dev/null 2>&1 || true
+        fi
+        if have blktrace && [ "$(id -u)" = 0 ]; then
+            dev="$(df "$JOURNAL_DIR" | tail -1 | awk '{print $1}')"
+            (blktrace -d "$dev" -w 20 -o - | blkparse -i - >"$PROF/journal-blktrace.txt" 2>/dev/null) &
+            sleep 1; "$JT" journal_overhead --ignored --nocapture >/dev/null 2>&1 || true; wait
+        else
+            echo "blktrace skipped (needs the tool and root)" | tee -a "$OUT/session.log"
+        fi
+    fi
+
+    # off-CPU time and lock contention on the contended paths
+    for spec in matcher:balance_contention matcher:matcher_throughput; do
+        pkg="${spec%%:*}"; b="${spec##*:}"; bin="$(pb "$pkg" "$b" 2>/dev/null || true)"
+        [ -x "$bin" ] || continue
+        if have perf; then
+            perf sched record -o "$PROF/sched-$b.data" -- "$bin" --bench --profile-time "$PSECS" >/dev/null 2>&1 || true
+            perf sched latency -i "$PROF/sched-$b.data" 2>/dev/null | head -40 >"$PROF/sched-$b.latency.txt" || true
+            perf lock record -o "$PROF/lock-$b.data" -- "$bin" --bench --profile-time "$PSECS" >/dev/null 2>&1 || true
+            perf lock report -i "$PROF/lock-$b.data" 2>/dev/null | head -40 >"$PROF/lock-$b.txt" || true
+        fi
+        if have offcputime-bpfcc && [ "$(id -u)" = 0 ]; then
+            ("$bin" --bench --profile-time "$PSECS" >/dev/null 2>&1 &) ; sleep 2
+            offcputime-bpfcc -f -p "$(pgrep -n -f "$b")" "$PSECS" >"$PROF/offcpu-$b.folded" 2>/dev/null || true
+            have flamegraph.pl && flamegraph.pl --color=io <"$PROF/offcpu-$b.folded" >"$PROF/offcpu-$b.svg" || true
+        fi
+    done
+    log "profile: done -> $PROF  (*.top.txt, *.svg, *.time.txt, *.heap.txt, sched-*, lock-*, journal-*)"
+fi
+
 # ── devnet / soak (opt-in) ──────────────────────────────────────────
 if want devnet; then
-    log "devnet: fleet CPU per committed tx at 4/7/16 validators"
+    log "devnet: fleet CPU per committed tx at 4/7/16 validators, with per-process series + in-situ profile"
     cargo build --release -p oxide-devnet >/dev/null 2>&1
     for n in 4 7 16; do
-        run devnet_admission.txt scripts/measure-admission.sh target/release/oxide-devnet "$n" 500 60
+        sampler_start "devnet$n" oxide-devnet
+        # run the load in the background; attach perf/heaptrack once warmed up (measure-admission warms 20 s)
+        (run devnet_admission.txt scripts/measure-admission.sh target/release/oxide-devnet "$n" 500 60) &
+        LOAD=$!
+        sleep 28
+        pids="$(pgrep -d, -f 'oxide-devnet.*--node' || true)"
+        if [ -n "$pids" ] && have perf; then
+            mkdir -p "$OUT/prof"
+            perf record -F 199 -g -p "$pids" -o "$OUT/prof/devnet$n.perf.data" -- sleep 30 >/dev/null 2>&1 || true
+            perf report --stdio --no-children --percent-limit 0.5 -i "$OUT/prof/devnet$n.perf.data" \
+                >"$OUT/prof/devnet$n.top.txt" 2>/dev/null || true
+        fi
+        if [ -n "$pids" ] && have heaptrack && [ "$n" = 4 ]; then
+            heaptrack --pid "$(echo "$pids" | cut -d, -f1)" -o "$OUT/prof/devnet-heap" >/dev/null 2>&1 &
+            HT=$!; sleep 20; kill "$HT" 2>/dev/null || true
+        fi
+        wait "$LOAD" || true
+        sampler_stop
     done
     echo "latency injection: see scripts/inject-latency.sh (tc netem) — run it, then re-run this section" \
         | tee -a "$OUT/session.log"
 fi
 if want soak; then
-    log "soak: scripts/soak-test.sh (long-running)"
+    log "soak: scripts/soak-test.sh (long-running) with per-process + container series"
+    sampler_start soak oxide-validator oxide-devnet oxide-matcher
+    if have docker; then
+        ( while true; do
+              docker stats --no-stream --format '{{.Name}},{{.CPUPerc}},{{.MemUsage}},{{.NetIO}},{{.BlockIO}},{{.PIDs}}' \
+                  | sed "s/^/$(date +%s),/" >>"$OUT/soak_docker_stats.csv" 2>/dev/null
+              sleep 10
+          done ) &
+        DSTAT=$!
+    fi
     run soak.txt scripts/soak-test.sh
+    [ -n "${DSTAT:-}" ] && kill "$DSTAT" 2>/dev/null || true
+    sampler_stop
+    echo "RSS leak slopes: see proc_soak.summary.txt (LEAK SUSPECT = growth > 1%/h of mean RSS)" | tee -a "$OUT/session.log"
 fi
 
 log "done: results in $OUT"
-echo "Send back: $OUT (env.txt, corpus_*.txt, perf_*.txt, journal_*.txt, scaling_*.txt, digests.txt)"
+echo "Send back: $OUT (env.txt, digests.txt, corpus_*, journal_*, scaling_*, prof/, proc_*.csv + summaries, iostat_*, soak_docker_stats.csv)"

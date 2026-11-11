@@ -24491,3 +24491,38 @@ scripted: the `ExactDiv` A/B (the patch was reverted and lives only as the
 description in the step-5 entry; recreate it if the rig shows division cost) and
 `tc netem` latency injection (`scripts/inject-latency.sh` exists; run it by hand,
 then re-run `devnet`).
+
+### Rig plan: profiling added to `rig-bench.sh`
+
+New `profile` section (in the default set) and per-process sampling in
+`journal`/`devnet`/`soak`:
+
+- **CPU, per function:** every workspace bench (trading, matcher×4, executor×2,
+  consensus, mempool, storage×3, p2p, broadcast, codec, node, exchange, evm×2,
+  crypto×3 — override with `PROFILE_SPECS="pkg:bench ..."`) is built with frame
+  pointers in its own target dir and run under `perf record -F 999 -g`; output is
+  `*.top.txt` (top functions) and `*.svg` (inferno or FlameGraph scripts, whichever
+  is installed). The engine on W4 and the deepest W5 book, fold on/off, and the
+  journal worker are profiled too. Live validators are profiled in situ in `devnet`
+  (`perf record -p`).
+- **Per process over time:** `scripts/rig/sampler.py` writes CPU %, RSS, VSZ, threads,
+  FDs, voluntary/involuntary context switches, minor/major faults per process every
+  5 s to CSV and prints a summary with the RSS growth slope (second half of the run);
+  > 1 %/h of mean RSS is flagged LEAK SUSPECT. Used around `journal`, `devnet` and
+  `soak` (plus a `docker stats` series in `soak`).
+- **Peak memory per run:** `/usr/bin/time -v` max RSS, page faults, context switches
+  for every profiled command.
+- **Heap:** `heaptrack` + `heaptrack_print` top allocators per profiled command; live
+  validator attach in `devnet`. (The matcher's `alloc_accounting` gate remains the
+  regression check.)
+- **Off-CPU / locks:** `perf sched record|latency`, `perf lock record|report` on the
+  balance-contention and matcher-throughput benches; bcc `offcputime` when root.
+- **I/O:** `iostat -x` during journal runs, `strace -c -f` fsync/write counts and
+  time, `blktrace|blkparse` (root) on the journal test.
+
+Validated on the M1: sampler (macOS `ps` fallback), env tool check, and the profile
+section's build + `/usr/bin/time` + journal-worker path. NOT validated (Linux tools
+absent here): `perf`, `heaptrack`, `strace`, `iostat`, `blktrace`, the Linux `/proc`
+branch of the sampler (field indices checked against `proc(5)` by hand), and the
+devnet/soak attach logic. Expect to fix small things on the first box minutes;
+run `QUICK=1 PROFILE_SPECS="storage:mmr" PROFILE_SECS=2 SECTIONS=profile` first.
