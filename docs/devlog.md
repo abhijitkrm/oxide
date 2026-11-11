@@ -24331,3 +24331,39 @@ modules' pre-checks.
   and positions after every op.
 
 Existing state roots and golden vectors are unchanged (new tag, no new state).
+
+### Step 7 (chunked layout): re-examined, still not built
+
+One more experiment before committing to the rewrite: if the cost at 600k
+resting is the two neighbour nodes an unlink splices (the thing chunked storage
+removes), prefetching `node.prev`/`node.next` in the batch path should recover
+most of it. It recovered 2–3% (13.6–13.9 → 14.0–14.1M/s, `--features prefetch`,
+native amend, no fold) — within noise — and was reverted. So the remaining
+deep-book gap to matcher-rust is not the linked-list neighbours; guessing at the
+rest (TLB reach of 64 B/order vs 21 B/order, id-map footprint) needs a profile
+on the x86_64 rig, not a rewrite of the consensus-critical book here. With the
+fold on, the same book is hash-bound (5.7M/s), so the layout would not move the
+chain-configured number meaningfully either way.
+
+### Step 8: command journal (`crates/matcher/src/journal.rs`); loom test not done
+
+Built from orderer-rust's design: `Journal::append` only encodes a CRC-32C
+framed record into a 256 KiB chunk (no syscall); a dedicated I/O thread writes
+chunks and group-commits with one `fsync` per drained batch, publishing a
+`durable` watermark (`wait_durable(seq)` for acks); bounded queue (64 chunks) =
+backpressure; 64 MiB segment rotation; `read_dir(.., Repair)` truncates only a
+torn final record of the last segment (short header/payload, or a complete record
+with a bad checksum that ends exactly at EOF) — a bad record with bytes after it
+is a hole and is an error even in Repair mode, and `Journal::open` refuses to
+append after one. 7 tests: CRC-32C check values, round trip + watermark,
+multi-chunk + reopen continuing the sequence, a tear at every byte offset of the
+last record, checksum-failed tail, mid-file damage untouched, oversized payload.
+
+Deliberately NOT done: (a) wiring into the market workers (which commands are
+journaled and when acks release is a service-level choice, and replay-through-
+the-engine recovery needs the matcher's balance/nonce state journaled
+consistently with it); (b) the loom model check of `ring.rs`: the ring embeds
+tokio `Notify` and padded atomics in the same struct as the SPSC core, so a
+faithful loom test first needs the core (`slots/head/tail`) extracted behind a
+`sync` shim and a pinned `loom` dev-dependency (new-dependency rules: ≥7 days
+old, exact pin, `cargo deny`). Both are follow-ups.

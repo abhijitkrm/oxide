@@ -65,6 +65,7 @@
 
 pub mod balance;
 pub mod fix;
+pub mod journal;
 pub mod jsonrpc;
 pub mod market_data;
 pub mod protocol;

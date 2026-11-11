@@ -39,6 +39,13 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - **In plain words:** editing an order is now one cheaper step that cannot
     leave you half-way between the old order and the new one.
 
+- **Matcher command journal** (`crates/matcher::journal`, not yet wired
+  into the matching server). A crash-safe, checksummed log of commands with
+  group-commit durability and torn-tail repair, so a restarted matcher can
+  be rebuilt by replay.
+  - **In plain words:** the building block that will let the off-chain
+    matcher recover its order books after a crash.
+
 - **New benchmark: `cargo bench -p trading --bench corpus`** replays the
   matcher-rust W1–W5 workloads through the engine so the two can be
   compared on identical commands.
