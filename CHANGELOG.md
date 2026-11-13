@@ -10,6 +10,21 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ## [Unreleased]
 
+### Added
+
+- **`lanes` crate and `docs/lanes-spec.md`: sharded, swappable lanes**
+  (prototype, not wired into consensus). Authentication
+  (per-item, batched, gateway-certified, session MAC), fill commitment
+  (per-fill, stream, Merkle), a market-sharded trading lane, and an
+  account-range EVM-style lane with cross-lane credits and a conservation
+  test. Benches `crypto:budget` and `lanes:lanes` measure the per-stage cost
+  and the shard scaling; `scripts/rig-bench.sh` gains `budget` and `lanes`.
+  - **In plain words:** the road to 10M orders/s and 1M EVM tx/s is to stop
+    every validator re-checking every signature and to split the work into
+    parallel lanes. On a laptop the trading lane reaches 12.5M orders/s with
+    cheap session authentication, but only 0.3M with a signature per order.
+    This is the building block and its measurements, not a running network.
+
 ### Performance
 
 - **Matching engine: the committed-state fold is computed lazily**

@@ -17,6 +17,12 @@
 #   fold     FOLD_LOG_CAP and block-size sweeps (fold on)
 #   journal  ack policy overhead (off/queued/durable), CHUNK_BYTES sweep,
 #            crash-test loop, recovery time vs journal size
+#   budget   per-item cost of each authentication/commit stage per core and its
+#            thread scaling (secp256k1 recover, ed25519 strict/batch, BLAKE3 leaf,
+#            session MAC) and the cores needed for 1M EVM tx/s, 10M and 100M
+#            orders/s (crates/crypto/benches/budget.rs; docs/lanes-spec.md §8)
+#   lanes    sharded trading lane + EVM lane prototypes: orders/s vs shard count
+#            and verifier mode (crates/lanes/benches/lanes.rs)
 #   scaling  parallel-EVM, multi-market matcher, ring, hashing benches
 #   profile  CPU flamegraphs + top-function tables (perf record, frame pointers),
 #            peak RSS/page-faults/ctx-switches per run (/usr/bin/time), heap
@@ -29,7 +35,11 @@
 #   soak     scripts/soak-test.sh (long; never in the default set) with the same
 #            per-process sampler and `docker stats` series; flags RSS leak slopes
 #
+# Short-box preset (about 30 min, the measurements that decide the design):
+#   SECTIONS="env budget lanes" THREADS="1 2 4 8 16 32" scripts/rig-bench.sh
+#
 # Environment:
+#   THREADS         thread counts for budget/lanes scaling (default: 1 2 4 8 up to nproc)
 #   PROFILE_SECS    seconds each profiled bench runs under perf (default: 15)
 #   PROFILE_SPECS   space-separated pkg:bench list to profile (default: every bench)
 #   OUT             results directory
@@ -282,6 +292,34 @@ if want journal; then
     else
         echo "fio not installed: skipping raw fsync probe (see fsync_avg_us in the server log instead)" | tee -a "$OUT/session.log"
     fi
+fi
+
+# ── budget ──────────────────────────────────────────────────────────
+if want budget; then
+    log "budget: per-stage cost per core and thread scaling"
+    NPROC="$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null) || echo 4)"
+    if [ -z "${THREADS:-}" ]; then
+        THREADS=""; t=1
+        while [ "$t" -le "$NPROC" ]; do THREADS="$THREADS $t"; t=$((t * 2)); done
+        if [ "$((t / 2))" -ne "$NPROC" ]; then THREADS="$THREADS $NPROC"; fi
+    fi
+    TLIST="$(echo $THREADS | tr ' ' ',')"
+    SECS=2; [ "$QUICK" = 1 ] && SECS=0.3
+    run budget.csv cargo bench -p crypto --bench budget -- --secs "$SECS" --threads "$TLIST"
+fi
+
+# ── lanes ───────────────────────────────────────────────────────────
+if want lanes; then
+    log "lanes: seam matrix on 1 shard, shard scaling, EVM lane scaling"
+    NPROC="${NPROC:-$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null) || echo 4)}"
+    if [ -z "${THREADS:-}" ]; then
+        THREADS=""; t=1
+        while [ "$t" -le "$NPROC" ]; do THREADS="$THREADS $t"; t=$((t * 2)); done
+        if [ "$((t / 2))" -ne "$NPROC" ]; then THREADS="$THREADS $NPROC"; fi
+    fi
+    SECS=3; [ "$QUICK" = 1 ] && SECS=0.3
+    run lanes.csv cargo bench -p lanes --bench lanes -- --secs "$SECS" \
+        --shards "$(echo $THREADS | tr ' ' ',')"
 fi
 
 # ── scaling ─────────────────────────────────────────────────────────

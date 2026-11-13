@@ -84,3 +84,7 @@ harness = false
 [[bench]]
 name = "tx_recover"
 harness = false
+
+[[bench]]
+name = "budget"
+harness = false

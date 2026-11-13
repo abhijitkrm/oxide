@@ -24526,3 +24526,49 @@ absent here): `perf`, `heaptrack`, `strace`, `iostat`, `blktrace`, the Linux `/p
 branch of the sampler (field indices checked against `proc(5)` by hand), and the
 devnet/soak attach logic. Expect to fix small things on the first box minutes;
 run `QUICK=1 PROFILE_SPECS="storage:mmr" PROFILE_SECS=2 SECTIONS=profile` first.
+
+### Lanes: sharded, swappable authentication, commitment and EVM lanes (targets 10M orders/s, 1M EVM tx/s)
+
+Why: the user's targets are 10M orders/s and fills/s and 1M EVM tx/s (100M orders/s
+as design headroom). The per-item costs measured by the new `crypto` bench `budget`
+(M1, 1 core) say a single lane where every validator re-verifies everything cannot
+get there: secp256k1 recover 31 µs, ed25519 strict 46 µs, ed25519 batch(256) 16 µs,
+a BLAKE3 leaf 0.15 µs, a session-MAC 0.11 µs. 10M ed25519-batch orders/s is about
+156 cores of signature work alone; 1M EVM tx/s is about 31 cores for recovery alone.
+The engine itself (14.6M ops/s per core with the fold on) is not the limit.
+
+What landed: `docs/lanes-spec.md` and a prototype crate `lanes` (internal deps only):
+
+- `verify`: `Verifier` seam with `PerItem`, `Batched` (falls back to per-item),
+  `Certified` (gateway batch certificate, deterministic digest-seeded audit sample,
+  fail-closed on a bad cert/digest/audit), `SessionMac` (keyed BLAKE3, strictly
+  increasing counters).
+- `commit`: `FillCommit` seam with `PerFill`, `Stream`, `Merkle`.
+- `shard`: market-sharded trading lane over `MatchingEngine::apply_batch`.
+- `evm`: account-range lane, cross-lane credits, conservation property test.
+- Benches: `crypto/benches/budget.rs`, `lanes/benches/lanes.rs`; `rig-bench.sh`
+  sections `budget` and `lanes`.
+
+Findings:
+
+- Feeding the streaming hash 73 B per fill cost about 100 ns per fill, not the
+  ~15 ns I had estimated; buffering to 16 KiB per `update` cut it to about 58 ns
+  per fill (BLAKE3's multi-chunk SIMD path). Added cost over the bare engine, per
+  order: stream 35 ns, per-fill leaf 97 ns, merkle 183 ns.
+- Bug found by the property test (not review): cross-lane credit indices were
+  per-source, so a destination that sees only its own credits saw "gaps". Indices
+  are now per (source, destination) channel; spec corrected.
+- Mutation check: removing the sender debit makes the conservation test fail.
+- Swap safety is tested, not assumed: every authentication mode and every commit
+  mode yields the same lane output (digest, fills, resting) for the same orders.
+- Results: see spec §10. Session MAC + stream commit gives 12.5M orders/s on this
+  laptop on 8 shards; batched ed25519 per order gives 0.3M. The EVM lane mechanism
+  costs 13-35 ns per cross-lane credit against ~25 µs per real transaction.
+
+Not done, and not claimed: no consensus integration, no journal in the lane path, no
+network, no real EVM execution in the lane, no cross-lane contract calls, no
+session-open/scope enforcement or gateway slashing (hooks specified only). The
+100M figure is a design target, not a measurement.
+
+Box plan: `SECTIONS="env budget lanes"` is the short-box preset; it yields per-stage
+costs and the shard scaling curve on a many-core machine.
