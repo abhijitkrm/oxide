@@ -24648,3 +24648,40 @@ makes the existing attestation enforceable.
 
 Still not done: WebSocket and FIX carriage of the control frames, persisted sessions (they
 live in memory), bond withdrawal, a CLI for the bond deposit.
+
+### Laptop TPS sweep (M1, 8 cores: 4 performance + 4 efficiency; 16 GB; everything in one machine)
+
+Run one bench at a time after the changes above. Engine digests still match matcher-rust
+on all seven workloads. Numbers are single runs on a laptop that also hosts the load
+generator; treat them as order-of-magnitude, not as gates.
+
+| Kind | Result |
+|---|---|
+| Matching engine, 1 core, fold off, native amend | W1 39M, W2 32M, W3 25M, W4 38M, W5-1k 57M, W5-100k 36M, W5-600k 11.5M ops/s |
+| Matching engine, 1 core, commitment fold on | 8-25M ops/s (W1/W3 ~8M, W5-1k 25M) |
+| matcher-rust, same workloads | W5-1k 101M, W5-100k 23M, W5-600k 12.9M ops/s |
+| Lane prototype, session MAC + stream commit, 8 shards | 12.5M-17M orders/s (two runs) |
+| Lane prototype, batched ed25519 per order, 8 shards | 0.3-0.4M orders/s |
+| Admission only, 1 thread (matcher auth bench) | ed25519 20k, ed25519 batch 56k, EVM 33k (124k on 4 threads), session MAC 4.8M, certified 1.9M |
+| **Real loopback TCP, multi-market matcher, 4 conns, batch 500, real matching** | ed25519 67k, ed25519 batch 185k, EVM 164k, **session MAC 1.81M**, **certified 1.85M**, multi (mixed schemes enabled) 184k orders/s |
+| Older service tests (sync/pipelined, single-market mutex, per-order ed25519) | 10-18k orders/s |
+| Journal (queued ack / durable ack) | 44.6k / 33.6k orders/s vs 40.4k with no journal |
+| EVM execution, sequential, per tx | 34 us/tx (29.7k tx/s); 87% of it is secp256k1 recovery (29.6 us) |
+| EVM batch, parallel (8 cores) | 113k tx/s at 10k txs (gate 109k tx/s, floor 60k) |
+| Executor pipeline (native txs) | 269k tx/s propose+execute; 347k tx/s execute only |
+| Node sustained pipeline (native staking txs, in process) | 560-620k tx/s |
+| Uniswap-style EVM, 59,850 gas/tx | sequential 85k tx/s (5.0 GG/s); parallel 8 threads 343-391k tx/s (20.5 GG/s) |
+| Exchange batch settle | 1k distinct pairs 3.2M legs/s; 1k same pair 18M legs/s; 16k clustered 11M legs/s |
+| 4-validator local devnet over TCP | 4.0k tx/s sustained at 4k offered; collapsed to 0.9-2.8k above that (noisy, not a ceiling) |
+| Signatures (1 core) | secp256k1 recover 28.5-32 us, ed25519 strict 46 us, ed25519 batch 16 us, session MAC 0.12 us, BLS verify 772 us |
+
+Reading: the matching engine is not the service's limit. The service's limit is
+authentication: with a signature per order the real TCP path is 67k-185k orders/s even
+though the engine does tens of millions; with session MACs the same server does 1.8M
+orders/s on the same laptop while sharing cores with the load generator. EVM transactions
+are dominated by signature recovery (87%), so the EVM lane's lever is where recovery
+happens, not the execution engine.
+
+Caveats: not a multi-machine result; the devnet figure is unstable above 4k tx/s offered
+on this laptop and should not be quoted as a ceiling; criterion `elem/s` for the
+uniswap bench is mis-scaled, so tx/s above is computed from the measured times.
