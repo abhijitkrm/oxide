@@ -8,11 +8,12 @@
 
 use super::{
     Address, Event, ExchangeModule, ExecError, Hash, Height, Module, RejectCategory, TAG_AMEND,
-    TAG_BATCH_SETTLE, TAG_BATCH_SETTLE_COMMITTED, TAG_CANCEL, TAG_CANCEL_LINKED,
-    TAG_CANCEL_REGISTERED, TAG_DEPOSIT_BASE, TAG_DEPOSIT_BASE_FOR, TAG_LINK_TRADING_KEY,
-    TAG_LIST_MARKET, TAG_PLACE, TAG_REGISTER_LINKED, TAG_REGISTER_ORDER, TAG_SWEEP_LINKED,
-    TAG_UNLINK_TRADING_KEY, TAG_WITHDRAW_BASE, TAG_WITHDRAW_LINKED, TxContext, base_balances_leaf,
-    base_holds_leaf, decode, fee_vault_leaf, linked_leaf, module_id, registered_leaf, store_leaf,
+    TAG_BATCH_SETTLE, TAG_BATCH_SETTLE_COMMITTED, TAG_BOND_DEPOSIT, TAG_CANCEL, TAG_CANCEL_LINKED,
+    TAG_CANCEL_REGISTERED, TAG_DEPOSIT_BASE, TAG_DEPOSIT_BASE_FOR, TAG_DISPUTE,
+    TAG_LINK_TRADING_KEY, TAG_LIST_MARKET, TAG_PLACE, TAG_REGISTER_LINKED, TAG_REGISTER_ORDER,
+    TAG_SWEEP_LINKED, TAG_UNLINK_TRADING_KEY, TAG_WITHDRAW_BASE, TAG_WITHDRAW_LINKED, TxContext,
+    base_balances_leaf, base_holds_leaf, decode, fee_vault_leaf, linked_leaf, module_id,
+    registered_leaf, store_leaf,
 };
 
 impl Module for ExchangeModule {
@@ -24,7 +25,9 @@ impl Module for ExchangeModule {
         module_id::EXCHANGE
     }
 
-    fn begin_block(&self, _height: Height) {}
+    fn begin_block(&self, height: Height) {
+        self.height.store(height.0, std::sync::atomic::Ordering::Relaxed);
+    }
 
     fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
         if msg.is_empty() {
@@ -94,6 +97,10 @@ impl Module for ExchangeModule {
 
             TAG_BATCH_SETTLE_COMMITTED => self.handle_batch_settle_committed(ctx, body, &mut inner),
 
+            TAG_BOND_DEPOSIT => self.handle_bond_deposit(ctx, body),
+
+            TAG_DISPUTE => self.handle_dispute(ctx, body),
+
             TAG_REGISTER_ORDER => self.handle_register(ctx, body, &mut inner),
 
             TAG_CANCEL_REGISTERED => self.handle_cancel_registered(ctx, body, &mut inner),
@@ -120,7 +127,8 @@ impl Module for ExchangeModule {
         }
     }
 
-    fn end_block(&self, _height: Height) -> Vec<Event> {
+    fn end_block(&self, height: Height) -> Vec<Event> {
+        self.prune_records(height.0);
         Vec::new()
     }
 
@@ -250,6 +258,13 @@ impl Module for ExchangeModule {
 /// `ApplyFailed`, terminal, never retried.
 impl framework::ParameterSink for ExchangeModule {
     fn apply_param(&self, key: &[u8], value: &[u8]) -> Result<(), ExecError> {
+        if key == crate::dispute::REINSTATE_PARAM {
+            if !value.is_empty() {
+                return Err(ExecError::Malformed);
+            }
+            self.reinstate_operator();
+            return Ok(());
+        }
         if key != b"exchange.fee_vault.withdraw" {
             return Err(ExecError::rejected(
                 RejectCategory::NotFound,

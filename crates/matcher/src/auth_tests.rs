@@ -435,3 +435,188 @@ fn replay_protection_still_holds_for_every_scheme() {
     // The identical signed order again: authentic, but the nonce is spent.
     assert_eq!(m.submit_batch(vec![o])[0].reject_reason, Some(RejectReason::StaleNonce));
 }
+
+// ── expiry, owner-signed close, gateway faults, encodings ──────────
+
+use crate::auth::{
+    BatchCertificate, CERT_LEN, DEFAULT_SUSPEND_AFTER, GatewayFault, SESSION_CLOSE_LEN,
+    SESSION_OPEN_LEN, SessionClose,
+};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+fn clocked(start: u64) -> (SessionMac, Arc<AtomicU64>) {
+    let now = Arc::new(AtomicU64::new(start));
+    let n = Arc::clone(&now);
+    (SessionMac::default().with_clock(Arc::new(move || n.load(Ordering::Relaxed))), now)
+}
+
+fn mac_order(owner: Address, id: u32, key: &[u8; 32], nonce: u64) -> OrderRequest {
+    let mut r = blank(0, Side::Buy, nonce);
+    r.owner = owner;
+    sign_order_session(&mut r, id, key, CHAIN);
+    r
+}
+
+#[test]
+fn sessions_expire_and_expiry_is_signed() {
+    let (a, now) = clocked(1_000);
+    let (sk, owner) = ed(4);
+    let key = [6; 32];
+    let open = SessionOpen::sign_ed25519_until(&sk, key, MarketScope::all(), 5_000, CHAIN);
+    let id = a.open_session(&open, CHAIN).expect("open");
+    assert_eq!(ok(&a.orders(&[mac_order(owner, id, &key, 1)], CHAIN)), [true]);
+    now.store(4_999, Ordering::Relaxed);
+    assert_eq!(ok(&a.orders(&[mac_order(owner, id, &key, 2)], CHAIN)), [true]);
+    now.store(5_000, Ordering::Relaxed);
+    assert_eq!(ok(&a.orders(&[mac_order(owner, id, &key, 3)], CHAIN)), [false], "expired");
+
+    // The expiry is covered by the owner's signature: extending it breaks the open.
+    let mut stretched = SessionOpen::sign_ed25519_until(&sk, key, MarketScope::all(), 6_000, CHAIN);
+    stretched.expires_ms = 9_999_999;
+    assert_eq!(a.open_session(&stretched, CHAIN), Err(SessionError::BadAuthorization));
+    // Already expired at open.
+    let past = SessionOpen::sign_ed25519_until(&sk, key, MarketScope::all(), 100, CHAIN);
+    assert_eq!(a.open_session(&past, CHAIN), Err(SessionError::BadExpiry));
+}
+
+#[test]
+fn max_session_lifetime_refuses_never_and_too_long() {
+    let now = Arc::new(AtomicU64::new(10_000));
+    let n = Arc::clone(&now);
+    let a = SessionMac::default()
+        .with_clock(Arc::new(move || n.load(Ordering::Relaxed)))
+        .with_max_ttl_ms(60_000);
+    let (sk, _) = ed(4);
+    let open = |exp| SessionOpen::sign_ed25519_until(&sk, [1; 32], MarketScope::all(), exp, CHAIN);
+    assert_eq!(a.open_session(&open(0), CHAIN), Err(SessionError::BadExpiry), "never");
+    assert_eq!(a.open_session(&open(80_000), CHAIN), Err(SessionError::BadExpiry), "too long");
+    assert!(a.open_session(&open(70_000), CHAIN).is_ok(), "exactly the cap");
+    // The configured default refuses never-expiring sessions.
+    let built = AuthConfig { kind: AuthKind::SessionMac, ..AuthConfig::default() }.build();
+    assert_eq!(
+        built.open_session(
+            &SessionOpen::sign_ed25519(&sk, [1; 32], MarketScope::all(), CHAIN),
+            CHAIN
+        ),
+        Err(SessionError::BadExpiry)
+    );
+}
+
+#[test]
+fn only_the_owner_can_close_a_session() {
+    let a = SessionMac::default();
+    let (sk, owner) = ed(4);
+    let (other_sk, _) = ed(5);
+    let key = [2; 32];
+    let id = open_ed(&a, 4, key, MarketScope::all());
+    let o = mac_order(owner, id, &key, 1);
+
+    // Someone else's signature, the session key itself (MAC-shaped), the wrong chain.
+    assert_eq!(
+        a.close_session_authorized(&SessionClose::sign_ed25519(&other_sk, id, CHAIN), CHAIN),
+        Err(SessionError::BadAuthorization)
+    );
+    let mut mac_shaped = SessionClose::sign_ed25519(&sk, id, CHAIN);
+    mac_shaped.pubkey = [0; 32];
+    mac_shaped.pubkey[..4].copy_from_slice(&id.to_le_bytes());
+    mac_shaped.signature = [0; 64];
+    assert_eq!(a.close_session_authorized(&mac_shaped, CHAIN), Err(SessionError::BadAuthorization));
+    assert_eq!(
+        a.close_session_authorized(&SessionClose::sign_ed25519(&sk, id, CHAIN), CHAIN + 1),
+        Err(SessionError::BadAuthorization)
+    );
+    assert_eq!(ok(&a.orders(&[o], CHAIN)), [true], "still open after refused closes");
+
+    assert_eq!(
+        a.close_session_authorized(&SessionClose::sign_ed25519(&sk, id, CHAIN), CHAIN),
+        Ok(())
+    );
+    assert_eq!(ok(&a.orders(&[mac_order(owner, id, &key, 2)], CHAIN)), [false]);
+    assert_eq!(
+        a.close_session_authorized(&SessionClose::sign_ed25519(&sk, id, CHAIN), CHAIN),
+        Err(SessionError::NotFound)
+    );
+    // An EVM-owned session closes with the EVM key.
+    let ek = evm_key(3);
+    let eid = a
+        .open_session(&SessionOpen::sign_evm(&ek, [8; 32], MarketScope::all(), CHAIN), CHAIN)
+        .expect("open");
+    assert_eq!(a.close_session_authorized(&SessionClose::sign_evm(&ek, eid, CHAIN), CHAIN), Ok(()));
+}
+
+#[test]
+fn wire_encodings_round_trip() {
+    let (sk, _) = ed(4);
+    let open =
+        SessionOpen::sign_ed25519_until(&sk, [9; 32], MarketScope::only(&[1, 200]), 123, CHAIN);
+    let back = SessionOpen::from_bytes(&open.to_bytes());
+    assert_eq!(back.to_bytes(), open.to_bytes());
+    assert_eq!(open.to_bytes().len(), SESSION_OPEN_LEN);
+    assert!(back.scope.contains(200) && !back.scope.contains(2));
+    let (a, _) = clocked(0);
+    assert!(a.open_session(&back, CHAIN).is_ok(), "a decoded open still verifies");
+
+    let close = SessionClose::sign_ed25519(&sk, 7, CHAIN);
+    assert_eq!(SessionClose::from_bytes(&close.to_bytes()).to_bytes(), close.to_bytes());
+    assert_eq!(close.to_bytes().len(), SESSION_CLOSE_LEN);
+
+    let (gw, _) = ed(99);
+    let reqs = [ed_order(1, 1)];
+    let cert = certify(&gw, &reqs, CHAIN);
+    assert_eq!(BatchCertificate::from_bytes(&cert.to_bytes()).to_bytes(), cert.to_bytes());
+    assert_eq!(cert.to_bytes().len(), CERT_LEN);
+}
+
+#[test]
+fn a_gateway_that_vouches_for_bad_orders_is_faulted_then_suspended() {
+    let (gw, _) = ed(99);
+    let gw_key = gw.verifying_key().to_bytes();
+    let seen: Arc<std::sync::Mutex<Vec<GatewayFault>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    let a = cert_auth(&gw, 1).with_fault_hook(Arc::new(move |f| sink.lock().unwrap().push(*f)));
+
+    let good: Vec<OrderRequest> = (1..=4u8).map(|s| ed_order(s, 1)).collect();
+    let mut bad = good.clone();
+    bad[2].signature = [1; 64];
+    let bad_cert = certify(&gw, &bad, CHAIN);
+
+    // Not attributable: a tampered digest and an unknown gateway leave no fault.
+    let mut tampered = bad_cert;
+    tampered.digest[5] ^= 1;
+    assert!(a.certified_orders(&bad, &tampered, CHAIN).iter().all(Option::is_none));
+    let (rogue, _) = ed(98);
+    assert!(
+        a.certified_orders(&bad, &certify(&rogue, &bad, CHAIN), CHAIN).iter().all(Option::is_none)
+    );
+    assert!(seen.lock().unwrap().is_empty(), "no provable fault yet");
+
+    // Provable: the gateway signed this digest and the audited order is bad.
+    for n in 1..=DEFAULT_SUSPEND_AFTER {
+        assert!(a.certified_orders(&bad, &bad_cert, CHAIN).iter().all(Option::is_none));
+        let f = *seen.lock().unwrap().last().expect("fault recorded");
+        assert_eq!((f.gateway, f.index, f.count), (gw_key, 2, n));
+        assert_eq!(f.suspended, n == DEFAULT_SUSPEND_AFTER);
+    }
+    assert_eq!(a.suspended(), vec![gw_key]);
+
+    // A suspended gateway's perfectly good batch is now refused too ...
+    let good_cert = certify(&gw, &good, CHAIN);
+    assert!(a.certified_orders(&good, &good_cert, CHAIN).iter().all(Option::is_none));
+    // ... until an operator reinstates it.
+    a.reinstate(&gw_key);
+    assert!(a.certified_orders(&good, &good_cert, CHAIN).iter().all(Option::is_some));
+    assert!(a.suspended().is_empty());
+}
+
+#[test]
+fn suspension_can_be_disabled() {
+    let (gw, _) = ed(99);
+    let a = cert_auth(&gw, 1).with_suspend_after(0);
+    let mut bad: Vec<OrderRequest> = (1..=3u8).map(|s| ed_order(s, 1)).collect();
+    bad[1].signature = [1; 64];
+    let cert = certify(&gw, &bad, CHAIN);
+    for _ in 0..10 {
+        assert!(a.certified_orders(&bad, &cert, CHAIN).iter().all(Option::is_none));
+    }
+    assert!(a.suspended().is_empty());
+}

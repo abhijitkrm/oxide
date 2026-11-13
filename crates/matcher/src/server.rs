@@ -85,24 +85,31 @@ async fn submit_batch_ring(
     ring_counter: &std::sync::atomic::AtomicUsize,
     orders: &[OrderRequest],
 ) -> Vec<OrderResponse> {
-    // Authenticate on THIS transport thread: Ed25519 verification
-    // parallelizes across connections, and the ring only accepts
-    // `VerifiedOrder` proof tokens (unforgeable outside
-    // `VerifiedOrder::new`), so the matcher thread can never execute
-    // an unauthenticated order. `positions[i]` is the original batch
-    // index of verified order i; failed entries keep an aligned
-    // `BadSignature` response and never touch the ring.
-    let mut positions: Vec<usize> = Vec::with_capacity(orders.len());
-    let mut verified: Vec<crate::protocol::VerifiedOrder> = Vec::with_capacity(orders.len());
-    let mut responses: Vec<Option<OrderResponse>> = Vec::with_capacity(orders.len());
-    // Verify against the ring's configured chain ID — the embedded
-    // server re-checks nothing for `VerifiedOrder`, so the transport
-    // MUST use the same domain or valid orders die here as
-    // `BadSignature`. Batch construction shares one multi-scalar
-    // multiplication across the whole batch — ~3× cheaper per order
-    // than per-item `verify_strict` at the batch sizes clients send.
-    let chain_id = ring.chain_id();
-    for (i, item) in ring.authenticator().orders(orders, chain_id).into_iter().enumerate() {
+    // Authenticate on THIS transport thread: verification parallelizes
+    // across connections, and the ring only accepts `VerifiedOrder`
+    // proof tokens, so the matcher thread can never execute an
+    // unauthenticated order. Authenticate against the ring's configured
+    // chain ID and scheme — the embedded server re-checks nothing for
+    // `VerifiedOrder`, so the transport MUST use the same domain or
+    // valid orders die here as `BadSignature`.
+    let authenticated = ring.authenticator().orders(orders, ring.chain_id());
+    submit_authenticated_ring(ring, ring_counter, authenticated).await
+}
+
+/// Push already-authenticated orders through the ring matcher.
+/// `authenticated[i]` is `Some(proof)` for an admitted order and `None`
+/// for one that failed authentication (answered `BadSignature` in place,
+/// never touching the ring). Responses stay aligned with the input.
+async fn submit_authenticated_ring(
+    ring: &crate::RingMatcher,
+    ring_counter: &std::sync::atomic::AtomicUsize,
+    authenticated: Vec<Option<crate::protocol::VerifiedOrder>>,
+) -> Vec<OrderResponse> {
+    let n = authenticated.len();
+    let mut positions: Vec<usize> = Vec::with_capacity(n);
+    let mut verified: Vec<crate::protocol::VerifiedOrder> = Vec::with_capacity(n);
+    let mut responses: Vec<Option<OrderResponse>> = Vec::with_capacity(n);
+    for (i, item) in authenticated.into_iter().enumerate() {
         match item {
             Some(vo) => {
                 positions.push(i);
@@ -470,6 +477,48 @@ async fn handle_connection(
             if socket.write_all(&batch_resp).await.is_err() {
                 break;
             }
+        } else if header[3] == crate::control::CONTROL_FLAG {
+            // Control frame: session open/close or a certified batch.
+            let auth = transport_auth(&matcher, ring_matcher.as_ref());
+            let chain_id = transport_chain_id(&matcher, ring_matcher.as_ref());
+            let Ok(frame) = crate::control::read_frame(&mut socket).await else {
+                break;
+            };
+            if let Some(resp) = crate::control::apply_session_frame(&*auth, chain_id, &frame) {
+                if socket.write_all(&resp).await.is_err() {
+                    break;
+                }
+            } else if let crate::control::Frame::CertBatch(cert, orders) = frame {
+                let authenticated = auth.certified_orders(&orders, &cert, chain_id);
+                let responses: Vec<OrderResponse> = if let Some(rm) = &ring_matcher {
+                    submit_authenticated_ring(rm, &ring_counter, authenticated).await
+                } else {
+                    match matcher.inner.lock() {
+                        Ok(mut server) => authenticated
+                            .iter()
+                            .map(|a| match a {
+                                Some(vo) => server.submit_verified(vo),
+                                None => OrderResponse::rejected(
+                                    crate::protocol::RejectReason::BadSignature,
+                                ),
+                            })
+                            .collect(),
+                        Err(_) => authenticated
+                            .iter()
+                            .map(|_| {
+                                OrderResponse::rejected(crate::protocol::RejectReason::EngineError)
+                            })
+                            .collect(),
+                    }
+                };
+                if socket
+                    .write_all(&crate::protocol::encode_batch_response(&responses))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
         } else if is_action_request(&header) {
             // Action request (cancel/amend/replace): the market byte
             // is ACTION_FLAG (0xFE). Read the remaining
@@ -612,6 +661,16 @@ async fn run_jsonrpc_tcp_server_impl(
                 let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
                 let params = req.get("params").cloned().unwrap_or(serde_json::Value::Null);
 
+                {
+                    let auth = transport_auth(&matcher, ring_matcher.as_ref());
+                    let chain_id = transport_chain_id(&matcher, ring_matcher.as_ref());
+                    if let Some(line) =
+                        crate::control::jsonrpc_session(&*auth, chain_id, method, &params, &id)
+                    {
+                        let _ = writer.write_all(line.as_bytes()).await;
+                        continue;
+                    }
+                }
                 if method == crate::jsonrpc::MANAGE_ORDER {
                     // Order action (cancel/amend/replace).
                     let Some(action_req) = crate::jsonrpc::parse_jsonrpc_action(&params) else {
@@ -1325,6 +1384,25 @@ async fn submit_batch_multi(
     })
 }
 
+/// Submit a gateway-certified batch through the multi-market matcher
+/// (blocking pool, like [`submit_batch_multi`]).
+async fn submit_certified_multi(
+    matcher: &Arc<crate::MultiMarketMatcher>,
+    orders: Vec<OrderRequest>,
+    cert: crate::auth::BatchCertificate,
+) -> Vec<OrderResponse> {
+    if orders.is_empty() {
+        return Vec::new();
+    }
+    let n = orders.len();
+    let matcher = Arc::clone(matcher);
+    tokio::task::spawn_blocking(move || matcher.submit_batch_certified(orders, &cert))
+        .await
+        .unwrap_or_else(|_| {
+            (0..n).map(|_| OrderResponse::rejected(RejectReason::EngineError)).collect()
+        })
+}
+
 /// Submit a single order through the multi-market parallel matcher —
 /// on the blocking pool, for the same reason as
 /// [`submit_batch_multi`]: `submit_one` blocks on an mpsc `recv`
@@ -1415,6 +1493,27 @@ async fn handle_connection_multi(
             if socket.write_all(&batch_resp).await.is_err() {
                 break;
             }
+        } else if header[3] == crate::control::CONTROL_FLAG {
+            // Control frame: session open/close or a certified batch.
+            let auth = matcher.authenticator();
+            let chain_id = matcher.chain_id();
+            let Ok(frame) = crate::control::read_frame(&mut socket).await else {
+                break;
+            };
+            if let Some(resp) = crate::control::apply_session_frame(&*auth, chain_id, &frame) {
+                if socket.write_all(&resp).await.is_err() {
+                    break;
+                }
+            } else if let crate::control::Frame::CertBatch(cert, orders) = frame {
+                let responses = submit_certified_multi(&matcher, orders, cert).await;
+                if socket
+                    .write_all(&crate::protocol::encode_batch_response(&responses))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
         } else if is_action_request(&header) {
             // Action request (cancel/amend/replace).
             let mut rest = [0u8; crate::protocol::ACTION_REQUEST_SIZE - 4];
@@ -1494,6 +1593,16 @@ pub async fn run_jsonrpc_tcp_server_multi(
                 let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
                 let params = req.get("params").cloned().unwrap_or(serde_json::Value::Null);
 
+                if let Some(line) = crate::control::jsonrpc_session(
+                    &*matcher.authenticator(),
+                    matcher.chain_id(),
+                    method,
+                    &params,
+                    &id,
+                ) {
+                    let _ = writer.write_all(line.as_bytes()).await;
+                    continue;
+                }
                 if method == crate::jsonrpc::MANAGE_ORDER {
                     let Some(action_req) = crate::jsonrpc::parse_jsonrpc_action(&params) else {
                         let _ = writer.write_all(br#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params"},"id":null}

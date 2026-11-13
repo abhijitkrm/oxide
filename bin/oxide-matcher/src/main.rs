@@ -309,6 +309,14 @@ fn parse_auth() -> matcher::auth::AuthConfig {
     }
     cfg.evm_threads = parse_flag("--evm-threads", 1usize).max(1);
     cfg.audit_every = parse_flag("--audit-every", cfg.audit_every);
+    // Longest session lifetime in ms (default 24h; 0 removes the cap, which
+    // also allows sessions that never expire).
+    match parse_flag("--max-session-ttl-ms", 24 * 60 * 60 * 1000u64) {
+        0 => cfg.max_session_ttl_ms = None,
+        t => cfg.max_session_ttl_ms = Some(t),
+    }
+    // Provable gateway faults before a gateway is suspended (0 = never).
+    cfg.suspend_after = parse_flag("--gateway-suspend-after", cfg.suspend_after);
     if let Some(keys) = parse_flag_opt::<String>("--gateway-keys") {
         for k in keys.split(',').filter(|k| !k.is_empty()) {
             let bytes = (0..k.len())

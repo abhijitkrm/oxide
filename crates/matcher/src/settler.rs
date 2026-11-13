@@ -35,7 +35,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use exchange::BatchFillEntry;
-use primitives::fixed::{Price, Qty};
 use types::TxBytes;
 
 /// The settlement lane's failure classes — a typed boundary so a
@@ -253,33 +252,11 @@ pub(crate) fn is_retryable_skip(reason: executor::TxSkipReason) -> bool {
 pub(crate) fn aggregate_fills(
     fills: &[crate::SettledFill],
 ) -> Result<Vec<BatchFillEntry>, SettleError> {
-    let mut aggregated: std::collections::BTreeMap<
-        (u16, Price, exchange::OrderKey, exchange::OrderKey),
-        Qty,
-    > = std::collections::BTreeMap::new();
-    for f in fills {
-        let key = (
-            f.market,
-            f.price,
-            exchange::OrderKey { owner: f.buyer, client_id: f.buyer_id },
-            exchange::OrderKey { owner: f.seller, client_id: f.seller_id },
-        );
-        match aggregated.get_mut(&key) {
-            Some(q) => {
-                // A qty sum above u64::MAX is unreachable in practice
-                // (would require ~1.8e13 lots traded in one batch);
-                // fail loudly rather than saturate.
-                *q = Qty(q.0.checked_add(f.qty.0).ok_or(SettleError::AggregateOverflow)?);
-            }
-            None => {
-                aggregated.insert(key, f.qty);
-            }
-        }
-    }
-    Ok(aggregated
-        .into_iter()
-        .map(|((market, price, buy, sell), qty)| BatchFillEntry { market, price, qty, buy, sell })
-        .collect())
+    // The aggregation is defined once in `exchange::dispute`, so the
+    // legs the settler submits and the legs a dispute re-derives from
+    // the same raw fills are the same function of them.
+    let raw: Vec<exchange::dispute::RawFill> = fills.iter().map(crate::commit::to_raw).collect();
+    exchange::dispute::aggregate_raw_fills(&raw).map_err(|_| SettleError::AggregateOverflow)
 }
 
 /// The settler's secp256k1 identity for signing settlement

@@ -24619,3 +24619,32 @@ Not done: session open/close and certificate frames on the network transports, s
 expiry, netted-delta settlement with a dispute path (the step that would remove per-leg
 chain work), and journaling the fills root in the seal record (it is recomputable from the
 journal, so nothing is lost). The `--commit-batches` default is off; the chain must know tag 16.
+
+### Open items closed: control frames, session expiry and close, gateway faults, bonded operator and disputes
+
+Done, in the order the user asked ("do what is not done first"):
+
+- **Control frames** (`matcher::control`): session open/close and certified batches on the
+  binary TCP protocol (flag 0xFD; multi-market, mutex and ring servers) and session
+  open/close as JSON-RPC methods. `submit_batch` was split so a certified batch skips
+  per-order verification but shares everything after authentication.
+- **Session expiry**: the expiry is inside the owner's signed open; a default 24 h maximum
+  lifetime also refuses "never expires". Close is owner-signed (ed25519 or EVM), not
+  session-key-signed.
+- **Gateway faults**: a provable fault (valid certificate, matching digest, failing audited
+  order) is counted per gateway, hooks an operator callback (default: a stderr line), and
+  suspends the gateway after 3. Mutation checks: 5/5 caught.
+- **Bonded operator and disputes** (`exchange::dispute`, tags 17 and 18): bond, per-batch
+  records in the committed KV store (no snapshot layout change; verified by a snapshot
+  round-trip test), dispute with the raw fills, slash plus suspension, governed
+  reinstatement, pruning at `end_block`. Raw-fill encoding, label and aggregation are
+  defined once in the exchange and imported by the matcher. Mutation checks: 7/7 caught.
+
+Decision recorded: I did not build "netted-delta settlement". Per-account netting does not
+remove per-leg chain work because each leg still updates the registered orders' remaining
+quantity and escrow; real savings need order state off chain, which is a trust-model change
+(dispute over order state), not an optimization. The dispute path above is the part that
+makes the existing attestation enforceable.
+
+Still not done: WebSocket and FIX carriage of the control frames, persisted sessions (they
+live in memory), bond withdrawal, a CLI for the bond deposit.

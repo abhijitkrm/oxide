@@ -103,10 +103,25 @@ pub trait Authenticator: Send + Sync {
         Err(SessionError::Unsupported)
     }
 
-    /// Revoke a session. Returns whether it existed. The default has
-    /// no sessions.
+    /// Revoke a session without authorization (operator-side). Returns
+    /// whether it existed. The default has no sessions.
     fn close_session(&self, _id: u32) -> bool {
         false
+    }
+
+    /// Revoke a session on the owner's signed request (a client-side
+    /// close, e.g. over the network).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] if unsupported, the request is not signed by the
+    /// session's owner, or the session does not exist.
+    fn close_session_authorized(
+        &self,
+        _req: &SessionClose,
+        _chain_id: u64,
+    ) -> Result<(), SessionError> {
+        Err(SessionError::Unsupported)
     }
 }
 
@@ -120,6 +135,11 @@ pub enum SessionError {
     BadAuthorization,
     /// The session table is full ([`MAX_SESSIONS`]).
     Full,
+    /// The expiry is in the past, or absent/too far out for this
+    /// authenticator's maximum session lifetime.
+    BadExpiry,
+    /// No open session with that id.
+    NotFound,
 }
 
 // ── credential shapes ───────────────────────────────────────────────
@@ -357,11 +377,25 @@ impl MarketScope {
         self.0[usize::from(market / 64)] >> (market % 64) & 1 == 1
     }
 
+    /// Decode the 32-byte bitmap ([`Self::bytes`]).
+    #[must_use]
+    pub fn from_bytes(b: &[u8; 32]) -> Self {
+        let mut w = [0u64; 4];
+        for (i, word) in w.iter_mut().enumerate() {
+            let mut x = [0u8; 8];
+            x.copy_from_slice(&b[i * 8..i * 8 + 8]);
+            *word = u64::from_le_bytes(x);
+        }
+        Self(w)
+    }
+
     fn is_empty(&self) -> bool {
         self.0.iter().all(|w| *w == 0)
     }
 
-    fn bytes(&self) -> [u8; 32] {
+    /// The 32-byte bitmap.
+    #[must_use]
+    pub fn bytes(&self) -> [u8; 32] {
         let mut b = [0u8; 32];
         for (i, w) in self.0.iter().enumerate() {
             b[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
@@ -383,6 +417,10 @@ pub struct SessionOpen {
     pub session_key: [u8; 32],
     /// Markets the session may trade.
     pub scope: MarketScope,
+    /// Expiry, milliseconds since the Unix epoch; signed with the rest
+    /// of the request. 0 means "never", which an authenticator with a
+    /// maximum session lifetime refuses.
+    pub expires_ms: u64,
     /// Credential `pubkey` field (ed25519 key, or EVM recovery id).
     pub pubkey: [u8; 32],
     /// Credential `signature` field over [`SessionOpen::message`].
@@ -392,17 +430,64 @@ pub struct SessionOpen {
 impl SessionOpen {
     /// The bytes the owner signs.
     #[must_use]
-    pub fn message(owner: &Address, key: &[u8; 32], scope: &MarketScope, chain_id: u64) -> Vec<u8> {
-        let mut m = Vec::with_capacity(SESSION_OPEN_DOMAIN.len() + 8 + 20 + 32 + 32);
+    pub fn message(
+        owner: &Address,
+        key: &[u8; 32],
+        scope: &MarketScope,
+        expires_ms: u64,
+        chain_id: u64,
+    ) -> Vec<u8> {
+        let mut m = Vec::with_capacity(SESSION_OPEN_DOMAIN.len() + 8 + 20 + 32 + 32 + 8);
         m.extend_from_slice(SESSION_OPEN_DOMAIN);
         m.extend_from_slice(&chain_id.to_le_bytes());
         m.extend_from_slice(&owner.0);
         m.extend_from_slice(key);
         m.extend_from_slice(&scope.bytes());
+        m.extend_from_slice(&expires_ms.to_le_bytes());
         m
     }
 
-    /// Open request authorized by an ed25519 key.
+    /// Wire encoding: `owner 20 ‖ key 32 ‖ scope 32 ‖ expires 8 ‖
+    /// pubkey 32 ‖ signature 64`.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; SESSION_OPEN_LEN] {
+        let mut b = [0u8; SESSION_OPEN_LEN];
+        b[0..20].copy_from_slice(&self.owner.0);
+        b[20..52].copy_from_slice(&self.session_key);
+        b[52..84].copy_from_slice(&self.scope.bytes());
+        b[84..92].copy_from_slice(&self.expires_ms.to_le_bytes());
+        b[92..124].copy_from_slice(&self.pubkey);
+        b[124..188].copy_from_slice(&self.signature);
+        b
+    }
+
+    /// Decode [`Self::to_bytes`].
+    #[must_use]
+    pub fn from_bytes(b: &[u8; SESSION_OPEN_LEN]) -> Self {
+        let arr = |r: std::ops::Range<usize>| -> Vec<u8> { b[r].to_vec() };
+        let mut owner = [0u8; 20];
+        owner.copy_from_slice(&arr(0..20));
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&arr(20..52));
+        let mut scope = [0u8; 32];
+        scope.copy_from_slice(&arr(52..84));
+        let mut exp = [0u8; 8];
+        exp.copy_from_slice(&arr(84..92));
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(&arr(92..124));
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&arr(124..188));
+        Self {
+            owner: Address(owner),
+            session_key: key,
+            scope: MarketScope::from_bytes(&scope),
+            expires_ms: u64::from_le_bytes(exp),
+            pubkey,
+            signature,
+        }
+    }
+
+    /// Open request authorized by an ed25519 key, with no expiry.
     #[must_use]
     pub fn sign_ed25519(
         secret: &crypto::ed25519::Ed25519SecretKey,
@@ -410,11 +495,33 @@ impl SessionOpen {
         scope: MarketScope,
         chain_id: u64,
     ) -> Self {
+        Self::sign_ed25519_until(secret, key, scope, 0, chain_id)
+    }
+
+    /// Open request authorized by an ed25519 key, expiring at
+    /// `expires_ms` (Unix epoch milliseconds).
+    #[must_use]
+    pub fn sign_ed25519_until(
+        secret: &crypto::ed25519::Ed25519SecretKey,
+        key: [u8; 32],
+        scope: MarketScope,
+        expires_ms: u64,
+        chain_id: u64,
+    ) -> Self {
         let pk = secret.verifying_key();
         let owner = crypto::ed25519::owner_address(&pk);
-        let sig =
-            crypto::ed25519::sign_message(secret, &Self::message(&owner, &key, &scope, chain_id));
-        Self { owner, session_key: key, scope, pubkey: pk.to_bytes(), signature: sig.to_bytes() }
+        let sig = crypto::ed25519::sign_message(
+            secret,
+            &Self::message(&owner, &key, &scope, expires_ms, chain_id),
+        );
+        Self {
+            owner,
+            session_key: key,
+            scope,
+            expires_ms,
+            pubkey: pk.to_bytes(),
+            signature: sig.to_bytes(),
+        }
     }
 
     /// Open request authorized by an EVM key.
@@ -424,16 +531,33 @@ impl SessionOpen {
     /// Panics if `secret` is not a valid secp256k1 secret key.
     #[must_use]
     pub fn sign_evm(secret: &[u8; 32], key: [u8; 32], scope: MarketScope, chain_id: u64) -> Self {
+        Self::sign_evm_until(secret, key, scope, 0, chain_id)
+    }
+
+    /// EVM-key open request expiring at `expires_ms`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `secret` is not a valid secp256k1 secret key.
+    #[must_use]
+    pub fn sign_evm_until(
+        secret: &[u8; 32],
+        key: [u8; 32],
+        scope: MarketScope,
+        expires_ms: u64,
+        chain_id: u64,
+    ) -> Self {
         let owner = secp::signable_pubkey_address(secret).expect("valid secp256k1 secret");
-        let hash = secp::keccak256(&Self::message(&owner, &key, &scope, chain_id));
+        let hash = secp::keccak256(&Self::message(&owner, &key, &scope, expires_ms, chain_id));
         let sig = secp::sign(secret, &hash).expect("sign");
         let mut pubkey = [0u8; 32];
         pubkey[0] = sig.recid.as_u8();
-        Self { owner, session_key: key, scope, pubkey, signature: sig.sig }
+        Self { owner, session_key: key, scope, expires_ms, pubkey, signature: sig.sig }
     }
 
     fn authorized(&self, chain_id: u64) -> bool {
-        let msg = Self::message(&self.owner, &self.session_key, &self.scope, chain_id);
+        let msg =
+            Self::message(&self.owner, &self.session_key, &self.scope, self.expires_ms, chain_id);
         match classify(&self.pubkey, &self.signature) {
             Scheme::Evm => evm_ok(&self.pubkey, &self.signature, &self.owner, &msg),
             // A MAC cannot open a session: that would let any session
@@ -444,10 +568,118 @@ impl SessionOpen {
     }
 }
 
+/// Encoded length of a [`SessionOpen`]: owner 20 + key 32 + scope 32 +
+/// expiry 8 + pubkey 32 + signature 64.
+pub const SESSION_OPEN_LEN: usize = 20 + 32 + 32 + 8 + 32 + 64;
+
+/// Encoded length of a [`SessionClose`]: id 4 + pubkey 32 + signature 64.
+pub const SESSION_CLOSE_LEN: usize = 4 + 32 + 64;
+
+/// Encoded length of a [`BatchCertificate`]: gateway 32 + digest 32 +
+/// signature 64.
+pub const CERT_LEN: usize = 32 + 32 + 64;
+
+/// Signing domain for session closes.
+pub const SESSION_CLOSE_DOMAIN: &[u8] = b"oxide-session-close-v1";
+
+/// A request to close a session, signed by the session's owner (ed25519
+/// or EVM key). The session key alone cannot close its own session: the
+/// point of an owner-signed close is revoking a session whose key leaked.
+#[derive(Clone, Copy, Debug)]
+pub struct SessionClose {
+    /// The session to close.
+    pub session_id: u32,
+    /// Credential `pubkey` field.
+    pub pubkey: [u8; 32],
+    /// Credential `signature` field over [`SessionClose::message`].
+    pub signature: [u8; 64],
+}
+
+impl SessionClose {
+    /// The bytes the owner signs.
+    #[must_use]
+    pub fn message(session_id: u32, chain_id: u64) -> Vec<u8> {
+        let mut m = Vec::with_capacity(SESSION_CLOSE_DOMAIN.len() + 8 + 4);
+        m.extend_from_slice(SESSION_CLOSE_DOMAIN);
+        m.extend_from_slice(&chain_id.to_le_bytes());
+        m.extend_from_slice(&session_id.to_le_bytes());
+        m
+    }
+
+    /// Close request signed by an ed25519 key.
+    #[must_use]
+    pub fn sign_ed25519(
+        secret: &crypto::ed25519::Ed25519SecretKey,
+        session_id: u32,
+        chain_id: u64,
+    ) -> Self {
+        let sig = crypto::ed25519::sign_message(secret, &Self::message(session_id, chain_id));
+        Self { session_id, pubkey: secret.verifying_key().to_bytes(), signature: sig.to_bytes() }
+    }
+
+    /// Close request signed by an EVM key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `secret` is not a valid secp256k1 secret key.
+    #[must_use]
+    pub fn sign_evm(secret: &[u8; 32], session_id: u32, chain_id: u64) -> Self {
+        let hash = secp::keccak256(&Self::message(session_id, chain_id));
+        let sig = secp::sign(secret, &hash).expect("sign");
+        let mut pubkey = [0u8; 32];
+        pubkey[0] = sig.recid.as_u8();
+        Self { session_id, pubkey, signature: sig.sig }
+    }
+
+    /// Wire encoding: `id 4 ‖ pubkey 32 ‖ signature 64`.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; SESSION_CLOSE_LEN] {
+        let mut b = [0u8; SESSION_CLOSE_LEN];
+        b[0..4].copy_from_slice(&self.session_id.to_le_bytes());
+        b[4..36].copy_from_slice(&self.pubkey);
+        b[36..100].copy_from_slice(&self.signature);
+        b
+    }
+
+    /// Decode [`Self::to_bytes`].
+    #[must_use]
+    pub fn from_bytes(b: &[u8; SESSION_CLOSE_LEN]) -> Self {
+        let mut id = [0u8; 4];
+        id.copy_from_slice(&b[0..4]);
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(&b[4..36]);
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&b[36..100]);
+        Self { session_id: u32::from_le_bytes(id), pubkey, signature }
+    }
+
+    /// The address that signed this close, if the signature verifies
+    /// (ed25519: the key's derived address; EVM: the recovered address).
+    fn signer(&self, chain_id: u64) -> Option<Address> {
+        let msg = Self::message(self.session_id, chain_id);
+        match classify(&self.pubkey, &self.signature) {
+            Scheme::SessionMac => None,
+            Scheme::Evm => {
+                let hash = secp::keccak256(&msg);
+                secp::recover_sender(&hash, &self.signature, self.pubkey[0]).ok()
+            }
+            Scheme::Ed25519 => {
+                let pk = crypto::ed25519::Ed25519PublicKey::from_bytes(&self.pubkey).ok()?;
+                let sig = crypto::ed25519::Ed25519Signature::from_slice(&self.signature).ok()?;
+                crypto::ed25519::verify_message(&pk, &msg, &sig)
+                    .ok()
+                    .map(|()| crypto::ed25519::owner_address(&pk))
+            }
+        }
+    }
+}
+
 struct Session {
     key: [u8; 32],
     owner: Address,
     scope: MarketScope,
+    /// Expiry in epoch milliseconds; 0 = never.
+    expires_ms: u64,
 }
 
 /// Session-MAC authentication over a table of open sessions.
@@ -455,12 +687,41 @@ struct Session {
 /// Replay protection is the matcher's own nonce gate (the nonce is part
 /// of the MAC'd message), so the table is read-only on the hot path:
 /// one shared read lock per batch.
-#[derive(Default)]
 pub struct SessionMac {
     slots: RwLock<Vec<Option<Session>>>,
+    /// Millisecond clock for expiry (injectable for tests).
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// Longest session lifetime accepted at open. `Some` also refuses
+    /// "never expires". Unit: milliseconds.
+    max_ttl_ms: Option<u64>,
+}
+
+impl Default for SessionMac {
+    fn default() -> Self {
+        Self {
+            slots: RwLock::new(Vec::new()),
+            clock: Arc::new(crate::wall_clock_ms),
+            max_ttl_ms: None,
+        }
+    }
 }
 
 impl SessionMac {
+    /// Use `clock` (epoch milliseconds) for expiry decisions.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Refuse sessions that never expire or that live longer than
+    /// `ttl_ms` milliseconds from open.
+    #[must_use]
+    pub fn with_max_ttl_ms(mut self, ttl_ms: u64) -> Self {
+        self.max_ttl_ms = Some(ttl_ms);
+        self
+    }
+
     fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, Vec<Option<Session>>> {
         // A poisoned table is a halted authenticator, not a permissive
         // one: recover the guard (the data is plain old data) so
@@ -475,6 +736,7 @@ impl SessionMac {
         owner: &Address,
         market: Option<u8>,
         msg: &[u8],
+        now_ms: u64,
     ) -> bool {
         if !all_zero(&pubkey[4..]) || !all_zero(&signature[32..]) {
             return false;
@@ -483,7 +745,7 @@ impl SessionMac {
         id.copy_from_slice(&pubkey[..4]);
         let id = u32::from_le_bytes(id);
         let Some(Some(s)) = table.get(id as usize) else { return false };
-        if s.owner != *owner {
+        if s.owner != *owner || (s.expires_ms != 0 && now_ms >= s.expires_ms) {
             return false;
         }
         if let Some(m) = market {
@@ -505,6 +767,7 @@ impl Authenticator for SessionMac {
     }
     fn orders(&self, reqs: &[OrderRequest], chain_id: u64) -> Vec<Option<VerifiedOrder>> {
         let table = self.lock_read();
+        let now = (self.clock)();
         reqs.iter()
             .map(|r| {
                 Self::check(
@@ -514,6 +777,7 @@ impl Authenticator for SessionMac {
                     &r.owner,
                     Some(r.market),
                     &signing_message_array(r, chain_id),
+                    now,
                 )
                 .then(|| VerifiedOrder::authenticated(*r))
             })
@@ -528,6 +792,7 @@ impl Authenticator for SessionMac {
             &req.owner,
             None,
             &signing_message_action_with_chain_id(&req, chain_id),
+            (self.clock)(),
         )
         .then(|| VerifiedAction::authenticated(req))
     }
@@ -535,16 +800,47 @@ impl Authenticator for SessionMac {
         if !open.authorized(chain_id) {
             return Err(SessionError::BadAuthorization);
         }
+        let now = (self.clock)();
+        if open.expires_ms != 0 && open.expires_ms <= now {
+            return Err(SessionError::BadExpiry);
+        }
+        if let Some(cap) = self.max_ttl_ms
+            && (open.expires_ms == 0 || open.expires_ms > now.saturating_add(cap))
+        {
+            return Err(SessionError::BadExpiry);
+        }
         let mut slots = self.slots.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         if slots.len() >= MAX_SESSIONS {
             return Err(SessionError::Full);
         }
-        slots.push(Some(Session { key: open.session_key, owner: open.owner, scope: open.scope }));
+        slots.push(Some(Session {
+            key: open.session_key,
+            owner: open.owner,
+            scope: open.scope,
+            expires_ms: open.expires_ms,
+        }));
         u32::try_from(slots.len() - 1).map_err(|_| SessionError::Full)
     }
     fn close_session(&self, id: u32) -> bool {
         let mut slots = self.slots.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         slots.get_mut(id as usize).and_then(Option::take).is_some()
+    }
+    fn close_session_authorized(
+        &self,
+        req: &SessionClose,
+        chain_id: u64,
+    ) -> Result<(), SessionError> {
+        let signer = req.signer(chain_id).ok_or(SessionError::BadAuthorization)?;
+        let mut slots = self.slots.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = slots.get_mut(req.session_id as usize).ok_or(SessionError::NotFound)?;
+        match slot {
+            Some(s) if s.owner == signer => {
+                *slot = None;
+                Ok(())
+            }
+            Some(_) => Err(SessionError::BadAuthorization),
+            None => Err(SessionError::NotFound),
+        }
     }
 }
 
@@ -562,6 +858,30 @@ pub struct BatchCertificate {
     pub digest: [u8; 32],
     /// Gateway signature over `CERT_DOMAIN ‖ digest`.
     pub signature: [u8; 64],
+}
+
+impl BatchCertificate {
+    /// Wire encoding: `gateway 32 ‖ digest 32 ‖ signature 64`.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; CERT_LEN] {
+        let mut b = [0u8; CERT_LEN];
+        b[0..32].copy_from_slice(&self.gateway);
+        b[32..64].copy_from_slice(&self.digest);
+        b[64..128].copy_from_slice(&self.signature);
+        b
+    }
+
+    /// Decode [`Self::to_bytes`].
+    #[must_use]
+    pub fn from_bytes(b: &[u8; CERT_LEN]) -> Self {
+        let mut gateway = [0u8; 32];
+        gateway.copy_from_slice(&b[0..32]);
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&b[32..64]);
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&b[64..128]);
+        Self { gateway, digest, signature }
+    }
 }
 
 /// Digest over a batch's signing messages in order (covers every order
@@ -607,6 +927,48 @@ pub struct Certified {
     audit_every: usize,
     inner: Box<dyn Authenticator>,
     audit_failures: std::sync::atomic::AtomicU64,
+    /// Provable faults per gateway and the suspended set.
+    faults: std::sync::Mutex<FaultState>,
+    /// Suspend a gateway after this many provable faults (0 = never).
+    suspend_after: u32,
+    /// Called once per provable fault, outside any lock: the operator's
+    /// hook for acting on it (alerting, an on-chain slash, ...).
+    fault_hook: Option<FaultHook>,
+}
+
+/// Default provable faults before a gateway is suspended. Unit: faults.
+/// A provable fault means a trusted gateway signed a batch containing an
+/// order that fails its own credential check, which an honest gateway
+/// never does; three tolerates a bug or a bad release without leaving a
+/// misbehaving gateway trusted indefinitely.
+pub const DEFAULT_SUSPEND_AFTER: u32 = 3;
+
+/// Callback invoked for each provable gateway fault.
+pub type FaultHook = Arc<dyn Fn(&GatewayFault) + Send + Sync>;
+
+/// Evidence that a trusted gateway vouched for a bad order: the batch
+/// certificate verified (so the gateway signed this digest) and the
+/// digest matches the orders, yet the audited order at `index` fails
+/// its own credential check. Anyone holding the batch and the
+/// certificate can re-derive this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GatewayFault {
+    /// The gateway that signed the batch.
+    pub gateway: [u8; 32],
+    /// The digest the gateway signed.
+    pub digest: [u8; 32],
+    /// Index in the batch of the first audited order that failed.
+    pub index: usize,
+    /// This gateway's provable-fault count including this one.
+    pub count: u32,
+    /// Whether this fault tipped the gateway into suspension.
+    pub suspended: bool,
+}
+
+#[derive(Default)]
+struct FaultState {
+    counts: std::collections::HashMap<[u8; 32], u32>,
+    suspended: std::collections::HashSet<[u8; 32]>,
 }
 
 impl Certified {
@@ -619,6 +981,55 @@ impl Certified {
             audit_every: (audit_every as usize).max(1),
             inner,
             audit_failures: std::sync::atomic::AtomicU64::new(0),
+            faults: std::sync::Mutex::new(FaultState::default()),
+            suspend_after: DEFAULT_SUSPEND_AFTER,
+            fault_hook: None,
+        }
+    }
+
+    /// Suspend a gateway after `n` provable faults (0 disables suspension).
+    #[must_use]
+    pub fn with_suspend_after(mut self, n: u32) -> Self {
+        self.suspend_after = n;
+        self
+    }
+
+    /// Install the provable-fault hook.
+    #[must_use]
+    pub fn with_fault_hook(mut self, hook: FaultHook) -> Self {
+        self.fault_hook = Some(hook);
+        self
+    }
+
+    /// Gateways currently suspended.
+    #[must_use]
+    pub fn suspended(&self) -> Vec<[u8; 32]> {
+        let st = primitives::sync::lock_state(&self.faults);
+        st.suspended.iter().copied().collect()
+    }
+
+    /// Lift a suspension and clear that gateway's fault count (an
+    /// operator decision, e.g. after the gateway fixed its bug).
+    pub fn reinstate(&self, gateway: &[u8; 32]) {
+        let mut st = primitives::sync::lock_state(&self.faults);
+        st.suspended.remove(gateway);
+        st.counts.remove(gateway);
+    }
+
+    fn record_fault(&self, gateway: [u8; 32], digest: [u8; 32], index: usize) {
+        let fault = {
+            let mut st = primitives::sync::lock_state(&self.faults);
+            let c = st.counts.entry(gateway).or_insert(0);
+            *c += 1;
+            let count = *c;
+            let tip = self.suspend_after != 0 && count >= self.suspend_after;
+            if tip {
+                st.suspended.insert(gateway);
+            }
+            GatewayFault { gateway, digest, index, count, suspended: tip }
+        };
+        if let Some(h) = &self.fault_hook {
+            h(&fault);
         }
     }
 
@@ -629,7 +1040,10 @@ impl Certified {
     }
 
     fn cert_ok(&self, reqs: &[OrderRequest], cert: &BatchCertificate, chain_id: u64) -> bool {
-        if !self.trusted.contains(&cert.gateway) || cert.digest != orders_digest(reqs, chain_id) {
+        if !self.trusted.contains(&cert.gateway)
+            || primitives::sync::lock_state(&self.faults).suspended.contains(&cert.gateway)
+            || cert.digest != orders_digest(reqs, chain_id)
+        {
             return false;
         }
         let Ok(pk) = crypto::ed25519::Ed25519PublicKey::from_bytes(&cert.gateway) else {
@@ -644,13 +1058,25 @@ impl Certified {
             return false;
         }
         let off = usize::from(cert.digest[0]) % self.audit_every;
-        let audited: Vec<OrderRequest> = reqs
+        let (idx, audited): (Vec<usize>, Vec<OrderRequest>) = reqs
             .iter()
             .enumerate()
             .filter(|(i, _)| (i + off).is_multiple_of(self.audit_every))
-            .map(|(_, r)| *r)
-            .collect();
-        audited.is_empty() || self.inner.orders(&audited, chain_id).iter().all(Option::is_some)
+            .map(|(i, r)| (i, *r))
+            .unzip();
+        if audited.is_empty() {
+            return true;
+        }
+        // The certificate verified and matches these orders, so the
+        // gateway provably signed them: a failing audited order is its
+        // fault (not a forgery by someone else).
+        match self.inner.orders(&audited, chain_id).iter().position(Option::is_none) {
+            None => true,
+            Some(k) => {
+                self.record_fault(cert.gateway, cert.digest, idx[k]);
+                false
+            }
+        }
     }
 }
 
@@ -682,6 +1108,13 @@ impl Authenticator for Certified {
     }
     fn close_session(&self, id: u32) -> bool {
         self.inner.close_session(id)
+    }
+    fn close_session_authorized(
+        &self,
+        req: &SessionClose,
+        chain_id: u64,
+    ) -> Result<(), SessionError> {
+        self.inner.close_session_authorized(req, chain_id)
     }
 }
 
@@ -743,6 +1176,26 @@ pub struct Multi {
 }
 
 impl Multi {
+    /// Refuse sessions that never expire or outlive `ttl_ms`.
+    #[must_use]
+    pub fn with_max_session_ttl_ms(mut self, ttl_ms: u64) -> Self {
+        self.mac = self.mac.with_max_ttl_ms(ttl_ms);
+        self
+    }
+
+    /// Use `clock` (epoch milliseconds) for session expiry.
+    #[must_use]
+    pub fn with_session_clock(mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        self.mac = self.mac.with_clock(clock);
+        self
+    }
+
+    /// The certificate scheme, if configured (fault inspection).
+    #[must_use]
+    pub fn certified(&self) -> Option<&Certified> {
+        self.cert.as_ref()
+    }
+
     /// Build over `schemes`. `cert` supplies the gateway-certificate
     /// scheme when enabled and configured.
     #[must_use]
@@ -827,6 +1280,17 @@ impl Authenticator for Multi {
     fn close_session(&self, id: u32) -> bool {
         self.mac.close_session(id)
     }
+    fn close_session_authorized(
+        &self,
+        req: &SessionClose,
+        chain_id: u64,
+    ) -> Result<(), SessionError> {
+        if self.schemes.session_mac {
+            self.mac.close_session_authorized(req, chain_id)
+        } else {
+            Err(SessionError::Unsupported)
+        }
+    }
 }
 
 // ── configuration ───────────────────────────────────────────────────
@@ -881,6 +1345,11 @@ pub struct AuthConfig {
     pub trusted_gateways: Vec<[u8; 32]>,
     /// Certificate audit sample, 1 in N orders.
     pub audit_every: u32,
+    /// Longest session lifetime, milliseconds; also refuses sessions
+    /// that never expire. `None` disables the cap. Default: 24 hours.
+    pub max_session_ttl_ms: Option<u64>,
+    /// Provable gateway faults before suspension (0 = never suspend).
+    pub suspend_after: u32,
 }
 
 impl Default for AuthConfig {
@@ -891,6 +1360,8 @@ impl Default for AuthConfig {
             evm_threads: 1,
             trusted_gateways: Vec::new(),
             audit_every: 64,
+            max_session_ttl_ms: Some(24 * 60 * 60 * 1000),
+            suspend_after: DEFAULT_SUSPEND_AFTER,
         }
     }
 }
@@ -901,18 +1372,43 @@ impl AuthConfig {
     pub fn build(&self) -> Arc<dyn Authenticator> {
         let cert = || {
             Certified::new(self.trusted_gateways.clone(), self.audit_every, Box::new(Ed25519Batch))
+                .with_suspend_after(self.suspend_after)
+                .with_fault_hook(Arc::new(|f| {
+                    eprintln!(
+                        "oxide-matcher: gateway fault: gateway {} vouched for a bad order \
+                         (batch index {}, fault #{}{})",
+                        f.gateway.iter().take(4).fold(String::new(), |mut acc, b| {
+                            use std::fmt::Write as _;
+                            let _ = write!(acc, "{b:02x}");
+                            acc
+                        }),
+                        f.index,
+                        f.count,
+                        if f.suspended { ", gateway SUSPENDED" } else { "" }
+                    );
+                }))
+        };
+        let mac = || {
+            let m = SessionMac::default();
+            match self.max_session_ttl_ms {
+                Some(t) => m.with_max_ttl_ms(t),
+                None => m,
+            }
         };
         match self.kind {
             AuthKind::Ed25519Batch => Arc::new(Ed25519Batch),
             AuthKind::Ed25519 => Arc::new(Ed25519PerItem),
             AuthKind::Evm => Arc::new(EvmRecover { threads: self.evm_threads }),
-            AuthKind::SessionMac => Arc::new(SessionMac::default()),
+            AuthKind::SessionMac => Arc::new(mac()),
             AuthKind::Certified => Arc::new(cert()),
-            AuthKind::Multi => Arc::new(Multi::new(
-                self.schemes,
-                self.evm_threads,
-                self.schemes.certified.then(cert),
-            )),
+            AuthKind::Multi => {
+                let m =
+                    Multi::new(self.schemes, self.evm_threads, self.schemes.certified.then(cert));
+                Arc::new(match self.max_session_ttl_ms {
+                    Some(t) => m.with_max_session_ttl_ms(t),
+                    None => m,
+                })
+            }
         }
     }
 }

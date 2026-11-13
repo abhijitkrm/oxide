@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use executor::{Module, TxContext};
+use framework::Balances;
 use primitives::Address;
 use primitives::fixed::{Price, Qty};
 use trading::MarketConfig;
@@ -139,4 +140,77 @@ fn the_real_exchange_accepts_the_committed_payload_and_commits_both_roots() {
     let ex2 = exchange();
     let plain = ex2.handle(&ctx, payload(&plain_env)).expect("plain accepted");
     assert_eq!(events.len(), plain.len() + 1);
+}
+
+// ── the settler's real output against the real dispute path ────────
+
+fn bonded_exchange() -> (exchange::ExchangeModule, Arc<framework::MemoryBalances>) {
+    let ledger = Arc::new(framework::MemoryBalances::new());
+    ledger.mint(&Address([0xAA; 20]), 10_000);
+    let mut ex = exchange::ExchangeModule::with_ledger(ledger.clone());
+    ex.set_settlement_operator(Address([0xAA; 20]));
+    ex.set_dispute_config(exchange::dispute::DisputeConfig { min_bond: 1_000, window_blocks: 20 });
+    ex.list_market(MarketConfig {
+        market_id: 0,
+        tick_size: Price(1_000_000),
+        lot_size: Qty(1_000),
+        min_price: Price(1_000_000_000),
+        max_price: Price(2_000_000_000),
+        max_resting: 1 << 10,
+    })
+    .expect("list");
+    (ex, ledger)
+}
+
+fn op_ctx(nonce: u64) -> TxContext {
+    TxContext { sender: Address([0xAA; 20]), nonce, fee: 100 }
+}
+
+#[test]
+fn an_honest_settlers_batch_cannot_be_successfully_disputed() {
+    let (ex, ledger) = bonded_exchange();
+    ex.handle(&op_ctx(1), &exchange::msg::bond_deposit(5_000)).expect("bond");
+    let (env, _) = settle(true, 41);
+    ex.handle(&op_ctx(41), payload(&env)).expect("committed settle accepted");
+    assert!(ex.has_batch_record(41));
+
+    // The auditor replays the same fills and disputes: nothing to prove.
+    let dispute = crate::commit::dispute_payload(41, &fills());
+    let err = ex
+        .handle(&TxContext { sender: Address([7; 20]), nonce: 0, fee: 0 }, &dispute)
+        .expect_err("an honest batch survives");
+    assert!(format!("{err:?}").contains("consistent"), "{err:?}");
+    assert_eq!(ex.operator_bond(), 5_000);
+    assert!(!ex.operator_suspended());
+    assert_eq!(ledger.balance(&Address([7; 20])), 0);
+}
+
+#[test]
+fn a_settler_that_submits_different_legs_than_it_attested_is_slashed() {
+    use exchange::dispute::{RAW_FILL_LEN, RawFill};
+    let (ex, ledger) = bonded_exchange();
+    ex.handle(&op_ctx(1), &exchange::msg::bond_deposit(5_000)).expect("bond");
+
+    // A dishonest operator keeps the honest attestation (header) but
+    // swaps in different legs: here, the first leg's quantity is doubled.
+    let (env, _) = settle(true, 41);
+    let mut forged = payload(&env).to_vec();
+    // [tag 1][seq 8][fills_root 32][raw 4][leg_count 4][legs...]: first leg's qty at +10.
+    let qty_at = 1 + 8 + 32 + 4 + 4 + 2 + 8;
+    let q = u64::from_le_bytes(forged[qty_at..qty_at + 8].try_into().unwrap());
+    forged[qty_at..qty_at + 8].copy_from_slice(&(q * 2).to_le_bytes());
+    ex.handle(&op_ctx(41), &forged).expect("the chain cannot tell without the raw fills");
+
+    // Anyone with the matcher's journal replays the fills and disputes.
+    let raw: Vec<RawFill> = fills().iter().map(crate::commit::to_raw).collect();
+    assert_eq!(raw.len() * RAW_FILL_LEN, 3 * RAW_FILL_LEN);
+    let ev = ex
+        .handle(
+            &TxContext { sender: Address([7; 20]), nonce: 0, fee: 0 },
+            &crate::commit::dispute_payload(41, &fills()),
+        )
+        .expect("dispute proves the lie");
+    assert!(ev.iter().any(|e| e.kind == "operator_slashed"));
+    assert_eq!(ledger.balance(&Address([7; 20])), 5_000);
+    assert!(ex.operator_suspended());
 }

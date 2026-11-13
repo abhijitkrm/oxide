@@ -12,6 +12,24 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Matcher: session and certificate frames, expiry, gateway suspension**
+  (binary TCP control frames `0xFD`, JSON-RPC `oxide_openSession` /
+  `oxide_closeSession`; `--max-session-ttl-ms`, `--gateway-suspend-after`).
+  Sessions expire (default maximum 24 h) and only the owner's key can close
+  one. A trusted gateway that vouches for a bad order is counted and, after
+  three provable faults, suspended.
+  - **In plain words:** a trader can sign in once over the network, trade with
+    cheap authenticated orders for a limited time, and revoke the session
+    with their main key. A gateway that signs for bad orders gets cut off.
+
+- **Exchange: bonded settlement operator and disputes** (`TAG_BOND_DEPOSIT`
+  17, `TAG_DISPUTE` 18; off unless configured). Anyone holding the matcher's
+  fills can prove an operator's committed batch false within a window; the
+  operator's bond goes to the challenger and the operator is suspended.
+  - **In plain words:** the fingerprint on each settlement batch now has money
+    behind it. If the operator's claim about what it matched doesn't fit what
+    it settled, whoever checks gets the operator's deposit.
+
 - **Matcher: pluggable order authentication** (`matcher::auth`; `--auth`,
   `--auth-schemes`, `--evm-threads`, `--gateway-keys`, `--audit-every`).
   Choose ed25519 (batched or per-order), EVM secp256k1 signatures, session

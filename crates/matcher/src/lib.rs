@@ -67,6 +67,7 @@ pub mod auth;
 pub mod balance;
 pub mod cmdlog;
 pub mod commit;
+pub mod control;
 pub mod fix;
 pub mod journal;
 pub mod jsonrpc;

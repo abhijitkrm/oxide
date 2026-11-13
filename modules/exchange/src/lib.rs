@@ -278,6 +278,15 @@ const TAG_BATCH_SETTLE: u8 = 3;
 /// it and compare. Tag 3 is unchanged and remains valid.
 const TAG_BATCH_SETTLE_COMMITTED: u8 = 16;
 
+/// Bond-deposit message tag (the settlement operator, while disputes
+/// are enabled): body `[amount:8 LE]`. See `dispute`.
+const TAG_BOND_DEPOSIT: u8 = 17;
+
+/// Dispute message tag: body `[batch_seq:8][raw_count:4][raw fills ×
+/// 82 B]`. Anyone may submit; proves a recorded committed batch's
+/// attestation false and slashes the operator. See `dispute`.
+const TAG_DISPUTE: u8 = 18;
+
 /// Length of the commitment header of a committed batch settle:
 /// `batch_seq` 8 + `fills_root` 32 + `raw_fill_count` 4.
 const BATCH_COMMIT_HEADER_LEN: usize = 8 + 32 + 4;
@@ -493,6 +502,12 @@ pub struct ExchangeModule {
     /// batch settlement entirely (fail-closed) — an unconfigured
     /// operator must never be able to move balances.
     settlement_operator: Option<Address>,
+    /// Bond-and-dispute configuration (`dispute`); `None` (default)
+    /// leaves tag 16 without a bond requirement or retained records.
+    dispute: Option<dispute::DisputeConfig>,
+    /// Current block height, set by `begin_block`. Local bookkeeping
+    /// (re-derived every block), not committed state.
+    height: std::sync::atomic::AtomicU64,
     /// The validator-committee handle gating the `TAG_LIST_MARKET`
     /// transaction path. `None` (bare `new()`) means the tx path is
     /// *closed*: only the in-process `list_market` call (genesis /
@@ -677,6 +692,7 @@ type CommittedState = (
 
 mod codec;
 mod decode;
+pub mod dispute;
 mod handlers;
 mod module_impl;
 mod settle;
@@ -702,6 +718,8 @@ impl ExchangeModule {
             store: Mutex::new(framework::CommittedStore::new(store_leaf)),
             ledger: None,
             settlement_operator: None,
+            dispute: None,
+            height: std::sync::atomic::AtomicU64::new(0),
             committee: None,
             endorsements: framework::Endorsements::new(),
         }
@@ -1120,6 +1138,28 @@ pub mod msg {
         msg.extend_from_slice(fills_root);
         msg.extend_from_slice(&raw_fill_count.to_le_bytes());
         msg.extend_from_slice(&plain[1..]); // drop tag 3, keep [count][legs]
+        msg
+    }
+
+    /// Build a bond deposit (`TAG_BOND_DEPOSIT`).
+    #[must_use]
+    pub fn bond_deposit(amount: u64) -> Vec<u8> {
+        let mut msg = vec![super::TAG_BOND_DEPOSIT];
+        msg.extend_from_slice(&amount.to_le_bytes());
+        msg
+    }
+
+    /// Build a dispute (`TAG_DISPUTE`) for `batch_seq` carrying the raw
+    /// fills the operator attested.
+    #[must_use]
+    pub fn dispute(batch_seq: u64, fills: &[crate::dispute::RawFill]) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(13 + fills.len() * crate::dispute::RAW_FILL_LEN);
+        msg.push(super::TAG_DISPUTE);
+        msg.extend_from_slice(&batch_seq.to_le_bytes());
+        msg.extend_from_slice(&u32::try_from(fills.len()).unwrap_or(u32::MAX).to_le_bytes());
+        for f in fills {
+            msg.extend_from_slice(&f.encode());
+        }
         msg
     }
 

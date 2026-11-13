@@ -1390,6 +1390,17 @@ impl ExchangeModule {
     ) -> Result<Vec<Event>, ExecError> {
         let header = body.get(..BATCH_COMMIT_HEADER_LEN).ok_or(ExecError::Malformed)?;
         let rest = &body[BATCH_COMMIT_HEADER_LEN..];
+        let batch_seq =
+            u64::from_le_bytes(header[0..8].try_into().map_err(|_| ExecError::Malformed)?);
+        // Authorization first, so an unauthorized sender learns nothing
+        // about bond or sequence state.
+        if self.settlement_operator != Some(ctx.sender) {
+            return Err(ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "unauthorized settlement operator",
+            ));
+        }
+        self.pre_committed_settle(batch_seq)?;
         let mut events = self.handle_batch_settle(ctx, rest, inner)?;
         // `handle_batch_settle` has validated `rest` as `[count][legs]`
         // with exactly `count * FILL_ENTRY_LEN` bytes of legs.
@@ -1400,6 +1411,17 @@ impl ExchangeModule {
             stream.push(leg);
         }
         let (legs_root, leg_count) = stream.finish();
+        let mut fills_root = [0u8; 32];
+        fills_root.copy_from_slice(&header[8..40]);
+        let raw_count =
+            u32::from_le_bytes(header[40..44].try_into().map_err(|_| ExecError::Malformed)?);
+        self.record_committed_settle(
+            batch_seq,
+            fills_root,
+            raw_count,
+            legs_root,
+            u32::try_from(leg_count).unwrap_or(u32::MAX),
+        );
         let mut data = Vec::with_capacity(BATCH_COMMIT_HEADER_LEN + 32 + 4);
         data.extend_from_slice(header); // seq ‖ fills_root ‖ raw_fill_count
         data.extend_from_slice(&legs_root);
@@ -1422,6 +1444,7 @@ impl ExchangeModule {
                 "unauthorized settlement operator",
             ));
         }
+        self.require_operator_active()?;
         let fill_count = usize::try_from(u32::from_le_bytes(
             body.get(0..4)
                 .ok_or(ExecError::Malformed)?

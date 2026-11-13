@@ -2839,3 +2839,234 @@ fn committed_batch_settle_keeps_every_plain_rejection() {
     let ev = ex.handle(&ctx(0xAA), &good).unwrap();
     assert_eq!(ev.last().unwrap().kind, "batch_commit");
 }
+
+// ── bonded operator and disputes ─────────────────────────────────
+
+mod disputes {
+    use super::*;
+    use crate::dispute::{
+        DisputeConfig, REINSTATE_PARAM, RawFill, aggregate_raw_fills, legs_root, raw_fills_root,
+    };
+    use executor::Event;
+    use framework::ParameterSink;
+    use primitives::Height;
+
+    const OP: u8 = 0xAA;
+    const CHALLENGER: u8 = 7;
+    const BOND: u64 = 5_000;
+
+    fn key(owner: u8, id: u64) -> crate::OrderKey {
+        crate::OrderKey { owner: addr(owner), client_id: id }
+    }
+
+    /// Two raw fills on one registered pair that aggregate into one leg
+    /// of 3 000 qty at price 1.0e9.
+    fn raw_fills() -> Vec<RawFill> {
+        let f = |qty| RawFill {
+            market: 0,
+            price: Price(1_000_000_000),
+            qty: Qty(qty),
+            buy: key(1, 1),
+            sell: key(9, 1),
+            quote_amount: qty * 10,
+        };
+        vec![f(1_000), f(2_000)]
+    }
+
+    fn fixture(window: u64) -> (Arc<framework::MemoryBalances>, ExchangeModule) {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let mut ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.set_settlement_operator(addr(OP));
+        ex.set_dispute_config(DisputeConfig { min_bond: 1_000, window_blocks: window });
+        ex.list_market(test_cfg()).unwrap();
+        registered_pair(&ledger, &ex, 1_500_000_000, 1_000_000_000, 3_000);
+        ledger.mint(&addr(OP), 20_000);
+        (ledger, ex)
+    }
+
+    fn deposit_bond(ex: &ExchangeModule, amount: u64) -> Result<Vec<Event>, ExecError> {
+        ex.handle(&ctx(OP), &msg::bond_deposit(amount))
+    }
+
+    /// Post a committed batch: `attested` is the raw set the operator
+    /// claims, `applied` the legs it actually submits.
+    fn post(
+        ex: &ExchangeModule,
+        seq: u64,
+        attested: &[RawFill],
+        applied: &[crate::BatchFillEntry],
+    ) -> Result<Vec<Event>, ExecError> {
+        let (root, n) = raw_fills_root(attested);
+        ex.handle(&ctx(OP), &msg::batch_settle_committed(seq, &root, n, applied))
+    }
+
+    fn honest_legs() -> Vec<crate::BatchFillEntry> {
+        aggregate_raw_fills(&raw_fills()).unwrap()
+    }
+
+    #[test]
+    fn honest_batch_survives_a_dispute_and_the_bond_is_untouched() {
+        let (_ledger, ex) = fixture(10);
+        deposit_bond(&ex, BOND).unwrap();
+        post(&ex, 1, &raw_fills(), &honest_legs()).unwrap();
+        assert!(ex.has_batch_record(1));
+
+        let err = ex.handle(&ctx(CHALLENGER), &msg::dispute(1, &raw_fills())).unwrap_err();
+        assert!(format!("{err:?}").contains("consistent"), "{err:?}");
+        assert_eq!(ex.operator_bond(), BOND);
+        assert!(!ex.operator_suspended());
+        assert!(ex.has_batch_record(1), "a failed dispute leaves the record");
+    }
+
+    #[test]
+    fn a_lying_operator_is_slashed_suspended_and_can_be_reinstated() {
+        let (ledger, ex) = fixture(10);
+        deposit_bond(&ex, BOND).unwrap();
+        // Attests the full 3 000 qty of fills but settles only the first 1 000.
+        let mut partial = honest_legs();
+        partial[0].qty = Qty(1_000);
+        post(&ex, 1, &raw_fills(), &partial).unwrap();
+
+        let challenger_before = ledger.balance(&addr(CHALLENGER));
+        let ev = ex.handle(&ctx(CHALLENGER), &msg::dispute(1, &raw_fills())).unwrap();
+        let slash = ev.iter().find(|e| e.kind == "operator_slashed").expect("slash event");
+        assert_eq!(&slash.data[0..8], &1u64.to_le_bytes());
+        assert_eq!(&slash.data[28..36], &BOND.to_le_bytes());
+        // Conservation: the whole bond moved from module custody to the challenger.
+        assert_eq!(ledger.balance(&addr(CHALLENGER)), challenger_before + BOND);
+        assert_eq!(ex.operator_bond(), 0);
+        assert!(ex.operator_suspended());
+        assert!(!ex.has_batch_record(1), "a proven record is consumed");
+
+        // A suspended operator cannot settle by any path.
+        assert!(post(&ex, 2, &raw_fills(), &honest_legs()).is_err());
+        assert!(ex.handle(&ctx(OP), &msg::batch_settle(&honest_legs())).is_err());
+        // A second dispute for the same batch finds nothing to dispute.
+        assert!(ex.handle(&ctx(CHALLENGER), &msg::dispute(1, &raw_fills())).is_err());
+
+        // Governance reinstates; the plain path works again (no bond needed
+        // for tag 3), while committed settles still need a fresh bond.
+        ex.apply_param(REINSTATE_PARAM, &[]).unwrap();
+        assert!(!ex.operator_suspended());
+        assert!(post(&ex, 3, &raw_fills(), &honest_legs()).is_err(), "no bond left");
+        deposit_bond(&ex, BOND).unwrap();
+        post(&ex, 3, &raw_fills(), &honest_legs()).unwrap();
+    }
+
+    #[test]
+    fn a_dispute_that_proves_nothing_changes_nothing() {
+        let (_ledger, ex) = fixture(10);
+        deposit_bond(&ex, BOND).unwrap();
+        let mut partial = honest_legs();
+        partial[0].qty = Qty(1_000);
+        post(&ex, 1, &raw_fills(), &partial).unwrap();
+        let root_before = ex.state_root();
+
+        // Fills that are not the attested ones.
+        let mut tampered = raw_fills();
+        tampered[0].qty = Qty(999);
+        let e = ex.handle(&ctx(CHALLENGER), &msg::dispute(1, &tampered)).unwrap_err();
+        assert!(format!("{e:?}").contains("attested root"), "{e:?}");
+        // Wrong count, unknown batch, malformed body.
+        assert!(ex.handle(&ctx(CHALLENGER), &msg::dispute(1, &raw_fills()[..1])).is_err());
+        assert!(ex.handle(&ctx(CHALLENGER), &msg::dispute(99, &raw_fills())).is_err());
+        let mut short = msg::dispute(1, &raw_fills());
+        short.pop();
+        assert!(ex.handle(&ctx(CHALLENGER), &short).is_err());
+
+        assert_eq!(ex.state_root(), root_before, "failed disputes mutate nothing");
+        assert_eq!(ex.operator_bond(), BOND);
+        assert!(!ex.operator_suspended());
+    }
+
+    #[test]
+    fn bond_gates_committed_settles_and_sequences_are_unique() {
+        let (ledger, ex) = fixture(10);
+        // No bond yet.
+        assert!(post(&ex, 1, &raw_fills(), &honest_legs()).is_err());
+        // Only the operator may bond, and only what it holds.
+        assert!(ex.handle(&ctx(CHALLENGER), &msg::bond_deposit(100)).is_err());
+        assert!(deposit_bond(&ex, 0).is_err());
+        assert!(deposit_bond(&ex, 1_000_000).is_err(), "cannot bond more than the balance");
+        assert_eq!(ex.operator_bond(), 0);
+        // Bond below the minimum still does not unlock settling.
+        deposit_bond(&ex, 999).unwrap();
+        assert!(post(&ex, 1, &raw_fills(), &honest_legs()).is_err());
+        let before = ledger.balance(&addr(OP));
+        deposit_bond(&ex, 1).unwrap();
+        assert_eq!(ledger.balance(&addr(OP)), before - 1, "the bond is debited from the operator");
+        post(&ex, 1, &raw_fills(), &honest_legs()).unwrap();
+        // The same sequence cannot be recorded twice.
+        assert!(post(&ex, 1, &raw_fills(), &honest_legs()).is_err());
+    }
+
+    #[test]
+    fn records_expire_after_the_window_and_pruning_bounds_state() {
+        let (_ledger, ex) = fixture(5);
+        deposit_bond(&ex, BOND).unwrap();
+        let mut partial = honest_legs();
+        partial[0].qty = Qty(1_000);
+        ex.begin_block(Height::new(100));
+        post(&ex, 1, &raw_fills(), &partial).unwrap();
+        for h in 100..=105 {
+            ex.begin_block(Height::new(h));
+            ex.end_block(Height::new(h));
+        }
+        assert!(ex.has_batch_record(1), "still inside the window at height 105");
+        ex.begin_block(Height::new(106));
+        ex.end_block(Height::new(106));
+        assert!(!ex.has_batch_record(1), "pruned once the window passed");
+        // Too late to dispute.
+        assert!(ex.handle(&ctx(CHALLENGER), &msg::dispute(1, &raw_fills())).is_err());
+        assert!(!ex.operator_suspended());
+    }
+
+    #[test]
+    fn disputes_disabled_is_exactly_the_old_behaviour() {
+        let fixture_plain = |committed: bool| {
+            let ledger = Arc::new(framework::MemoryBalances::new());
+            let mut ex = ExchangeModule::with_ledger(ledger.clone());
+            ex.set_settlement_operator(addr(OP));
+            ex.list_market(test_cfg()).unwrap();
+            registered_pair(&ledger, &ex, 1_500_000_000, 1_000_000_000, 3_000);
+            let legs = honest_legs();
+            if committed {
+                post(&ex, 1, &raw_fills(), &legs).unwrap();
+            } else {
+                ex.handle(&ctx(OP), &msg::batch_settle(&legs)).unwrap();
+            }
+            ex
+        };
+        // Without a dispute config a committed settle writes no state at all.
+        assert_eq!(fixture_plain(true).state_root(), fixture_plain(false).state_root());
+        let ex = fixture_plain(true);
+        assert!(!ex.has_batch_record(1));
+        assert!(ex.handle(&ctx(OP), &msg::bond_deposit(1)).is_err());
+        assert!(ex.handle(&ctx(CHALLENGER), &msg::dispute(1, &raw_fills())).is_err());
+    }
+
+    #[test]
+    fn records_and_bond_are_committed_and_survive_a_snapshot() {
+        let (ledger, ex) = fixture(50);
+        deposit_bond(&ex, BOND).unwrap();
+        let root_empty = fixture(50).1.state_root();
+        let mut partial = honest_legs();
+        partial[0].qty = Qty(1_000);
+        post(&ex, 1, &raw_fills(), &partial).unwrap();
+        assert_ne!(ex.state_root(), root_empty, "bond and record are in the state root");
+
+        // Round-trip through a snapshot into a fresh module.
+        let snap = ex.export_state().expect("snapshot");
+        let mut fresh = ExchangeModule::with_ledger(ledger.clone());
+        fresh.set_settlement_operator(addr(OP));
+        fresh.set_dispute_config(DisputeConfig { min_bond: 1_000, window_blocks: 50 });
+        fresh.import_state(&snap).expect("import");
+        assert_eq!(fresh.state_root(), ex.state_root());
+        assert_eq!(fresh.operator_bond(), BOND);
+        assert!(fresh.has_batch_record(1));
+        // And the restored module can still adjudicate the dispute.
+        let ev = fresh.handle(&ctx(CHALLENGER), &msg::dispute(1, &raw_fills())).unwrap();
+        assert!(ev.iter().any(|e| e.kind == "operator_slashed"));
+        let _ = legs_root(&honest_legs());
+    }
+}

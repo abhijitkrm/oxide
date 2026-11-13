@@ -418,6 +418,37 @@ impl MultiMarketMatcher {
     /// range, or if a market worker thread has died mid-batch.
     pub fn submit_batch(&self, orders: Vec<OrderRequest>) -> Vec<OrderResponse> {
         assert!(!orders.is_empty(), "batch must not be empty");
+        let authenticated = self.auth.orders(&orders, self.chain_id);
+        self.submit_authenticated(&orders, authenticated)
+    }
+
+    /// Submit a batch a trusted gateway has certified
+    /// ([`crate::auth::Certified`]): one certificate check plus a
+    /// deterministic audit sample instead of a verification per order.
+    /// A failed certificate or audit rejects the whole batch with
+    /// `BadSignature`; everything after authentication (nonce gate,
+    /// routing, execution) is identical to [`Self::submit_batch`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `orders` is empty, like [`Self::submit_batch`].
+    pub fn submit_batch_certified(
+        &self,
+        orders: Vec<OrderRequest>,
+        cert: &crate::auth::BatchCertificate,
+    ) -> Vec<OrderResponse> {
+        assert!(!orders.is_empty(), "batch must not be empty");
+        let authenticated = self.auth.certified_orders(&orders, cert, self.chain_id);
+        self.submit_authenticated(&orders, authenticated)
+    }
+
+    /// Everything after authentication: replay gate, routing by each
+    /// order's market, execution, aligned responses.
+    fn submit_authenticated(
+        &self,
+        orders: &[OrderRequest],
+        authenticated: Vec<Option<protocol::VerifiedOrder>>,
+    ) -> Vec<OrderResponse> {
         // Authenticate + replay-check every order on this thread, IN
         // BATCH ORDER. `positions[i]` records the original index of
         // admitted order i so its response lands in the right slot.
@@ -440,7 +471,6 @@ impl MultiMarketMatcher {
         // per-item afterwards, in batch order — verification ordering
         // relative to nonce consumption is unchanged (every signature
         // is proven before any nonce is consumed).
-        let authenticated = self.auth.orders(&orders, self.chain_id);
         let mut verified: Vec<protocol::VerifiedOrder> = Vec::with_capacity(orders.len());
         for (i, item) in authenticated.into_iter().enumerate() {
             match item {

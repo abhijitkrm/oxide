@@ -119,11 +119,29 @@ Measured on the M1 (`matcher:auth`, orders/s on one thread): ed25519
 per-item 20k, ed25519 batch 56k, EVM recover 33k (124k on 4 threads), session
 MAC 4.8M, gateway certificate with 1-in-64 audit 1.9M.
 
-Not built: a transport frame to open or close a session over TCP/WebSocket/
-JSON-RPC (the API and the signed open message exist: `open_session`,
-`SessionOpen`), a transport frame carrying a batch certificate, session
-expiry, and gateway slashing. Sessions live in memory (a restart drops them
-and clients re-open).
+Session and certificate control frames (built):
+
+- **Binary TCP**: header flag `0xFD` (control) with a kind byte: session open
+  (188 B body), session close (100 B), certified batch (128 B certificate plus a
+  standard batch request). Session responses are 5 bytes
+  `[status][session_id]`. Implemented on the multi-market, mutex and ring
+  servers (`matcher::control`).
+- **JSON-RPC**: `oxide_openSession` / `oxide_closeSession` with
+  `{"frame":"<hex>"}`.
+- **Expiry**: the expiry is part of the owner's signed open; a session is
+  refused at or after it. A default maximum lifetime of 24 h
+  (`--max-session-ttl-ms`) also refuses "never expires" opens.
+- **Close** needs the *owner's* signature (ed25519 or EVM), not the session
+  key: the point is to revoke a session whose key leaked.
+- **Gateway faults**: if a trusted gateway signed a batch and an audited order
+  fails its own credential check, that is a provable fault (the certificate
+  verifies and the digest matches). Faults are counted per gateway, a hook is
+  called, and after `--gateway-suspend-after` (default 3) the gateway is
+  suspended until an operator reinstates it. Bad certificates from unknown or
+  mismatching parties are rejected but not attributed.
+
+Not carried on the WebSocket and FIX transports. Sessions live in memory (a
+restart drops them and clients re-open).
 
 ## 5. Trading lane
 
@@ -192,13 +210,45 @@ and leg events), and the chain emits one `batch_commit` event:
   (~55 ns per fill).
 - `batch_seq` is the settler's envelope nonce.
 
-Honest limits: this adds an auditable, chain-recorded commitment; it does
-**not** yet remove per-leg work on chain. The module still validates and
-applies every leg. Netted-delta settlement (chain applies per-account net
-deltas and checks them against `fills_root`, with fraud proofs for the
-off-chain stream) is the step that would, and it needs a dispute design that
-is not built. Tag 3 stays valid; the default is off because the chain must
-understand tag 16.
+### 7.2 Bonded operator and disputes (built, opt-in)
+
+The attestation is made enforceable by a bond and a dispute path
+(`modules/exchange/src/dispute.rs`; off unless `set_dispute_config` is called,
+in which case tag 16 behaves exactly as above):
+
+1. The operator escrows a bond (`TAG_BOND_DEPOSIT` 17, debited from its
+   ledger balance). A committed settle needs bond >= `min_bond` and an
+   unsuspended operator, and must use a fresh `batch_seq`.
+2. Each accepted batch leaves a record (`fills_root`, `legs_root`, counts,
+   height) in the module's committed key-value store, so it is in the state
+   root and in snapshots (no layout change: the keys are `net/...`, disjoint
+   from the `m/{id}` market keys the snapshot decoder checks).
+3. For `window_blocks` anyone may submit the raw fills (`TAG_DISPUTE` 18). The
+   chain checks they hash to the attested `fills_root`, re-derives the legs
+   with the same `aggregate_raw_fills` the settler uses, and compares with the
+   legs root it recorded when it applied the batch. A mismatch is proof the
+   operator attested fills that do not match what it settled: the whole bond
+   is paid to the challenger and the operator is suspended (plain and
+   committed settles are both refused) until governance reinstates it
+   (`exchange.operator.reinstate`).
+4. A dispute that proves nothing (wrong fills, or consistent legs) changes no
+   state and costs the challenger the transaction fee. Records past the
+   window are pruned at `end_block`.
+
+The raw-fill encoding, stream label and aggregation are defined once in
+`exchange::dispute`; the matcher imports them, so the root the settler attests
+is the root a dispute recomputes (tested end to end: an honest settler's batch
+survives a dispute, a settler that submits different legs than it attested is
+slashed).
+
+What this is not: **netted-delta settlement**. Netting the money movement per
+account would not remove per-leg work, because every leg still updates the
+registered orders' remaining quantity and escrow; the chain would only stop
+doing that work if order state moved off chain, which needs a different trust
+model and is not built. Also not built: bond withdrawal (the bond stays
+locked), a CLI to submit the bond deposit, and a dispute fee/reward market
+beyond paying the challenger the bond. The chain still validates and applies
+every leg.
 
 ## 8. Budget formula
 
