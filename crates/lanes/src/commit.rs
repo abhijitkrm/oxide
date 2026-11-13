@@ -73,14 +73,22 @@ impl FillCommit for PerFill {
     }
 }
 
-/// One streaming hash over the encoded fills in match order
-/// (order-sensitive). Cheapest; no per-fill proofs.
+/// A buffered, labeled, order-sensitive streaming commitment over
+/// byte records: the construction behind [`Stream`], usable for any
+/// fixed- or variable-size record stream (the matcher's sealed fills,
+/// the chain's settlement legs).
 ///
-/// Fills are buffered and hashed in [`STREAM_FLUSH_BYTES`] pieces:
-/// feeding BLAKE3 73 bytes at a time pays per-call block handling on
-/// every fill, while a large `update` lets it hash many 1 KiB chunks
+/// `root = BLAKE3(MmrLeaf-domain ‖ label ‖ records… ‖ count)`. The
+/// `label` names the stream (so a fills root can never be mistaken for a
+/// legs root) and the count is bound at the end (so a truncated stream
+/// cannot reproduce the root).
+///
+/// Records are buffered and hashed in [`STREAM_FLUSH_BYTES`] pieces:
+/// feeding BLAKE3 a record at a time pays per-call block handling on
+/// every record, while a large `update` lets it hash many 1 KiB chunks
 /// at once with SIMD (measured in `benches/lanes.rs`).
-pub struct Stream {
+pub struct ByteStream {
+    label: &'static [u8],
     h: Hasher,
     buf: Vec<u8>,
     n: u64,
@@ -91,25 +99,58 @@ pub struct Stream {
 /// only grows the buffer past L1 with no gain.
 pub const STREAM_FLUSH_BYTES: usize = 16 * 1024;
 
+impl ByteStream {
+    /// A new stream named `label`.
+    #[must_use]
+    pub fn new(label: &'static [u8]) -> Self {
+        let mut h = Hasher::new(Domain::MmrLeaf);
+        h.update(label);
+        Self { label, h, buf: Vec::with_capacity(STREAM_FLUSH_BYTES + FILL_LEN), n: 0 }
+    }
+
+    /// Append one record.
+    #[inline]
+    pub fn push(&mut self, record: &[u8]) {
+        self.buf.extend_from_slice(record);
+        if self.buf.len() >= STREAM_FLUSH_BYTES {
+            self.h.update(&self.buf);
+            self.buf.clear();
+        }
+        self.n += 1;
+    }
+
+    /// The commitment and the record count; resets for the next stream.
+    pub fn finish(&mut self) -> ([u8; 32], u64) {
+        let mut fresh = Hasher::new(Domain::MmrLeaf);
+        fresh.update(self.label);
+        let mut h = std::mem::replace(&mut self.h, fresh);
+        h.update(&self.buf);
+        h.update(&self.n.to_le_bytes());
+        self.buf.clear();
+        let out = (h.finalize().0, self.n);
+        self.n = 0;
+        out
+    }
+}
+
+/// Label for the trading lane's fill stream.
+pub const FILL_STREAM_LABEL: &[u8] = b"lanes-fill-stream-v1";
+
+/// One [`ByteStream`] over the encoded fills in match order
+/// (order-sensitive). Cheapest; no per-fill proofs, so a fill is
+/// verified by replaying the journal.
+pub struct Stream(ByteStream);
+
 impl Default for Stream {
     fn default() -> Self {
-        Self {
-            h: Hasher::new(Domain::MmrLeaf),
-            buf: Vec::with_capacity(STREAM_FLUSH_BYTES + FILL_LEN),
-            n: 0,
-        }
+        Self(ByteStream::new(FILL_STREAM_LABEL))
     }
 }
 
 impl FillSink for Stream {
     #[inline]
     fn fill(&mut self, f: FillEvent) {
-        self.buf.extend_from_slice(&encode_fill(&f));
-        if self.buf.len() >= STREAM_FLUSH_BYTES {
-            self.h.update(&self.buf);
-            self.buf.clear();
-        }
-        self.n += 1;
+        self.0.push(&encode_fill(&f));
     }
 }
 
@@ -118,13 +159,7 @@ impl FillCommit for Stream {
         "stream"
     }
     fn finish(&mut self) -> ([u8; 32], u64) {
-        let mut h = std::mem::replace(&mut self.h, Hasher::new(Domain::MmrLeaf));
-        h.update(&self.buf);
-        h.update(&self.n.to_le_bytes());
-        self.buf.clear();
-        let out = (h.finalize().0, self.n);
-        self.n = 0;
-        out
+        self.0.finish()
     }
 }
 
@@ -280,11 +315,28 @@ mod tests {
                 all.extend_from_slice(&encode_fill(&fill(i)));
             }
             let mut h = Hasher::new(Domain::MmrLeaf);
+            h.update(FILL_STREAM_LABEL);
             h.update(&all);
             h.update(&n.to_le_bytes());
             let got = run(&mut Stream::default(), n);
             assert_eq!(got, (h.finalize().0, n), "n={n}");
         }
+    }
+
+    #[test]
+    fn labels_separate_streams() {
+        let mut a = ByteStream::new(b"one");
+        let mut b = ByteStream::new(b"two");
+        a.push(b"rec");
+        b.push(b"rec");
+        assert_ne!(a.finish().0, b.finish().0);
+        // Reusable after finish, and a truncated stream differs.
+        let mut c = ByteStream::new(b"one");
+        c.push(b"rec");
+        let full = c.finish();
+        c.push(b"rec");
+        c.push(b"rec");
+        assert_ne!(c.finish().0, full.0);
     }
 
     #[test]

@@ -221,7 +221,7 @@ impl<V: Verifier, C: FillCommit> ShardLane<V, C> {
 mod tests {
     use super::*;
     use crate::commit::{Merkle, PerFill, Stream};
-    use crate::verify::{Auth, Batched, Item, NoVerify, PerItem, SessionMac, session_tag};
+    use crate::verify::{Auth, Batched, Item, NoVerify, PerItem, Schemes, SessionMac, session_tag};
     use crypto::ed25519;
 
     const MID: u64 = 500_000;
@@ -429,6 +429,155 @@ mod tests {
         ];
         m.verify(&Batch { items: &items, cert: None }, &mut ok);
         assert_eq!(ok, [true, false, true, false, false, false, true]);
+    }
+
+    fn evm_item(sk: &[u8; 32], addr: Address, body: [u8; BODY_LEN]) -> Item {
+        let hash = crypto::secp::keccak256(&body);
+        let sig = crypto::secp::sign(sk, &hash).expect("sign");
+        Item { body, auth: Auth::Evm { sender: addr, sig } }
+    }
+
+    #[test]
+    fn evm_recover_accepts_good_rejects_wrong_sender_and_tampered_body() {
+        use crate::verify::EvmRecover;
+        let (sk, addr) = crypto::secp::generate_keypair_for_test();
+        let (_, other) = crypto::secp::generate_keypair_for_test();
+        let bodies = workload(200, 9);
+        let mut items: Vec<Item> = bodies.iter().map(|b| evm_item(&sk, addr, *b)).collect();
+        items[7].auth = match items[7].auth {
+            Auth::Evm { sig, .. } => Auth::Evm { sender: other, sig },
+            a => a,
+        };
+        items[9].body[6] ^= 1;
+        let want: Vec<bool> = (0..200).map(|i| i != 7 && i != 9).collect();
+        let mut serial = Vec::new();
+        EvmRecover { threads: 1 }.verify(&Batch { items: &items, cert: None }, &mut serial);
+        assert_eq!(serial, want);
+        // Parallel must give exactly the serial answer.
+        for t in [2, 3, 8] {
+            let mut par = Vec::new();
+            EvmRecover { threads: t }.verify(&Batch { items: &items, cert: None }, &mut par);
+            assert_eq!(par, serial, "threads={t}");
+        }
+        // Non-EVM items are rejected by this verifier.
+        let (esk, epk) = ed25519::generate_keypair_for_test();
+        let ed = Item {
+            body: bodies[0],
+            auth: Auth::Sig { key: epk, sig: ed25519::sign_message(&esk, &bodies[0]) },
+        };
+        let mut ok = Vec::new();
+        EvmRecover::default().verify(&Batch { items: &[ed], cert: None }, &mut ok);
+        assert_eq!(ok, [false]);
+    }
+
+    #[test]
+    fn owner_binding_rejects_signing_for_someone_elses_owner() {
+        use crate::verify::OwnerBound;
+        let (sk, addr) = crypto::secp::generate_keypair_for_test();
+        let mine = encode_body(Side::Buy, false, Price(5 * TICK), Qty(LOT), addr);
+        let theirs = encode_body(Side::Buy, false, Price(5 * TICK), Qty(LOT), Address([1; 20]));
+        let items = [evm_item(&sk, addr, mine), evm_item(&sk, addr, theirs)];
+        let mut ok = Vec::new();
+        OwnerBound { inner: crate::verify::EvmRecover::default() }
+            .verify(&Batch { items: &items, cert: None }, &mut ok);
+        assert_eq!(ok, [true, false]);
+        // ed25519 too: key's address must be the owner.
+        let (esk, epk) = ed25519::generate_keypair_for_test();
+        let eaddr = ed25519::owner_address(&epk);
+        let b_ok = encode_body(Side::Buy, false, Price(5 * TICK), Qty(LOT), eaddr);
+        let b_bad = encode_body(Side::Buy, false, Price(5 * TICK), Qty(LOT), addr);
+        let sig = |b: &[u8; BODY_LEN]| Auth::Sig { key: epk, sig: ed25519::sign_message(&esk, b) };
+        let items =
+            [Item { body: b_ok, auth: sig(&b_ok) }, Item { body: b_bad, auth: sig(&b_bad) }];
+        OwnerBound { inner: PerItem }.verify(&Batch { items: &items, cert: None }, &mut ok);
+        assert_eq!(ok, [true, false]);
+    }
+
+    #[test]
+    fn multi_dispatches_each_scheme_and_honours_the_allow_list() {
+        use crate::verify::{Schemes, VerifierConfig};
+        let (sk, addr) = crypto::secp::generate_keypair_for_test();
+        let (esk, epk) = ed25519::generate_keypair_for_test();
+        let eaddr = ed25519::owner_address(&epk);
+        let key = [4u8; 32];
+        let body = |o: Address| encode_body(Side::Buy, false, Price(5 * TICK), Qty(LOT), o);
+        let mk = |cfg: &VerifierConfig| {
+            let mut v = cfg.build();
+            let sid = v.open_session(key);
+            let eb = body(eaddr);
+            let mb = body(Address([2; 20]));
+            let items = [
+                evm_item(&sk, addr, body(addr)),
+                Item {
+                    body: eb,
+                    auth: Auth::Sig { key: epk, sig: ed25519::sign_message(&esk, &eb) },
+                },
+                Item {
+                    body: mb,
+                    auth: Auth::Mac {
+                        session: sid.unwrap_or(0),
+                        counter: 1,
+                        tag: session_tag(&key, sid.unwrap_or(0), 1, &mb),
+                    },
+                },
+                Item { body: body(addr), auth: Auth::Certified }, // no cert: must fail
+            ];
+            let mut ok = Vec::new();
+            v.verify(&Batch { items: &items, cert: None }, &mut ok);
+            ok
+        };
+        let all = VerifierConfig::default();
+        assert_eq!(mk(&all), [true, true, true, false], "all schemes on");
+        let only_evm =
+            VerifierConfig { schemes: Schemes::parse("evm").unwrap(), ..VerifierConfig::default() };
+        assert_eq!(mk(&only_evm), [true, false, false, false]);
+        let no_evm = VerifierConfig {
+            schemes: Schemes::parse("ed25519,mac").unwrap(),
+            ..VerifierConfig::default()
+        };
+        assert_eq!(mk(&no_evm), [false, true, true, false]);
+    }
+
+    #[test]
+    fn multi_uses_the_certificate_path_when_a_cert_is_present() {
+        use crate::verify::{VerifierConfig, VerifierKind};
+        let (gw_sk, gw_pk) = ed25519::generate_keypair_for_test();
+        let items: Vec<Item> =
+            workload(16, 2).iter().map(|b| Item { body: *b, auth: Auth::Certified }).collect();
+        let cert = certified_batch(&gw_sk, gw_pk, &items);
+        let cfg = VerifierConfig {
+            kind: VerifierKind::Multi,
+            trusted_gateways: vec![gw_pk],
+            ..VerifierConfig::default()
+        };
+        let mut v = cfg.build();
+        let mut ok = Vec::new();
+        v.verify(&Batch { items: &items, cert: Some(&cert) }, &mut ok);
+        assert!(ok.iter().all(|o| *o));
+        // Same batch, certificates disabled: fails closed.
+        let cfg = VerifierConfig { schemes: Schemes::parse("ed25519").unwrap(), ..cfg };
+        let mut v = cfg.build();
+        v.verify(&Batch { items: &items, cert: Some(&cert) }, &mut ok);
+        assert!(ok.iter().all(|o| !*o));
+    }
+
+    #[test]
+    fn config_names_parse_and_every_kind_builds() {
+        use crate::verify::{VerifierConfig, VerifierKind};
+        for (n, want) in [
+            ("per_item", "per_item"),
+            ("batched", "batched"),
+            ("evm", "evm_recover"),
+            ("certified", "certified"),
+            ("session_mac", "session_mac"),
+            ("multi", "multi"),
+        ] {
+            let kind = VerifierKind::parse(n).expect("known name");
+            let cfg = VerifierConfig { kind, bind_owner: false, ..VerifierConfig::default() };
+            assert_eq!(cfg.build().name(), want);
+        }
+        assert!(VerifierKind::parse("none").is_err(), "accept-everything must not be configurable");
+        assert!(Schemes::parse("ed25519,bogus").is_err());
     }
 
     #[test]
