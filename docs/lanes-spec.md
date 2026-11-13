@@ -91,6 +91,40 @@ and is fetched on demand (data availability is a replica-group duty).
   its own sessions, so session scope (market set, notional cap, expiry) is
   signed by the client at open and enforced by the lane.
 
+### 4.1 Authentication in the matcher service (built)
+
+The matcher service's admission path asks a `matcher::auth::Authenticator`
+for its `VerifiedOrder` / `VerifiedAction` proof tokens, so the scheme is a
+runtime choice and nothing downstream changes. Selected with
+`--auth <kind>` (and `--auth-schemes`, `--evm-threads`, `--gateway-keys`,
+`--audit-every`) or `ServerConfig.auth`:
+
+| `--auth` | Credential | Notes |
+|---|---|---|
+| `ed25519_batch` (default) | ed25519 signature | Historical behaviour, bit-identical (tested). |
+| `ed25519` | ed25519 signature | One strict verify per order. |
+| `evm` | secp256k1 recoverable signature | Recovered address must equal `owner`: the order trades for the on-chain EOA directly. Parallel with `--evm-threads`. |
+| `session_mac` | keyed-hash tag under a session key | Sessions are opened by a request signed by the owner (ed25519 or EVM); scope = market set; revocable; a MAC cannot open sessions. |
+| `certified` | gateway signs the batch | Deterministic audit sample, fail closed; uncertified traffic falls to ed25519. |
+| `multi` | any of the above per order | `--auth-schemes ed25519,evm,mac,cert` picks the set; others are rejected. |
+
+There is no "accept everything" kind. The wire format is unchanged: each
+scheme uses a canonical shape of the existing 32-byte `pubkey` and 64-byte
+`signature` fields (EVM: recovery id + `r ‖ s`; MAC: session id + 32-byte
+tag), which is also how `multi` routes without a version bump. All schemes
+sign or MAC the same signing message and the matcher's existing nonce gate
+is the replay protection for all of them.
+
+Measured on the M1 (`matcher:auth`, orders/s on one thread): ed25519
+per-item 20k, ed25519 batch 56k, EVM recover 33k (124k on 4 threads), session
+MAC 4.8M, gateway certificate with 1-in-64 audit 1.9M.
+
+Not built: a transport frame to open or close a session over TCP/WebSocket/
+JSON-RPC (the API and the signed open message exist: `open_session`,
+`SessionOpen`), a transport frame carrying a batch certificate, session
+expiry, and gateway slashing. Sessions live in memory (a restart drops them
+and clients re-open).
+
 ## 5. Trading lane
 
 - Shard = market. A `Router` maps market id to shard id; shards are fixed by
@@ -138,6 +172,33 @@ and is fetched on demand (data availability is a replica-group duty).
 They commit to the same fill sequence but are different functions, so a lane
 picks one in config and never mixes them. The lane's header carries the one
 32-byte root; fills themselves are reproducible from the journal.
+
+### 7.1 Commitments in the settlement path (built, opt-in)
+
+With `--commit-batches` (`ServerConfig.commit_batches`) the settler submits a
+**committed batch settle** (exchange tag 16) instead of tag 3. The legs
+settle exactly as before (differential-tested: identical balances, fee vault
+and leg events), and the chain emits one `batch_commit` event:
+
+`batch_seq ‖ fills_root ‖ raw_fill_count ‖ legs_root ‖ leg_count`
+
+- `legs_root` is computed by the chain over the legs it applied (stream
+  commitment, label `oxide-exchange-legs-v1`).
+- `fills_root` is the settlement operator's attestation over the raw sealed
+  fills the legs were aggregated from (label `oxide-matcher-fills-v1`). The
+  chain cannot recompute it, since it never sees the raw fills, but anyone with
+  the matcher's journal can replay it and compare. The matcher's order path
+  is untouched: the root is computed once per batch on the settler thread
+  (~55 ns per fill).
+- `batch_seq` is the settler's envelope nonce.
+
+Honest limits: this adds an auditable, chain-recorded commitment; it does
+**not** yet remove per-leg work on chain. The module still validates and
+applies every leg. Netted-delta settlement (chain applies per-account net
+deltas and checks them against `fills_root`, with fraud proofs for the
+off-chain stream) is the step that would, and it needs a dispute design that
+is not built. Tag 3 stays valid; the default is off because the chain must
+understand tag 16.
 
 ## 8. Budget formula
 

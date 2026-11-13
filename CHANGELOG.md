@@ -12,6 +12,24 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Matcher: pluggable order authentication** (`matcher::auth`; `--auth`,
+  `--auth-schemes`, `--evm-threads`, `--gateway-keys`, `--audit-every`).
+  Choose ed25519 (batched or per-order), EVM secp256k1 signatures, session
+  MACs, gateway-certified batches, or several at once. The default is the
+  existing batched ed25519, unchanged. No wire-format change.
+  - **In plain words:** operators decide how traders prove who they are.
+    A trader can sign every order with their Ethereum key, or sign in once and
+    send cheap authenticated orders (about 240x cheaper to check than a
+    signature per order on the test laptop). Nothing changes unless you
+    choose a different scheme.
+
+- **Settlement: committed batch settle** (`--commit-batches`; exchange message
+  tag 16). Each settlement batch carries a root over the raw fills and the chain
+  records it with its own root over the legs it applied in a `batch_commit`
+  event. Legs settle exactly as before; the default is off.
+  - **In plain words:** every settlement batch now leaves a fingerprint on the
+    chain that an auditor can check against the matcher's journal.
+
 - **`lanes` crate and `docs/lanes-spec.md`: sharded, swappable lanes**
   (prototype, not wired into consensus). Authentication
   (per-item, batched, gateway-certified, session MAC), fill commitment

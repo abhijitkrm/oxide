@@ -263,6 +263,29 @@ const TAG_LIST_MARKET: u8 = 2;
 /// is `[fill_count:4][fill entries...]`.
 const TAG_BATCH_SETTLE: u8 = 3;
 
+/// Committed batch-settle message tag: a [`TAG_BATCH_SETTLE`] body
+/// preceded by a commitment header, `[batch_seq:8][fills_root:32]
+/// [raw_fill_count:4]`, then the ordinary `[leg_count:4][legs...]`.
+/// The legs settle exactly as in tag 3 (same checks, same state
+/// changes). The chain additionally computes a root over the legs it
+/// applied and emits one `batch_commit` event carrying
+/// `batch_seq ‖ fills_root ‖ raw_fill_count ‖ legs_root ‖ leg_count`.
+///
+/// `legs_root` is chain-computed. `fills_root` is the settlement
+/// operator's attestation over the raw off-chain fill stream the legs
+/// were aggregated from; the chain cannot recompute it (it never sees
+/// the raw fills), but anyone holding the matcher's journal can replay
+/// it and compare. Tag 3 is unchanged and remains valid.
+const TAG_BATCH_SETTLE_COMMITTED: u8 = 16;
+
+/// Length of the commitment header of a committed batch settle:
+/// `batch_seq` 8 + `fills_root` 32 + `raw_fill_count` 4.
+const BATCH_COMMIT_HEADER_LEN: usize = 8 + 32 + 4;
+
+/// Stream label of the legs commitment (keeps a legs root distinct from
+/// any other stream's root).
+pub const LEGS_STREAM_LABEL: &[u8] = b"oxide-exchange-legs-v1";
+
 /// Register-order message tag: puts an off-chain-matched order's
 /// authorization on-chain so batch-settle legs can reference it.
 /// Body: `[market:2][side:1][price:8][qty:8][client_id:8]` = 27
@@ -1071,6 +1094,32 @@ pub mod msg {
             msg.extend_from_slice(&f.sell.owner.0);
             msg.extend_from_slice(&f.sell.client_id.to_le_bytes());
         }
+        msg
+    }
+
+    /// Build a committed batch-settle message: the same legs as
+    /// [`batch_settle`], preceded by the commitment header (see
+    /// `TAG_BATCH_SETTLE_COMMITTED`). `fills_root` is the operator's
+    /// attestation over the `raw_fill_count` raw fills the legs were
+    /// aggregated from; `batch_seq` should be strictly increasing (the
+    /// settler uses its envelope nonce).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `fills` is empty (as [`batch_settle`]).
+    pub fn batch_settle_committed(
+        batch_seq: u64,
+        fills_root: &[u8; 32],
+        raw_fill_count: u32,
+        fills: &[crate::BatchFillEntry],
+    ) -> Vec<u8> {
+        let plain = batch_settle(fills);
+        let mut msg = Vec::with_capacity(plain.len() + super::BATCH_COMMIT_HEADER_LEN);
+        msg.push(super::TAG_BATCH_SETTLE_COMMITTED);
+        msg.extend_from_slice(&batch_seq.to_le_bytes());
+        msg.extend_from_slice(fills_root);
+        msg.extend_from_slice(&raw_fill_count.to_le_bytes());
+        msg.extend_from_slice(&plain[1..]); // drop tag 3, keep [count][legs]
         msg
     }
 

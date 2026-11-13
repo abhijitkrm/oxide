@@ -8,11 +8,11 @@
 
 use super::{
     Address, Event, ExchangeModule, ExecError, Hash, Height, Module, RejectCategory, TAG_AMEND,
-    TAG_BATCH_SETTLE, TAG_CANCEL, TAG_CANCEL_LINKED, TAG_CANCEL_REGISTERED, TAG_DEPOSIT_BASE,
-    TAG_DEPOSIT_BASE_FOR, TAG_LINK_TRADING_KEY, TAG_LIST_MARKET, TAG_PLACE, TAG_REGISTER_LINKED,
-    TAG_REGISTER_ORDER, TAG_SWEEP_LINKED, TAG_UNLINK_TRADING_KEY, TAG_WITHDRAW_BASE,
-    TAG_WITHDRAW_LINKED, TxContext, base_balances_leaf, base_holds_leaf, decode, fee_vault_leaf,
-    linked_leaf, module_id, registered_leaf, store_leaf,
+    TAG_BATCH_SETTLE, TAG_BATCH_SETTLE_COMMITTED, TAG_CANCEL, TAG_CANCEL_LINKED,
+    TAG_CANCEL_REGISTERED, TAG_DEPOSIT_BASE, TAG_DEPOSIT_BASE_FOR, TAG_LINK_TRADING_KEY,
+    TAG_LIST_MARKET, TAG_PLACE, TAG_REGISTER_LINKED, TAG_REGISTER_ORDER, TAG_SWEEP_LINKED,
+    TAG_UNLINK_TRADING_KEY, TAG_WITHDRAW_BASE, TAG_WITHDRAW_LINKED, TxContext, base_balances_leaf,
+    base_holds_leaf, decode, fee_vault_leaf, linked_leaf, module_id, registered_leaf, store_leaf,
 };
 
 impl Module for ExchangeModule {
@@ -91,6 +91,8 @@ impl Module for ExchangeModule {
             }
 
             TAG_BATCH_SETTLE => self.handle_batch_settle(ctx, body, &mut inner),
+
+            TAG_BATCH_SETTLE_COMMITTED => self.handle_batch_settle_committed(ctx, body, &mut inner),
 
             TAG_REGISTER_ORDER => self.handle_register(ctx, body, &mut inner),
 

@@ -102,10 +102,7 @@ async fn submit_batch_ring(
     // multiplication across the whole batch — ~3× cheaper per order
     // than per-item `verify_strict` at the batch sizes clients send.
     let chain_id = ring.chain_id();
-    for (i, item) in crate::protocol::VerifiedOrder::batch_with_chain_id(orders, chain_id)
-        .into_iter()
-        .enumerate()
-    {
+    for (i, item) in ring.authenticator().orders(orders, chain_id).into_iter().enumerate() {
         match item {
             Some(vo) => {
                 positions.push(i);
@@ -199,6 +196,16 @@ fn transport_chain_id(
     ring_matcher.map_or_else(|| matcher.chain_id(), |rm| rm.chain_id())
 }
 
+/// The authenticator the target matcher uses — same selection rule as
+/// [`transport_chain_id`], so early transport checks and the matcher agree
+/// on both the scheme and the chain domain.
+fn transport_auth(
+    matcher: &SharedMatcher,
+    ring_matcher: Option<&Arc<crate::RingMatcher>>,
+) -> Arc<dyn crate::auth::Authenticator> {
+    ring_matcher.map_or_else(|| matcher.authenticator(), |rm| rm.authenticator())
+}
+
 /// Submit a single order through the ring matcher (batch of one).
 /// Borrows the request instead of `vec![req]`-copying it — the
 /// per-order fast path takes no allocation it does not need (F-14).
@@ -241,8 +248,7 @@ async fn handle_jsonrpc_action<W>(
     W: tokio::io::AsyncWriteExt + Unpin + ?Sized,
 {
     let action_chain_id = transport_chain_id(matcher, ring_matcher);
-    let Some(verified) =
-        crate::protocol::VerifiedAction::with_chain_id(action_req, action_chain_id)
+    let Some(verified) = transport_auth(matcher, ring_matcher).action(action_req, action_chain_id)
     else {
         let _ = writer
             .write_all(
@@ -486,7 +492,7 @@ async fn handle_connection(
             let action_chain_id =
                 ring_matcher.as_ref().map_or_else(|| matcher.chain_id(), |rm| rm.chain_id());
             let Some(verified) =
-                crate::protocol::VerifiedAction::with_chain_id(action_req, action_chain_id)
+                transport_auth(&matcher, ring_matcher.as_ref()).action(action_req, action_chain_id)
             else {
                 let rej = OrderResponse::rejected(crate::protocol::RejectReason::BadSignature);
                 let _ = socket.write_all(&encode_response(&rej)).await;
@@ -777,8 +783,8 @@ async fn run_fix_server_impl(
                         continue;
                     };
                     let action_chain_id = transport_chain_id(&matcher, ring_matcher.as_ref());
-                    let Some(verified) =
-                        crate::protocol::VerifiedAction::with_chain_id(action_req, action_chain_id)
+                    let Some(verified) = transport_auth(&matcher, ring_matcher.as_ref())
+                        .action(action_req, action_chain_id)
                     else {
                         let resp = OrderResponse::rejected(RejectReason::BadSignature);
                         crate::fix::format_fix_execution_report_into(
@@ -925,8 +931,8 @@ async fn run_websocket_server_impl(
                         continue;
                     };
                     let action_chain_id = transport_chain_id(&matcher, ring_matcher.as_ref());
-                    let Some(verified) =
-                        crate::protocol::VerifiedAction::with_chain_id(action_req, action_chain_id)
+                    let Some(verified) = transport_auth(&matcher, ring_matcher.as_ref())
+                        .action(action_req, action_chain_id)
                     else {
                         let resp = OrderResponse::rejected(RejectReason::BadSignature);
                         let response = crate::ws::format_ws_response(&resp, 0);
@@ -1039,6 +1045,13 @@ pub struct ServerConfig {
     /// balances BEFORE reservations (freshly funded, or loaded as free
     /// balance); a cache that already nets them would be debited twice.
     pub journal: Option<crate::cmdlog::JournalConfig>,
+    /// Order/action authentication scheme (see [`crate::auth`]); the
+    /// default is ed25519 batch, the historical behaviour.
+    pub auth: crate::auth::AuthConfig,
+    /// Attach a per-batch commitment over the raw fills to each
+    /// settlement (exchange tag 16). Off by default; the chain must
+    /// understand the committed batch-settle message.
+    pub commit_batches: bool,
 }
 
 impl Default for ServerConfig {
@@ -1058,6 +1071,8 @@ impl Default for ServerConfig {
             worker_base_core: None,
             sequencer_idle: crate::SequencerIdle::default(),
             journal: None,
+            auth: crate::auth::AuthConfig::default(),
+            commit_batches: false,
         }
     }
 }
@@ -1079,6 +1094,9 @@ fn build_settler(
     }
     if let Some(path) = &config.settlement_outbox {
         settler = settler.with_outbox(path.clone());
+    }
+    if config.commit_batches {
+        settler = settler.with_commitment();
     }
     Arc::new(settler)
 }
@@ -1411,8 +1429,7 @@ async fn handle_connection_multi(
                 let _ = socket.write_all(&encode_response(&rej)).await;
                 continue;
             };
-            let Some(verified) =
-                crate::protocol::VerifiedAction::with_chain_id(action_req, matcher.chain_id())
+            let Some(verified) = matcher.authenticator().action(action_req, matcher.chain_id())
             else {
                 let rej = OrderResponse::rejected(crate::protocol::RejectReason::BadSignature);
                 let _ = socket.write_all(&encode_response(&rej)).await;
@@ -1483,10 +1500,9 @@ pub async fn run_jsonrpc_tcp_server_multi(
 "#).await;
                         continue;
                     };
-                    let Some(verified) = crate::protocol::VerifiedAction::with_chain_id(
-                        action_req,
-                        matcher.chain_id(),
-                    ) else {
+                    let Some(verified) =
+                        matcher.authenticator().action(action_req, matcher.chain_id())
+                    else {
                         let _ = writer.write_all(br#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"bad signature"},"id":null}
 "#).await;
                         continue;
@@ -1584,10 +1600,9 @@ pub async fn run_fix_server_multi(
                         let _ = socket.write_all(report_buf.as_bytes()).await;
                         continue;
                     };
-                    let Some(verified) = crate::protocol::VerifiedAction::with_chain_id(
-                        action_req,
-                        matcher.chain_id(),
-                    ) else {
+                    let Some(verified) =
+                        matcher.authenticator().action(action_req, matcher.chain_id())
+                    else {
                         let resp = OrderResponse::rejected(RejectReason::BadSignature);
                         crate::fix::format_fix_execution_report_into(
                             &resp,
@@ -1729,7 +1744,8 @@ pub async fn run_server_multi(
             config.worker_base_core,
             config.journal.clone(),
         )
-        .unwrap_or_else(|e| panic!("matcher journal recovery failed: {e}")),
+        .unwrap_or_else(|e| panic!("matcher journal recovery failed: {e}"))
+        .with_authenticator(config.auth.build()),
     );
     if journaling {
         for r in matcher.recovery_reports() {

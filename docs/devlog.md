@@ -24572,3 +24572,50 @@ session-open/scope enforcement or gateway slashing (hooks specified only). The
 
 Box plan: `SECTIONS="env budget lanes"` is the short-box preset; it yields per-stage
 costs and the shard scaling curve on a many-core machine.
+
+### Lanes wired into the matcher and the settlement path (pluggable authentication, per-batch fill commitment)
+
+User direction: modular and swappable; operators choose the scheme and performance only
+sets the default. So every scheme is built and selected by config.
+
+**Authentication (matcher).** New `matcher::auth` with an `Authenticator` seam
+(`orders`, `action`, `certified_orders`, `open_session`, `close_session`) behind every
+admission path: `MatchingServer`, `RingMatcher`, `MultiMarketMatcher` and the TCP/WS/
+JSON-RPC/FIX transports (about 15 sites; no direct `VerifiedOrder::with_chain_id` calls
+remain outside `protocol`/`auth`). Schemes: ed25519 batch (default, bit-identical),
+ed25519 per-item, EVM secp256k1 recovery (parallel option), session MAC, gateway
+certificate with deterministic audit, and `Multi` over a chosen set. No wire change:
+each scheme uses a canonical shape of the existing `pubkey`/`signature` bytes; the nonce
+in the signed message stays the replay gate for all. Owner binding is enforced per scheme
+(ed25519 derived address, EVM recovered address, session owner).
+
+Findings and checks:
+- Mutation testing caught a gap in my own tests: removing the session owner check
+  survived because my "stolen owner" case changed the owner after MACing (MAC then failed
+  for an unrelated reason). The real threat is a session holder MACing correctly for an
+  account that is not the session's; the test now covers it (orders and actions).
+- The EVM scheme authenticates against the on-chain EOA address, which closes the
+  trading-key/ledger-key gap that `protocol.rs` documents for ed25519 trading keys.
+- Matcher admission, M1, orders/s on one thread: ed25519 per-item 20k, batch 56k, EVM
+  33k (124k on 4 threads), session MAC 4.8M, certificate (audit 1/64) 1.9M, mixed thirds 59k.
+- Default behaviour is unchanged: the whole matcher suite passes and a test asserts the
+  default authenticator equals `VerifiedOrder::batch_with_chain_id` on a mixed batch.
+
+**Lane-level verifiers (`lanes::verify`).** Added the EVM scheme (`EvmRecover`, optional
+threads), an `OwnerBound` decorator, `Multi` (per-item dispatch with an allow list), and a
+`VerifierConfig` that builds any of them at run time; the default is `Multi` with every
+scheme on. No accept-everything kind is configurable (`NoVerify` is a bench control).
+
+**Commitment (steps 2 and 3).** `matcher::commit::fills_root` folds the sealed fills into a
+root with `lanes::commit::ByteStream` (extracted from `Stream`, now labeled and
+count-bound). The settler can submit a committed batch settle (exchange tag 16:
+`[seq][fills_root][raw_count]` + the tag-3 body). The chain settles the legs identically and
+emits `batch_commit` carrying the operator's `fills_root` and its own `legs_root`. The
+chain only sees aggregated legs, which shaped the design: it can verify a root over what
+it applied, and only record the operator's attestation over the raw fills. End-to-end test:
+the settler's real payload is accepted by the real `ExchangeModule`.
+
+Not done: session open/close and certificate frames on the network transports, session
+expiry, netted-delta settlement with a dispute path (the step that would remove per-leg
+chain work), and journaling the fills root in the seal record (it is recomputable from the
+journal, so nothing is lost). The `--commit-batches` default is off; the chain must know tag 16.

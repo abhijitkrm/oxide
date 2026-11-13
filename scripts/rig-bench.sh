@@ -20,7 +20,8 @@
 #   budget   per-item cost of each authentication/commit stage per core and its
 #            thread scaling (secp256k1 recover, ed25519 strict/batch, BLAKE3 leaf,
 #            session MAC) and the cores needed for 1M EVM tx/s, 10M and 100M
-#            orders/s (crates/crypto/benches/budget.rs; docs/lanes-spec.md §8)
+#            orders/s (crates/crypto/benches/budget.rs; docs/lanes-spec.md §8), plus
+#            the matcher's per-scheme admission cost (crates/matcher/benches/auth.rs)
 #   lanes    sharded trading lane + EVM lane prototypes: orders/s vs shard count
 #            and verifier mode (crates/lanes/benches/lanes.rs)
 #   scaling  parallel-EVM, multi-market matcher, ring, hashing benches
@@ -306,6 +307,10 @@ if want budget; then
     TLIST="$(echo $THREADS | tr ' ' ',')"
     SECS=2; [ "$QUICK" = 1 ] && SECS=0.3
     run budget.csv cargo bench -p crypto --bench budget -- --secs "$SECS" --threads "$TLIST"
+    # Admission cost per authentication scheme through the matcher's own
+    # authenticators (ed25519 per-item/batch, EVM recover, session MAC,
+    # gateway certificate, mixed).
+    run auth.csv cargo bench -p matcher --bench auth -- --secs "$SECS" --threads "$TLIST"
 fi
 
 # ── lanes ───────────────────────────────────────────────────────────

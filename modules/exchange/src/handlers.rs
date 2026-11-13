@@ -8,12 +8,12 @@
 //! (`release_maker_holds`), so conservation is auditable here.
 
 use super::{
-    Address, CANCEL_LINKED_BODY_LEN, CANCEL_REGISTERED_BODY_LEN, CUSTODY_BODY_LEN, Event,
-    ExchangeModule, ExecError, FILL_ENTRY_LEN, Inner, LINK_BODY_LEN, LINKED_CUSTODY_BODY_LEN,
-    LinkedEntry, MAX_BATCH_FILLS, MAX_REGISTERED_ORDERS, MarketConfig, OrderKey, OrderType,
-    PRICE_SCALE, Price, Qty, REGISTER_BODY_LEN, REGISTER_LINKED_BODY_LEN, RegisteredOrder,
-    RejectCategory, Reserved, SWEEP_LINKED_BODY_LEN, Side, TradingError, TxContext, qty_add,
-    qty_sub,
+    Address, BATCH_COMMIT_HEADER_LEN, CANCEL_LINKED_BODY_LEN, CANCEL_REGISTERED_BODY_LEN,
+    CUSTODY_BODY_LEN, Event, ExchangeModule, ExecError, FILL_ENTRY_LEN, Inner, LINK_BODY_LEN,
+    LINKED_CUSTODY_BODY_LEN, LinkedEntry, MAX_BATCH_FILLS, MAX_REGISTERED_ORDERS, MarketConfig,
+    OrderKey, OrderType, PRICE_SCALE, Price, Qty, REGISTER_BODY_LEN, REGISTER_LINKED_BODY_LEN,
+    RegisteredOrder, RejectCategory, Reserved, SWEEP_LINKED_BODY_LEN, Side, TradingError,
+    TxContext, qty_add, qty_sub,
 };
 use crate::codec::{
     amended_event, cancel_event, decode_side, encode_side, fill_event, outcome_event, pair_event,
@@ -1376,6 +1376,38 @@ impl ExchangeModule {
     ///
     /// `inner` is the already-held module lock (batch settle never
     /// mutates the books — only the registered-order map).
+    /// Handle a committed batch settle: settle the legs exactly as
+    /// [`Self::handle_batch_settle`] (same authorization, validation and
+    /// state changes) and append one `batch_commit` event with the
+    /// operator's `fills_root` and the root the chain computed over the
+    /// legs it applied. Anything the plain handler rejects is rejected
+    /// here with the same error, before any event.
+    pub(crate) fn handle_batch_settle_committed(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        let header = body.get(..BATCH_COMMIT_HEADER_LEN).ok_or(ExecError::Malformed)?;
+        let rest = &body[BATCH_COMMIT_HEADER_LEN..];
+        let mut events = self.handle_batch_settle(ctx, rest, inner)?;
+        // `handle_batch_settle` has validated `rest` as `[count][legs]`
+        // with exactly `count * FILL_ENTRY_LEN` bytes of legs.
+        let legs = &rest[4..];
+        let mut stream = lanes::commit::ByteStream::new(crate::LEGS_STREAM_LABEL);
+        let (entries, _) = legs.as_chunks::<FILL_ENTRY_LEN>();
+        for leg in entries {
+            stream.push(leg);
+        }
+        let (legs_root, leg_count) = stream.finish();
+        let mut data = Vec::with_capacity(BATCH_COMMIT_HEADER_LEN + 32 + 4);
+        data.extend_from_slice(header); // seq ‖ fills_root ‖ raw_fill_count
+        data.extend_from_slice(&legs_root);
+        data.extend_from_slice(&u32::try_from(leg_count).unwrap_or(u32::MAX).to_le_bytes());
+        events.push(Event { module: "exchange", kind: "batch_commit", data });
+        Ok(events)
+    }
+
     pub(crate) fn handle_batch_settle(
         &self,
         ctx: &TxContext,

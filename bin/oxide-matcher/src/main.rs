@@ -114,6 +114,8 @@ struct CliConfig {
     worker_base_core: Option<u32>,
     sequencer_idle: matcher::SequencerIdle,
     journal: Option<matcher::cmdlog::JournalConfig>,
+    auth: matcher::auth::AuthConfig,
+    commit_batches: bool,
 }
 
 /// Parse CLI flags into a `CliConfig`.
@@ -193,6 +195,11 @@ fn parse_cli() -> CliConfig {
         // (default 100000, 0 = never) is how often a checkpoint is
         // taken at a settlement seal. Typos are startup errors.
         journal: parse_journal(),
+        auth: parse_auth(),
+        // `--commit-batches`: submit committed batch settles (exchange tag
+        // 16) with a root over each batch's raw fills. Needs a chain that
+        // understands tag 16.
+        commit_batches: env::args().any(|a| a == "--commit-batches"),
         sequencer_idle: parse_flag_opt::<String>("--sequencer-idle").map_or_else(
             matcher::SequencerIdle::default,
             |v| {
@@ -276,7 +283,44 @@ fn build_server_config(cli: &CliConfig) -> ServerConfig {
         worker_base_core: cli.worker_base_core,
         sequencer_idle: cli.sequencer_idle,
         journal: cli.journal.clone(),
+        auth: cli.auth.clone(),
+        commit_batches: cli.commit_batches,
     }
+}
+
+/// Parse the `--auth*` flags: which order/action authentication scheme
+/// the matcher runs (see `matcher::auth`). Default is `ed25519_batch`,
+/// the historical behaviour.
+fn parse_auth() -> matcher::auth::AuthConfig {
+    use matcher::auth::{AuthConfig, AuthKind, Schemes};
+    let die = |what: &str, v: &str| -> ! {
+        eprintln!("error: {what}: '{v}'");
+        std::process::exit(1);
+    };
+    let mut cfg = AuthConfig::default();
+    if let Some(k) = parse_flag_opt::<String>("--auth") {
+        cfg.kind = AuthKind::parse(&k).unwrap_or_else(|v| {
+            die("--auth (use ed25519_batch, ed25519, evm, session_mac, certified, multi)", &v)
+        });
+    }
+    if let Some(list) = parse_flag_opt::<String>("--auth-schemes") {
+        cfg.schemes = Schemes::parse(&list)
+            .unwrap_or_else(|v| die("--auth-schemes (use ed25519,evm,mac,cert or all)", &v));
+    }
+    cfg.evm_threads = parse_flag("--evm-threads", 1usize).max(1);
+    cfg.audit_every = parse_flag("--audit-every", cfg.audit_every);
+    if let Some(keys) = parse_flag_opt::<String>("--gateway-keys") {
+        for k in keys.split(',').filter(|k| !k.is_empty()) {
+            let bytes = (0..k.len())
+                .step_by(2)
+                .map(|i| k.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
+                .collect::<Option<Vec<u8>>>()
+                .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                .unwrap_or_else(|| die("--gateway-keys (64 hex chars each, comma-separated)", k));
+            cfg.trusted_gateways.push(bytes);
+        }
+    }
+    cfg
 }
 
 /// Parse the `--journal-*` flags.
@@ -365,6 +409,8 @@ fn main() {
     println!("  WebSocket:       127.0.0.1:{}", cli.ws_port);
     println!("  batch interval:  {}ms", cli.batch_interval);
     println!("  chain ID:        {}", cli.chain_id);
+    println!("  auth scheme:     {:?}", cli.auth.kind);
+    println!("  commit batches:  {}", cli.commit_batches);
     if let Some(p) = &cli.nonce_state {
         println!("  nonce state:     {}", p.display());
     } else {
@@ -480,6 +526,7 @@ fn main() {
             let mut server =
                 MatchingServer::with_risk_config(single_market_config(), cli.accounts, cli.risk);
             server.set_chain_id(cli.chain_id);
+            server.set_authenticator(cli.auth.build());
             if let Some(p) = &cli.nonce_state {
                 server.set_nonce_store(p.clone());
             }
@@ -492,6 +539,7 @@ fn main() {
             let mut server =
                 MatchingServer::with_risk_config(single_market_config(), cli.accounts, cli.risk);
             server.set_chain_id(cli.chain_id);
+            server.set_authenticator(cli.auth.build());
             if let Some(p) = &cli.nonce_state {
                 server.set_nonce_store(p.clone());
             }

@@ -63,8 +63,10 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+pub mod auth;
 pub mod balance;
 pub mod cmdlog;
+pub mod commit;
 pub mod fix;
 pub mod journal;
 pub mod jsonrpc;
@@ -167,6 +169,9 @@ pub struct MatchingServer {
     /// chain can never replay on another. Defaults to the devnet
     /// [`protocol::CHAIN_ID`].
     chain_id: u64,
+    /// How requests become proof tokens (`auth` module). Defaults to
+    /// [`auth::Ed25519Batch`], the historical behaviour.
+    auth: Arc<dyn auth::Authenticator>,
     /// Scratch for non-fill book removals the sweep reports —
     /// reused across orders like `fills` (zero alloc steady-state).
     removed: Vec<trading::MakerRemoval>,
@@ -204,6 +209,7 @@ impl MatchingServer {
             order_client_ids: HashMap::with_capacity(65_536),
             clock: Arc::new(wall_clock_ms),
             chain_id: protocol::CHAIN_ID,
+            auth: auth::default_authenticator(),
             removed: Vec::with_capacity(64),
             orders_processed: 0,
             fills_produced: 0,
@@ -241,6 +247,7 @@ impl MatchingServer {
             order_client_ids: HashMap::with_capacity(65_536),
             clock: Arc::new(wall_clock_ms),
             chain_id: protocol::CHAIN_ID,
+            auth: auth::default_authenticator(),
             removed: Vec::with_capacity(64),
             orders_processed: 0,
             fills_produced: 0,
@@ -271,6 +278,18 @@ impl MatchingServer {
     /// is exactly the cross-chain replay boundary.
     pub fn set_chain_id(&mut self, chain_id: u64) {
         self.chain_id = chain_id;
+    }
+
+    /// Choose how requests are authenticated (see [`auth`]). Call
+    /// before serving traffic.
+    pub fn set_authenticator(&mut self, a: Arc<dyn auth::Authenticator>) {
+        self.auth = a;
+    }
+
+    /// The configured authenticator (transports share it).
+    #[must_use]
+    pub fn authenticator(&self) -> Arc<dyn auth::Authenticator> {
+        Arc::clone(&self.auth)
     }
 
     /// Attach a durable checkpoint file for consumed nonces. Without
@@ -329,7 +348,8 @@ impl MatchingServer {
     ///
     /// Returns the order response (filled, resting, or rejected).
     pub fn submit_order(&mut self, req: &OrderRequest) -> OrderResponse {
-        if let Some(verified) = protocol::VerifiedOrder::with_chain_id(*req, self.chain_id) {
+        let authed = self.auth.orders(std::slice::from_ref(req), self.chain_id).pop().flatten();
+        if let Some(verified) = authed {
             self.submit_verified(&verified)
         } else {
             self.auth_rejections += 1;
@@ -592,7 +612,7 @@ impl MatchingServer {
     pub fn submit_action(&mut self, req: &ActionRequest) -> OrderResponse {
         // Authentication gate — identical policy to `submit_order`,
         // including the configured chain ID.
-        let Some(verified) = protocol::VerifiedAction::with_chain_id(*req, self.chain_id) else {
+        let Some(verified) = self.auth.action(*req, self.chain_id) else {
             self.orders_processed += 1;
             self.auth_rejections += 1;
             return OrderResponse::rejected(RejectReason::BadSignature);
@@ -924,6 +944,18 @@ impl SharedMatcher {
         }
     }
 
+    /// The authenticator the inner server uses, so transports'
+    /// early checks use the same scheme as the server. Falls back to
+    /// the default if the mutex is poisoned (which only ever rejects
+    /// more, never less: the proof tokens are re-minted by the same
+    /// scheme).
+    pub fn authenticator(&self) -> Arc<dyn auth::Authenticator> {
+        match self.inner.lock() {
+            Ok(guard) => guard.authenticator(),
+            Err(_) => auth::default_authenticator(),
+        }
+    }
+
     /// Get a snapshot of the server's stats.
     ///
     /// Returns zeroed stats if the internal mutex is poisoned.
@@ -1066,6 +1098,8 @@ pub struct RingMatcher {
     /// matcher thread, so this can never diverge). Transport threads
     /// verify `VerifiedOrder` proofs with the same value.
     chain_id: u64,
+    /// The embedded server's authenticator, shared with transports.
+    auth: Arc<dyn auth::Authenticator>,
     /// The matcher thread handle — its `is_finished` flag is the
     /// worker-liveness oracle for lease holders awaiting a response.
     worker_thread: std::thread::JoinHandle<()>,
@@ -1150,6 +1184,7 @@ impl RingMatcher {
         }
 
         let chain_id = server.chain_id();
+        let auth = server.authenticator();
         let (control_tx, control_rx) = std::sync::mpsc::channel::<ControlCommand>();
         // A response batch the client has not yet drained. The lease
         // guarantees at most ONE exchange in flight per ring, so a
@@ -1185,6 +1220,7 @@ impl RingMatcher {
             control_tx,
             wakeup: shared_wakeup,
             chain_id,
+            auth,
             worker_thread: thread,
         }
     }
@@ -1270,6 +1306,12 @@ impl RingMatcher {
         self.chain_id
     }
 
+    /// The authenticator transports use to mint proof tokens.
+    #[must_use]
+    pub fn authenticator(&self) -> Arc<dyn auth::Authenticator> {
+        Arc::clone(&self.auth)
+    }
+
     /// Seal the settlement batch via a control-channel command to the
     /// matcher thread. This reads from THE SAME order book the
     /// protocols write to — there is exactly one book.
@@ -1311,8 +1353,7 @@ impl RingMatcher {
     /// Returns an `EngineError` rejection if the control channel is
     /// disconnected (matcher thread died) or the reply fails.
     pub fn submit_action(&self, action: ActionRequest) -> OrderResponse {
-        let Some(verified) = protocol::VerifiedAction::with_chain_id(action, self.chain_id())
-        else {
+        let Some(verified) = self.auth.action(action, self.chain_id()) else {
             return OrderResponse::rejected(crate::protocol::RejectReason::BadSignature);
         };
         self.submit_verified_action(verified)
@@ -1575,6 +1616,10 @@ pub struct MatcherStats {
     pub pending_settlements: usize,
 }
 
+#[cfg(test)]
+mod auth_tests;
+#[cfg(test)]
+mod commit_tests;
 #[cfg(test)]
 mod journal_wiring_tests;
 #[cfg(test)]

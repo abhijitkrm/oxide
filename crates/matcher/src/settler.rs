@@ -176,6 +176,9 @@ pub struct SettleReport {
     /// `batch_rejected`, but the nonce was NOT consumed — the next
     /// sealed batch reuses it.
     pub dead_lettered: Option<String>,
+    /// The commitment over the raw fills of the batch submitted this
+    /// tick, when committed settlement is on (`BatchSettler::with_commitment`).
+    pub fills_root: Option<[u8; 32]>,
 }
 
 /// A settlement envelope in flight — mempool-submitted (or
@@ -338,6 +341,10 @@ pub struct BatchSettler {
     /// (a restart mid-flight then falls back to the executor's
     /// `executed_nonce` resync on the next resolution).
     pub(crate) outbox: std::sync::Mutex<Option<SettlementOutbox>>,
+    /// Submit committed batch settles (exchange tag 16) carrying the
+    /// raw-fill root, instead of plain ones (tag 3). Off by default: the
+    /// chain must understand tag 16.
+    pub(crate) commit_batches: bool,
 }
 
 impl BatchSettler {
@@ -375,6 +382,7 @@ impl BatchSettler {
             nonce: std::sync::atomic::AtomicU64::new(start_nonce),
             pending: std::sync::Mutex::new(None),
             outbox: std::sync::Mutex::new(None),
+            commit_batches: false,
         }
     }
 
@@ -393,6 +401,16 @@ impl BatchSettler {
         self.sender = crypto::secp::signable_pubkey_address(&privkey)
             .expect("settlement key must be a valid secp256k1 secret");
         self.signing = Some(SigningConfig { privkey: zeroize::Zeroizing::new(privkey), chain_id });
+        self
+    }
+
+    /// Attach a commitment over each batch's raw fills (exchange tag 16,
+    /// `crate::commit::fills_root`). The envelope nonce serves as the
+    /// batch sequence. Requires a chain that understands the committed
+    /// batch-settle message; legs settle identically either way.
+    #[must_use]
+    pub fn with_commitment(mut self) -> Self {
+        self.commit_batches = true;
         self
     }
 
@@ -560,15 +578,23 @@ impl BatchSettler {
         let entries = aggregate_fills(&fills)?;
         let pair_count = entries.len();
 
-        // Encode as a batch-settle message.
-        let module_payload = exchange::msg::batch_settle(&entries);
+        // Encode as a batch-settle message. With commitment on, the raw
+        // fills' root rides along and the envelope nonce is the batch
+        // sequence (read here, same value the envelope below uses).
+        let nonce = self.nonce.load(std::sync::atomic::Ordering::Relaxed);
+        let module_payload = if self.commit_batches {
+            let (root, raw) = crate::commit::fills_root(&fills);
+            report.fills_root = Some(root);
+            exchange::msg::batch_settle_committed(nonce, &root, raw, &entries)
+        } else {
+            exchange::msg::batch_settle(&entries)
+        };
 
         // Wrap in an Oxide transaction envelope. The nonce is READ
         // here, not consumed — it advances only when the confirmer
         // proves execution, so a rejected submission or a terminal
         // skip leaves the sequence contiguous for the retry (and for
         // the next batch).
-        let nonce = self.nonce.load(std::sync::atomic::Ordering::Relaxed);
         let fee = 100u64;
         let envelope = self.encode_envelope(nonce, fee, &module_payload)?;
 

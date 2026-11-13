@@ -173,6 +173,8 @@ pub struct MultiMarketMatcher {
     /// with every worker so transport-side and worker-side
     /// authentication can never disagree.
     pub(crate) chain_id: u64,
+    /// How requests become proof tokens (`auth` module).
+    auth: Arc<dyn crate::auth::Authenticator>,
 }
 
 impl MultiMarketMatcher {
@@ -354,7 +356,15 @@ impl MultiMarketMatcher {
             }
         }
 
-        Ok(Self { market_senders, _threads: threads, num_markets, nonces, chain_id, recovery })
+        Ok(Self {
+            market_senders,
+            _threads: threads,
+            num_markets,
+            nonces,
+            chain_id,
+            auth: crate::auth::default_authenticator(),
+            recovery,
+        })
     }
 
     /// What each market worker recovered from its journal at start,
@@ -362,6 +372,20 @@ impl MultiMarketMatcher {
     #[must_use]
     pub fn recovery_reports(&self) -> &[RecoveryReport] {
         &self.recovery
+    }
+
+    /// Choose how requests are authenticated (see [`crate::auth`]).
+    /// Call before serving traffic; the default is ed25519 batch.
+    #[must_use]
+    pub fn with_authenticator(mut self, a: Arc<dyn crate::auth::Authenticator>) -> Self {
+        self.auth = a;
+        self
+    }
+
+    /// The configured authenticator (transports share it).
+    #[must_use]
+    pub fn authenticator(&self) -> Arc<dyn crate::auth::Authenticator> {
+        Arc::clone(&self.auth)
     }
 
     /// The chain ID order signatures are verified against —
@@ -416,7 +440,7 @@ impl MultiMarketMatcher {
         // per-item afterwards, in batch order — verification ordering
         // relative to nonce consumption is unchanged (every signature
         // is proven before any nonce is consumed).
-        let authenticated = protocol::VerifiedOrder::batch_with_chain_id(&orders, self.chain_id);
+        let authenticated = self.auth.orders(&orders, self.chain_id);
         let mut verified: Vec<protocol::VerifiedOrder> = Vec::with_capacity(orders.len());
         for (i, item) in authenticated.into_iter().enumerate() {
             match item {
@@ -547,7 +571,7 @@ impl MultiMarketMatcher {
     /// Returns an `EngineError` rejection if the market worker thread
     /// has died.
     pub fn submit_action(&self, action: &ActionRequest) -> OrderResponse {
-        let Some(verified) = protocol::VerifiedAction::with_chain_id(*action, self.chain_id) else {
+        let Some(verified) = self.auth.action(*action, self.chain_id) else {
             return OrderResponse::rejected(RejectReason::BadSignature);
         };
         self.submit_verified_action(verified)

@@ -2763,3 +2763,79 @@ fn amend_conserves_value_over_random_ops() {
         }
     }
 }
+
+// ── committed batch settle (tag 16) ──────────────────────────────
+
+/// Two identical fixtures: one settles a batch with tag 3, the other the
+/// same legs with tag 16. State must match exactly (the commitment adds
+/// an event, never a state change), and the `batch_commit` event must
+/// carry the operator's root untouched plus a legs root that equals an
+/// independent recomputation.
+#[test]
+fn committed_batch_settle_changes_no_state_and_commits_the_legs() {
+    let fixture = || {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let mut ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.set_settlement_operator(addr(0xAA));
+        ex.list_market(test_cfg()).unwrap();
+        registered_pair(&ledger, &ex, 1_500_000_000, 1_000_000_000, 3_000);
+        (ledger, ex)
+    };
+    let legs = [leg(0, 1_000_000_000, 1_000, 1, 1, 9, 1), leg(0, 1_500_000_000, 2_000, 1, 1, 9, 1)];
+
+    let (ledger_a, ex_a) = fixture();
+    let plain = ex_a.handle(&ctx(0xAA), &msg::batch_settle(&legs)).unwrap();
+
+    let (ledger_b, ex_b) = fixture();
+    let fills_root = [0x77u8; 32];
+    let committed =
+        ex_b.handle(&ctx(0xAA), &msg::batch_settle_committed(41, &fills_root, 5, &legs)).unwrap();
+
+    for a in [1u8, 9] {
+        assert_eq!(ledger_a.balance(&addr(a)), ledger_b.balance(&addr(a)), "account {a}");
+    }
+    assert_eq!(ex_a.fee_vault(0), ex_b.fee_vault(0));
+    assert_eq!(committed.len(), plain.len() + 1);
+    assert_eq!(
+        committed[..plain.len()].iter().map(|e| (e.kind, e.data.clone())).collect::<Vec<_>>(),
+        plain.iter().map(|e| (e.kind, e.data.clone())).collect::<Vec<_>>(),
+        "legs settle with identical events"
+    );
+
+    let ev = committed.last().unwrap();
+    assert_eq!((ev.module, ev.kind), ("exchange", "batch_commit"));
+    assert_eq!(&ev.data[0..8], &41u64.to_le_bytes());
+    assert_eq!(&ev.data[8..40], &fills_root);
+    assert_eq!(&ev.data[40..44], &5u32.to_le_bytes());
+    // Independent recomputation of the legs root from the wire bytes.
+    let wire = msg::batch_settle(&legs);
+    let mut s = lanes::commit::ByteStream::new(crate::LEGS_STREAM_LABEL);
+    for chunk in wire[1 + 4..].as_chunks::<{ crate::FILL_ENTRY_LEN }>().0 {
+        s.push(chunk);
+    }
+    let (want_root, want_n) = s.finish();
+    assert_eq!(&ev.data[44..76], &want_root);
+    assert_eq!(&ev.data[76..80], &u32::try_from(want_n).unwrap().to_le_bytes());
+    assert_eq!(want_n, 2);
+}
+
+#[test]
+fn committed_batch_settle_keeps_every_plain_rejection() {
+    let ledger = Arc::new(framework::MemoryBalances::new());
+    let mut ex = ExchangeModule::with_ledger(ledger.clone());
+    ex.set_settlement_operator(addr(0xAA));
+    ex.list_market(test_cfg()).unwrap();
+    registered_pair(&ledger, &ex, 1_500_000_000, 1_000_000_000, 3_000);
+    let legs = [leg(0, 1_000_000_000, 1_000, 1, 1, 9, 1)];
+    let good = msg::batch_settle_committed(1, &[0; 32], 1, &legs);
+
+    // Not the operator.
+    assert!(ex.handle(&ctx(1), &good).is_err());
+    // Header truncated.
+    assert!(ex.handle(&ctx(0xAA), &good[..20]).is_err());
+    // Leg bytes truncated (count says 1, body is short).
+    assert!(ex.handle(&ctx(0xAA), &good[..good.len() - 1]).is_err());
+    // Nothing settled by any of the failures: the good one still works.
+    let ev = ex.handle(&ctx(0xAA), &good).unwrap();
+    assert_eq!(ev.last().unwrap().kind, "batch_commit");
+}
