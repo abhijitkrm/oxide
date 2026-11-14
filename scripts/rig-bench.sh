@@ -445,24 +445,34 @@ fi
 # ── scaling ─────────────────────────────────────────────────────────
 if want scaling; then
     NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
+    # Criterion's defaults (100 samples, 5 s each) make this section an hour on a
+    # big box; these keep the medians usable. Override with CRIT_ARGS.
+    CRIT="${CRIT_ARGS:---warm-up-time 1 --measurement-time 2 --sample-size 20}"
+    SCORES="1 2 4 8 16 32 64 128"
+    [ "$QUICK" = 1 ] && { CRIT="--warm-up-time 1 --measurement-time 1 --sample-size 10"; SCORES="1 2"; }
     log "scaling: parallel EVM vs cores ($NCPU online)"
     EBIN="$(bench_bin executor uniswap_transfer)"
-    for c in 1 2 4 8 16 32 64 128; do
+    for c in $SCORES; do
         [ "$c" -gt "$NCPU" ] && break
         if command -v taskset >/dev/null 2>&1; then
-            run scaling_evm.txt taskset -c "0-$((c-1))" "$EBIN" --bench
+            # shellcheck disable=SC2086
+            run scaling_evm.txt taskset -c "0-$((c-1))" "$EBIN" --bench $CRIT
         else
-            RAYON_NUM_THREADS=$c run scaling_evm.txt "$EBIN" --bench
+            # shellcheck disable=SC2086
+            RAYON_NUM_THREADS=$c run scaling_evm.txt "$EBIN" --bench $CRIT
         fi
         echo "(cores=$c above)" >>"$OUT/scaling_evm.txt"
     done
     log "scaling: matcher benches (multi-market, balance contention, nonce, ring, allocs)"
     for b in matcher_throughput balance_contention nonce_contention ring alloc_accounting; do
-        run "scaling_matcher_$b.txt" cargo bench -p matcher --bench "$b"
+        # shellcheck disable=SC2086
+        run "scaling_matcher_$b.txt" cargo bench -p matcher --bench "$b" -- $CRIT
     done
     log "scaling: hashing / signature benches (leaf hash, BLS, tx recovery)"
-    for b in hash bls tx_recover; do run "scaling_crypto_$b.txt" cargo bench -p crypto --bench "$b"; done
-    run scaling_pipeline.txt cargo bench -p executor --bench block_pipeline
+    # shellcheck disable=SC2086
+    for b in hash bls tx_recover; do run "scaling_crypto_$b.txt" cargo bench -p crypto --bench "$b" -- $CRIT; done
+    # shellcheck disable=SC2086
+    run scaling_pipeline.txt cargo bench -p executor --bench block_pipeline -- $CRIT
 fi
 
 # ── profile ─────────────────────────────────────────────────────────
