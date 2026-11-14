@@ -131,7 +131,8 @@ def main(d):
             if m and not line.startswith(("Benchmarking", "Warning")):
                 last = m.group(1)
             t2 = re.search(r"time:\s+\[\S+ \S+ (\S+) (\S+)", line)
-            if t2 and last and cores:
+            # criterion's "change:" block also has a `time: [...%...]` line; only absolute times count
+            if t2 and "%" not in line and last and cores:
                 v = float(t2.group(1)) * {"ns": 1e-9, "µs": 1e-6, "us": 1e-6, "ms": 1e-3, "s": 1.0}[t2.group(2)]
                 res.setdefault(last, {})[cores] = v
         return res

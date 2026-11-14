@@ -114,8 +114,10 @@ log() { printf '\n== %s\n' "$*" | tee -a "$OUT/session.log"; }
 run() { # run <outfile> <cmd...> — tee stdout+stderr; a failing command is recorded, never fatal
     local f="$OUT/$1"; shift
     echo "\$ $*" | tee -a "$OUT/session.log" >>"$f"
-    "$@" 2>&1 | tee -a "$f" >>"$OUT/session.log"
-    local rc="${PIPESTATUS[0]}"
+    # `|| rc=...` keeps `set -e` + `pipefail` from ending the script on a failing bench
+    # (the status line is evaluated for this very pipeline, so PIPESTATUS is still valid).
+    local rc=0
+    "$@" 2>&1 | tee -a "$f" >>"$OUT/session.log" || rc="${PIPESTATUS[0]}"
     # Benches carry hard gates (e.g. tps_rw's 60k tx/s floor) that legitimately fail at low
     # core counts: record the exit status and carry on instead of letting `set -e` end the run.
     if [ "$rc" -ne 0 ]; then
