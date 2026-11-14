@@ -69,7 +69,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-SHA="$(git rev-parse --short HEAD)"
+# The tree may have been rsync'd without .git (scripts/rig/remote.sh, the Linux
+# container smoke test): fall back to the hash the sync recorded.
+SHA="$(git rev-parse --short HEAD 2>/dev/null || cat "$ROOT/.rig-sha" 2>/dev/null || echo nogit)"
 HOST="$(hostname -s)"
 OUT="${OUT:-$ROOT/rig-results/$HOST-$SHA-$(date +%Y%m%d-%H%M%S)}"
 CORES="${CORES:-2}"
@@ -108,6 +110,13 @@ want() { case " $SECTIONS " in *" $1 "*) return 0 ;; esac; return 1; }
 
 
 have() { command -v "$1" >/dev/null 2>&1; }
+# Copy the source tree (no build output, no VCS) to $1: a scratch tree for the
+# sweeps that patch a constant and rebuild. A plain copy, not `git worktree`, so
+# it works on trees that were rsync'd without .git.
+copy_tree() {
+    mkdir -p "$1"
+    tar -C "$ROOT" --exclude=./target --exclude=./rig-results --exclude=./.git -cf - . | tar -C "$1" -xf -
+}
 SAMPLER="$ROOT/scripts/rig/sampler.py"
 # sampler_start <name> <match>... ; sampler_stop — per-process time series
 SAMPLER_PID=""
@@ -131,7 +140,7 @@ iostat_stop() { [ -n "$IOSTAT_PID" ] && { kill "$IOSTAT_PID" 2>/dev/null || true
 
 # ── env ─────────────────────────────────────────────────────────────
 {
-    echo "git: $(git rev-parse HEAD) $(git status --porcelain | wc -l | tr -d ' ') dirty files"
+    echo "git: $(git rev-parse HEAD 2>/dev/null || cat "$ROOT/.rig-sha" 2>/dev/null || echo unknown) $(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') dirty files"
     echo "rustc: $(rustc --version)  cargo: $(cargo --version)"
     uname -a
     if [ -r /proc/cpuinfo ]; then
@@ -237,7 +246,7 @@ fi
 sweep_const() { # sweep_const <file> <regex-for-line> <name> <values...>
     local file="$1" pat="$2" name="$3"; shift 3
     local wt="$OUT/worktree-$name"
-    git worktree add --detach "$wt" HEAD >/dev/null 2>&1 || true
+    copy_tree "$wt"
     for v in "$@"; do
         sed -E "s/$pat/\\1$v\\2/" "$ROOT/$file" >"$wt/$file"
         local bin; bin="$(cd "$wt" && bench_bin_in "$name")"
@@ -246,7 +255,7 @@ sweep_const() { # sweep_const <file> <regex-for-line> <name> <values...>
             pin "$bin" "$CORPUS/$w" --fold --reps "$REPS" 2>&1 | tee -a "$OUT/${name}_sweep.txt" >>"$OUT/session.log"
         done
     done
-    git worktree remove --force "$wt" >/dev/null 2>&1 || true
+    rm -rf "$wt"
 }
 bench_bin_in() { CARGO_TARGET_DIR="$OUT/target-$1" cargo bench -p trading --bench corpus --no-run 2>&1 |
     sed -n 's/.*Executable .*(\(.*\))/\1/p' | tail -1; }
@@ -290,7 +299,7 @@ if want journal; then
     done
     log "journal: CHUNK_BYTES sweep (rebuilds)"
     JW="$OUT/worktree-chunk"
-    git worktree add --detach "$JW" HEAD >/dev/null 2>&1 || true
+    copy_tree "$JW"
     for kb in 64 256 1024; do
         sed -E "s/(pub const CHUNK_BYTES: usize = )[^;]+(;)/\\1$kb * 1024\\2/" \
             crates/matcher/src/journal.rs >"$JW/crates/matcher/src/journal.rs"
@@ -298,7 +307,7 @@ if want journal; then
         (cd "$JW" && CARGO_TARGET_DIR="$OUT/target-chunk" cargo test -p matcher --release --lib \
             journal_overhead -- --ignored --nocapture 2>&1) | tee -a "$OUT/journal_chunk.txt" >>"$OUT/session.log"
     done
-    git worktree remove --force "$JW" >/dev/null 2>&1 || true
+    rm -rf "$JW"
     log "journal: raw fsync cost on this disk"
     if command -v fio >/dev/null 2>&1; then
         run fsync_fio.txt fio --name=fsync --directory="$JOURNAL_DIR" --rw=write --bs=64k --size=256m \

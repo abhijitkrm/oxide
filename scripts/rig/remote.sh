@@ -14,8 +14,12 @@ T="${1:?ssh target, e.g. user@host}"; CMD="${2:?command}"; shift 2
 DIR='$HOME/oxide'
 case "$CMD" in
   sync)
+    # Record the commit (the tree goes over without .git); the dirty count too.
+    TOP="$(cd "$(dirname "$0")/../.." && pwd)"
+    git -C "$TOP" rev-parse --short HEAD > "$TOP/.rig-sha" 2>/dev/null || true
     rsync -az --delete --exclude target --exclude .git --exclude rig-results --exclude 'rig-results-remote' \
-        "$(cd "$(dirname "$0")/../.." && pwd)/" "$T:oxide/" ;;
+        "$TOP/" "$T:oxide/"
+    rm -f "$TOP/.rig-sha" ;;
   setup)
     ssh "$T" "cd $DIR && TUNE=${TUNE:-0} scripts/rig/setup-linux.sh" ;;
   start)

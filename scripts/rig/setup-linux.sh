@@ -13,17 +13,30 @@ TODO=()
 
 export DEBIAN_FRONTEND=noninteractive
 $SUDO apt-get update -y
+# One missing package aborts a whole `apt-get install`, so install in tiers:
+# the build prerequisites must succeed; each profiling tool is best-effort.
 $SUDO apt-get install -y build-essential pkg-config libssl-dev clang cmake git curl rsync \
-    python3 python3-pip sysstat strace blktrace fio htop numactl util-linux \
-    heaptrack bpfcc-tools linux-tools-common "linux-tools-$(uname -r)" linux-tools-generic \
-    || TODO+=("some apt packages failed (perf for this kernel? try linux-tools-generic)")
+    python3 python3-pip util-linux numactl procps
+for pkg in sysstat strace fio htop blktrace heaptrack; do
+    $SUDO apt-get install -y "$pkg" >/dev/null 2>&1 || TODO+=("package $pkg not installed (that profiling step will be skipped)")
+done
+# perf: the package name depends on the distro and kernel flavour.
+if ! perf --version >/dev/null 2>&1; then
+    for pkg in "linux-tools-$(uname -r)" linux-tools-generic linux-tools-common linux-perf; do
+        $SUDO apt-get install -y "$pkg" >/dev/null 2>&1 && perf --version >/dev/null 2>&1 && break
+    done
+    perf --version >/dev/null 2>&1 || TODO+=("perf not available for this kernel (flamegraphs / counters will be skipped)")
+fi
+# bcc off-CPU tooling (Ubuntu: bpfcc-tools; Debian: bpfcc-tools too).
+$SUDO apt-get install -y bpfcc-tools >/dev/null 2>&1 || TODO+=("bpfcc-tools not installed (offcputime skipped)")
 
-if ! command -v cargo >/dev/null 2>&1; then
+# SKIP_RUST=1 / SKIP_INFERNO=1: for testing the package steps alone.
+if [ "${SKIP_RUST:-0}" != 1 ] && ! command -v cargo >/dev/null 2>&1; then
     curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 fi
 # shellcheck disable=SC1090
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
-command -v inferno-flamegraph >/dev/null 2>&1 || cargo install inferno --locked || TODO+=("inferno (flamegraphs) not installed")
+[ "${SKIP_INFERNO:-0}" = 1 ] || command -v inferno-flamegraph >/dev/null 2>&1 || cargo install inferno --locked || TODO+=("inferno (flamegraphs) not installed")
 
 if [ "${TUNE:-0}" = 1 ]; then
     # perf needs kernel symbols and unrestricted counters.
@@ -44,7 +57,7 @@ echo "SMT active: $SMT"
 if [ "$SMT" = 1 ]; then
     TODO+=("SMT is on: for per-core numbers run  echo off | sudo tee /sys/devices/system/cpu/smt/control  (or record it; the summary will carry it)")
 fi
-echo "perf: $(command -v perf >/dev/null && perf --version || echo missing)"
+echo "perf: $(perf --version 2>/dev/null || echo missing)"
 echo "free disk (journal target): $(df -h "${JOURNAL_DIR:-$HOME}" | tail -1)"
 echo "toolchain: $(rustc --version 2>/dev/null || echo missing)"
 if [ "${#TODO[@]}" -gt 0 ]; then
