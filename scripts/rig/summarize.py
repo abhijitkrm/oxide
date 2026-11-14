@@ -119,8 +119,8 @@ def main(d):
                 v = float(t2.group(1)) * {"ns": 1e-9, "µs": 1e-6, "us": 1e-6, "ms": 1e-3, "s": 1.0}[t2.group(2)]
                 res.setdefault(last, {})[cores] = v
         return res
-    for title, fn in (("Parallel EVM, executor OCC scheduler (Uniswap-style, 59,850 gas/tx)", "scaling_evm_parallel.txt"),
-                      ("EVM batch (rayon sender recovery + execution), `modules/evm`", "scaling_evm_batch.txt")):
+    for title, fn in (("Parallel scheduler, MODELED workload (synthetic spin loop per tx, Uniswap-style gas mix of 59,850 gas/tx; NOT real EVM execution, no signature recovery)", "scaling_evm_parallel.txt"),
+                      ("REAL EVM execution (revm, signed 21k-gas transfers, rayon sender recovery + execution), `modules/evm`", "scaling_evm_batch.txt")):
         res = crit_rows(os.path.join(d, fn))
         if not res:
             continue

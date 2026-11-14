@@ -24670,7 +24670,7 @@ generator; treat them as order-of-magnitude, not as gates.
 | EVM batch, parallel (8 cores) | 113k tx/s at 10k txs (gate 109k tx/s, floor 60k) |
 | Executor pipeline (native txs) | 269k tx/s propose+execute; 347k tx/s execute only |
 | Node sustained pipeline (native staking txs, in process) | 560-620k tx/s |
-| Uniswap-style EVM, 59,850 gas/tx | sequential 85k tx/s (5.0 GG/s); parallel 8 threads 343-391k tx/s (20.5 GG/s) |
+| Parallel scheduler on a MODELED Uniswap-style mix (a calibrated spin loop per tx, 59,850 gas/tx; not real EVM) | sequential 85k tx/s (5.0 modeled GG/s); parallel 8 threads 343-391k tx/s (20.5 modeled GG/s) |
 | Exchange batch settle | 1k distinct pairs 3.2M legs/s; 1k same pair 18M legs/s; 16k clustered 11M legs/s |
 | 4-validator local devnet over TCP | 4.0k tx/s sustained at 4k offered; collapsed to 0.9-2.8k above that (noisy, not a ceiling) |
 | Signatures (1 core) | secp256k1 recover 28.5-32 us, ed25519 strict 46 us, ed25519 batch 16 us, session MAC 0.12 us, BLS verify 772 us |
@@ -24734,3 +24734,15 @@ all four schemes with 0 rejections; the pinned many-core curve is for the rig.
 
 Still open: pipelined durable ack; the `procs`/`shards` sections are smoke-tested only; `perf`,
 heaptrack and blktrace paths remain unvalidated (no tools in the container).
+
+### Correction: what `uniswap_transfer` measures (2026-11-14)
+
+The `uniswap_transfer` bench is a synthetic scheduler benchmark: each transaction is a calibrated
+CPU spin loop (`NS_PER_GAS`) over a Uniswap-style gas mix, with no revm and no signature recovery
+(its own header says so). I labeled its rows "Uniswap-style EVM" in the laptop sweep and quoted its
+tx/s and GG/s as EVM figures. They are scheduler-scaling figures on a modeled workload. The real
+EVM execution numbers are `modules/evm` `tps_rw` (signed transfers through revm with sender
+recovery): 17.2k tx/s on one core of the 64-core EPYC, about 113k tx/s on the 8-core laptop. The
+project's older "12.96 GG/s parallel vs 1 GG/s gate" headline comes from the modeled bench; the
+real parallel figure is about 2.5 GG/s on the 8-core laptop (bench header). The rig summary now
+labels the two tables accordingly.

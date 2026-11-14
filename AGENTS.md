@@ -94,7 +94,7 @@ nightly adds fuzz and long simulations.
 ## Current status
 
 Phases 0–3 complete: oxideBFT + chain skeleton, EVM + storage
-(12.96 GG/s parallel vs the 1 GG/s gate), and the trading core
+(real revm about 2.5 GG/s parallel on an 8-core laptop vs the 1 GG/s gate; the 12.96 GG/s figure is the scheduler model, see devlog), and the trading core
 (engine 20.6M mixed ops/s single-core; ~3.7M orders/s chain-wide
 over oxideBFT vs the 1M gate). Phase 4 hardening is in progress:
 the fuzz campaign (11 targets, committed corpus, nightly CI), the
