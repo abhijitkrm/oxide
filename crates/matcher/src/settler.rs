@@ -227,6 +227,9 @@ pub(crate) const MAX_PENDING_RETRIES: u32 = 60;
 /// pairs). Origin: `exchange::MAX_BATCH_FILLS`.
 pub const MAX_PAIRS_PER_BATCH: usize = exchange::MAX_BATCH_FILLS;
 
+/// A batch ready to submit: its legs and the raw fills they aggregate from.
+type NextBatch = (Vec<BatchFillEntry>, Vec<crate::SettledFill>);
+
 /// One chunk of an oversized seal waiting for its turn: its legs, and (when
 /// commitments are on) exactly the raw fills those legs aggregate from, so the
 /// chunk's fills root is checkable against its legs by the dispute path.
@@ -502,6 +505,34 @@ impl BatchSettler {
         self.persist(guard.as_ref());
     }
 
+    /// The legs (and their raw fills) of the next batch to submit: a deferred chunk of an
+    /// earlier oversized seal if one is waiting, otherwise a fresh seal of the order book,
+    /// of which only the first chunk is returned when it exceeds [`MAX_PAIRS_PER_BATCH`]
+    /// (the rest are queued). `None` when there is nothing to settle.
+    fn next_batch(&self) -> Result<Option<NextBatch>, SettleError> {
+        if let Some(d) = primitives::sync::lock_state(&self.deferred).pop_front() {
+            return Ok(Some((d.entries, d.fills)));
+        }
+        let fills = self.sealer.seal_batch();
+        if fills.is_empty() {
+            return Ok(None);
+        }
+        let all = aggregate_fills(&fills)?;
+        if all.len() <= MAX_PAIRS_PER_BATCH {
+            return Ok(Some((all, fills)));
+        }
+        let mut chunks = self.split_oversized(all, fills).into_iter();
+        let first = chunks.next().ok_or(SettleError::AggregateOverflow)?;
+        let mut queue = primitives::sync::lock_state(&self.deferred);
+        queue.extend(chunks);
+        eprintln!(
+            "batch settler: seal of {} pairs split into {} batches of at most {MAX_PAIRS_PER_BATCH}",
+            first.entries.len() + queue.iter().map(|c| c.entries.len()).sum::<usize>(),
+            queue.len() + 1,
+        );
+        Ok(Some((first.entries, first.fills)))
+    }
+
     /// Split an oversized seal into chunks of at most [`MAX_PAIRS_PER_BATCH`] legs.
     ///
     /// Legs are independent (each consumes its own pair of registered orders), so
@@ -606,31 +637,9 @@ impl BatchSettler {
         }
 
         // Chunks of an earlier oversized seal go first, so legs settle in seal order;
-        // otherwise seal the single order book.
-        let next_deferred = primitives::sync::lock_state(&self.deferred).pop_front();
-        let (entries, fills) = if let Some(d) = next_deferred {
-            (d.entries, d.fills)
-        } else {
-            let fills = self.sealer.seal_batch();
-            if fills.is_empty() {
-                return Ok(report);
-            }
-            let all = aggregate_fills(&fills)?;
-            if all.len() <= MAX_PAIRS_PER_BATCH {
-                (all, fills)
-            } else {
-                let chunks = self.split_oversized(all, fills);
-                let mut it = chunks.into_iter();
-                let first = it.next().ok_or(SettleError::AggregateOverflow)?;
-                let mut q = primitives::sync::lock_state(&self.deferred);
-                q.extend(it);
-                eprintln!(
-                    "batch settler: seal of {} pairs split into {} batches of at most {MAX_PAIRS_PER_BATCH}",
-                    first.entries.len() + q.iter().map(|c| c.entries.len()).sum::<usize>(),
-                    q.len() + 1,
-                );
-                (first.entries, first.fills)
-            }
+        // otherwise seal the single order book (splitting it if it is oversized).
+        let Some((entries, fills)) = self.next_batch()? else {
+            return Ok(report);
         };
         let pair_count = entries.len();
         report.deferred_pairs =
