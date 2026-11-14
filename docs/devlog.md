@@ -24841,3 +24841,37 @@ Candidate fixes, in order of expected value (none done):
 3. Revisit `parallel_threshold` and per-group overhead for blocks near the gas limit.
 A 16- or 8-core x86 box is enough to measure any of these (the plateau already appears by 8
 threads).
+
+### EVM block execution: cheaper end_block (laptop finalize 60k -> 76k tx/s on 1,428-transfer blocks)
+
+Follow-up to the diagnosis above. Sub-timing inside the EVM `end_block` (temporary, reverted) on the
+`chain_mix --mix transfer` block: state_root 5.0 ms (patch 0.5 + sparse walk 3.0 + stale-branch
+removal 1.8), history seal and undo 3.3 ms (receipts and transactions ordered tries), nothing else.
+
+Changes (roots are bit-identical; all 221 evm tests and the sparse-vs-full differential suite pass,
+plus a new test that deepens the trie from 20 to ~11k accounts between rounds):
+- **Stale-branch removal bounded by `retained_depth`** (new field, only ever raised): the merge probed
+  all 64 prefix lengths per touched key against `retained_branches` (about 90k hash-map removals per
+  block, mostly absent keys). It now stops at the deepest key ever stored. 1.8 ms -> 0.2 ms.
+- **Each touched address hashed once** (was three keccaks: patch, touched set, removal).
+- **receipts_root and transactions_root computed on two rayon workers, concurrently with the
+  state-root update** (`History::pending_roots` + `seal_block_with_roots`; `seal_block` keeps its
+  signature). `end_block` 8.6 ms -> 4.6 ms at 8 rayon threads.
+
+Result, laptop, 200k signed transfers, 8 ingest threads: finalize 60.4k -> 75.6k tx/s at 8 rayon
+threads (61.3k -> 68.8k at 1). Still far from the 1M tx/s target: a block is now roughly plan 0.5 +
+dispatch ~3.5 (speculate 2.3 + commit 1.1) + end_block 4.6 ms.
+
+Dead end: sharding `MvState` (one global `RwLock` over the version maps) by address changed nothing
+(speculate 2.3 ms at 8 threads vs 1.9 ms at 1, before and after), so it was reverted. At ~1.3 us per
+transfer the speculation phase is too short for 8 workers to pay back task and cache-line overhead;
+the lock was not the cause.
+
+What is left is structural, not a micro-fix: per-block fixed work is serial, and the gas limit caps a
+block at ~1.4k transfers. The next real step is taking the state root off the critical path by letting
+block h's header commit to the root of h-k (lagged app hash, root computed on a worker while h+1
+executes). The Mint-Network evm-node `box/next` design doc `docs/clob-deferred-exec-design.md` does
+this (`CLOB_LAGGED_APP_HASH=k`, backpressure rule `E(H) >= H-k`, snapshots taken at an executed
+height); that is a protocol change (attestation, state sync, light clients) and needs its own spec in
+`docs/` first, so it is not done here. Their design also streams fills before the root commits and
+treats CPU-per-input as the honest throughput number.

@@ -460,18 +460,27 @@ impl Module for EvmModule {
         // second call hit the O(1) cached fast path
         // (`leaves_ready && touched.is_empty()`), so sealing adds no
         // extra trie work per block.
-        let root = self.state_root();
+        // The state-root update and the two ordered tries of the block
+        // header (receipts, transactions) are independent, so they run
+        // concurrently. Lock order is unchanged (`history` is taken
+        // only for the trie computation; `state_root` takes its own
+        // locks and never `history`).
+        let (root, roots) = rayon::join(
+            || self.state_root(),
+            || framework::lock_state(&self.history).pending_roots(),
+        );
         let timestamp = *framework::lock_state(&self.block_timestamp);
         let coinbase = *framework::lock_state(&self.coinbase);
         let (sealed_block, evicted) = {
             let mut history = framework::lock_state(&self.history);
-            let evicted = history.seal_block(
+            let evicted = history.seal_block_with_roots(
                 height.value(),
                 timestamp,
                 self.block_gas_limit(),
                 self.current_base_fee(),
                 coinbase,
                 alloy_primitives::B256::from(root.0),
+                roots,
             );
             // Clone the sealed record for persistence — the clone is
             // once per block (cold path) and keeps the backend write
@@ -581,6 +590,16 @@ impl Module for EvmModule {
             return Hash(cached.0);
         }
 
+        // Hash every touched address exactly once: the patch loop, the
+        // sparse walk's touched set and the stale-branch removal all
+        // key on `keccak256(address)`.
+        let touched_pairs: Vec<(_, alloy_primitives::B256)> = if *leaves_ready {
+            touched.iter().map(|a| (*a, alloy_primitives::keccak256(a))).collect()
+        } else {
+            Vec::new()
+        };
+        let touched_keys: Vec<alloy_primitives::B256> =
+            touched_pairs.iter().map(|(_, h)| *h).collect();
         let db = framework::lock_state(&self.db);
         let mut storage_root_cache = framework::lock_state(&self.storage_root_cache);
 
@@ -590,8 +609,8 @@ impl Module for EvmModule {
             // (populated from `EvmState::keys()` post-commit), so
             // every changed account is patched; accounts absent
             // from the cache were removed from state.
-            for addr in touched.iter() {
-                let hashed = alloy_primitives::keccak256(addr);
+            for (addr, hashed) in &touched_pairs {
+                let (addr, hashed) = (addr, *hashed);
                 // `NotExisting` tombstones (selfdestruct, or a revm
                 // `basic()` miss cached as absent) are NOT part of the
                 // state trie — committing them as leaves would put the
@@ -770,7 +789,7 @@ impl Module for EvmModule {
         if can_sparse {
             // Sparse incremental walk — O(touched · log n).
             let touched_hashes: std::collections::BTreeSet<alloy_primitives::B256> =
-                touched.iter().map(alloy_primitives::keccak256).collect();
+                touched_keys.iter().copied().collect();
             sparse_walk(
                 alloy_trie::Nibbles::default(),
                 &retained,
@@ -795,6 +814,8 @@ impl Module for EvmModule {
             // (hashbrown, DefaultHashBuilder); convert to the std
             // HashMap used by `retained_branches`.
             *retained = branch_updates.into_iter().collect();
+            let max_len = retained.keys().map(alloy_trie::Nibbles::len).max().unwrap_or(0);
+            self.retained_depth.fetch_max(max_len, std::sync::atomic::Ordering::Relaxed);
         } else {
             // Incremental build: remove stale branches on the
             // touched path, then merge the rebuilt branches.
@@ -802,17 +823,19 @@ impl Module for EvmModule {
             // prefix is a prefix of any touched hashed key. We
             // check all 64 prefix lengths per touched key; only
             // prefixes that exist in `retained` are removed.
-            for addr in touched.iter() {
-                let hashed = alloy_primitives::keccak256(addr);
+            let depth = self.retained_depth.load(std::sync::atomic::Ordering::Relaxed);
+            for hashed in &touched_keys {
                 let nibbles = alloy_trie::Nibbles::unpack(hashed);
-                for len in 0..nibbles.len() {
-                    let prefix = nibbles.slice(..len);
-                    retained.remove(&prefix);
+                for len in 0..=depth.min(nibbles.len().saturating_sub(1)) {
+                    retained.remove(&nibbles.slice(..len));
                 }
             }
+            let mut new_depth = depth;
             for (prefix, node) in branch_updates {
+                new_depth = new_depth.max(prefix.len());
                 retained.insert(prefix, node);
             }
+            self.retained_depth.fetch_max(new_depth, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Cache the state root for the next call's fast path.

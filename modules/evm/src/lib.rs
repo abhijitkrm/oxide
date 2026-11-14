@@ -615,6 +615,18 @@ pub struct EvmModule {
     /// path first, then inserting the new `BranchNodeCompact`s).
     retained_branches:
         Mutex<std::collections::HashMap<alloy_trie::Nibbles, alloy_trie::BranchNodeCompact>>,
+    /// Upper bound, in nibbles, on the length of any key in
+    /// `retained_branches`. Only ever raised (cleared maps leave it
+    /// high, which is merely conservative). The incremental merge
+    /// removes stale branches on each touched key's path; prefixes
+    /// longer than this bound cannot be present, so the removal loop
+    /// stops there instead of probing all 64 prefix lengths per key
+    /// (about 10x fewer hash-map probes at a million accounts, where
+    /// real branch depth is ~6). Unit: nibbles; changing it to a
+    /// smaller value than the true depth would leave stale branches
+    /// and corrupt roots, hence it is maintained only through
+    /// `fetch_max` on every insertion.
+    retained_depth: std::sync::atomic::AtomicUsize,
     /// accounts were touched since the last computation, the cached
     /// root is returned directly (O(1) fast path).
     cached_state_root: Mutex<Option<alloy_primitives::B256>>,
@@ -695,6 +707,7 @@ impl EvmModule {
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
+            retained_depth: std::sync::atomic::AtomicUsize::new(0),
             trie_leaves_ready: Mutex::new(false),
             cached_state_root: Mutex::new(None),
             exchange: Mutex::new(None),
@@ -732,6 +745,7 @@ impl EvmModule {
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
+            retained_depth: std::sync::atomic::AtomicUsize::new(0),
             trie_leaves_ready: Mutex::new(false),
             cached_state_root: Mutex::new(None),
             exchange: Mutex::new(None),
@@ -796,6 +810,7 @@ impl EvmModule {
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
+            retained_depth: std::sync::atomic::AtomicUsize::new(0),
             trie_leaves_ready: Mutex::new(false),
             cached_state_root: Mutex::new(None),
             exchange: Mutex::new(None),

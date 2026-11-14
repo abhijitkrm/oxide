@@ -3057,6 +3057,36 @@ fn sparse_root_matches_full_multiple_rounds() {
     }
 }
 
+/// The stale-branch removal is bounded by `retained_depth`; a trie
+/// that deepens sharply between blocks (20 accounts, then thousands
+/// inserted per round) must still match a full rebuild every round —
+/// a bound that lagged the true depth would leave stale branches.
+#[test]
+fn sparse_root_matches_full_while_trie_deepens() {
+    let m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
+    let addrs = make_addrs(12_000);
+    for a in &addrs[..20] {
+        m.fund_account_for_test(a, 1_000_000);
+    }
+    executor::Module::state_root(&m); // full build at depth ~2
+    let mut next = 20usize;
+    for (round, grow) in [200usize, 1_500, 3_000, 6_000].into_iter().enumerate() {
+        for a in &addrs[next..next + grow] {
+            m.mark_touched_for_test(a);
+            m.fund_account_for_test(a, 1_000_000);
+        }
+        // Re-touch a few old accounts too so shallow branches rebuild.
+        for a in &addrs[..10] {
+            m.mark_touched_for_test(a);
+            m.fund_account_for_test(a, 2_000_000 + round as u128);
+        }
+        next += grow;
+        let root = executor::Module::state_root(&m);
+        let truth = full_rebuild_root(&m);
+        assert_eq!(root, truth, "sparse root must match full rebuild at round {round}");
+    }
+}
+
 /// Sparse root must match full rebuild after account insertion
 /// (new account not in the previous build).
 #[test]
