@@ -63,6 +63,17 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Performance
 
+- **Executor: block execution no longer re-recovers pending signatures** (`executor`;
+  no format or result change). Each block dropped the ingest-time verified-sender cache
+  entries of every transaction still waiting for a later block, so native signed
+  transactions (e.g. CLOB orders) in blocks 2, 3, ... were recovered again, serially,
+  during execution. Entries are now kept (bounded by the mempool capacity). Signed CLOB
+  orders execute 4-10x faster in the laptop benchmark (40k: 98k -> 405k tx/s; 400k: 31k
+  -> 300k tx/s).
+  - **In plain words:** the chain was checking each order's signature a second time,
+    one at a time, for everything but the first block's worth of orders. It now remembers
+    the check it already did.
+
 - **Matcher: the multi-market replay gate is sharded by owner** (`matcher`;
   no wire or file-format change). The gate was one mutex taken per order;
   it is now 64 shards with identical per-owner semantics. With 8 markets the

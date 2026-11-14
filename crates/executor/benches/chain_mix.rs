@@ -20,12 +20,20 @@
 //! sender's nonce advanced by exactly its transaction count (all executed) and
 //! prints the CLOB's resting-order count (a crossing mix leaves few).
 //!
-//! Output CSV: `mix,threads,txs,ingest_tps,propose_tps,finalize_tps,total_tps,executed,resting`.
+//! Output CSV: `mix,threads,txs,ingest_tps,propose_tps,finalize_tps,total_tps,executed,resting,
+//! exec_sig_reverifications` (the last is signatures recovered AGAIN at execution: should be 0).
 //! Gate: informational.
 //!
 //! ```sh
 //! cargo bench -p executor --bench chain_mix -- [--mix transfer,clob,mixed] [--txs 100000] \
-//!     [--threads 1,4,16] [--accounts 512]
+//!     [--threads 1,4,16] [--accounts 512] [--ring]
+//! ```
+//!
+//! `--ring` makes every transfer pay the next sender (the worst case for speculative
+//! parallel execution); the default pays a fresh recipient. Block execution's rayon pool
+//! follows `RAYON_NUM_THREADS`.
+//!
+//! ```text
 //! ```
 
 #![allow(
@@ -69,6 +77,15 @@ fn accounts(n: usize) -> Vec<Account> {
             Account { key, addr: Address(addr.0) }
         })
         .collect()
+}
+
+/// A recipient address that is nobody's sender: derived from the tx's coordinates.
+fn fresh_recipient(i: usize, n: u64) -> Address {
+    let mut a = [0u8; 20];
+    a[..8].copy_from_slice(&(i as u64).to_le_bytes());
+    a[8..16].copy_from_slice(&n.to_le_bytes());
+    a[19] = 0xFE;
+    Address(a)
 }
 
 fn evm_transfer(acct: &Account, nonce: u64, to: Address) -> TxBytes {
@@ -165,7 +182,7 @@ fn is_clob(mix: &str, i: usize) -> bool {
     }
 }
 
-fn build(mix: &str, accts: &[Account], per_acct: usize) -> Vec<Vec<TxBytes>> {
+fn build(mix: &str, accts: &[Account], per_acct: usize, ring: bool) -> Vec<Vec<TxBytes>> {
     accts
         .iter()
         .enumerate()
@@ -183,7 +200,14 @@ fn build(mix: &str, accts: &[Account], per_acct: usize) -> Vec<Vec<TxBytes>> {
                             &msg::place(0, order(side, a.addr)),
                         )
                     } else {
-                        evm_transfer(a, n, accts[(i + 1) % accts.len()].addr)
+                        // `ring`: pay the next sender (every account both sends and receives: the
+                        // worst case for speculative parallelism). Default: a fresh recipient.
+                        let to = if ring {
+                            accts[(i + 1) % accts.len()].addr
+                        } else {
+                            fresh_recipient(i, n)
+                        };
+                        evm_transfer(a, n, to)
                     }
                 })
                 .collect()
@@ -191,10 +215,10 @@ fn build(mix: &str, accts: &[Account], per_acct: usize) -> Vec<Vec<TxBytes>> {
         .collect()
 }
 
-fn run(mix: &str, threads: usize, total: usize, n_accts: usize) {
+fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
     let accts = accounts(n_accts);
     let per = (total / n_accts).max(1);
-    let txs = build(mix, &accts, per);
+    let txs = build(mix, &accts, per, ring);
     let n: usize = txs.iter().map(Vec::len).sum();
     let r = rig(&accts, n);
 
@@ -222,6 +246,7 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize) {
     let ingest = t0.elapsed().as_secs_f64();
 
     // Propose + finalize until the mempool is drained.
+    eprintln!("phase: execution start ({mix}, {threads} ingest threads)");
     let (mut propose, mut finalize) = (0.0f64, 0.0f64);
     let mut height = 1u64;
     let mut executed_txs = 0usize;
@@ -260,12 +285,13 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize) {
     let resting = r.exchange.resting_count(0);
     let rate = |count: usize, secs: f64| count as f64 / secs;
     println!(
-        "{mix},{threads},{n},{:.0},{:.0},{:.0},{:.0},{},{resting}",
+        "{mix},{threads},{n},{:.0},{:.0},{:.0},{:.0},{},{resting},{}",
         rate(accepted, ingest),
         rate(executed_txs, propose),
         rate(executed_txs, finalize),
         rate(executed_txs, ingest + propose + finalize),
         if executed_ok { "all" } else { "MISMATCH" },
+        r.executor.exec_sig_reverifications(),
     );
 }
 
@@ -274,6 +300,7 @@ fn main() {
     let mut threads = vec![1usize, 4];
     let mut total = 100_000usize;
     let mut n_accts = 512usize;
+    let mut ring = false;
     let a: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < a.len() {
@@ -290,6 +317,11 @@ fn main() {
                 }
             }
             "--txs" => total = v.and_then(|x| x.parse().ok()).unwrap_or(total),
+            "--ring" => {
+                ring = true;
+                i += 1;
+                continue;
+            }
             "--accounts" => n_accts = v.and_then(|x| x.parse().ok()).unwrap_or(n_accts),
             _ => {
                 i += 1;
@@ -303,7 +335,7 @@ fn main() {
     );
     for m in &mixes {
         for &t in &threads {
-            run(m, t, total, n_accts);
+            run(m, t, total, n_accts, ring);
         }
     }
 }

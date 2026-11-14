@@ -1770,6 +1770,16 @@ pub struct Executor {
     /// re-borrowed from the block's tx at execution time, so no
     /// per-tx `Vec<u8>` is ever cloned into or out of this cache.
     preverify_cache: Mutex<primitives::digest_map::DigestMap<[u8; 20]>>,
+    /// Most entries the preverify cache may hold: the mempool's capacity,
+    /// the most pending transactions that can legitimately be waiting for
+    /// a later block. Beyond it, unused entries are dropped after a block
+    /// (the pre-fix behaviour) instead of retained.
+    preverify_cap: usize,
+    /// Count of envelope signatures recovered AT EXECUTION because the
+    /// ingest-time cache had no entry (a gossip race, a tx first seen in
+    /// the block, or an evicted entry). Zero in steady state; a large
+    /// value means block execution is paying signature recovery serially.
+    sig_reverifications: std::sync::atomic::AtomicU64,
     /// Minimum batch size to use the parallel speculative execution
     /// path. Configurable via [`Executor::with_config`]. Default:
     /// [`DEFAULT_PARALLEL_THRESHOLD`] (32 txs). Lowered from 100
@@ -1930,6 +1940,8 @@ impl Executor {
             events: Mutex::new(Vec::new()),
             tx_outcomes: Mutex::new(TxOutcomeStore::default()),
             preverify_cache: Mutex::new(primitives::digest_map::DigestMap::default()),
+            preverify_cap: max_mempool_entries,
+            sig_reverifications: std::sync::atomic::AtomicU64::new(0),
             parallel_threshold,
             recorder: None,
             mempool_intake_tx: intake_tx,
@@ -1960,6 +1972,15 @@ impl Executor {
     pub fn with_chain_id(mut self, chain_id: u64) -> Self {
         self.chain_id = chain_id;
         self
+    }
+
+    /// Signatures recovered at block execution because the ingest-time
+    /// cache missed (see the `sig_reverifications` field). Exposed for
+    /// tests and benches: it should stay 0 for transactions this node
+    /// admitted itself.
+    #[must_use]
+    pub fn exec_sig_reverifications(&self) -> u64 {
+        self.sig_reverifications.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Size the mempool-intake rayon pool to `threads` (hft-audit-2

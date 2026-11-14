@@ -110,10 +110,10 @@ def main(d):
         body = []
         for line in cm.splitlines():
             r = line.split(",")
-            if len(r) == 9 and r[1].isdigit():
-                body.append([r[0], r[1], r[2], human(r[3]), human(r[4]), human(r[5]), human(r[6]), r[7], r[8]])
+            if len(r) in (9, 10) and r[1].isdigit():
+                body.append([r[0], r[1], r[2], human(r[3]), human(r[4]), human(r[5]), human(r[6]), r[7], r[8], r[9] if len(r) == 10 else "n/a"])
         if body:
-            out.append(table(["mix", "ingest threads", "txs", "admission tx/s", "propose tx/s", "execution tx/s", "end-to-end tx/s", "executed", "resting"], body))
+            out.append(table(["mix", "ingest threads", "txs", "admission tx/s", "propose tx/s", "execution tx/s", "end-to-end tx/s", "executed", "resting", "re-verified at exec"], body))
             out.append("")
 
     # ---- parallel EVM scaling (evmscale)

@@ -106,6 +106,11 @@ impl Executor {
                 return Ok(true);
             }
         }
+        // Past the cache: this recovery runs inside the (serial) block-planning loop when
+        // `verified` is Some, i.e. at execution. Count it so a cache miss is visible.
+        if verified.is_some() {
+            self.sig_reverifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let Some(sig_bytes) = envelope_signature(bytes) else {
             return Err("malformed: truncated envelope signature");
         };
@@ -569,6 +574,11 @@ impl Executor {
                 self.record_group_outcomes(&group, results, &mut block_events);
             }
         }
+        // Keep the ingest-time verification of every transaction still waiting for a LATER
+        // block. Taking the whole cache above and dropping what is left made every block after
+        // the first re-recover each pending native tx's signature serially in
+        // `plan_block_runs` (~50 us each: the measured 18k tx/s CLOB ceiling).
+        self.restore_preverify_leftover(preverify_cache, &block.txs);
         if !dispatch_skipped.is_empty() {
             let mut outcomes = primitives::sync::lock_state(&self.tx_outcomes);
             for (hash, reason) in dispatch_skipped {
@@ -640,6 +650,33 @@ impl Executor {
         }
 
         canonical_state_root(module_roots, nonce_root)
+    }
+
+    /// Put back the preverify-cache entries this block did not consume.
+    ///
+    /// `leftover` is what remains of the cache `execute_block` took. Entries for
+    /// this block's own transactions are removed (their tx has executed; fee-paying
+    /// native runs never consume theirs), and the rest are returned to the shared
+    /// cache, which ingest has kept filling meanwhile. A hit still means "this node
+    /// verified these exact bytes at ingest", so retention cannot change any result,
+    /// only skip a redundant recovery. If retaining would exceed `preverify_cap`
+    /// (stale entries for txs the pool evicted) the leftover is dropped, the old
+    /// behaviour, so the cache stays bounded.
+    pub(crate) fn restore_preverify_leftover(
+        &self,
+        mut leftover: primitives::digest_map::DigestMap<[u8; 20]>,
+        block_txs: &[types::TxBytes],
+    ) {
+        if leftover.is_empty() {
+            return;
+        }
+        for tx in block_txs {
+            leftover.remove(&Hasher::hash_one(Domain::Transaction, tx.as_bytes()));
+        }
+        let mut shared = primitives::sync::lock_state(&self.preverify_cache);
+        if shared.len().saturating_add(leftover.len()) <= self.preverify_cap {
+            shared.extend(leftover);
+        }
     }
 
     /// Record the finalized outcome for every tx in one module

@@ -24746,3 +24746,34 @@ recovery): 17.2k tx/s on one core of the 64-core EPYC, about 113k tx/s on the 8-
 project's older "12.96 GG/s parallel vs 1 GG/s gate" headline comes from the modeled bench; the
 real parallel figure is about 2.5 GG/s on the 8-core laptop (bench header). The rig summary now
 labels the two tables accordingly.
+
+### Fix: block execution re-recovered every pending signature (the "single-writer" CLOB ceiling)
+
+Measured on the 64-core box (`executor:chain_mix`, signed transactions through the real executor):
+EVM transfer admission scaled to 924k tx/s at 64 threads, but CLOB-order **block execution sat at
+18.3k tx/s (about 54 us per order) at every thread count**. I first called that single-writer
+execution. A profile of the execution phase (laptop, `sample`) showed secp256k1 recovery
+(`gej_double`, `ecmult`, `fe_sqrt`) inside block execution, and the laptop reproduced the shape:
+CLOB execution cost 2.0 us/tx up to ~20k transactions, then 10 us at 40k and 22 us at 80k.
+
+Root cause (`crates/executor/src/exec.rs`): `execute_block` moved the whole ingest-time
+preverify cache out with `mem::take`, consumed only the entries for that block's transactions,
+and dropped the rest when it returned. Every transaction waiting for a later block therefore
+lost its verified-sender entry, so `plan_block_runs` recovered each pending native transaction's
+EIP-712 signature again, serially, at execution. The field's own documentation said entries are
+removed *after the block containing the tx is finalized*; the code removed more.
+
+Fix: `restore_preverify_leftover` puts back every entry whose tx was not in the block (removing
+this block's own, since fee-paying native runs never consume theirs), bounded by the mempool
+capacity so stale entries cannot grow it without limit. A hit still means "this node verified
+these exact bytes at ingest", so retention changes no result, only skips a redundant recovery.
+New counter `Executor::exec_sig_reverifications()` (also printed by `chain_mix`) makes a miss
+visible. Tests: a 90-tx signed backlog over three blocks recovers 0 signatures at execution
+(60 without the fix: the mutant is caught), and a never-ingested tx is recovered exactly once.
+
+Laptop, CLOB, 8 ingest threads: 40k txs 97.7k -> 404.8k tx/s, 80k 46.0k -> 376.2k, 400k 31.1k ->
+299.7k; re-verified at execution 0. EVM transfers are unchanged (their parallel path already
+recovered senders with rayon): execution scales with threads (laptop 24k, 37k, 50k, 54k tx/s at
+1/2/4/8 rayon threads), and the box's flat 73.5k tx/s at 64 threads is a serial fraction in that
+path still to be profiled on the next box. The 64-core numbers in this devlog's earlier tables
+for CLOB execution (18.3k tx/s) are the pre-fix figures.
