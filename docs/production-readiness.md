@@ -222,7 +222,10 @@ level. Need evidence.
     state management. Parallel sender recovery recovers ~4.4× of
     this gap.
   - The bottleneck for EVM throughput is revm execution itself, not
-    the Oxide executor pipeline. The pipeline overhead (mempool →
+    the Oxide executor pipeline. *(Correction, 2026-11-14: the
+    `execution_breakdown` bench shows 34.0 µs per full tx handle, of
+    which 29.6 µs is secp256k1 sender recovery, 87%. Recovery, not revm,
+    dominates a simple transfer. See `docs/lanes-spec.md` §10.1.)* The pipeline overhead (mempool →
     proposal → finalization) adds ~10% on top of raw EVM execution
     (28.7K → 28.2K from 1-tx to full-block-cycle).
 
@@ -599,3 +602,26 @@ EVM-RPC parity gap list in `docs/evm-parity-gap-analysis.md` is
 closed out through P2; the only remaining rows are non-EVM
 (distribution, slashing, state sync) and the deliberate omissions
 (key-custody `eth_sendTransaction`/`personal_*`, EIP-4844 blobs).
+
+### Follow-up (2026-11-14): lanes, pluggable authentication, settlement commitments
+
+Scope: `docs/lanes-spec.md`. Not a gate pass; an engineering follow-up with
+laptop measurements.
+
+- **Built and tested:** a matcher authentication seam (ed25519 batched or per
+  order, EVM, session MAC with expiry and owner-signed close, gateway
+  certificates with provable-fault suspension, multi-scheme), carried on binary
+  TCP and JSON-RPC control frames; committed batch settle (exchange tag 16);
+  an opt-in bonded operator and dispute path (tags 17/18). The default
+  authenticator is bit-identical to the previous behaviour and the whole
+  workspace suite passes.
+- **Measured (laptop, one machine):** real loopback TCP matcher 67k-185k
+  orders/s with a signature per order, ~1.8M with session MACs or certified
+  batches; matching engine digests still match matcher-rust on all workloads.
+- **Not established:** any multi-machine or many-core figure, consensus in the
+  lane path, the 4-validator devnet above 4k tx/s offered on a laptop (it
+  degrades and is noisy), netted-delta settlement (not built), persisted
+  sessions, control frames on WebSocket and FIX.
+- **Does not close** the "1M orders/sec" or "1M EVM tx/s" targets; it removes
+  authentication as the single-service limit and gives the seams to test
+  sharding on a real rig.

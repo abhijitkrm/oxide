@@ -1,7 +1,11 @@
 # Lanes: sharded, swappable execution lanes
 
-Status: draft v1. Implemented in `crates/lanes` (prototype: trading shard
-path and EVM lane split). Code and this spec change together.
+Status: v2. Implemented in `crates/lanes` (prototype seams, trading shard and
+EVM lane split) and wired into the matcher service (`crates/matcher`: pluggable
+authentication, control frames, settlement commitments) and the exchange module
+(committed batch settle, bonded operator and disputes). Code and this spec
+change together. What is measured is on one laptop only (§10); the many-core,
+multi-machine and consensus-in-the-path results are not yet measured.
 
 ## 1. Targets and why one global lane cannot reach them
 
@@ -314,3 +318,43 @@ What this does and does not show:
 - 100M orders/s needs about 8 to 10x this machine's trading throughput:
   consistent with a 64 to 128 shard deployment across several machines, and
   unproven.
+
+### 10.1 Real TCP through the matcher service (laptop, same machine as the load generator)
+
+Source: `cargo test -p matcher --release --test e2e_auth_tps -- --ignored
+--nocapture`. Multi-market matcher, 4 connections, batch endpoint of 500,
+orders pre-authenticated, real matching (50% of orders fill) and the replay
+gate; 200,000 orders.
+
+| `--auth` | Orders/s |
+|---|---|
+| `ed25519` (one strict verify per order) | 67k |
+| `ed25519_batch` (the default) | 185k |
+| `evm` (4 recovery threads) | 164k |
+| `session_mac` | 1.81M |
+| `certified` (audit 1/64) | 1.85M |
+| `multi` (schemes enabled, ed25519 traffic) | 184k |
+
+Admission alone on one thread (`cargo bench -p matcher --bench auth`):
+ed25519 20k, batch 56k, EVM 33k (124k on 4 threads), session MAC 4.8M,
+certified 1.9M orders/s.
+
+Reading: the engine does tens of millions of ops/s per core, so the service's
+limit is authentication. With a signature per order it is 67k-185k orders/s;
+with a session MAC or a gateway certificate the same server reaches ~1.8M on a
+laptop that is also running the load generator. The older single-market
+mutex-mode service tests (per-order ed25519, synchronous or pipelined
+clients) measure 10-18k orders/s.
+
+EVM execution (laptop, one core): 34 us per transaction, of which
+secp256k1 recovery is 29.6 us (87%). The 8-core parallel batch does 113k tx/s.
+A 1M tx/s EVM target is therefore mostly a question of where signature
+recovery happens (ingress verification, certified batches, sharded lanes),
+not of the execution engine.
+
+### 10.2 Not measured yet (needs the rig)
+
+Many-core scaling of the lanes and of signature recovery (1-64 threads), the
+x86 prefetch / exact-division A/B, journal fsync on NVMe, a multi-machine
+matcher, and multi-validator consensus with a lane in the path. Run
+`SECTIONS="env budget lanes scaling" scripts/rig-bench.sh`.

@@ -104,3 +104,15 @@ the external security review and the geo-distributed 20–50
 validator public testnet. See `plan.md` §13 for gate detail. Do
 not start Phase N+1 work before Phase N's gates pass unless the
 plan says otherwise.
+
+Throughput work toward the 10M orders/s and 1M EVM tx/s targets lives in
+**`docs/lanes-spec.md`** (swappable authentication, commitment and routing
+seams; `crates/lanes`) and is wired into the matcher service: order
+authentication is a runtime choice (`oxide-matcher --auth`: ed25519, EVM,
+session MAC, gateway certificate, or several), the settler can attach a
+per-batch fills root (`--commit-batches`, exchange tag 16), and the exchange
+has an opt-in bonded-operator dispute path (tags 17/18). Measured on a laptop
+the real TCP matcher does 67k orders/s with an ed25519 signature per order
+and 1.8M with session MACs: authentication, not matching, is the service's
+limit. None of this is a multi-machine result yet. Add a `docs/devlog.md`
+entry for any change here, and keep `docs/lanes-spec.md` in step with the code.

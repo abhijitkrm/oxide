@@ -140,7 +140,10 @@ oxide/
 │   ├── storage/         # ★ journal + MMR-over-log + StorageBackend adapters
 │   ├── executor/        # block executor: module router + parallel EVM scheduler
 │   ├── trading/         # ★ matching engine, risk engine (HFT-grade)
-│   ├── matcher/         # ★ order-entry gateway: SPSC rings, FIX/WS/TCP/JSON-RPC
+│   ├── matcher/         # ★ order-entry gateway: SPSC rings, FIX/WS/TCP/JSON-RPC,
+│   │                    #   pluggable authentication (ed25519/EVM/session MAC/certified)
+│   ├── lanes/           # swappable lane seams: verifier, fill commitment, shards
+│   │                    #   (docs/lanes-spec.md)
 │   ├── rpc/             # JSON-RPC + WebSocket (eth_* + web3_* + txpool_* + debug_*)
 │   ├── indexer/         # finalized-block index for explorer queries
 │   ├── statesync/       # certificate-verified snapshot bootstrap
@@ -362,6 +365,29 @@ gates) and `docs/system-audit.md` for the follow-up system audit.
 - **EVM load test**: 100K EVM txs at 6,410 tx/s (4 validators),
   throughput stable as state grows (sparse state root).
 - **Trading load test**: 2M trading txs at 72,556 tx/s (4 validators).
+
+### Throughput lanes (toward 10M orders/s and 1M EVM tx/s) — in progress
+
+Design and measurements: [`docs/lanes-spec.md`](docs/lanes-spec.md).
+
+- **Pluggable authentication** (`crates/matcher/src/auth.rs`,
+  `oxide-matcher --auth`): ed25519 (batched or per order, the default),
+  EVM secp256k1 signatures, session MACs (signed session open, expiry,
+  owner-signed close), gateway-certified batches (deterministic audit,
+  provable-fault suspension), or several at once. No wire-format change.
+- **Settlement commitments** (`--commit-batches`): each batch carries a root
+  over the raw fills; the chain records it with its own root over the legs in
+  a `batch_commit` event. An opt-in bond and dispute path lets anyone with the
+  matcher's journal prove a batch false and take the operator's bond.
+- **Lane prototype** (`crates/lanes`): market-sharded trading lane and an
+  account-range EVM lane with cross-lane credits and a conservation test.
+- **Measured on a laptop (single machine):** engine 11-57M ops/s per core;
+  real loopback TCP matcher 67k orders/s (ed25519 per order), 185k (batched),
+  164k (EVM), **1.8M (session MAC or certified)**. Not yet measured: many-core
+  scaling, multi-machine, consensus in the lane path. Run
+  `SECTIONS="env budget lanes" scripts/rig-bench.sh` on a many-core box.
+- **Not built:** netted-delta settlement (needs order state off chain),
+  session/certificate frames on WebSocket and FIX, persisted sessions.
 
 ### Phase 4 — Hardening & testnet (in progress)
 

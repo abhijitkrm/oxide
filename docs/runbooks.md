@@ -17,6 +17,8 @@ what it does, when to use it, prerequisites, steps, and verification.
 9. [Key rotation](#9-key-rotation)
 10. [Software upgrade](#10-software-upgrade)
 11. [Public RPC exposure](#11-public-rpc-exposure)
+12. [Matcher gateway exposure](#12-matcher-gateway-exposure)
+13. [Matcher authentication, sessions and settlement commitments](#13-matcher-authentication-sessions-and-settlement-commitments)
 
 ---
 
@@ -654,3 +656,81 @@ ss -ltnp | grep -E '987[0-9]|988[0-9]'
 # → 127.0.0.1:<port> entries only; a 0.0.0.0 entry means a proxy
 #   config error or a forbidden code change.
 ```
+
+---
+
+## 13. Matcher authentication, sessions and settlement commitments
+
+### When to use
+
+Choosing how traders authenticate to `oxide-matcher`, running session or
+gateway-certified order flow, turning on per-batch fill commitments, or
+responding to a suspended gateway or settlement operator. Design:
+`docs/lanes-spec.md` §4, §7.
+
+### Choosing the scheme
+
+| Flag | Effect |
+|---|---|
+| `--auth ed25519_batch` | Default. ed25519, one batch equation per batch (historical behaviour). |
+| `--auth ed25519` | ed25519, one strict verify per order. |
+| `--auth evm` | secp256k1 signatures; the recovered address must equal the order's `owner`. `--evm-threads N` parallelizes large batches. |
+| `--auth session_mac` | Keyed-hash tag under a session opened with an owner-signed request. |
+| `--auth certified` | Gateway-signed batches (`--gateway-keys <64 hex,...>`), `--audit-every N` (default 64). |
+| `--auth multi --auth-schemes ed25519,evm,mac,cert` | Several at once; disabled schemes are rejected. |
+
+There is no "accept everything" option. Selecting a scheme never changes the
+wire format; clients just send the matching credential shape.
+
+Session limits: `--max-session-ttl-ms` (default 24 h; also refuses sessions
+that never expire; `0` removes the cap). Sessions live in memory: a restart
+drops them and clients must re-open. Closing a session needs the owner's
+signature, not the session key.
+
+### Gateway suspension
+
+A trusted gateway that signs a batch containing an order that fails its own
+credential check has committed a *provable fault*. The matcher logs
+`gateway fault: ... fault #N` to stderr and, after
+`--gateway-suspend-after` faults (default 3, `0` = never), suspends the
+gateway: its batches are refused until an operator reinstates it. There is no
+CLI to reinstate yet; restart the matcher (suspension is in memory) after
+fixing the gateway, or call `Certified::reinstate` from an embedding.
+
+### Settlement commitments and the bonded operator
+
+- `--commit-batches` makes the settler submit committed batch settles
+  (exchange tag 16). Requires a chain that understands tag 16. Off by default.
+  The chain emits a `batch_commit` event with the operator's `fills_root`
+  and its own `legs_root`.
+- Disputes are an exchange-module setting (`set_dispute_config`, off by
+  default). When on, the operator must hold a bond (message tag 17) of at
+  least `min_bond` to settle a committed batch.
+- **Auditing:** replay the matcher journal to the batch's fills and submit
+  `commit::dispute_payload(batch_seq, fills)` (tag 18) within the window. A
+  consistent batch is rejected and costs only the fee; a false one pays the
+  bond to the submitter and suspends the operator.
+- **Suspended operator:** plain and committed settles are refused until
+  governance applies `exchange.operator.reinstate`. Re-bond before settling
+  committed batches again. Bond withdrawal is not implemented; the bond stays
+  locked.
+
+### Verification
+
+```sh
+# Which scheme is running (startup banner prints it):
+oxide-matcher ... 2>&1 | grep -E "auth scheme|commit batches"
+# Gateway faults in the log:
+grep "gateway fault" matcher.log
+# Chain side: batch_commit events in receipts for the settlement txs.
+```
+
+### Notes
+
+- Throughput by scheme (laptop, real TCP, single machine): ed25519 per order
+  67k orders/s, batched 185k, EVM 164k, session MAC or certified ~1.8M. Pick
+  the scheme for your trust model first; performance only sets the default.
+- A session MAC lets the gateway/matcher that holds the key forge orders for
+  that session, bounded by the session's signed market scope and expiry.
+- Control frames (session open/close, certified batch) are carried on binary
+  TCP and (open/close) JSON-RPC only, not on WebSocket or FIX.
