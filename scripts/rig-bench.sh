@@ -386,7 +386,8 @@ if want procs; then
     NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
     log "procs: oxide-matcher + oxide-loadgen as pinned separate processes"
     cargo build --release -p oxide-matcher --features dev-identities -p oxide-loadgen 2>&1 | tail -2 | tee -a "$OUT/session.log"
-    MBIN="$ROOT/target/release/oxide-matcher"; LBIN="$ROOT/target/release/oxide-loadgen"
+    TD="${CARGO_TARGET_DIR:-$ROOT/target}"   # honour a custom target dir
+    MBIN="$TD/release/oxide-matcher"; LBIN="$TD/release/oxide-loadgen"
     GW="$("$LBIN" --print-gateway-key)"
     # oxide-matcher refuses to start without a settlement key (there is no default).
     # A throwaway random one is fine here: nothing this bench settles has value.
