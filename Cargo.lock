@@ -1792,6 +1792,7 @@ dependencies = [
  "criterion",
  "crypto",
  "evm",
+ "exchange",
  "framework",
  "mempool",
  "metrics",
@@ -1799,9 +1800,11 @@ dependencies = [
  "primitives",
  "rayon",
  "redb",
+ "revm",
  "staking",
  "storage",
  "tempfile",
+ "trading",
  "types",
 ]
 

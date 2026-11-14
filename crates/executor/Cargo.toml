@@ -40,6 +40,10 @@ crypto = { workspace = true, features = ["dev-identities"] }
 # the extern crates against the published lib, so no cycle forms.
 evm = { workspace = true }
 staking = { workspace = true }
+# `chain_mix` bench: CLOB orders as signed transactions through the real executor.
+exchange = { workspace = true }
+trading = { workspace = true }
+revm = { workspace = true }
 # The `redb` feature gives durability tests a real disk-backed
 # StorageBackend — the "EVM durable ahead of native modules" crash
 # scenario only exists when the EVM's store survives the executor's
@@ -66,3 +70,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "chain_mix"
+harness = false

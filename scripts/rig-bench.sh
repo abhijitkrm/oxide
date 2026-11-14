@@ -39,6 +39,10 @@
 #            via taskset so the curve shows how the whole service scales
 #   summary  assemble summary.md (scaling tables, cores-needed-for-target
 #            extrapolation) from the files above (scripts/rig/summarize.py)
+#   chainmix signed transactions through the real executor by type: EVM transfers,
+#            CLOB orders (exchange place) and a mix; admission (signature recovery)
+#            at 1..64 threads, then proposal and block execution timed separately,
+#            plus a batch-size sweep (crates/executor/benches/chain_mix.rs)
 #   evmscale parallel EVM at 1..64 cores with the thread count set to the core count
 #            (OXIDE_EVM_THREADS for the executor's OCC scheduler; the evm module's
 #            rayon batch follows the core set), unlike the old scaling loop whose
@@ -128,7 +132,7 @@ bench_bin() { # bench_bin <package> <bench> [extra cargo args...]
 }
 
 if [ "${1:-}" = "single-box" ] && [ -z "${SECTIONS:-}" ]; then
-    SECTIONS="env budget lanes shards procs e2e evmscale scaling journal profile summary"
+    SECTIONS="env budget lanes shards procs e2e evmscale chainmix scaling journal profile summary"
 else
     SECTIONS="${SECTIONS:-${*:-env corpus fold journal scaling profile}}"
 fi
@@ -456,6 +460,21 @@ if want e2e; then
             AUTH_ORDERS=$ORDERS run e2e_auth.txt "$TBIN" --ignored --nocapture
             break
         fi
+    done
+fi
+
+# ── chainmix ────────────────────────────────────────────────────────
+if want chainmix; then
+    NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
+    log "chainmix: signed EVM transfers / CLOB orders / mix through the real executor"
+    CMB="$(bench_bin executor chain_mix)"
+    CTH="1,2,4,8,16,32,64"; CTX=400000; CAC=4096; SWEEP="20000 100000 400000 1000000"
+    [ "$QUICK" = 1 ] && { CTH="1,2"; CTX=20000; CAC=256; SWEEP="10000"; }
+    echo "# thread scaling, $CTX txs, $CAC accounts" >>"$OUT/chain_mix.csv"
+    run chain_mix.csv "$CMB" --bench --mix transfer,clob,mixed --txs "$CTX" --threads "$CTH" --accounts "$CAC"
+    echo "# batch-size sweep (clob, ingest threads = $NCPU)" >>"$OUT/chain_mix.csv"
+    for n in $SWEEP; do
+        run chain_mix.csv "$CMB" --bench --mix clob --txs "$n" --threads "$((NCPU > 64 ? 64 : NCPU))" --accounts "$CAC"
     done
 fi
 

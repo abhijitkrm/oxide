@@ -100,6 +100,22 @@ def main(d):
     if evm:
         out.append("EVM lane mechanism only (not EVM execution): " + ", ".join(f"{r[3]} lanes {human(r[4])}/s" for r in evm) + "\n")
 
+    # ---- chain path by transaction type (chainmix)
+    cm = read(os.path.join(d, "chain_mix.csv"))
+    if cm:
+        out.append("## Signed transactions through the real executor (`executor:chain_mix`)\n")
+        out.append("Admission recovers every signature (parallel over the ingest threads); execution is "
+                   "single-writer per block. `executed=all` means every tx was admitted, proposed, finalized, "
+                   "and every CLOB sender's nonce advanced exactly.\n")
+        body = []
+        for line in cm.splitlines():
+            r = line.split(",")
+            if len(r) == 9 and r[1].isdigit():
+                body.append([r[0], r[1], r[2], human(r[3]), human(r[4]), human(r[5]), human(r[6]), r[7], r[8]])
+        if body:
+            out.append(table(["mix", "ingest threads", "txs", "admission tx/s", "propose tx/s", "execution tx/s", "end-to-end tx/s", "executed", "resting"], body))
+            out.append("")
+
     # ---- parallel EVM scaling (evmscale)
     def crit_rows(path):
         t = read(path)
