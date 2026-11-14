@@ -273,16 +273,27 @@ fn bench_sequential(c: &mut Criterion) {
 
 /// Benchmark the parallel OCC scheduler on the Uniswap mix.
 fn bench_parallel(c: &mut Criterion) {
-    let num_threads = 8; // M1 has 8 cores.
+    // Worker threads: `OXIDE_EVM_THREADS` (default 8, the original M1 setting).
+    // The rig sweeps it with the core count: a hard-coded 8 meant the "parallel"
+    // result could not scale past 8 cores however many were available.
+    let num_threads: usize =
+        std::env::var("OXIDE_EVM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    // Batch sizes: `OXIDE_EVM_SIZES` (comma-separated). More threads need more
+    // transactions to keep every thread busy.
+    let sizes: Vec<usize> = std::env::var("OXIDE_EVM_SIZES")
+        .ok()
+        .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+        .filter(|v: &Vec<usize>| !v.is_empty())
+        .unwrap_or_else(|| vec![500, 1_000, 2_000]);
     let scheduler = ParallelScheduler::new(num_threads);
     let mut group = c.benchmark_group("uniswap_transfer");
     group.throughput(Throughput::Elements(1));
 
-    for &n in &[500usize, 1_000, 2_000] {
+    for &n in &sizes {
         let txs = make_uniswap_mix(n);
         let total_gas = txs.iter().map(|t| t.gas).sum::<u64>();
         group.bench_with_input(
-            BenchmarkId::new("parallel_8", n),
+            BenchmarkId::new(format!("parallel_{num_threads}"), n),
             &(txs, total_gas),
             |b, (txs, _total_gas)| {
                 b.iter_custom(|iters| {
@@ -299,7 +310,10 @@ fn bench_parallel(c: &mut Criterion) {
                 });
             },
         );
-        println!("  parallel_8 n={n}: total_gas={total_gas} avg_gas/tx={}", total_gas / n as u64);
+        println!(
+            "  parallel_{num_threads} n={n}: total_gas={total_gas} avg_gas/tx={}",
+            total_gas / n as u64
+        );
     }
     group.finish();
 }

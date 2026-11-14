@@ -39,6 +39,10 @@
 #            via taskset so the curve shows how the whole service scales
 #   summary  assemble summary.md (scaling tables, cores-needed-for-target
 #            extrapolation) from the files above (scripts/rig/summarize.py)
+#   evmscale parallel EVM at 1..64 cores with the thread count set to the core count
+#            (OXIDE_EVM_THREADS for the executor's OCC scheduler; the evm module's
+#            rayon batch follows the core set), unlike the old scaling loop whose
+#            bench hard-coded 8 threads
 #   scaling  parallel-EVM, multi-market matcher, ring, hashing benches
 #   profile  CPU flamegraphs + top-function tables (perf record, frame pointers),
 #            peak RSS/page-faults/ctx-switches per run (/usr/bin/time), heap
@@ -116,7 +120,7 @@ bench_bin() { # bench_bin <package> <bench> [extra cargo args...]
 }
 
 if [ "${1:-}" = "single-box" ] && [ -z "${SECTIONS:-}" ]; then
-    SECTIONS="env budget lanes shards procs e2e scaling journal profile summary"
+    SECTIONS="env budget lanes shards procs e2e evmscale scaling journal profile summary"
 else
     SECTIONS="${SECTIONS:-${*:-env corpus fold journal scaling profile}}"
 fi
@@ -447,6 +451,27 @@ if want e2e; then
     done
 fi
 
+# ── evmscale ────────────────────────────────────────────────────────
+if want evmscale; then
+    NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
+    CRIT="${CRIT_ARGS:---warm-up-time 1 --measurement-time 3 --sample-size 10}"
+    SCORES="1 2 4 8 16 32 64 128"; ESIZES="2000,20000,100000"
+    [ "$QUICK" = 1 ] && { CRIT="--warm-up-time 1 --measurement-time 1 --sample-size 10"; SCORES="1 2"; ESIZES="500,2000"; }
+    log "evmscale: parallel EVM at 1..$NCPU cores (threads = cores)"
+    EBIN="$(bench_bin executor uniswap_transfer)"
+    TBIN="$(bench_bin evm tps_rw)"
+    for c in $SCORES; do
+        [ "$c" -gt "$NCPU" ] && break
+        PIN=""; command -v taskset >/dev/null 2>&1 && PIN="taskset -c 0-$((c - 1))"
+        echo "# cores=$c" >>"$OUT/scaling_evm_parallel.txt"
+        # shellcheck disable=SC2086
+        OXIDE_EVM_THREADS=$c OXIDE_EVM_SIZES=$ESIZES run scaling_evm_parallel.txt $PIN "$EBIN" --bench parallel_ $CRIT
+        echo "# cores=$c" >>"$OUT/scaling_evm_batch.txt"
+        # shellcheck disable=SC2086
+        RAYON_NUM_THREADS=$c run scaling_evm_batch.txt $PIN "$TBIN" --bench batch_parallel $CRIT
+    done
+fi
+
 # ── scaling ─────────────────────────────────────────────────────────
 if want scaling; then
     NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
@@ -456,18 +481,8 @@ if want scaling; then
     SCORES="1 2 4 8 16 32 64 128"
     [ "$QUICK" = 1 ] && { CRIT="--warm-up-time 1 --measurement-time 1 --sample-size 10"; SCORES="1 2"; }
     log "scaling: parallel EVM vs cores ($NCPU online)"
-    EBIN="$(bench_bin executor uniswap_transfer)"
-    for c in $SCORES; do
-        [ "$c" -gt "$NCPU" ] && break
-        if command -v taskset >/dev/null 2>&1; then
-            # shellcheck disable=SC2086
-            run scaling_evm.txt taskset -c "0-$((c-1))" "$EBIN" --bench $CRIT
-        else
-            # shellcheck disable=SC2086
-            RAYON_NUM_THREADS=$c run scaling_evm.txt "$EBIN" --bench $CRIT
-        fi
-        echo "(cores=$c above)" >>"$OUT/scaling_evm.txt"
-    done
+    # (the parallel-EVM core sweep moved to the evmscale section: this loop used a
+    # bench that hard-coded 8 threads and could not scale past 8 cores)
     log "scaling: matcher benches (multi-market, balance contention, nonce, ring, allocs)"
     for b in matcher_throughput balance_contention nonce_contention ring alloc_accounting; do
         # shellcheck disable=SC2086

@@ -100,6 +100,48 @@ def main(d):
     if evm:
         out.append("EVM lane mechanism only (not EVM execution): " + ", ".join(f"{r[3]} lanes {human(r[4])}/s" for r in evm) + "\n")
 
+    # ---- parallel EVM scaling (evmscale)
+    def crit_rows(path):
+        t = read(path)
+        if not t:
+            return {}
+        cores, last, res = None, None, {}
+        for line in t.splitlines():
+            m = re.match(r"# cores=(\d+)", line)
+            if m:
+                cores = int(m.group(1))
+                continue
+            m = re.match(r"^(\S+/\S+)\s*(time:.*)?$", line.strip())
+            if m and not line.startswith(("Benchmarking", "Warning")):
+                last = m.group(1)
+            t2 = re.search(r"time:\s+\[\S+ \S+ (\S+) (\S+)", line)
+            if t2 and last and cores:
+                v = float(t2.group(1)) * {"ns": 1e-9, "µs": 1e-6, "us": 1e-6, "ms": 1e-3, "s": 1.0}[t2.group(2)]
+                res.setdefault(last, {})[cores] = v
+        return res
+    for title, fn in (("Parallel EVM, executor OCC scheduler (Uniswap-style, 59,850 gas/tx)", "scaling_evm_parallel.txt"),
+                      ("EVM batch (rayon sender recovery + execution), `modules/evm`", "scaling_evm_batch.txt")):
+        res = crit_rows(os.path.join(d, fn))
+        if not res:
+            continue
+        out.append(f"## {title}\n")
+        cs = sorted({c for v in res.values() for c in v})
+        body = []
+        for name, v in sorted(res.items()):
+            m = re.search(r"/(\d+)(?:_|$)", name)
+            n = int(m.group(1)) if m else 0
+            cells = []
+            for c in cs:
+                if c in v and n:
+                    cells.append(human(n / v[c]) + " tx/s")
+                elif c in v:
+                    cells.append(f"{v[c]*1e3:.1f} ms")
+                else:
+                    cells.append("-")
+            body.append([name] + cells)
+        out.append(table(["bench"] + [f"{c} cores" for c in cs], body))
+        out.append("")
+
     # ---- real-service shard scaling
     sh = [r for r in rows(os.path.join(d, "shards.csv")) if len(r) >= 9 and r[0].isdigit()]
     shard_best = {}
