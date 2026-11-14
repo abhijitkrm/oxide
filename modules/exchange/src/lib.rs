@@ -395,12 +395,12 @@ const TAG_AMEND: u8 = 15;
 
 /// Size of a single fill entry in a batch-settle message:
 /// 2 + 8 + 8 + 20 + 8 + 20 + 8 = 74 bytes.
-const FILL_ENTRY_LEN: usize = 74;
+pub const FILL_ENTRY_LEN: usize = 74;
 
 /// Maximum number of fills in a single batch-settle message. Prevents
 /// a byzantine settlement operator from submitting a huge batch that
 /// causes excessive processing. `65_536` fills × 74 bytes = ~4.8 MiB.
-const MAX_BATCH_FILLS: usize = 65_536;
+pub const MAX_BATCH_FILLS: usize = 65_536;
 
 /// Maximum live registered orders module-wide.
 ///

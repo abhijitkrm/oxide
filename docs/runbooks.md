@@ -745,3 +745,9 @@ grep "gateway fault" matcher.log
   that session, bounded by the session's signed market scope and expiry.
 - Control frames (session open/close, certified batch) are carried on binary
   TCP and (open/close) JSON-RPC only, not on WebSocket or FIX.
+- **Settlement limits.** One settlement transaction carries at most 65,536 legs and the settler
+  keeps one in flight, so confirmed settlement throughput is bounded well below matching
+  throughput at high rates. An oversized seal is split across successive batches (log line `seal
+  of N pairs split into K batches`); the unsent chunks are held in memory only, so a crash in
+  that window loses them. Watch for repeated "split into" lines: it means settlement is
+  falling behind and the matcher's `--batch-interval` or order rate needs attention.

@@ -24777,3 +24777,30 @@ recovered senders with rayon): execution scales with threads (laptop 24k, 37k, 5
 1/2/4/8 rayon threads), and the box's flat 73.5k tx/s at 64 threads is a serial fraction in that
 path still to be profiled on the next box. The 64-core numbers in this devlog's earlier tables
 for CLOB execution (18.3k tx/s) are the pre-fix figures.
+
+### Fix: the settler could lose every fill of a busy interval (batches above 65,536 legs)
+
+Found while triaging a log line from the standalone matcher benchmark: `batch settler: CRITICAL -
+batch of 0 pairs rejected at execution: malformed transaction`. Two problems:
+- The "0 pairs" was a logging bug (`resolve_pending` only set the pair count on success).
+- The rejection was real: the exchange refuses a batch-settle message with more than
+  `MAX_BATCH_FILLS` (65,536) legs as malformed, and the settler sealed everything into ONE
+  message. Any interval that aggregates to more pairs (at the default 100 ms, above ~655k pairs/s,
+  always at benchmark rates) was rejected wholesale, with the documented outcome "fills lost
+  on-chain". A test using the real exchange module reproduces it.
+
+Fix: `settle_now` splits an oversized seal into batches of at most `MAX_PAIRS_PER_BATCH`
+(= `exchange::MAX_BATCH_FILLS`) legs and submits them in order through the existing
+one-in-flight pipeline; later chunks wait in a queue that is drained before any newer seal.
+With commitments on, each chunk carries a fills root over exactly the raw fills its legs aggregate
+from (aggregation is per leg key, so this is a partition), so every chunk stays disputable; a test
+runs each chunk through the real exchange and the dispute path. The rejected-pairs count is now
+reported. Mutation checks: no-split and unpartitioned-fills are both caught.
+
+Known limits, stated plainly:
+- The deferred queue is in memory. A crash loses unsent chunks (before this change the chain would
+  have rejected the whole batch, so this is strictly better, but it is not durable).
+- Settlement throughput is bounded by one in-flight batch at a time: at most 65,536 legs per
+  confirmed transaction. At the default cadence that is a ceiling of roughly 65k-650k legs/s
+  depending on block time, far below the matcher's order rate. Settlement, not matching, is the
+  next system-wide limit for the 10M orders/s target and needs pipelining or netting.

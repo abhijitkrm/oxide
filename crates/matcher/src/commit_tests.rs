@@ -214,3 +214,208 @@ fn a_settler_that_submits_different_legs_than_it_attested_is_slashed() {
     assert_eq!(ledger.balance(&Address([7; 20])), 5_000);
     assert!(ex.operator_suspended());
 }
+
+// ── oversized seals are split into batches the chain accepts ───────
+
+/// A chain that executes whatever is submitted: records each envelope and reports it
+/// executed with no error, advancing the executed nonce one per transaction.
+#[derive(Default)]
+struct EagerChain {
+    envelopes: Mutex<Vec<Vec<u8>>>,
+    executed: Mutex<std::collections::HashSet<primitives::Hash>>,
+}
+impl TxSubmitter for EagerChain {
+    fn submit_tx(&self, tx: TxBytes) -> Result<(), String> {
+        self.envelopes.lock().unwrap().push(tx.0);
+        Ok(())
+    }
+}
+impl TxConfirmer for EagerChain {
+    fn tx_outcome(&self, h: &primitives::Hash) -> Option<executor::TxOutcome> {
+        let known = self
+            .envelopes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| crypto::Hasher::hash_one(crypto::Domain::Transaction, e) == *h);
+        known.then(|| {
+            self.executed.lock().unwrap().insert(*h);
+            executor::TxOutcome::Executed { events: Vec::new().into(), error: None }
+        })
+    }
+    fn executed_nonce(&self, _: &Address) -> u64 {
+        self.executed.lock().unwrap().len() as u64
+    }
+}
+
+/// `n` fills that aggregate to `n` distinct legs (distinct order ids).
+fn many_fills(n: u64) -> Vec<SettledFill> {
+    (0..n)
+        .map(|i| SettledFill {
+            market: 0,
+            price: Price(1_000_000_000),
+            qty: Qty(1_000),
+            buyer: Address([1; 20]),
+            buyer_id: i,
+            seller: Address([2; 20]),
+            seller_id: i,
+            quote_amount: 10,
+        })
+        .collect()
+}
+
+/// Drive `settle_now` until the settler has nothing in flight and nothing deferred.
+fn drain(settler: &BatchSettler, chain: &EagerChain, max_ticks: usize) -> Vec<Vec<u8>> {
+    for _ in 0..max_ticks {
+        settler.settle_now().expect("tick");
+        if !settler.has_pending() && settler.deferred_pairs() == 0 {
+            break;
+        }
+    }
+    chain.envelopes.lock().unwrap().clone()
+}
+
+fn settler_over(fills: Vec<SettledFill>, chain: Arc<EagerChain>, commit: bool) -> BatchSettler {
+    let s = BatchSettler::new(
+        Arc::new(OneShot(Mutex::new(Some(fills)))),
+        chain.clone(),
+        chain,
+        1000,
+        Address([0xAA; 20]),
+        0,
+    );
+    if commit { s.with_commitment() } else { s }
+}
+
+fn legs_of(payload: &[u8], header: usize) -> Vec<Vec<u8>> {
+    let count = u32::from_le_bytes(payload[1 + header..5 + header].try_into().unwrap()) as usize;
+    payload[5 + header..5 + header + count * exchange::FILL_ENTRY_LEN]
+        .chunks(exchange::FILL_ENTRY_LEN)
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+#[test]
+fn an_oversized_seal_is_split_into_batches_the_chain_accepts() {
+    use crate::settler::MAX_PAIRS_PER_BATCH;
+    let total = MAX_PAIRS_PER_BATCH as u64 * 2 + 18_928;
+    let fills = many_fills(total);
+
+    // The bug: the whole seal in one message is rejected as malformed by the real exchange.
+    let (ex, _ledger) = bonded_exchange();
+    let all_legs = crate::settler::aggregate_fills(&fills).unwrap();
+    assert_eq!(all_legs.len() as u64, total);
+    let ctx = |n| TxContext { sender: Address([0xAA; 20]), nonce: n, fee: 100 };
+    let one_big = exchange::msg::batch_settle(&all_legs);
+    assert!(ex.handle(&ctx(1), &one_big).is_err(), "a >65,536-leg message must be refused");
+
+    // The fix: chunks of at most MAX_PAIRS_PER_BATCH, every one accepted, together the same legs.
+    let chain = Arc::new(EagerChain::default());
+    let settler = settler_over(fills, chain.clone(), false);
+    let envelopes = drain(&settler, &chain, 20);
+    assert_eq!(envelopes.len(), 3, "65,536 + 65,536 + 18,928 legs");
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    for (i, env) in envelopes.iter().enumerate() {
+        let payload = &env[37..];
+        assert_eq!(payload[0], 3, "plain batch settle");
+        let legs = legs_of(payload, 0);
+        assert!(legs.len() <= MAX_PAIRS_PER_BATCH);
+        ex.handle(&ctx(100 + i as u64), payload).expect("the chain accepts every chunk");
+        got.extend(legs);
+    }
+    let mut want: Vec<Vec<u8>> =
+        all_legs.iter().map(|l| exchange::dispute::leg_bytes(l).to_vec()).collect();
+    want.sort();
+    got.sort();
+    assert_eq!(got, want, "every leg settles exactly once");
+    assert!(!settler.has_pending());
+}
+
+#[test]
+fn chunks_of_an_oversized_seal_each_carry_a_root_over_exactly_their_own_fills() {
+    use crate::settler::MAX_PAIRS_PER_BATCH;
+    use exchange::dispute::{aggregate_raw_fills, legs_root};
+    let total = MAX_PAIRS_PER_BATCH as u64 + 5_000;
+    let fills = many_fills(total);
+    let chain = Arc::new(EagerChain::default());
+    let settler = settler_over(fills.clone(), chain.clone(), true);
+    let envelopes = drain(&settler, &chain, 20);
+    assert_eq!(envelopes.len(), 2);
+
+    let (ex, _ledger) = bonded_exchange();
+    ex.handle(&op_ctx(1), &exchange::msg::bond_deposit(5_000)).expect("bond");
+    for (i, env) in envelopes.iter().enumerate() {
+        let p = &env[37..];
+        assert_eq!(p[0], 16, "committed batch settle");
+        // [tag][seq 8][fills_root 32][raw count 4] then [leg count][legs]
+        let seq = u64::from_le_bytes(p[1..9].try_into().unwrap());
+        let raw_count = u32::from_le_bytes(p[41..45].try_into().unwrap()) as usize;
+        let legs = legs_of(p, 44);
+        assert_eq!(raw_count, legs.len(), "one raw fill per leg here: the chunk's own fills");
+        ex.handle(&TxContext { sender: Address([0xAA; 20]), nonce: seq, fee: 100 }, p)
+            .expect("committed chunk accepted");
+
+        // The chunk's own raw fills, found by leg key, must re-aggregate to the chunk's legs ...
+        let keys: std::collections::HashSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = legs
+            .iter()
+            .map(|l| (l[..2].to_vec(), l[18..38].to_vec(), l[38..46].to_vec()))
+            .collect();
+        let raw: Vec<_> = fills
+            .iter()
+            .map(crate::commit::to_raw)
+            .filter(|r| {
+                keys.contains(&(
+                    r.market.to_le_bytes().to_vec(),
+                    r.buy.owner.0.to_vec(),
+                    r.buy.client_id.to_le_bytes().to_vec(),
+                ))
+            })
+            .collect();
+        assert_eq!(raw.len(), raw_count);
+        let rebuilt = aggregate_raw_fills(&raw).unwrap();
+        assert_eq!(legs_root(&rebuilt).1 as usize, legs.len());
+        // ... and the chain must find the honest chunk consistent when disputed.
+        let dispute = exchange::msg::dispute(seq, &raw);
+        let err = ex
+            .handle(&TxContext { sender: Address([7; 20]), nonce: 0, fee: 0 }, &dispute)
+            .expect_err("an honest chunk survives a dispute");
+        assert!(format!("{err:?}").contains("consistent"), "chunk {i}: {err:?}");
+    }
+    assert!(!ex.operator_suspended());
+}
+
+#[test]
+fn a_rejected_batch_reports_how_many_pairs_it_held() {
+    // The log used to say "batch of 0 pairs rejected" for any rejection.
+    struct Rejecting(Mutex<Vec<Vec<u8>>>);
+    impl TxSubmitter for Rejecting {
+        fn submit_tx(&self, tx: TxBytes) -> Result<(), String> {
+            self.0.lock().unwrap().push(tx.0);
+            Ok(())
+        }
+    }
+    impl TxConfirmer for Rejecting {
+        fn tx_outcome(&self, _: &primitives::Hash) -> Option<executor::TxOutcome> {
+            Some(executor::TxOutcome::Executed {
+                events: Vec::new().into(),
+                error: Some("malformed transaction".into()),
+            })
+        }
+        fn executed_nonce(&self, _: &Address) -> u64 {
+            0
+        }
+    }
+    let chain = Arc::new(Rejecting(Mutex::new(Vec::new())));
+    let s = BatchSettler::new(
+        Arc::new(OneShot(Mutex::new(Some(many_fills(40))))),
+        chain.clone(),
+        chain,
+        1000,
+        Address([0xAA; 20]),
+        0,
+    );
+    s.settle_now().expect("submits");
+    let report = s.settle_now().expect("resolves");
+    assert!(report.batch_rejected.is_some());
+    assert_eq!(report.rejected_pairs, 40);
+}

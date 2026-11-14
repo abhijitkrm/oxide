@@ -61,6 +61,16 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     cheap session authentication, but only 0.3M with a signature per order.
     This is the building block and its measurements, not a running network.
 
+### Fixed
+
+- **Settler: an oversized seal is split instead of rejected** (`matcher`). A settlement
+  interval that aggregated to more than 65,536 pairs was sent as one message the exchange
+  refuses as malformed, losing every fill in it. It is now split into batches within the
+  limit (with per-chunk commitments when enabled), and the rejected-batch log reports the
+  real pair count.
+  - **In plain words:** on a very busy market the settlement step could throw away a whole
+    interval of trades; it now sends them in several pieces.
+
 ### Performance
 
 - **Executor: block execution no longer re-recovers pending signatures** (`executor`;
