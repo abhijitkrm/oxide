@@ -3,23 +3,24 @@
 # detached, watch progress, fetch results. Nothing here stores credentials;
 # it uses whatever ssh config/agent you already have.
 #
-#   scripts/rig/remote.sh <ssh-target> sync            # rsync this tree to ~/oxide (no target/, .git/)
+#   scripts/rig/remote.sh <ssh-target> sync [ref]      # box: git fetch + checkout from GitHub (no rsync)
 #   scripts/rig/remote.sh <ssh-target> setup           # install deps (TUNE=1 to apply machine tuning)
 #   scripts/rig/remote.sh <ssh-target> start [args]    # start rig-bench.sh detached (default: single-box)
 #   scripts/rig/remote.sh <ssh-target> status          # last lines of the log + which sections finished
-#   scripts/rig/remote.sh <ssh-target> fetch [dir]     # copy rig-results back (default ./rig-results-remote)
+#   scripts/rig/remote.sh <ssh-target> fetch [dir]     # copy rig-results back over ssh+tar (default ./rig-results-remote)
 #   scripts/rig/remote.sh <ssh-target> stop            # kill the run
+#
+# Code reaches the box through GitHub only: push the branch first, then `sync`
+# (default ref: rig/single-box, override with REF= or the argument). The repo is
+# public, so the box needs no credentials.
 set -euo pipefail
 T="${1:?ssh target, e.g. user@host}"; CMD="${2:?command}"; shift 2
 DIR='$HOME/oxide'
 case "$CMD" in
   sync)
-    # Record the commit (the tree goes over without .git); the dirty count too.
-    TOP="$(cd "$(dirname "$0")/../.." && pwd)"
-    git -C "$TOP" rev-parse --short HEAD > "$TOP/.rig-sha" 2>/dev/null || true
-    rsync -az --delete --exclude target --exclude .git --exclude rig-results --exclude 'rig-results-remote' \
-        "$TOP/" "$T:oxide/"
-    rm -f "$TOP/.rig-sha" ;;
+    REF_="${1:-${REF:-rig/single-box}}"
+    ssh "$T" "set -e; [ -d oxide/.git ] || git clone --quiet --depth 50 --branch $REF_ https://github.com/abhijitkrm/oxide.git oxide; \
+        cd oxide && git fetch --quiet --depth 50 origin $REF_ && git checkout -q -f FETCH_HEAD && git log --oneline | head -1" ;;
   setup)
     ssh "$T" "cd $DIR && TUNE=${TUNE:-0} scripts/rig/setup-linux.sh" ;;
   start)
@@ -32,7 +33,7 @@ case "$CMD" in
         grep -E "^== " $HOME/rig.log | tail -15; echo ---; tail -8 $HOME/rig.log' ;;
   fetch)
     OUT="${1:-./rig-results-remote}"; mkdir -p "$OUT"
-    rsync -az "$T:oxide/rig-results/" "$OUT/" ;;
+    ssh "$T" 'tar -C "$HOME/oxide/rig-results" -cf - .' | tar -C "$OUT" -xf - ;;
   stop)
     ssh "$T" 'pkill -f rig-bench.sh || true; pkill -f "target/release" || true' ;;
   *) echo "unknown command: $CMD" >&2; exit 2 ;;
