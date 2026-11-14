@@ -24804,3 +24804,40 @@ Known limits, stated plainly:
   confirmed transaction. At the default cadence that is a ceiling of roughly 65k-650k legs/s
   depending on block time, far below the matcher's order rate. Settlement, not matching, is the
   next system-wide limit for the 10M orders/s target and needs pipelining or netting.
+
+### Diagnosis: why EVM block execution plateaus at ~73k tx/s (not fixed; next engineering item)
+
+After the preverify-cache fix, EVM transfers remained the slowest chain-path type: execution was
+flat at ~73.5k tx/s from 8 to 64 rayon threads on the 64-core box, and on the laptop it scaled only
+24k, 37k, 50k, 54k tx/s over 1/2/4/8 threads (Amdahl serial fraction about 40%).
+
+Per-phase timing of `execute_block` (temporary instrumentation, since reverted), laptop, a block of
+1,428 EVM transfers (the 30M block gas limit):
+
+| Phase | 1 rayon thread | 8 rayon threads |
+|---|---|---|
+| plan_block_runs (serial, per-tx gates) | 0.48 ms | 0.48 ms |
+| dispatch (the "parallel" EVM execution) | 4.3 ms | 4.6-5.1 ms |
+| end_block + attendance (EVM `end_block`: `state_root()` then history/undo/backend) | 6.7-8.6 ms | 6.7-8.6 ms |
+| state_root (executor call; cached by end_block) | ~0.01 ms | ~0.01 ms |
+
+Findings:
+- At this block size parallel dispatch is no faster than one thread (rayon task and merge overhead
+  eat the gain), and the block is dominated by **end_block, whose first act is the EVM module's
+  incremental Merkle-Patricia state-root update** (`module_impl.rs` `state_root()`, keccak over the
+  touched accounts' trie paths, serial). A `sample` of the execution phase agrees: keccak,
+  `alloy_trie::HashBuilder::update`, `ordered_trie_root` and `EvmModule::state_root` are the hot
+  non-idle frames.
+- Block size is gas-limited (1,428 transfers per 30M-gas block), so the per-block fixed work is paid
+  every ~1.4k transactions.
+
+Candidate fixes, in order of expected value (none done):
+1. Parallel state root: partition the touched leaves by the first nibble of `keccak(address)`,
+   hash the 16 subtries in parallel, combine at the root. The root is bit-identical by
+   construction (same MPT), so it must be proven by a differential test against the sequential
+   root; consensus-critical, hence not a pre-flight change.
+2. Pipeline the root off the critical path: the block attestation only needs the root of block h-1
+   when block h is proposed, so compute it on a worker while block h executes.
+3. Revisit `parallel_threshold` and per-group overhead for blocks near the gas limit.
+A 16- or 8-core x86 box is enough to measure any of these (the plateau already appears by 8
+threads).
