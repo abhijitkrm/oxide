@@ -24,6 +24,11 @@
 #            the matcher's per-scheme admission cost (crates/matcher/benches/auth.rs)
 #   lanes    sharded trading lane + EVM lane prototypes: orders/s vs shard count
 #            and verifier mode (crates/lanes/benches/lanes.rs)
+#   e2e      real loopback TCP through the matcher service for every auth scheme
+#            (crates/matcher/tests/e2e_auth_tps.rs), repeated at 4/8/16/32/64 cores
+#            via taskset so the curve shows how the whole service scales
+#   summary  assemble summary.md (scaling tables, cores-needed-for-target
+#            extrapolation) from the files above (scripts/rig/summarize.py)
 #   scaling  parallel-EVM, multi-market matcher, ring, hashing benches
 #   profile  CPU flamegraphs + top-function tables (perf record, frame pointers),
 #            peak RSS/page-faults/ctx-switches per run (/usr/bin/time), heap
@@ -35,6 +40,10 @@
 #            in-situ perf record of the live validators
 #   soak     scripts/soak-test.sh (long; never in the default set) with the same
 #            per-process sampler and `docker stats` series; flags RSS leak slopes
+#
+# One-box preset (about 3 hours; everything that needs only one machine):
+#   scripts/rig-bench.sh single-box          # = env budget lanes e2e scaling journal profile summary
+#   QUICK=1 scripts/rig-bench.sh single-box  # 5-minute smoke test of the script first
 #
 # Short-box preset (about 30 min, the measurements that decide the design):
 #   SECTIONS="env budget lanes" THREADS="1 2 4 8 16 32" scripts/rig-bench.sh
@@ -90,7 +99,11 @@ bench_bin() { # bench_bin <package> <bench> [extra cargo args...]
         sed -n 's/.*Executable .*(\(.*\))/\1/p' | tail -1
 }
 
-SECTIONS="${SECTIONS:-${*:-env corpus fold journal scaling profile}}"
+if [ "${1:-}" = "single-box" ] && [ -z "${SECTIONS:-}" ]; then
+    SECTIONS="env budget lanes e2e scaling journal profile summary"
+else
+    SECTIONS="${SECTIONS:-${*:-env corpus fold journal scaling profile}}"
+fi
 want() { case " $SECTIONS " in *" $1 "*) return 0 ;; esac; return 1; }
 
 
@@ -327,12 +340,36 @@ if want lanes; then
         --shards "$(echo $THREADS | tr ' ' ',')"
 fi
 
+# ── e2e ─────────────────────────────────────────────────────────────
+# Real loopback TCP through the matcher for every authentication scheme.
+# The test process (server + load generator together) is confined to the
+# first N cores with taskset, so each step shows how the whole service
+# scales; on a one-box rig the load generator shares those cores, which
+# understates the server (note it when quoting).
+if want e2e; then
+    NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
+    log "e2e: real TCP per auth scheme, core steps up to $NCPU"
+    TBIN="$(cargo test -p matcher --release --test e2e_auth_tps --no-run 2>&1 |
+        sed -n 's/.*Executable .*(\(.*\))/\1/p' | tail -1)"
+    ORDERS=200000; [ "$QUICK" = 1 ] && ORDERS=20000
+    for c in 4 8 16 32 64 128; do
+        [ "$c" -gt "$NCPU" ] && break
+        echo "# cores=$c" >>"$OUT/e2e_auth.txt"
+        if command -v taskset >/dev/null 2>&1; then
+            AUTH_ORDERS=$ORDERS run e2e_auth.txt taskset -c "0-$((c-1))" "$TBIN" --ignored --nocapture
+        else
+            AUTH_ORDERS=$ORDERS run e2e_auth.txt "$TBIN" --ignored --nocapture
+            break
+        fi
+    done
+fi
+
 # ── scaling ─────────────────────────────────────────────────────────
 if want scaling; then
     NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
     log "scaling: parallel EVM vs cores ($NCPU online)"
     EBIN="$(bench_bin executor uniswap_transfer)"
-    for c in 1 2 4 8 16 32; do
+    for c in 1 2 4 8 16 32 64 128; do
         [ "$c" -gt "$NCPU" ] && break
         if command -v taskset >/dev/null 2>&1; then
             run scaling_evm.txt taskset -c "0-$((c-1))" "$EBIN" --bench
@@ -505,6 +542,13 @@ if want soak; then
     [ -n "${DSTAT:-}" ] && kill "$DSTAT" 2>/dev/null || true
     sampler_stop
     echo "RSS leak slopes: see proc_soak.summary.txt (LEAK SUSPECT = growth > 1%/h of mean RSS)" | tee -a "$OUT/session.log"
+fi
+
+# ── summary ─────────────────────────────────────────────────────────
+if want summary; then
+    log "summary: assembling summary.md"
+    python3 "$ROOT/scripts/rig/summarize.py" "$OUT" | tee "$OUT/summary.md" >/dev/null || true
+    echo "see $OUT/summary.md" | tee -a "$OUT/session.log"
 fi
 
 log "done: results in $OUT"

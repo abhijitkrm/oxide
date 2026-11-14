@@ -356,5 +356,13 @@ not of the execution engine.
 
 Many-core scaling of the lanes and of signature recovery (1-64 threads), the
 x86 prefetch / exact-division A/B, journal fsync on NVMe, a multi-machine
-matcher, and multi-validator consensus with a lane in the path. Run
-`SECTIONS="env budget lanes scaling" scripts/rig-bench.sh`.
+matcher, and multi-validator consensus with a lane in the path.
+
+On a single dedicated Linux box (about 3 hours): `scripts/rig/setup-linux.sh`
+(`TUNE=1` for machine settings), then `scripts/rig-bench.sh single-box`
+(env, budget, lanes, e2e at 4-128 cores, scaling, journal, profile, summary;
+`QUICK=1` first as a 5-minute smoke test). It writes `summary.md` with the
+scaling tables and a cores-needed extrapolation. `scripts/rig/remote.sh
+<ssh-target> sync|setup|start|status|fetch|stop` drives a rig over ssh using
+your existing ssh config; it stores no credentials. A single box cannot
+measure the network, multi-validator consensus, or geo-distribution.
