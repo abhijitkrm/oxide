@@ -77,6 +77,10 @@
 # records what it can see but cannot fix it for you.
 set -euo pipefail
 
+# Non-interactive ssh shells do not source ~/.cargo/env: without it every build
+# below fails and the sections that rebuild (profile, procs) skip silently.
+command -v cargo >/dev/null 2>&1 || { [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; } || true
+command -v cargo >/dev/null 2>&1 || { echo "rig-bench: cargo not found (run scripts/rig/setup-linux.sh)" >&2; exit 1; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 # The tree may have been rsync'd without .git (scripts/rig/remote.sh, the Linux

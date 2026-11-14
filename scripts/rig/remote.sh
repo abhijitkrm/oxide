@@ -5,7 +5,8 @@
 #
 #   scripts/rig/remote.sh <ssh-target> sync [ref]      # box: git fetch + checkout from GitHub (no rsync)
 #   scripts/rig/remote.sh <ssh-target> setup           # install deps (TUNE=1 to apply machine tuning)
-#   scripts/rig/remote.sh <ssh-target> start [args]    # start rig-bench.sh detached (default: single-box)
+#   scripts/rig/remote.sh <ssh-target> start [args]    # start rig-bench.sh detached (default: single-box;
+#                                                      #   QUICK=1 and EXTRA_ENV="A=b C=d" are forwarded)
 #   scripts/rig/remote.sh <ssh-target> status          # last lines of the log + which sections finished
 #   scripts/rig/remote.sh <ssh-target> fetch [dir]     # copy rig-results back over ssh+tar (default ./rig-results-remote)
 #   scripts/rig/remote.sh <ssh-target> stop            # kill the run
@@ -26,7 +27,7 @@ case "$CMD" in
   start)
     ARGS="${*:-single-box}"
     ssh "$T" "cd $DIR && . \$HOME/.cargo/env 2>/dev/null; rm -f \$HOME/rig.pid; \
-        nohup env QUICK=${QUICK:-0} scripts/rig-bench.sh $ARGS > \$HOME/rig.log 2>&1 & echo \$! > \$HOME/rig.pid; \
+        nohup env QUICK=${QUICK:-0} ${EXTRA_ENV:-} scripts/rig-bench.sh $ARGS > \$HOME/rig.log 2>&1 & echo \$! > \$HOME/rig.pid; \
         echo started pid \$(cat \$HOME/rig.pid)" ;;
   status)
     ssh "$T" 'echo "running: $(pgrep -f rig-bench.sh >/dev/null && echo yes || echo no)"; \
