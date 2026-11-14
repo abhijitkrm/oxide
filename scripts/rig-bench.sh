@@ -107,10 +107,18 @@ done
 # Pin a command to $CORES when taskset exists (Linux); run bare otherwise.
 pin() { if command -v taskset >/dev/null 2>&1; then taskset -c "$CORES" "$@"; else "$@"; fi; }
 log() { printf '\n== %s\n' "$*" | tee -a "$OUT/session.log"; }
-run() { # run <outfile> <cmd...> — tee stdout+stderr
+run() { # run <outfile> <cmd...> — tee stdout+stderr; a failing command is recorded, never fatal
     local f="$OUT/$1"; shift
     echo "\$ $*" | tee -a "$OUT/session.log" >>"$f"
     "$@" 2>&1 | tee -a "$f" >>"$OUT/session.log"
+    local rc="${PIPESTATUS[0]}"
+    # Benches carry hard gates (e.g. tps_rw's 60k tx/s floor) that legitimately fail at low
+    # core counts: record the exit status and carry on instead of letting `set -e` end the run.
+    if [ "$rc" -ne 0 ]; then
+        echo "(exit $rc: $*)" | tee -a "$f" >>"$OUT/session.log"
+        echo "$1 :: exit $rc" >>"$OUT/failed_steps.txt"
+    fi
+    return 0
 }
 # Build a bench once and print its executable path (cargo prints it on stderr).
 bench_bin() { # bench_bin <package> <bench> [extra cargo args...]
