@@ -15,6 +15,10 @@ repository.workspace = true
 # loom --lib loom_`). Swaps the ring's atomics/cell for loom's, so the
 # rest of the crate's tests must not be run with it on.
 loom = ["dep:loom"]
+# Deterministic, publicly derivable benchmark identities (`loadkeys`) shared
+# by `oxide-matcher --fund-loadgen-keys` and `oxide-loadgen`. Never on in a
+# production build.
+dev-identities = []
 
 [dependencies]
 # loom 0.7.2: exact pin, > 7 days old (0.7.3 is newer than the policy
@@ -87,4 +91,8 @@ harness = false
 
 [[bench]]
 name = "auth"
+harness = false
+
+[[bench]]
+name = "shards"
 harness = false

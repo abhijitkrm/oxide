@@ -615,9 +615,13 @@ laptop measurements.
   an opt-in bonded operator and dispute path (tags 17/18). The default
   authenticator is bit-identical to the previous behaviour and the whole
   workspace suite passes.
-- **Measured (laptop, one machine):** real loopback TCP matcher 67k-185k
-  orders/s with a signature per order, ~1.8M with session MACs or certified
-  batches; matching engine digests still match matcher-rust on all workloads.
+- **Measured (laptop, one machine):** real loopback TCP matcher 72k-184k
+  orders/s with a signature per order, ~2.2M with session MACs or certified
+  batches (one market); the multi-market service scales 1.8M, 3.6M, 6.3M, 7.5M
+  orders/s over 1, 2, 4, 8 markets in process; matching engine digests still
+  match matcher-rust on all workloads. An earlier figure of 1.8M for session
+  MACs was understated by a benchmark setup error (balance-cache capacity 8) and
+  is corrected in `docs/lanes-spec.md` §10.1.
 - **Not established:** any multi-machine or many-core figure, consensus in the
   lane path, the 4-validator devnet above 4k tx/s offered on a laptop (it
   degrades and is noisy), netted-delta settlement (not built), persisted

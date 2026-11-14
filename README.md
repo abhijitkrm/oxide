@@ -382,10 +382,12 @@ Design and measurements: [`docs/lanes-spec.md`](docs/lanes-spec.md).
 - **Lane prototype** (`crates/lanes`): market-sharded trading lane and an
   account-range EVM lane with cross-lane credits and a conservation test.
 - **Measured on a laptop (single machine):** engine 11-57M ops/s per core;
-  real loopback TCP matcher 67k orders/s (ed25519 per order), 185k (batched),
-  164k (EVM), **1.8M (session MAC or certified)**. Not yet measured: many-core
-  scaling, multi-machine, consensus in the lane path. Run
-  `SECTIONS="env budget lanes" scripts/rig-bench.sh` on a many-core box.
+  real loopback TCP matcher 72k orders/s (ed25519 per order), 184k (batched),
+  159k (EVM), **2.2M (session MAC or certified)**; the real multi-market
+  service scales 1.8M, 3.6M, 6.3M, 7.5M orders/s over 1, 2, 4, 8 markets
+  in process. Not yet measured: many-core scaling, multi-machine, consensus in
+  the lane path. On a many-core box: `scripts/rig-bench.sh single-box`
+  (`scripts/rig/linux-smoke.sh` first, to catch Linux-only bugs for free).
 - **Not built:** netted-delta settlement (needs order state off chain),
   session/certificate frames on WebSocket and FIX, persisted sessions.
 

@@ -4,6 +4,18 @@
 //! orders at scale using the batch protocol. Reports throughput
 //! (orders/s), fills, and latency.
 //!
+//! # Authentication schemes
+//!
+//! `--auth ed25519` (default), `evm`, `session_mac` or `certified` choose the
+//! credential every order carries; the server must run a matching
+//! `oxide-matcher --auth ...` (or `--auth multi`). Identities are the
+//! deterministic, publicly derivable benchmark keys of `matcher::loadkeys`;
+//! start the server with `--fund-loadgen-keys` (a `dev-identities` build) so
+//! they have balances, and for `certified` pass the gateway key printed by
+//! `oxide-loadgen --print-gateway-key` as `--gateway-keys`. Batch mode builds,
+//! signs and frames every order BEFORE the clock starts, so the reported
+//! throughput is the server's, not the generator's signing speed.
+//!
 //! # Usage
 //!
 //! ```sh
@@ -26,6 +38,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crypto::ed25519::Ed25519SecretKey;
+use matcher::auth::{MarketScope, SessionOpen, certify, sign_order_evm, sign_order_session};
+use matcher::control::{Status, decode_session_response, encode_cert_batch, encode_session_open};
+use matcher::loadkeys;
 use matcher::protocol::{
     OrderRequest, decode_batch_response, decode_response, encode_batch_request, encode_request,
     sign_order,
@@ -65,6 +80,22 @@ fn main() {
     let batch_size = parse_flag("--batch", DEFAULT_BATCH);
     let mode = parse_flag("--mode", "batch".to_string());
     let markets = parse_flag("--markets", DEFAULT_MARKETS);
+    let auth = parse_flag("--auth", "ed25519".to_string());
+    let chain_id = parse_flag("--chain-id", matcher::protocol::CHAIN_ID);
+    if env::args().any(|a| a == "--print-gateway-key") {
+        let pk = loadkeys::gateway_key().verifying_key().to_bytes();
+        let hex = pk.iter().fold(String::new(), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+        println!("{hex}");
+        return;
+    }
+    if !matches!(auth.as_str(), "ed25519" | "evm" | "session_mac" | "certified") {
+        eprintln!("error: --auth must be ed25519, evm, session_mac or certified");
+        std::process::exit(1);
+    }
 
     println!("oxide-loadgen: connecting to {host}:{port}");
     println!("  orders:      {orders}");
@@ -73,6 +104,7 @@ fn main() {
     println!("  batch size:  {batch_size}");
     println!("  markets:     {markets}");
     println!("  mode:        {mode}");
+    println!("  auth:        {auth}");
 
     let runtime =
         tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
@@ -84,7 +116,18 @@ fn main() {
             run_pipelined(&host, port, orders, accounts, batch_size, markets).await
         } else {
             // Default: batch mode (fastest).
-            run_batch(&host, port, orders, accounts, connections, batch_size, markets).await
+            run_batch(
+                &host,
+                port,
+                orders,
+                accounts,
+                connections,
+                batch_size,
+                markets,
+                &auth,
+                chain_id,
+            )
+            .await
         }
     });
 
@@ -92,6 +135,7 @@ fn main() {
     println!("=== oxide-loadgen Results ===");
     println!("  orders:      {}", result.orders);
     println!("  fills:       {}", result.fills);
+    println!("  rejected:    {}", result.rejected);
     println!("  elapsed:     {:.3}s", result.elapsed.as_secs_f64());
     println!("  throughput:  {:.0} orders/s", result.tps);
     println!(
@@ -104,6 +148,9 @@ fn main() {
 struct BenchResult {
     orders: usize,
     fills: u64,
+    /// Orders the server rejected (should be 0; non-zero means the run is
+    /// measuring rejections, not matching).
+    rejected: u64,
     elapsed: Duration,
     tps: f64,
 }
@@ -222,7 +269,7 @@ async fn run_sync(
     }
     let elapsed = start.elapsed();
     let tps = orders as f64 / elapsed.as_secs_f64();
-    BenchResult { orders, fills, elapsed, tps }
+    BenchResult { orders, fills, rejected: 0, elapsed, tps }
 }
 
 /// Pipelined mode: send N requests in a burst, then read N responses.
@@ -259,7 +306,7 @@ async fn run_pipelined(
     }
     let elapsed = start.elapsed();
     let tps = orders as f64 / elapsed.as_secs_f64();
-    BenchResult { orders, fills, elapsed, tps }
+    BenchResult { orders, fills, rejected: 0, elapsed, tps }
 }
 
 /// Batch mode: M connections, each sending batch requests.
@@ -271,6 +318,96 @@ async fn run_pipelined(
 /// keeps that connection's stream totally ordered). Splitting one
 /// account across connections could deliver a higher nonce before
 /// a lower one and get it rejected as `StaleNonce`.
+/// Wall-clock milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Open one session per account (in `range`) over a short-lived blocking
+/// connection and return `account index -> session id`. Sessions are
+/// server-wide, so this need not be the connection that sends orders.
+fn open_sessions(
+    host: &str,
+    port: u16,
+    range: std::ops::Range<u32>,
+    chain_id: u64,
+) -> std::collections::HashMap<u32, u32> {
+    use std::io::{Read, Write};
+    let mut sock = std::net::TcpStream::connect((host, port)).expect("connect for session open");
+    let mut ids = std::collections::HashMap::new();
+    for idx in range {
+        let open = SessionOpen::sign_ed25519_until(
+            &loadkeys::ed_key(idx),
+            loadkeys::SESSION_KEY,
+            MarketScope::all(),
+            now_ms() + 3_600_000,
+            chain_id,
+        );
+        sock.write_all(&encode_session_open(&open)).expect("write session open");
+        let mut resp = [0u8; 5];
+        sock.read_exact(&mut resp).expect("read session response");
+        match decode_session_response(&resp) {
+            Some((Status::Ok, id)) => {
+                ids.insert(idx, id);
+            }
+            other => panic!(
+                "session open for account {idx} failed: {other:?} (server needs --auth session_mac \
+                 or multi, and --fund-loadgen-keys)"
+            ),
+        }
+    }
+    ids
+}
+
+/// Build and frame one connection's batches under `auth` (untimed).
+#[allow(clippy::too_many_arguments)] // one value per knob of a single batch-prep step
+fn prepare_frames(
+    host: &str,
+    port: u16,
+    lo: u32,
+    hi: u32,
+    orders_per_conn: usize,
+    batch_size: usize,
+    markets: u8,
+    auth: &str,
+    chain_id: u64,
+) -> Vec<Vec<u8>> {
+    let keys: Vec<Ed25519SecretKey> = (lo..hi).map(loadkeys::ed_key).collect();
+    let mut chunk = generate_orders_grouped(orders_per_conn, &keys, markets, batch_size);
+    // Owner address -> global account index, to re-authenticate under another scheme.
+    let by_owner: std::collections::HashMap<primitives::Address, u32> =
+        (lo..hi).map(|i| (loadkeys::ed_owner(i), i)).collect();
+    match auth {
+        "evm" => {
+            for o in &mut chunk {
+                let idx = by_owner[&o.owner];
+                sign_order_evm(o, &loadkeys::evm_key(idx), chain_id);
+            }
+        }
+        "session_mac" => {
+            let ids = open_sessions(host, port, lo..hi, chain_id);
+            for o in &mut chunk {
+                let idx = by_owner[&o.owner];
+                // `owner` stays the ed25519-derived address the session was opened for.
+                sign_order_session(o, ids[&idx], &loadkeys::SESSION_KEY, chain_id);
+            }
+        }
+        _ => {}
+    }
+    if auth == "certified" {
+        let gw = loadkeys::gateway_key();
+        chunk
+            .chunks(batch_size)
+            .map(|sub| encode_cert_batch(&certify(&gw, sub, chain_id), sub))
+            .collect()
+    } else {
+        chunk.chunks(batch_size).map(encode_batch_request).collect()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_batch(
     host: &str,
     port: u16,
@@ -279,30 +416,53 @@ async fn run_batch(
     connections: usize,
     batch_size: usize,
     markets: u8,
+    auth: &str,
+    chain_id: u64,
 ) -> BenchResult {
     let orders_per_conn = orders / connections;
     // Floor partition — leftover accounts (accounts % connections)
     // simply go unused; every connection's account set is disjoint.
     let accounts_per_conn = (accounts / connections).max(1);
-    let host = Arc::new(host.to_string());
 
+    // Phase 1 (untimed): build, authenticate and frame every connection's
+    // batches in parallel, opening sessions if the scheme needs them.
+    let prep: Vec<_> = (0..connections)
+        .map(|conn_idx| {
+            let lo = u32::try_from(conn_idx * accounts_per_conn).unwrap_or(u32::MAX);
+            let hi = lo + u32::try_from(accounts_per_conn).unwrap_or(u32::MAX);
+            let (host, auth) = (host.to_string(), auth.to_string());
+            tokio::task::spawn_blocking(move || {
+                prepare_frames(
+                    &host,
+                    port,
+                    lo,
+                    hi,
+                    orders_per_conn,
+                    batch_size,
+                    markets,
+                    &auth,
+                    chain_id,
+                )
+            })
+        })
+        .collect();
+    let mut all_frames = Vec::with_capacity(connections);
+    for p in prep {
+        all_frames.push(p.await.expect("prepare frames"));
+    }
+    println!("oxide-loadgen: {} orders prepared, sending...", orders_per_conn * connections);
+
+    // Phase 2 (timed): send the prebuilt frames.
+    let host = Arc::new(host.to_string());
     let start = Instant::now();
     let mut handles = Vec::with_capacity(connections);
-    for conn_idx in 0..connections {
-        let lo = conn_idx * accounts_per_conn;
-        let hi = lo + accounts_per_conn;
-        let keys: Vec<Ed25519SecretKey> = (u32::try_from(lo).unwrap_or(u32::MAX)
-            ..u32::try_from(hi).unwrap_or(u32::MAX))
-            .map(account_key)
-            .collect();
-        let chunk = generate_orders_grouped(orders_per_conn, &keys, markets, batch_size);
+    for frames in all_frames {
         let host = Arc::clone(&host);
         handles.push(tokio::spawn(async move {
             let mut sock = TcpStream::connect((host.as_str(), port)).await.expect("connect");
-            let mut fills = 0u64;
-            for sub in chunk.chunks(batch_size) {
-                let batch_req = encode_batch_request(sub);
-                sock.write_all(&batch_req).await.expect("write batch");
+            let (mut fills, mut rejected) = (0u64, 0u64);
+            for frame in frames {
+                sock.write_all(&frame).await.expect("write batch");
                 // Read batch response header (5 bytes).
                 let mut header = [0u8; 5];
                 sock.read_exact(&mut header).await.expect("read header");
@@ -316,18 +476,22 @@ async fn run_batch(
                 let responses = decode_batch_response(&full).expect("decode batch");
                 for r in &responses {
                     fills += u64::from(r.fills_count);
+                    rejected += u64::from(r.rejected);
                 }
             }
-            fills
+            (fills, rejected)
         }));
     }
-    let mut total_fills = 0u64;
+    let (mut total_fills, mut total_rejected) = (0u64, 0u64);
     for h in handles {
-        total_fills += h.await.expect("join");
+        let (f, r) = h.await.expect("join");
+        total_fills += f;
+        total_rejected += r;
     }
     let elapsed = start.elapsed();
-    let tps = orders as f64 / elapsed.as_secs_f64();
-    BenchResult { orders, fills: total_fills, elapsed, tps }
+    let sent = orders_per_conn * connections;
+    let tps = sent as f64 / elapsed.as_secs_f64();
+    BenchResult { orders: sent, fills: total_fills, rejected: total_rejected, elapsed, tps }
 }
 
 /// Parse a CLI flag of the form `--name value`.

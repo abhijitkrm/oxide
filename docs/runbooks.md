@@ -727,9 +727,20 @@ grep "gateway fault" matcher.log
 
 ### Notes
 
-- Throughput by scheme (laptop, real TCP, single machine): ed25519 per order
-  67k orders/s, batched 185k, EVM 164k, session MAC or certified ~1.8M. Pick
-  the scheme for your trust model first; performance only sets the default.
+- Throughput by scheme (laptop, real TCP, one market, single machine): ed25519
+  per order 72k orders/s, batched 184k, EVM 159k, session MAC or certified
+  ~2.2M. Pick the scheme for your trust model first; performance only sets the
+  default.
+- **Size `--accounts-cap` to the number of distinct accounts you expect (default
+  1M).** The balance cache's lock-free tiers hold that many accounts; beyond it
+  accounts fall back to a global-mutex map and throughput collapses (a bench that
+  built the cache with capacity 8 measured exactly that). The replay gate is
+  sharded by owner (64 shards) and needs no tuning.
+- Benchmarking a standalone `oxide-matcher` with `oxide-loadgen` needs a
+  `--features dev-identities` build and `--fund-loadgen-keys` (the keys are publicly
+  derivable; never on a node holding value). `oxide-loadgen --auth
+  ed25519|evm|session_mac|certified` picks the credential; for `certified`
+  start the matcher with `--gateway-keys $(oxide-loadgen --print-gateway-key)`.
 - A session MAC lets the gateway/matcher that holds the key forge orders for
   that session, bounded by the session's signed market scope and expiry.
 - Control frames (session open/close, certified batch) are carried on binary

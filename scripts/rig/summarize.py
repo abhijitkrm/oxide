@@ -100,6 +100,42 @@ def main(d):
     if evm:
         out.append("EVM lane mechanism only (not EVM execution): " + ", ".join(f"{r[3]} lanes {human(r[4])}/s" for r in evm) + "\n")
 
+    # ---- real-service shard scaling
+    sh = [r for r in rows(os.path.join(d, "shards.csv")) if len(r) >= 9 and r[0].isdigit()]
+    shard_best = {}
+    if sh:
+        out.append("## Real matcher shard scaling (`matcher:shards`, session MAC)\n")
+        body = []
+        for r in sh:
+            body.append([r[0], r[1], r[2], human(r[6]), human(r[7]), r[8]])
+            if r[2] == "queued" and r[1] == "1":
+                shard_best[int(r[0])] = float(r[6])
+        out.append(table(["markets", "submitters/market", "journal", "orders/s", "per market", "rejects"], body))
+        out.append("")
+
+    # ---- separate-process, pinned
+    pt = read(os.path.join(d, "procs.txt"))
+    if pt:
+        out.append("## Real binaries, separate pinned processes (`oxide-matcher` vs `oxide-loadgen`)\n")
+        data, cur, rej = {}, None, {}
+        for line in pt.splitlines():
+            m = re.match(r"# server cores=(\d+) .* scheme=(\w+)", line)
+            if m:
+                cur = (int(m.group(1)), m.group(2))
+            m = re.search(r"throughput:\s+(\d+) orders/s", line)
+            if m and cur:
+                data[cur] = int(m.group(1))
+            m = re.search(r"rejected:\s+(\d+)", line)
+            if m and cur:
+                rej[cur] = int(m.group(1))
+        schemes = sorted({k[1] for k in data})
+        cs = sorted({k[0] for k in data})
+        body = []
+        for sc in schemes:
+            body.append([sc] + [(human(data[(c, sc)]) + (" (rejects!)" if rej.get((c, sc)) else "")) if (c, sc) in data else "-" for c in cs])
+        out.append(table(["scheme"] + [f"{c} server cores" for c in cs], body))
+        out.append("")
+
     # ---- e2e
     e = read(os.path.join(d, "e2e_auth.txt"))
     if e:
@@ -131,6 +167,11 @@ def main(d):
         one, eff, tmax = best["ed25519_verify_batch256"]
         for name, t in (("10M orders/s", 1e7), ("100M orders/s", 1e8)):
             ext.append([f"{name}, batched ed25519 authentication only", f"{t / (one * eff):.0f}", f"{one:.0f}/s per core at {eff:.0%}"])
+    if shard_best:
+        n = max(shard_best)
+        per = shard_best[n] / n
+        for name, t in (("10M orders/s", 1e7), ("100M orders/s", 1e8)):
+            ext.append([f"{name}, real matcher with a queued journal", f"{t / per:.0f} markets", f"{human(per)}/s per market at {n} markets (worker + submitter threads)"])
     if lane_best:
         n = max(lane_best)
         per_shard = lane_best[n] / n

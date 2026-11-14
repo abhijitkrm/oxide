@@ -63,6 +63,21 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Performance
 
+- **Matcher: the multi-market replay gate is sharded by owner** (`matcher`;
+  no wire or file-format change). The gate was one mutex taken per order;
+  it is now 64 shards with identical per-owner semantics. With 8 markets the
+  in-process service goes from 4.6M to 7.5M orders/s (three runs each).
+  - **In plain words:** all markets used to queue behind one lock to check
+    "have I seen this order number before"; unrelated accounts no longer wait
+    for each other.
+
+- **Load generation: `oxide-loadgen --auth ed25519|evm|session_mac|certified`**
+  builds and signs every order before its clock starts (the old figure
+  included signing time), counts rejections, and pairs with
+  `oxide-matcher --fund-loadgen-keys` (a `dev-identities` build; publicly
+  derivable keys, development only). `cargo bench -p matcher --bench shards`
+  measures the real multi-market service across markets and journal modes.
+
 - **Matching engine: the committed-state fold is computed lazily**
   (`trading`, `framework`). Resting-order changes no longer hash on
   every mutation; the hashes are paid once per net-changed order when

@@ -324,33 +324,90 @@ What this does and does not show:
 Source: `cargo test -p matcher --release --test e2e_auth_tps -- --ignored
 --nocapture`. Multi-market matcher, 4 connections, batch endpoint of 500,
 orders pre-authenticated, real matching (50% of orders fill) and the replay
-gate; 200,000 orders.
+gate; 200,000 orders; one market (so one worker thread).
 
 | `--auth` | Orders/s |
 |---|---|
-| `ed25519` (one strict verify per order) | 67k |
-| `ed25519_batch` (the default) | 185k |
-| `evm` (4 recovery threads) | 164k |
-| `session_mac` | 1.81M |
-| `certified` (audit 1/64) | 1.85M |
-| `multi` (schemes enabled, ed25519 traffic) | 184k |
+| `ed25519` (one strict verify per order) | 72k |
+| `ed25519_batch` (the default) | 184k |
+| `evm` (4 recovery threads) | 159k |
+| `session_mac` | 2.19M |
+| `certified` (audit 1/64) | 2.33M |
+| `multi` (schemes enabled, ed25519 traffic) | 175k |
+
+**Correction (2026-11-14):** an earlier version of this table reported session
+MAC 1.81M and certified 1.85M. Those runs built the balance cache with
+`AtomicBalanceCache::new(8)`, a capacity of 8 accounts, so every account
+overflowed to the global-mutex sparse map. The signature-bound rows were
+unaffected (they are verification-bound); the cheap-authentication rows were
+understated. Operators: `--accounts-cap` must be at least the number of
+distinct accounts, or throughput collapses (runbook section 13).
 
 Admission alone on one thread (`cargo bench -p matcher --bench auth`):
 ed25519 20k, batch 56k, EVM 33k (124k on 4 threads), session MAC 4.8M,
 certified 1.9M orders/s.
 
 Reading: the engine does tens of millions of ops/s per core, so the service's
-limit is authentication. With a signature per order it is 67k-185k orders/s;
-with a session MAC or a gateway certificate the same server reaches ~1.8M on a
-laptop that is also running the load generator. The older single-market
-mutex-mode service tests (per-order ed25519, synchronous or pipelined
-clients) measure 10-18k orders/s.
+limit is authentication. With a signature per order it is 72k-184k orders/s;
+with a session MAC or a gateway certificate the same one-market server reaches
+~2.2M on a laptop that is also running the load generator. The older
+single-market mutex-mode service tests (per-order ed25519, synchronous or
+pipelined clients) measure 10-18k orders/s.
 
 EVM execution (laptop, one core): 34 us per transaction, of which
 secp256k1 recovery is 29.6 us (87%). The 8-core parallel batch does 113k tx/s.
 A 1M tx/s EVM target is therefore mostly a question of where signature
 recovery happens (ingress verification, certified batches, sharded lanes),
 not of the execution engine.
+
+### 10.1a Real-service shard scaling (in process, laptop, session MAC)
+
+Source: `cargo bench -p matcher --bench shards`. The production
+`MultiMarketMatcher` (one worker per market), one submitter thread per market
+calling `submit_batch`, orders pre-authenticated. Includes the real
+admission path, replay gate, balance reservation, risk, per-market worker and
+settlement buffer; excludes TCP.
+
+| Markets | Orders/s (journal off) | Per market |
+|---|---|---|
+| 1 | 1.83M | 1.83M |
+| 2 | 3.61M | 1.80M |
+| 4 | 6.3-6.9M | 1.6-1.7M |
+| 8 | 7.5-7.6M | 0.95M |
+
+Near-linear to 4 markets (8 threads on the 4 performance cores); at 8 markets
+the laptop is oversubscribed (16 threads on 4 fast + 4 slow cores), so the
+flattening is the machine, not the design. The rig's curve is the real one.
+
+- **Replay gate sharding.** The multi-market replay gate was one mutex taken
+  per order. It is now 64 shards keyed by owner (`ShardedNonces`), with
+  identical per-owner semantics (differential-tested against a single tracker
+  for 1/2/7/64 shards; concurrent and durable tests) and the same on-disk
+  format. A/B, three runs each: 8 markets 7.5M orders/s with 64 shards against
+  4.6M with one (+64%); 4 markets 6.8M against 6.0M (+12%). My first
+  hypothesis (the gate was *the* limit) was wrong; the limit that first showed
+  up was the balance-cache capacity artifact above, and the gate became the
+  next one once that was fixed.
+- **Journal.** `queued` ack is nearly free (4 markets: 5.2M with it, 5.25M
+  without). `durable` ack does not scale with submitters on this laptop: about
+  95k orders/s per market however many submitters (1, 4 or 16), because the
+  worker blocks on one fsync per batch (about 5 ms here) instead of
+  group-committing across queued batches. On local NVMe (fsync ~0.1 ms) the
+  bound is far higher; on network disks it will bind. Pipelining the ack
+  across queued batches is a known improvement, not built.
+
+### 10.1b Separate processes (smoke only on the laptop)
+
+`scripts/rig-bench.sh procs` runs `oxide-matcher` (built with
+`--features dev-identities`, started with `--fund-loadgen-keys`) and
+`oxide-loadgen --auth <scheme>` as separate processes pinned to disjoint cores,
+restarting the matcher per run (the replay gate is per process lifetime).
+`oxide-loadgen` now builds, signs and frames every order before its clock
+starts, supports `--auth ed25519|evm|session_mac|certified`, and counts
+rejections (a run with rejections is flagged). Unpinned laptop smoke, 20k
+orders: 1 market ed25519 99k, evm 64k, session MAC 2.1M, certified 1.5M;
+2 markets 186k, 122k, 3.5M, 2.4M orders/s. Too small and unpinned to quote
+as results; the rig run is the measurement.
 
 ### 10.2 Not measured yet (needs the rig)
 

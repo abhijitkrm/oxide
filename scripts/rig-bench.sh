@@ -24,6 +24,16 @@
 #            the matcher's per-scheme admission cost (crates/matcher/benches/auth.rs)
 #   lanes    sharded trading lane + EVM lane prototypes: orders/s vs shard count
 #            and verifier mode (crates/lanes/benches/lanes.rs)
+#   shards   the REAL multi-market matcher (one worker per market) driven by one
+#            submitter per market, session-MAC auth, journal off/queued/durable,
+#            markets 1..NPROC/2 (crates/matcher/benches/shards.rs): the service's
+#            shard-scaling curve including the journal on the disk under test
+#   procs    the real binaries as SEPARATE pinned processes: oxide-matcher on cores
+#            0..S-1 and oxide-loadgen on a disjoint core set, per auth scheme
+#            (ed25519, evm, session_mac, certified) at S = 1,2,4,.. up to half the
+#            cores; the loadgen builds and signs everything before its clock starts,
+#            so the curve is the server's (crates/matcher/benches/shards.rs is the
+#            in-process counterpart; e2e is the single-process one)
 #   e2e      real loopback TCP through the matcher service for every auth scheme
 #            (crates/matcher/tests/e2e_auth_tps.rs), repeated at 4/8/16/32/64 cores
 #            via taskset so the curve shows how the whole service scales
@@ -102,7 +112,7 @@ bench_bin() { # bench_bin <package> <bench> [extra cargo args...]
 }
 
 if [ "${1:-}" = "single-box" ] && [ -z "${SECTIONS:-}" ]; then
-    SECTIONS="env budget lanes e2e scaling journal profile summary"
+    SECTIONS="env budget lanes shards procs e2e scaling journal profile summary"
 else
     SECTIONS="${SECTIONS:-${*:-env corpus fold journal scaling profile}}"
 fi
@@ -347,6 +357,65 @@ if want lanes; then
     SECS=3; [ "$QUICK" = 1 ] && SECS=0.3
     run lanes.csv cargo bench -p lanes --bench lanes -- --secs "$SECS" \
         --shards "$(echo $THREADS | tr ' ' ',')"
+fi
+
+# ── shards ──────────────────────────────────────────────────────────
+# Each market costs a worker thread plus a submitter thread, so the market
+# steps stop at half the cores.
+if want shards; then
+    NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
+    MK=""; m=1
+    while [ "$m" -le "$((NCPU / 2))" ] || [ -z "$MK" ]; do MK="$MK,$m"; m=$((m * 2)); done
+    MK="${MK#,}"
+    SORD=200000; SSUB="1,8"; [ "$QUICK" = 1 ] && { SORD=20000; MK="1,2"; SSUB="1"; }
+    log "shards: real matcher scaling, markets $MK, journal on $JOURNAL_DIR"
+    mkdir -p "$JOURNAL_DIR/shards"
+    run shards.csv cargo bench -p matcher --bench shards -- --markets "$MK" \
+        --journal off,queued,durable --sub "$SSUB" --orders "$SORD" --dir "$JOURNAL_DIR/shards"
+fi
+
+# ── procs ───────────────────────────────────────────────────────────
+# Real binaries, separate processes, disjoint core sets. Matcher state (the
+# replay gate) is per process lifetime, so the matcher restarts for every
+# (cores, scheme) run: nonces from the previous run would be rejected.
+if want procs; then
+    NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
+    log "procs: oxide-matcher + oxide-loadgen as pinned separate processes"
+    cargo build --release -p oxide-matcher --features dev-identities -p oxide-loadgen 2>&1 | tail -2 | tee -a "$OUT/session.log"
+    MBIN="$ROOT/target/release/oxide-matcher"; LBIN="$ROOT/target/release/oxide-loadgen"
+    GW="$("$LBIN" --print-gateway-key)"
+    # oxide-matcher refuses to start without a settlement key (there is no default).
+    # A throwaway random one is fine here: nothing this bench settles has value.
+    SKEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+    PPORT=39000
+    SLOW=200000; FAST=2000000
+    STEPS="1 2 4 8 16 32 64"
+    [ "$QUICK" = 1 ] && { SLOW=20000; FAST=20000; STEPS="1 2"; }
+    for S in $STEPS; do
+        [ "$S" -gt "$((NCPU / 2))" ] && [ "$S" -gt 1 ] && break
+        C="${CLIENT_CORES:-$S}"; [ "$((S + C))" -gt "$NCPU" ] && C=$((NCPU - S)); [ "$C" -lt 1 ] && C=1
+        SRV_SET="0-$((S - 1))"; CLI_SET="$S-$((S + C - 1))"
+        if ! command -v taskset >/dev/null 2>&1; then SRV_SET=""; CLI_SET=""; fi
+        for scheme in ed25519 evm session_mac certified; do
+            N=$SLOW; case "$scheme" in session_mac|certified) N=$FAST ;; esac
+            ACCTS=$((C * 2 * 64))
+            MLOG="$OUT/procs_matcher_${S}_${scheme}.log"
+            if [ -n "$SRV_SET" ]; then PIN_S="taskset -c $SRV_SET"; PIN_C="taskset -c $CLI_SET"; else PIN_S=""; PIN_C=""; fi
+            # shellcheck disable=SC2086
+            $PIN_S "$MBIN" --mode multi --markets "$S" --accounts "$ACCTS" --accounts-cap 262144 \
+                --tcp-port "$PPORT" --jsonrpc-port $((PPORT + 1)) --fix-port $((PPORT + 2)) --ws-port $((PPORT + 3)) \
+                --auth multi --gateway-keys "$GW" --audit-every 64 --fund-loadgen-keys \
+                --settlement-key "$SKEY" >"$MLOG" 2>&1 &
+            MPID=$!
+            for _ in $(seq 1 100); do (echo >/dev/tcp/127.0.0.1/$PPORT) 2>/dev/null && break; sleep 0.2; done
+            echo "# server cores=$S ($SRV_SET) client cores=$C ($CLI_SET) scheme=$scheme orders=$N" >>"$OUT/procs.txt"
+            # shellcheck disable=SC2086
+            $PIN_C "$LBIN" --port "$PPORT" --orders "$N" --accounts "$ACCTS" --connections $((C * 2)) \
+                --batch 500 --markets "$S" --auth "$scheme" 2>&1 | tee -a "$OUT/procs.txt" >>"$OUT/session.log" || true
+            kill "$MPID" 2>/dev/null || true; wait "$MPID" 2>/dev/null || true
+            sleep 1
+        done
+    done
 fi
 
 # ── e2e ─────────────────────────────────────────────────────────────

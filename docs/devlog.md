@@ -24685,3 +24685,52 @@ happens, not the execution engine.
 Caveats: not a multi-machine result; the devnet figure is unstable above 4k tx/s offered
 on this laptop and should not be quoted as a ceiling; criterion `elem/s` for the
 uniswap bench is mis-scaled, so tx/s above is computed from the measured times.
+
+### Before renting the box: Linux validation, the real-service shard bench, pinned separate-process load
+
+Goal: find bugs and bad assumptions on the laptop instead of on paid hours.
+
+**1. Linux in a container** (`scripts/rig/linux-smoke.sh`; Docker VM: 4 CPUs, 3.8 GB).
+Workspace tests (lanes, matcher, exchange, crypto, trading, primitives) pass on Linux
+including the SIGKILL crash test (5/5). Emulated x86-64: the `prefetch` feature compiles and
+the trading (67), crypto (60, asm keccak path) and lanes (22) tests pass. QUICK rig run on
+Linux completed with `taskset`, the `/proc` sampler, `iostat` and the crash loop working.
+Bugs it found (each would have cost box minutes):
+- `rig-bench.sh` called `git rev-parse` and `git worktree`, which fail on trees rsync'd without
+  `.git` (the ssh driver does exactly that), so every remote run died in the first second. Now
+  falls back to a recorded hash, and the patch-and-rebuild sweeps use plain tree copies.
+- `setup-linux.sh` used one `apt-get install` for everything (one missing package aborted all)
+  and trusted `command -v perf` (Ubuntu ships a wrapper that exists without working tools). Now
+  tiered, and checks `perf --version`.
+Not testable in a container: `perf` counters, real NVMe, x86 timing.
+
+**2. The real-service shard bench** (`cargo bench -p matcher --bench shards`; the production
+`MultiMarketMatcher`, one submitter per market, journal off/queued/durable). My hypothesis was
+that the shared replay gate caps the service at ~3-5M orders/s (the `nonce_contention` bench
+suggested it). Sharding the gate (64 shards by owner) changed nothing at first, so I profiled
+with `sample`: the real culprit was my bench's `AtomicBalanceCache::new(8)`, a capacity of 8
+accounts, which pushed every account onto the global-mutex sparse map. With a sized cache the
+service scales 1.8M, 3.6M, 6.3M, 7.5M orders/s over 1, 2, 4, 8 markets. The gate sharding is
+kept because a proper A/B (3 runs each) shows it matters once the real bottleneck is gone: 8
+markets 7.5M vs 4.6M with one shard (+64%).
+- **Correction**: the same capacity mistake was in `e2e_auth_tps`, so the published session
+  MAC (1.81M) and certified (1.85M) TCP figures were understated; corrected to 2.19M and 2.33M
+  (signature-bound rows unchanged). Fixed in docs and noted in `docs/lanes-spec.md` §10.1.
+- Durable ack does not scale with submitters here (~95k orders/s per market for 1, 4 or 16):
+  the worker blocks on one fsync (~5 ms on this laptop) per batch instead of group-committing
+  queued batches. Irrelevant on ~0.1 ms NVMe, binding on network disks. Pipelining the ack is
+  a known improvement, not built.
+- The bench's setup derived an address from a secret key per order (~20 us each); precomputed.
+
+**3. Separate processes** (`scripts/rig-bench.sh procs`). Found that the shipped
+`oxide-matcher` funded canonical `[index][0..]` addresses while `oxide-loadgen` signs with keys
+whose derived owners are hash addresses, so the pair could not trade. Added
+`matcher::loadkeys` (deterministic, publicly derivable identities; feature `dev-identities`,
+off in production), `oxide-matcher --fund-loadgen-keys`, and `oxide-loadgen --auth
+ed25519|evm|session_mac|certified` with `--print-gateway-key`. Loadgen now prepares every order
+before its clock starts (it used to sign inside the timed region) and counts rejections. The
+matcher restarts per run (replay gate is per process lifetime). Smoke on the laptop works for
+all four schemes with 0 rejections; the pinned many-core curve is for the rig.
+
+Still open: pipelined durable ack; the `procs`/`shards` sections are smoke-tested only; `perf`,
+heaptrack and blktrace paths remain unvalidated (no tools in the container).

@@ -112,7 +112,8 @@ authentication is a runtime choice (`oxide-matcher --auth`: ed25519, EVM,
 session MAC, gateway certificate, or several), the settler can attach a
 per-batch fills root (`--commit-batches`, exchange tag 16), and the exchange
 has an opt-in bonded-operator dispute path (tags 17/18). Measured on a laptop
-the real TCP matcher does 67k orders/s with an ed25519 signature per order
-and 1.8M with session MACs: authentication, not matching, is the service's
+the real TCP matcher does 72k orders/s with an ed25519 signature per order
+and 2.2M with session MACs (the multi-market service reaches 7.5M orders/s
+over 8 markets in process): authentication, not matching, is the service's
 limit. None of this is a multi-machine result yet. Add a `docs/devlog.md`
 entry for any change here, and keep `docs/lanes-spec.md` in step with the code.

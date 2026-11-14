@@ -135,7 +135,9 @@ fn run(scheme: &str, n_orders: usize) -> f64 {
     };
     let auth: Arc<dyn Authenticator> = cfg.build();
 
-    let balances = Arc::new(AtomicBalanceCache::new(8));
+    // Capacity = accounts the lock-free tiers can hold (`--accounts-cap`). A
+    // tiny value pushes every account onto the global-mutex overflow map.
+    let balances = Arc::new(AtomicBalanceCache::new(ACCOUNTS * 16));
     for a in 0..ACCOUNTS {
         balances.set(&addr_of(scheme, a), 1_000_000_000_000_000);
     }

@@ -116,6 +116,7 @@ struct CliConfig {
     journal: Option<matcher::cmdlog::JournalConfig>,
     auth: matcher::auth::AuthConfig,
     commit_batches: bool,
+    fund_loadgen_keys: bool,
 }
 
 /// Parse CLI flags into a `CliConfig`.
@@ -200,6 +201,9 @@ fn parse_cli() -> CliConfig {
         // 16) with a root over each batch's raw fills. Needs a chain that
         // understands tag 16.
         commit_batches: env::args().any(|a| a == "--commit-batches"),
+        // `--fund-loadgen-keys` (needs a `dev-identities` build): fund the
+        // publicly derivable identities `oxide-loadgen` signs with.
+        fund_loadgen_keys: env::args().any(|a| a == "--fund-loadgen-keys"),
         sequencer_idle: parse_flag_opt::<String>("--sequencer-idle").map_or_else(
             matcher::SequencerIdle::default,
             |v| {
@@ -346,6 +350,28 @@ fn parse_journal() -> Option<matcher::cmdlog::JournalConfig> {
     };
     cfg.checkpoint_after_records = parse_flag("--journal-checkpoint-records", 100_000u64);
     Some(cfg)
+}
+
+/// Fund the benchmark identities `oxide-loadgen` signs with (ed25519-derived
+/// owners and EVM addresses for accounts `0..n`). DEVELOPMENT ONLY: these
+/// keys are publicly derivable, so anything funded here is spendable by anyone.
+#[cfg(feature = "dev-identities")]
+fn fund_loadgen_identities(n: usize, mut fund: impl FnMut(&primitives::Address)) {
+    eprintln!(
+        "oxide-matcher: WARNING --fund-loadgen-keys: funding {n} publicly derivable benchmark \
+         identities; never use this on a node that holds real value"
+    );
+    for i in 0..u32::try_from(n).unwrap_or(u32::MAX) {
+        fund(&matcher::loadkeys::ed_owner(i));
+        fund(&matcher::loadkeys::evm_address(i));
+    }
+}
+
+/// Refuse `--fund-loadgen-keys` in a build without the feature.
+#[cfg(not(feature = "dev-identities"))]
+fn fund_loadgen_identities(_n: usize, _fund: impl FnMut(&primitives::Address)) {
+    eprintln!("error: --fund-loadgen-keys needs a build with --features dev-identities");
+    std::process::exit(1);
 }
 
 /// Fund `n` accounts in a sharded balance cache, each with `DEFAULT_BALANCE`.
@@ -522,6 +548,9 @@ fn main() {
             );
             let balances = Arc::new(matcher::AtomicBalanceCache::new(cli.accounts_cap));
             fund_sharded(&balances, cli.accounts);
+            if cli.fund_loadgen_keys {
+                fund_loadgen_identities(cli.accounts, |a| balances.set(a, DEFAULT_BALANCE));
+            }
             println!("oxide-matcher: funded {} accounts with {DEFAULT_BALANCE} each", cli.accounts);
             let configs = build_market_configs(cli.markets);
             println!("oxide-matcher: spawning {} market worker threads...", configs.len());
@@ -539,6 +568,9 @@ fn main() {
                 server.set_nonce_store(p.clone());
             }
             fund_server(&mut server, cli.accounts);
+            if cli.fund_loadgen_keys {
+                fund_loadgen_identities(cli.accounts, |a| server.fund_account(a, DEFAULT_BALANCE));
+            }
             println!("oxide-matcher: funded {} accounts with {DEFAULT_BALANCE} each", cli.accounts);
             runtime.block_on(run_server_ring(server, submitter, confirmer, config, sender));
         }
@@ -552,6 +584,9 @@ fn main() {
                 server.set_nonce_store(p.clone());
             }
             fund_server(&mut server, cli.accounts);
+            if cli.fund_loadgen_keys {
+                fund_loadgen_identities(cli.accounts, |a| server.fund_account(a, DEFAULT_BALANCE));
+            }
             println!("oxide-matcher: funded {} accounts with {DEFAULT_BALANCE} each", cli.accounts);
             let shared = Arc::new(matcher::SharedMatcher::new(server));
             runtime.block_on(matcher::server::run_server(

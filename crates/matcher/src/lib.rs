@@ -71,6 +71,8 @@ pub mod control;
 pub mod fix;
 pub mod journal;
 pub mod jsonrpc;
+#[cfg(feature = "dev-identities")]
+pub mod loadkeys;
 pub mod market_data;
 pub mod protocol;
 pub mod ring;

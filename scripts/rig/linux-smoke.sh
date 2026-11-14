@@ -14,7 +14,7 @@
 #   scripts/rig/linux-smoke.sh x86       # emulated x86-64: prefetch feature, trading, crypto (asm keccak) and lanes tests
 #   scripts/rig/linux-smoke.sh shell     # interactive shell in the same environment
 #
-# Environment: IMAGE (default rust:1.98.1-bookworm, the Dockerfile's builder),
+# Environment: RIG_SECTIONS (rig mode sections), IMAGE (default rust:1.98.1-bookworm, the Dockerfile's builder),
 # JOBS (default 2: a Docker Desktop VM is small), PLATFORM (default native).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -31,7 +31,7 @@ inner() { # the command run inside the container
         echo 'cargo test -j'"$JOBS"' -p lanes -p matcher -p exchange -p crypto -p trading -p primitives 2>&1 | grep -E "^(test result|error|warning: unused|failures:|---- )|FAILED|panicked" | sort | uniq -c | sort -rn | head -40' ;;
     rig)
         echo 'apt-get install -y --no-install-recommends sysstat strace util-linux python3 procps >/dev/null 2>&1 || true;
-              cd /work && QUICK=1 CARGO_BUILD_JOBS='"$JOBS"' OUT=/out/rig SECTIONS="env budget lanes e2e journal summary" scripts/rig-bench.sh 2>&1 | tail -60' ;;
+              cd /work && QUICK=1 CARGO_BUILD_JOBS='"$JOBS"' OUT=/out/rig SECTIONS="${RIG_SECTIONS:-env budget lanes shards procs e2e journal summary}" scripts/rig-bench.sh 2>&1 | tail -60' ;;
     x86)
         echo 'uname -m; cargo check -j'"$JOBS"' -p trading --features prefetch 2>&1 | tail -3;
               cargo test -j'"$JOBS"' -p trading --features prefetch --lib 2>&1 | grep -E "^test result|FAILED|panicked|^error" | head;
