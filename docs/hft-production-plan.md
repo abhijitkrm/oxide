@@ -154,14 +154,16 @@ Each lists the change, the gate that proves it, and the evidence class (laptop =
 
 No phase starts before the previous gate passes unless this plan says so (consistent with AGENTS.md).
 
-## 6. Decisions needed from you
+## 6. Decisions (user, 15 Nov 2026)
 
-1. Retail share: what fraction of load may arrive individually signed (sets the verify budget).
-2. Commitment change: lagged sharded root (header commits to h-k). Needs a spec and an audit; recommended.
-3. EVM target definition: 1M tx/s of simple transfers implies either a higher block gas limit or very short blocks;
-   which parameter may we move?
-4. Hot markets as opt-in batch auctions: yes/no for the 10M+ stretch.
-5. Box budget: one 8-16 core x86 box first (recommended), then a 2-host session; any dedicated multi-host budget.
+1. **Retail share: under 5%** of load may arrive individually signed. Verify budget is sized for 95%+ bundle/MAC/
+   gateway traffic; the retail lane is bounded and may not starve bundles.
+2. **Lagged sharded root: approved.** Spec first (`docs/`), audit before it ships; header at h commits to root of h-k.
+3. **EVM target: move both** block gas limit and block time as needed; the plan must report the throughput for each
+   setting (gas limit x block interval grid) so the binding parameter is visible.
+4. **Hot markets as opt-in batch auctions: approved** (per-market flag; continuous matching stays the default).
+5. **Hardware ladder:** 8-core x86 box until we can prove hardware, not code, is the limit; then 16 cores to scale;
+   then the multi-validator set only after single-node limits are at physics limits (memory bandwidth, NVMe, NIC).
 
 ## 7. First two weeks of concrete work (no box needed)
 
