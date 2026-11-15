@@ -81,6 +81,7 @@ pub mod deadline;
 mod fastpath;
 pub mod fee;
 pub mod history;
+mod lanes;
 pub mod ledger;
 mod module_impl;
 pub mod native_journal;
@@ -628,6 +629,15 @@ pub struct EvmModule {
     /// and corrupt roots, hence it is maintained only through
     /// `fetch_max` on every insertion.
     retained_depth: std::sync::atomic::AtomicUsize,
+    /// Run qualifying light batches on sender-partitioned lanes (see `lanes`). OFF by
+    /// default: exact (differential-tested) but, on the 8-thread laptop, not faster than the
+    /// serial lane for fresh-recipient transfers (the serial merge into the global account,
+    /// touched, undo and history structures costs as much as the ~0.3 us/tx of execution it
+    /// parallelizes). The serial lane stays the reference and the fallback.
+    pub(crate) exec_lanes: std::sync::atomic::AtomicBool,
+    /// Batches executed on lanes (test/bench instrumentation: a qualifying batch must
+    /// use them, a non-qualifying one must not).
+    pub(crate) lane_batches: std::sync::atomic::AtomicU64,
     /// Root-stage state (`docs/root-stage-spec.md`); inert unless enabled.
     pub(crate) root_stage: rootstage::RootStageState,
     /// accounts were touched since the last computation, the cached
@@ -711,6 +721,8 @@ impl EvmModule {
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
             retained_depth: std::sync::atomic::AtomicUsize::new(0),
+            exec_lanes: std::sync::atomic::AtomicBool::new(false),
+            lane_batches: std::sync::atomic::AtomicU64::new(0),
             root_stage: rootstage::RootStageState::default(),
             trie_leaves_ready: Mutex::new(false),
             cached_state_root: Mutex::new(None),
@@ -750,6 +762,8 @@ impl EvmModule {
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
             retained_depth: std::sync::atomic::AtomicUsize::new(0),
+            exec_lanes: std::sync::atomic::AtomicBool::new(false),
+            lane_batches: std::sync::atomic::AtomicU64::new(0),
             root_stage: rootstage::RootStageState::default(),
             trie_leaves_ready: Mutex::new(false),
             cached_state_root: Mutex::new(None),
@@ -816,6 +830,8 @@ impl EvmModule {
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
             retained_depth: std::sync::atomic::AtomicUsize::new(0),
+            exec_lanes: std::sync::atomic::AtomicBool::new(false),
+            lane_batches: std::sync::atomic::AtomicU64::new(0),
             root_stage: rootstage::RootStageState::default(),
             trie_leaves_ready: Mutex::new(false),
             cached_state_root: Mutex::new(None),
@@ -1374,6 +1390,17 @@ impl EvmModule {
     #[doc(hidden)]
     pub fn parallel_reexec_count_for_test(&self) -> usize {
         self.parallel_reexecs.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of batches that ran on sender-partitioned lanes.
+    #[doc(hidden)]
+    pub fn lane_batches_for_test(&self) -> u64 {
+        self.lane_batches.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Enable or disable sender-partitioned execution lanes for light batches.
+    pub fn set_exec_lanes(&self, on: bool) {
+        self.exec_lanes.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Reset the leaf cache so the next `state_root` call performs

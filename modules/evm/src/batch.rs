@@ -718,6 +718,16 @@ impl EvmModule {
         // Blocks with enough contract-touching transactions keep
         // speculating, where revm time (10-50 us/tx) dominates.
         if Self::prefer_serial(&decoded) {
+            // Sender-partitioned lanes when the batch qualifies (they hand the batch
+            // back untouched otherwise); the serial lane is the reference.
+            let decoded = if self.exec_lanes.load(std::sync::atomic::Ordering::Relaxed) {
+                match self.execute_lanes(decoded) {
+                    Ok(results) => return results,
+                    Err(back) => back,
+                }
+            } else {
+                decoded
+            };
             return self.execute_decoded(ctx, decoded);
         }
         self.execute_parallel_decoded(ctx, decoded)
@@ -1395,6 +1405,24 @@ impl EvmModule {
         results
     }
 
+    /// The `evm_call` event for a finished transaction's receipt (shared by the serial
+    /// recording path and the lane path, which builds it in parallel).
+    pub(crate) fn evm_call_event(receipt: &receipts::Receipt, base_fee: u64) -> Event {
+        let status_str = if receipt.status { "success" } else { "revert" };
+        let contract_info =
+            receipt.contract_address.map(|a| format!(" contract={a}")).unwrap_or_default();
+        let log_count = receipt.logs.len();
+        Event {
+            module: "evm",
+            kind: "evm_call",
+            data: format!(
+                "gas_used={} status={} base_fee={} logs={}{}",
+                receipt.gas_used, status_str, base_fee, log_count, contract_info
+            )
+            .into_bytes(),
+        }
+    }
+
     /// Convert a revm `ExecutionResult` to a vector of Oxide events,
     /// recording the transaction into the executed-block history.
     ///
@@ -1425,23 +1453,7 @@ impl EvmModule {
                         call_trace,
                     );
                 }
-                let status_str = if receipt.status { "success" } else { "revert" };
-                let contract_info =
-                    receipt.contract_address.map(|a| format!(" contract={a}")).unwrap_or_default();
-                let log_count = receipt.logs.len();
-                Ok(vec![Event {
-                    module: "evm",
-                    kind: "evm_call",
-                    data: format!(
-                        "gas_used={} status={} base_fee={} logs={}{}",
-                        receipt.gas_used,
-                        status_str,
-                        self.current_base_fee(),
-                        log_count,
-                        contract_info
-                    )
-                    .into_bytes(),
-                }])
+                Ok(vec![Self::evm_call_event(&receipt, self.current_base_fee())])
             }
             Err(e) => Err(e),
         }

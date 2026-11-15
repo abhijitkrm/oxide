@@ -352,6 +352,25 @@ impl History {
         self.pending.traces.push(trace);
     }
 
+    /// [`Self::record`] for an owned batch: one call, no per-tx copy of the raw
+    /// bytes. Items are recorded in the given (canonical) order.
+    pub fn record_many(
+        &mut self,
+        items: Vec<(StoredTx, Receipt, Vec<u8>, Option<crate::trace::CallFrame>)>,
+    ) {
+        self.pending.txs.reserve(items.len());
+        self.pending.receipts.reserve(items.len());
+        self.pending.raws.reserve(items.len());
+        self.pending.traces.reserve(items.len());
+        for (mut tx, receipt, raw, trace) in items {
+            tx.tx_index = u32::try_from(self.pending.txs.len()).unwrap_or(u32::MAX);
+            self.pending.txs.push(tx);
+            self.pending.receipts.push(receipt);
+            self.pending.raws.push(raw);
+            self.pending.traces.push(trace);
+        }
+    }
+
     /// Receipts recorded so far in the still-open block, in
     /// execution order. The conformance runner reads the just-executed
     /// transaction's logs from here before `seal_block` runs; RPC
