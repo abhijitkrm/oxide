@@ -657,8 +657,25 @@ pub fn committed_leaf(map_tag: u64, preimage: &[u8]) -> Hash {
 /// problem over 256-bit leaf hashes — ~2^128-class work.
 pub struct CommittedMap<K, V> {
     map: BTreeMap<K, V>,
-    root: Hash,
+    /// Lazily maintained fold (see [`LazyFold`]).
+    fold: std::cell::RefCell<LazyFold<K>>,
     leaf: fn(&K, &V) -> Hash,
+}
+
+/// The deferred fold of a [`CommittedMap`].
+///
+/// `base` is the XOR of `leaf(k, v)` over every record **as of the last
+/// flush**. A key mutated since then is in `dirty` with the hash of the leaf
+/// it had at that flush (`None` if it was absent). A mutation therefore
+/// costs one map lookup after the first touch of a key, instead of two leaf
+/// hashes per mutation; the fold is settled once per key when the root is
+/// read (`flush`): XOR out the remembered leaf, XOR in the current one. The
+/// root is identical to the eager definition `XOR leaf(k, v)` over the
+/// current map (property-tested against `recomputed_root`).
+#[derive(Debug, Clone)]
+pub struct LazyFold<K> {
+    base: Hash,
+    dirty: BTreeMap<K, Option<Hash>>,
 }
 
 impl<K: Ord, V> CommittedMap<K, V> {
@@ -668,7 +685,11 @@ impl<K: Ord, V> CommittedMap<K, V> {
     /// [`committed_leaf`]).
     #[must_use]
     pub fn new(leaf: fn(&K, &V) -> Hash) -> Self {
-        Self { map: BTreeMap::new(), root: Hash::ZERO, leaf }
+        Self {
+            map: BTreeMap::new(),
+            fold: std::cell::RefCell::new(LazyFold { base: Hash::ZERO, dirty: BTreeMap::new() }),
+            leaf,
+        }
     }
 
     /// Wrap an existing map, folding every leaf once — O(n), the
@@ -681,13 +702,28 @@ impl<K: Ord, V> CommittedMap<K, V> {
         for (k, v) in &map {
             xor_fold(&mut root, leaf(k, v));
         }
-        Self { map, root, leaf }
+        Self {
+            map,
+            fold: std::cell::RefCell::new(LazyFold { base: root, dirty: BTreeMap::new() }),
+            leaf,
+        }
     }
 
-    /// The maintained root — O(1).
+    /// The maintained root: settles the keys mutated since the last read
+    /// (O(dirty keys), one leaf hash each), then O(1).
     #[must_use]
     pub fn root(&self) -> Hash {
-        self.root
+        let mut fold = self.fold.borrow_mut();
+        let dirty = std::mem::take(&mut fold.dirty);
+        for (k, orig) in dirty {
+            if let Some(h) = orig {
+                xor_fold(&mut fold.base, h);
+            }
+            if let Some(v) = self.map.get(&k) {
+                xor_fold(&mut fold.base, (self.leaf)(&k, v));
+            }
+        }
+        fold.base
     }
 
     /// The authoritative root, recomputed from the map — O(n).
@@ -716,43 +752,44 @@ impl<K: Ord, V> CommittedMap<K, V> {
         self.map.contains_key(k)
     }
 
-    /// Insert `v` at `k`, folding out the replaced leaf (if any) and
-    /// folding in the new one. Returns the previous value.
-    pub fn insert(&mut self, k: K, v: V) -> Option<V> {
-        if let Some(old) = self.map.get(&k) {
-            xor_fold(&mut self.root, (self.leaf)(&k, old));
+    /// Insert `v` at `k`, replacing (and folding out) the previous leaf if
+    /// any. Returns the previous value.
+    pub fn insert(&mut self, k: K, v: V) -> Option<V>
+    where
+        K: Clone,
+    {
+        if !self.fold.get_mut().dirty.contains_key(&k) {
+            let orig = self.map.get(&k).map(|old| (self.leaf)(&k, old));
+            self.fold.get_mut().dirty.insert(k.clone(), orig);
         }
-        xor_fold(&mut self.root, (self.leaf)(&k, &v));
         self.map.insert(k, v)
     }
 
-    /// Mutate the value at `k` in place, folding the old leaf out
-    /// before `f` runs and the new leaf in after. Returns `None` (and
-    /// does not call `f`) when `k` is absent.
-    ///
-    /// The root is identical to `get(k).cloned()` → mutate →
-    /// `insert(k, v)` — the same two leaves leave and enter the fold —
-    /// but without cloning the value, which for a value holding
-    /// collections (a perps account's positions and open orders) is
+    /// Mutate the value at `k` in place. Returns `None` (and does not call
+    /// `f`) when `k` is absent. The root equals `get(k).cloned()` -> mutate
+    /// -> `insert(k, v)`, without cloning the value, which for a value
+    /// holding collections (a perps account's positions and open orders) is
     /// one heap allocation per element (hft-audit-2 T-2).
     ///
     /// # Panics
-    /// Only if `f` panics. The fold is then out of step with the map
-    /// (the old leaf is out, the partially mutated value is in);
-    /// `recomputed_root` diverging from `root` makes that visible, and
-    /// a panic mid-mutation already leaves the module's state suspect.
-    pub fn update<R>(&mut self, k: &K, f: impl FnOnce(&mut V) -> R) -> Option<R> {
-        let leaf = self.leaf;
+    /// Only if `f` panics: the map then holds a partially mutated value
+    /// that the fold will account for at the next root read; a panic
+    /// mid-mutation already leaves the module's state suspect.
+    pub fn update<R>(&mut self, k: &K, f: impl FnOnce(&mut V) -> R) -> Option<R>
+    where
+        K: Clone,
+    {
+        if !self.fold.get_mut().dirty.contains_key(k) {
+            let orig = self.map.get(k).map(|v| (self.leaf)(k, v))?;
+            self.fold.get_mut().dirty.insert(k.clone(), Some(orig));
+        }
         let v = self.map.get_mut(k)?;
-        xor_fold(&mut self.root, leaf(k, v));
-        let r = f(v);
-        xor_fold(&mut self.root, leaf(k, v));
-        Some(r)
+        Some(f(v))
     }
 
     /// Mutate the value at `k` in place, inserting `default()` first
     /// when absent — the in-place equivalent of
-    /// `get(&k).cloned().unwrap_or_else(default)` → mutate →
+    /// `get(&k).cloned().unwrap_or_else(default)` -> mutate ->
     /// `insert(k, v)`, with the same resulting map and root (an absent
     /// key ends up present even if `f` changes nothing). See
     /// [`Self::update`] for the clone this avoids and the panic note.
@@ -761,30 +798,31 @@ impl<K: Ord, V> CommittedMap<K, V> {
         k: K,
         default: impl FnOnce() -> V,
         f: impl FnOnce(&mut V) -> R,
-    ) -> R {
-        let leaf = self.leaf;
-        match self.map.entry(k) {
-            std::collections::btree_map::Entry::Occupied(mut slot) => {
-                xor_fold(&mut self.root, leaf(slot.key(), slot.get()));
-                let out = f(slot.get_mut());
-                xor_fold(&mut self.root, leaf(slot.key(), slot.get()));
-                out
-            }
-            std::collections::btree_map::Entry::Vacant(slot) => {
-                let mut value = default();
-                let out = f(&mut value);
-                xor_fold(&mut self.root, leaf(slot.key(), &value));
-                slot.insert(value);
-                out
-            }
+    ) -> R
+    where
+        K: Clone,
+    {
+        if !self.fold.get_mut().dirty.contains_key(&k) {
+            let orig = self.map.get(&k).map(|old| (self.leaf)(&k, old));
+            self.fold.get_mut().dirty.insert(k.clone(), orig);
         }
+        let value = self.map.entry(k).or_insert_with(default);
+        f(value)
     }
 
     /// Remove `k`, folding its leaf out. Returns the removed value.
-    pub fn remove(&mut self, k: &K) -> Option<V> {
-        let prev = self.map.remove(k)?;
-        xor_fold(&mut self.root, (self.leaf)(k, &prev));
-        Some(prev)
+    pub fn remove(&mut self, k: &K) -> Option<V>
+    where
+        K: Clone,
+    {
+        if !self.map.contains_key(k) {
+            return None;
+        }
+        if !self.fold.get_mut().dirty.contains_key(k) {
+            let orig = self.map.get(k).map(|v| (self.leaf)(k, v));
+            self.fold.get_mut().dirty.insert(k.clone(), orig);
+        }
+        self.map.remove(k)
     }
 
     /// Number of committed records.
@@ -856,7 +894,7 @@ where
     V: Clone,
 {
     fn clone(&self) -> Self {
-        Self { map: self.map.clone(), root: self.root, leaf: self.leaf }
+        Self { map: self.map.clone(), fold: self.fold.clone(), leaf: self.leaf }
     }
 }
 
@@ -864,7 +902,7 @@ impl<K: Ord + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for Committed
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CommittedMap")
             .field("map", &self.map)
-            .field("root", &self.root)
+            .field("root", &self.root())
             .finish_non_exhaustive()
     }
 }
@@ -1351,6 +1389,55 @@ pub fn stage_blob_snapshot<'a, S>(
 
 #[cfg(test)]
 mod tests {
+
+    /// The lazy fold must equal the eager definition (`recomputed_root`) after
+    /// any interleaving of insert/update/upsert/remove and root reads,
+    /// including keys removed and re-inserted between reads.
+    #[test]
+    fn committed_map_lazy_fold_matches_recomputed_root() {
+        #[allow(clippy::trivially_copy_pass_by_ref)] // the map API fixes the fn(&K, &V) shape
+        fn leaf(k: &u32, v: &u64) -> Hash {
+            committed_leaf(7, &[k.to_le_bytes().as_slice(), v.to_le_bytes().as_slice()].concat())
+        }
+        let mut seed = 0xDEAD_BEEF_CAFE_F00Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..30 {
+            let mut m: CommittedMap<u32, u64> = CommittedMap::new(leaf);
+            for _ in 0..1_500 {
+                let k = (next() % 24) as u32;
+                match next() % 6 {
+                    0 => {
+                        m.insert(k, next());
+                    }
+                    1 => {
+                        m.update(&k, |v| *v = v.wrapping_add(1));
+                    }
+                    2 => m.update_or_insert_with(k, || 5, |v| *v ^= 0xFF),
+                    3 => {
+                        m.remove(&k);
+                    }
+                    4 => assert_eq!(m.root(), m.recomputed_root(), "mid-stream root"),
+                    _ => {
+                        // A burst of repeated mutations of one key between reads.
+                        for _ in 0..5 {
+                            m.update_or_insert_with(k, || 1, |v| *v = v.wrapping_mul(3));
+                        }
+                    }
+                }
+            }
+            assert_eq!(m.root(), m.recomputed_root());
+            // Reading twice is idempotent; a clone carries the pending state.
+            let again = m.root();
+            assert_eq!(m.root(), again);
+            let c = m.clone();
+            assert_eq!(c.root(), m.recomputed_root());
+        }
+    }
 
     /// `committed_leaf` moved from a streaming `Hasher` to the
     /// single-shot `hash_pair`; every committed-map root depends on

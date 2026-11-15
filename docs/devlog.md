@@ -24974,3 +24974,17 @@ operation; mutation-checked (shrinking the bound by one fails it).
 Bundle mix (64 orders per signed tx, 1.92M orders, 8 threads, real executor): dispatch 92 -> 45 us per bundle, loop
 600k -> 1.05-1.13M orders/s, end-to-end total 549-569k -> 937-997k orders/s (per-order transactions at the start of the
 day: 94k). Remaining frames: the per-order ledger escrow and the committed-state fold (blake3 `committed_leaf`).
+
+### Committed-map fold made lazy: exchange execution 2x again
+
+Profile after the IdMap fix: blake3 `compress` (the `CommittedMap` XOR fold: two leaf hashes per mutation) was the top frame;
+an order touches several committed maps (base balances, holds, fee vault, registrations) and a bundle mutates the same keys
+dozens of times per block. `CommittedMap` now defers the fold (`LazyFold`): the first mutation of a key since the last root
+read remembers the leaf it had then (one hash), later mutations of that key cost one map lookup, and `root()` settles each
+dirty key once (XOR out the remembered leaf, XOR in the current one). The root is by definition unchanged;
+`committed_map_lazy_fold_matches_recomputed_root` interleaves insert/update/upsert/remove/root reads/removed-then-reinserted
+keys against `recomputed_root` over 30 random streams (mutation-checked: dropping the XOR-out fails it), and the golden roots in
+exchange/perps and every module's tests are unchanged. Mutators now require `K: Clone` (all keys are).
+Measured (laptop, 8 threads, real executor): bundle dispatch 45 -> 21 us per 64-order bundle; bundle loop 1.05-1.13M ->
+1.60M (sync) / 1.99M (root stage) orders/s; end-to-end 1.34M / 1.61M orders/s (per-order transactions at the start of the day:
+94k, 17x). Per-order CLOB transactions: dispatch 1.10 -> 0.43 us/tx, loop 237k -> 434k tx/s.
