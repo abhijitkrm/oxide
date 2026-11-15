@@ -24960,3 +24960,17 @@ transactions, end-to-end total 549-569k orders/s versus 94k. Execution is now th
 workstream W3 (batch ledger deltas). Gate G4 in `scripts/bench-gate.sh` (bundle admission >= 10x per-order; 51x measured).
 Not yet done from the spec: fee model per item (the envelope fee is flat per tx), fuzz target for the decoder, wallet/SDK,
 loadgen scheme, activation-height gate.
+
+### Matching engine id map: O(cluster) removal fixed (bundle execution 2x)
+
+Profile of the bundle benchmark: the top non-idle frame was `trading::idmap::IdMap::remove`. The map uses the identity
+hash (sequential ids get perfect locality) but removal used backward-shift deletion that walks to the next EMPTY slot, and
+sequential ids make the live set one contiguous cluster, so every removal (every fill of a resting order, every cancel)
+cost O(live resting orders). Fix: a `max_disp` bound (largest displacement of any entry from its home bucket, raised on
+insert, never lowered) ends the walk when no later entry can move into the hole. The resulting table is slot-for-slot
+identical to the unbounded algorithm: `bounded_backward_shift_matches_reference` replays random insert/remove streams
+(sequential and colliding keys, wrap-around) against a copy of the old algorithm and compares every slot after every
+operation; mutation-checked (shrinking the bound by one fails it).
+Bundle mix (64 orders per signed tx, 1.92M orders, 8 threads, real executor): dispatch 92 -> 45 us per bundle, loop
+600k -> 1.05-1.13M orders/s, end-to-end total 549-569k -> 937-997k orders/s (per-order transactions at the start of the
+day: 94k). Remaining frames: the per-order ledger escrow and the committed-state fold (blake3 `committed_leaf`).
