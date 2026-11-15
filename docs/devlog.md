@@ -24895,3 +24895,18 @@ item rising with trader count). EVM transfers for comparison: plan 0.34, dispatc
 find what the exchange does per touched account in `end_block` at scale (suspect per-account work rather than per
 order) and make it per-change. A clippy failure (cast_precision_loss) slipped into the first commit of the recorder
 because the gate was run without checking its exit code in the same command as the commit; fixed in the next commit.
+
+### W0 finding: the CLOB path pays the EVM Merkle-Patricia root per touched account
+
+Per-module timing at 100k accounts (temporary, reverted): the exchange and attendance hooks cost nanoseconds; the
+`end_block` cost (1.9 us/tx, 40-65 ms per block) is the **EVM module's state-root update**. CLOB transactions
+move native-token balances (fees, escrow, settlement) through the EVM account store, the chain's single native
+ledger, so a 28k-order block touches ~29k EVM accounts (`touched=29355`) and the incremental MPT update pays
+~1.5-2 us per touched account at 100k+ accounts (about 40 ms per block, plus ~10 ms for the undo fold), even though
+no EVM transaction ran. With 1k accounts the same stage is 0.02 us/tx, which is why small-account benches never saw it.
+
+This is the structural reason cost per CLOB tx is not flat in trader count, and it names two fixes, both already in
+the plan: (1) lagged sharded root (W4, approved): the MPT update leaves the critical path; (2) batch-level settlement
+(W3): net balance deltas per account per block instead of per-order ledger writes cuts touched accounts, and a
+non-MPT commitment for the exchange's own balances removes the dependency. Gate: finalize tx/s at 100k accounts
+within 1.5x of the 1k-account figure (today 196k vs 357k = 1.8x).
