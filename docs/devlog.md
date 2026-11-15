@@ -24936,3 +24936,13 @@ compares against select-all-then-filter at five caps. Blocks are unchanged (140 
 Pipeline loop (propose+finalize wall), 8 threads, 200k signed EVM transfers: sync 42.0k -> 66.6k tx/s; with the root
 stage 74.5k -> 108.0k tx/s; total from the start of the day 42.0k -> 108.0k (2.6x). Execution itself (plan+dispatch+
 end_block) is now the bound at ~8 us/tx (125k tx/s) in root-stage mode.
+
+### Preverify cache: O(block) instead of O(backlog) per block
+
+`execute_block` took the whole ingest-time signature cache and re-inserted the leftover per block (my earlier fix for
+re-recovering signatures): ~190k hash-map inserts per block at a 200k backlog (the top non-idle frame in a `sample`).
+Now only the block's own entries move out (one hash + one removal per tx), the rest stays in the shared cache, and the
+cache is cleared if it outgrows the pool capacity (stale entries for evicted txs). `dispatch` 5.3 -> 3.4 us/tx; loop
+(propose+finalize wall) EVM transfers 8 threads: sync 76k, root stage 121k tx/s (42k at the start of the day); CLOB
+at 100k accounts with the root stage 237k tx/s. Admission (secp256k1 recovery, ~145-155k tx/s on 8 threads) is now the
+pipeline's cap, which is exactly what bundle authentication (plan W2) addresses.

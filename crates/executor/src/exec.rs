@@ -522,10 +522,30 @@ impl Executor {
         // the loop consults it to skip re-verifying envelope
         // signatures that were already verified at mempool
         // admission, and the dispatch loop below consumes it.
-        // (`mem::take` swaps in an empty map — zero-copy, one lock
-        // acquisition for the whole block.)
-        let mut preverify_cache =
-            std::mem::take(&mut *primitives::sync::lock_state(&self.preverify_cache));
+        // Only THIS block's entries move out (one lock, one hash and one
+        // removal per tx): taking the whole cache and re-inserting the
+        // leftover per block was O(pending txs) per block — ~190k hash-map
+        // inserts per block at a 200k backlog. Entries for txs that wait
+        // for later blocks simply stay in the shared cache, where ingest
+        // keeps adding to it. A hit still only means "this node verified
+        // these exact bytes at ingest", so retention cannot change a result.
+        let mut preverify_cache: primitives::digest_map::DigestMap<[u8; 20]> = {
+            let mut shared = primitives::sync::lock_state(&self.preverify_cache);
+            // Bound stale entries (txs the pool evicted never execute):
+            // when the cache outgrows the pool capacity, drop it all; a
+            // miss only costs one signature recovery.
+            if shared.len() > self.preverify_cap {
+                shared.clear();
+            }
+            block
+                .txs
+                .iter()
+                .filter_map(|tx| {
+                    let h = Hasher::hash_one(Domain::Transaction, tx.as_bytes());
+                    shared.remove(&h).map(|sender| (h, sender))
+                })
+                .collect()
+        };
 
         let mut skipped: Vec<(Hash, TxSkipReason)> = Vec::new();
         let t_plan = std::time::Instant::now();
@@ -591,7 +611,6 @@ impl Executor {
         // block. Taking the whole cache above and dropping what is left made every block after
         // the first re-recover each pending native tx's signature serially in
         // `plan_block_runs` (~50 us each: the measured 18k tx/s CLOB ceiling).
-        self.restore_preverify_leftover(preverify_cache, &block.txs);
         if !dispatch_skipped.is_empty() {
             let mut outcomes = primitives::sync::lock_state(&self.tx_outcomes);
             for (hash, reason) in dispatch_skipped {
@@ -687,33 +706,6 @@ impl Executor {
                     .collect();
                 canonical_state_root(roots, *nonce_root)
             }
-        }
-    }
-
-    /// Put back the preverify-cache entries this block did not consume.
-    ///
-    /// `leftover` is what remains of the cache `execute_block` took. Entries for
-    /// this block's own transactions are removed (their tx has executed; fee-paying
-    /// native runs never consume theirs), and the rest are returned to the shared
-    /// cache, which ingest has kept filling meanwhile. A hit still means "this node
-    /// verified these exact bytes at ingest", so retention cannot change any result,
-    /// only skip a redundant recovery. If retaining would exceed `preverify_cap`
-    /// (stale entries for txs the pool evicted) the leftover is dropped, the old
-    /// behaviour, so the cache stays bounded.
-    pub(crate) fn restore_preverify_leftover(
-        &self,
-        mut leftover: primitives::digest_map::DigestMap<[u8; 20]>,
-        block_txs: &[types::TxBytes],
-    ) {
-        if leftover.is_empty() {
-            return;
-        }
-        for tx in block_txs {
-            leftover.remove(&Hasher::hash_one(Domain::Transaction, tx.as_bytes()));
-        }
-        let mut shared = primitives::sync::lock_state(&self.preverify_cache);
-        if shared.len().saturating_add(leftover.len()) <= self.preverify_cap {
-            shared.extend(leftover);
         }
     }
 
