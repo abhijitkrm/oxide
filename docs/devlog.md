@@ -24875,3 +24875,7 @@ this (`CLOB_LAGGED_APP_HASH=k`, backpressure rule `E(H) >= H-k`, snapshots taken
 height); that is a protocol change (attestation, state sync, light clients) and needs its own spec in
 `docs/` first, so it is not done here. Their design also streams fills before the root commits and
 treats CPU-per-input as the honest throughput number.
+
+### Study of the Go reference chain and the production/HFT plan
+
+Read the reference's design docs, practices checklist, box report and harness layout (not its keeper code line by line). Result: `docs/hft-production-plan.md`. Neither stack has shown 10M items/s end to end (the reference: ~1.1M/s measured, one 32-core node, signed, persisted). Our edge is the engine and EVM execution; theirs is method (per-item budget, traders x markets matrix, shadow-equal gates, lagged root, invalid-run rules). New data point: `chain_mix --mix clob`, laptop, 8 ingest threads, 200k signed orders: admission 153k/s (secp256k1 recovery bound), propose 873k/s, finalize 343k/s.
