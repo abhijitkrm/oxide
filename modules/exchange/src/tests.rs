@@ -3070,3 +3070,100 @@ mod disputes {
         let _ = legs_root(&honest_legs());
     }
 }
+
+// ── Bundles (docs/bundle-auth-spec.md) ───────────────────────────
+
+/// A mixed stream of places (crossing and resting) and cancels, as separate messages.
+fn bundle_stream() -> Vec<Vec<u8>> {
+    let mut items = Vec::new();
+    for i in 0..30u64 {
+        let side = if i % 2 == 0 { Side::Sell } else { Side::Buy };
+        // Alternating prices around a crossing point so some fill and some rest.
+        items.push(msg::place(0, limit(side, 480 + (i * 7) % 40, 1 + i % 3, 9)));
+    }
+    // Cancels of order ids that may or may not exist (rejections must match too).
+    for id in [1u64, 2, 3, 999] {
+        items.push(msg::cancel(0, OrderId(id)));
+    }
+    items
+}
+
+#[test]
+fn bundle_equals_separate_transactions() {
+    let items = bundle_stream();
+
+    let (ledger_a, ex_a) = ledger_and_exchange();
+    let mut sep_events = Vec::new();
+    for item in &items {
+        match ex_a.handle(&ctx(9), item) {
+            Ok(evs) => sep_events.extend(evs.into_iter().map(|e| (e.kind, e.data))),
+            Err(_) => sep_events.push(("rejected", Vec::new())),
+        }
+    }
+
+    let (ledger_b, ex_b) = ledger_and_exchange();
+    let bundle = msg::bundle(&items).expect("bundle");
+    let evs = ex_b.handle(&ctx(9), &bundle).expect("bundle handled");
+    let bundle_events: Vec<_> = evs
+        .into_iter()
+        .map(|e| {
+            if e.kind == "bundle_item_rejected" {
+                ("rejected", Vec::new())
+            } else {
+                (e.kind, e.data)
+            }
+        })
+        .collect();
+
+    assert_eq!(sep_events, bundle_events, "events must match item for item");
+    assert_eq!(executor::Module::state_root(&ex_a), executor::Module::state_root(&ex_b));
+    assert_eq!(ledger_a.balance(&addr(9)), ledger_b.balance(&addr(9)));
+    assert_eq!(ex_a.base_balance(addr(9), 0), ex_b.base_balance(addr(9), 0));
+}
+
+#[test]
+fn malformed_bundles_execute_nothing() {
+    let (_ledger, ex) = ledger_and_exchange();
+    let root = executor::Module::state_root(&ex);
+    let good = msg::place(0, limit(Side::Sell, 600, 1, 9));
+    let bundle = msg::bundle(&[good.clone(), good.clone()]).expect("bundle");
+
+    // Truncated, trailing garbage, zero count, wrong tag inside, oversize count.
+    let mut truncated = bundle.clone();
+    truncated.truncate(truncated.len() - 3);
+    let mut trailing = bundle.clone();
+    trailing.push(0);
+    let zero = vec![super::TAG_BUNDLE, 0, 0];
+    let mut bad_tag = msg::bundle(&[vec![super::TAG_LIST_MARKET, 1, 2]]).expect("bundle");
+    bad_tag[0] = super::TAG_BUNDLE;
+    let huge = vec![super::TAG_BUNDLE, 0xFF, 0xFF];
+    for m in [truncated, trailing, zero, bad_tag, huge] {
+        assert!(matches!(ex.handle(&ctx(9), &m), Err(ExecError::Malformed)));
+    }
+    assert_eq!(executor::Module::state_root(&ex), root, "no item may execute");
+    assert!(msg::bundle(&vec![good; super::MAX_BUNDLE_ITEMS + 1]).is_none());
+}
+
+#[test]
+fn bundle_acts_only_for_the_signer() {
+    // Another trader's resting order cannot be cancelled by a bundle signed by someone else.
+    let (_ledger, ex) = ledger_and_exchange();
+    ex.handle(&ctx(9), &msg::place(0, limit(Side::Sell, 700, 1, 9))).unwrap();
+    let before = executor::Module::state_root(&ex);
+    let evs = ex
+        .handle(&ctx(1), &msg::bundle(&[msg::cancel(0, OrderId(0))]).unwrap())
+        .expect("bundle handled");
+    assert!(evs.iter().any(|e| e.kind == "bundle_item_rejected"));
+    assert_eq!(executor::Module::state_root(&ex), before);
+}
+
+#[test]
+fn bundle_gas_charges_the_base_cost_per_item() {
+    let (_ledger, ex) = ledger_and_exchange();
+    let one = msg::place(0, limit(Side::Sell, 600, 1, 9));
+    let n = 64usize;
+    let bundle = msg::bundle(&vec![one.clone(); n]).expect("bundle");
+    let single = executor::Module::estimate_gas(&ex, &one);
+    let bundled = executor::Module::estimate_gas(&ex, &bundle);
+    assert!(bundled >= 1000 * n as u64 && bundled >= single * (n as u64) / 2);
+}

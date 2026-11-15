@@ -393,6 +393,23 @@ const TAG_CANCEL_LINKED: u8 = 14;
 /// `[market:1][order_id:8][price:8][qty:8][stp:1]` = 26 bytes.
 const TAG_AMEND: u8 = 15;
 
+/// Bundle message tag (`docs/bundle-auth-spec.md`): one signed transaction
+/// carrying many place/cancel/amend messages for the SIGNER's account. Body
+/// `[count:2 LE]` then `count` items of `[len:2 LE][message]`, where each
+/// message is an ordinary place, cancel or amend (tags 0, 1, 15). One
+/// signature recovery and one nonce cover the whole bundle, which is the
+/// point: signature recovery (~50 us) is the chain path's admission cap.
+const TAG_BUNDLE: u8 = 19;
+
+/// Most items in one bundle (unit: messages). Origin: spec section 2; 1,024
+/// items at one recovery is ~0.05 us/item of authentication. Raising it
+/// lengthens the time one tx holds the exchange lock inside a block.
+pub const MAX_BUNDLE_ITEMS: usize = 1_024;
+
+/// Largest bundle body (unit: bytes). Checked before any item executes, and
+/// by the mempool-side size limits before signature recovery.
+pub const MAX_BUNDLE_BYTES: usize = 128 * 1024;
+
 /// Size of a single fill entry in a batch-settle message:
 /// 2 + 8 + 8 + 20 + 8 + 20 + 8 = 74 bytes.
 pub const FILL_ENTRY_LEN: usize = 74;
@@ -989,6 +1006,24 @@ pub mod msg {
         msg.push(market);
         msg.extend_from_slice(&order_id.0.to_le_bytes());
         msg
+    }
+
+    /// Build a bundle message from already-built place/cancel/amend
+    /// messages. Returns `None` if the bundle would exceed
+    /// [`MAX_BUNDLE_ITEMS`] / [`MAX_BUNDLE_BYTES`] or an item is longer than
+    /// a `u16` length can express.
+    pub fn bundle(items: &[Vec<u8>]) -> Option<Vec<u8>> {
+        if items.len() > super::MAX_BUNDLE_ITEMS {
+            return None;
+        }
+        let mut msg = Vec::with_capacity(1 + 2 + items.iter().map(|i| 2 + i.len()).sum::<usize>());
+        msg.push(super::TAG_BUNDLE);
+        msg.extend_from_slice(&u16::try_from(items.len()).ok()?.to_le_bytes());
+        for item in items {
+            msg.extend_from_slice(&u16::try_from(item.len()).ok()?.to_le_bytes());
+            msg.extend_from_slice(item);
+        }
+        (msg.len() - 1 <= super::MAX_BUNDLE_BYTES).then_some(msg)
     }
 
     /// Build an amend-order message (`docs/amend-spec.md`): resize or

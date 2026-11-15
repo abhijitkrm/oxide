@@ -8,8 +8,8 @@
 
 use super::{
     Address, Event, ExchangeModule, ExecError, Hash, Height, Module, RejectCategory, TAG_AMEND,
-    TAG_BATCH_SETTLE, TAG_BATCH_SETTLE_COMMITTED, TAG_BOND_DEPOSIT, TAG_CANCEL, TAG_CANCEL_LINKED,
-    TAG_CANCEL_REGISTERED, TAG_DEPOSIT_BASE, TAG_DEPOSIT_BASE_FOR, TAG_DISPUTE,
+    TAG_BATCH_SETTLE, TAG_BATCH_SETTLE_COMMITTED, TAG_BOND_DEPOSIT, TAG_BUNDLE, TAG_CANCEL,
+    TAG_CANCEL_LINKED, TAG_CANCEL_REGISTERED, TAG_DEPOSIT_BASE, TAG_DEPOSIT_BASE_FOR, TAG_DISPUTE,
     TAG_LINK_TRADING_KEY, TAG_LIST_MARKET, TAG_PLACE, TAG_REGISTER_LINKED, TAG_REGISTER_ORDER,
     TAG_SWEEP_LINKED, TAG_UNLINK_TRADING_KEY, TAG_WITHDRAW_BASE, TAG_WITHDRAW_LINKED, TxContext,
     base_balances_leaf, base_holds_leaf, decode, fee_vault_leaf, linked_leaf, module_id,
@@ -23,6 +23,20 @@ impl Module for ExchangeModule {
 
     fn id(&self) -> u8 {
         module_id::EXCHANGE
+    }
+
+    /// Gas for a message: the default `1000 + bytes`, except a bundle, which
+    /// pays the base cost once per item (a bundle of N orders must not be
+    /// cheaper for block capacity than N separate transactions).
+    fn estimate_gas(&self, msg: &[u8]) -> u64 {
+        let default = 1000 + msg.len() as u64;
+        match msg {
+            [TAG_BUNDLE, c0, c1, ..] => {
+                let count = u64::from(u16::from_le_bytes([*c0, *c1])).max(1);
+                1000u64.saturating_mul(count).saturating_add(msg.len() as u64)
+            }
+            _ => default,
+        }
     }
 
     fn begin_block(&self, height: Height) {
@@ -44,6 +58,8 @@ impl Module for ExchangeModule {
             TAG_CANCEL => self.handle_cancel(ctx, body, &mut inner),
 
             TAG_AMEND => self.handle_amend(ctx, body, &mut inner),
+
+            TAG_BUNDLE => self.handle_bundle(ctx, body, &mut inner),
 
             TAG_LIST_MARKET => {
                 let cfg = Self::parse_list_market(body).ok_or(ExecError::Malformed)?;

@@ -24946,3 +24946,17 @@ cache is cleared if it outgrows the pool capacity (stale entries for evicted txs
 (propose+finalize wall) EVM transfers 8 threads: sync 76k, root stage 121k tx/s (42k at the start of the day); CLOB
 at 100k accounts with the root stage 237k tx/s. Admission (secp256k1 recovery, ~145-155k tx/s on 8 threads) is now the
 pipeline's cap, which is exactly what bundle authentication (plan W2) addresses.
+
+### Bundles implemented (exchange tag 19): admission 150k -> 7.5-8.4M orders/s
+
+`docs/bundle-auth-spec.md` step 1 built: `msg::bundle`, `TAG_BUNDLE = 19`, `handle_bundle` (framing validated for the whole
+bundle first; allowed items place/cancel/amend; per-item rejection events; acts only for the signer), gas =
+1000 per item + bytes. Tests: bundle equals the same orders as separate transactions (events, state root, balances;
+mutation-checked by reversing item order), malformed bundles execute nothing, signer-only authority, gas per item.
+`chain_mix --mix bundle` (`BUNDLE_ITEMS`, default 64): 1.92M orders as 30k signed bundles, laptop, 8 threads, signed
+through the real executor: admission 7.5M (sync) / 8.4M (root stage) orders/s versus 137-153k for per-order
+transactions, end-to-end total 549-569k orders/s versus 94k. Execution is now the bound: dispatch 92-94 us per
+64-order bundle (1.4 us/order), in the serial exchange path with per-order escrow through the EVM ledger; that is
+workstream W3 (batch ledger deltas). Gate G4 in `scripts/bench-gate.sh` (bundle admission >= 10x per-order; 51x measured).
+Not yet done from the spec: fee model per item (the envelope fee is flat per tx), fuzz target for the decoder, wallet/SDK,
+loadgen scheme, activation-height gate.

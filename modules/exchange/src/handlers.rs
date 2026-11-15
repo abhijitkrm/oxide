@@ -25,6 +25,69 @@ use crate::settle::{
 };
 
 impl ExchangeModule {
+    /// Handle a bundle (`docs/bundle-auth-spec.md`): validate the framing of
+    /// the whole bundle first (atomic: a malformed bundle executes nothing),
+    /// then run each place/cancel/amend item in order for the signer. A
+    /// rejected item does not abort the bundle; it is reported as a
+    /// `bundle_item_rejected` event carrying the item index and reason, so
+    /// the outcome equals sending the items as separate transactions.
+    pub(crate) fn handle_bundle(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        if body.len() > crate::MAX_BUNDLE_BYTES || body.len() < 2 {
+            return Err(ExecError::Malformed);
+        }
+        let count = usize::from(u16::from_le_bytes([body[0], body[1]]));
+        if count == 0 || count > crate::MAX_BUNDLE_ITEMS {
+            return Err(ExecError::Malformed);
+        }
+        // Pass 1: framing only (cheap, allocation-free); items are not executed
+        // unless every length is consistent and every tag is allowed.
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(count);
+        let mut at = 2usize;
+        for _ in 0..count {
+            let len_end = at.checked_add(2).ok_or(ExecError::Malformed)?;
+            let len = usize::from(u16::from_le_bytes([
+                *body.get(at).ok_or(ExecError::Malformed)?,
+                *body.get(at + 1).ok_or(ExecError::Malformed)?,
+            ]));
+            let end = len_end.checked_add(len).ok_or(ExecError::Malformed)?;
+            let item = body.get(len_end..end).ok_or(ExecError::Malformed)?;
+            match item.first() {
+                Some(&(crate::TAG_PLACE | crate::TAG_CANCEL | crate::TAG_AMEND)) => {}
+                _ => return Err(ExecError::Malformed),
+            }
+            spans.push((len_end, end));
+            at = end;
+        }
+        if at != body.len() {
+            return Err(ExecError::Malformed);
+        }
+        // Pass 2: execute in order for the signer.
+        let mut events = Vec::new();
+        for (i, (start, end)) in spans.into_iter().enumerate() {
+            let item = &body[start..end];
+            let (tag, rest) = (item[0], &item[1..]);
+            let result = match tag {
+                crate::TAG_PLACE => self.handle_place(ctx, rest, inner),
+                crate::TAG_CANCEL => self.handle_cancel(ctx, rest, inner),
+                _ => self.handle_amend(ctx, rest, inner),
+            };
+            match result {
+                Ok(evs) => events.extend(evs),
+                Err(e) => {
+                    let mut data = u16::try_from(i).unwrap_or(u16::MAX).to_le_bytes().to_vec();
+                    data.extend_from_slice(format!("{e:?}").as_bytes());
+                    events.push(Event { module: "exchange", kind: "bundle_item_rejected", data });
+                }
+            }
+        }
+        Ok(events)
+    }
+
     /// Handle a cancel-order message (extracted from `handle`):
     /// remove the resting order and release its reservation — quote
     /// for buys, base for sells — exactly once.

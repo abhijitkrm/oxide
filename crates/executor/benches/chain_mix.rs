@@ -177,9 +177,14 @@ fn rig(accts: &[Account], capacity: usize) -> Rig {
 fn is_clob(mix: &str, i: usize) -> bool {
     match mix {
         "transfer" => false,
-        "clob" => true,
+        "clob" | "bundle" => true,
         _ => i % 4 >= 2, // mixed: half the senders trade
     }
+}
+
+/// Orders per bundle transaction in the `bundle` mix (env `BUNDLE_ITEMS`, default 64).
+fn bundle_items() -> usize {
+    std::env::var("BUNDLE_ITEMS").ok().and_then(|v| v.parse().ok()).unwrap_or(64)
 }
 
 fn build(mix: &str, accts: &[Account], per_acct: usize, ring: bool) -> Vec<Vec<TxBytes>> {
@@ -190,7 +195,20 @@ fn build(mix: &str, accts: &[Account], per_acct: usize, ring: bool) -> Vec<Vec<T
             let clob = is_clob(mix, i);
             (0..per_acct as u64)
                 .map(|n| {
-                    if clob {
+                    if mix == "bundle" {
+                        // One signed tx carrying BUNDLE_ITEMS orders for this account
+                        // (docs/bundle-auth-spec.md): same orders as the `clob` mix, one signature.
+                        let side = if i % 2 == 0 { Side::Sell } else { Side::Buy };
+                        let items: Vec<Vec<u8>> = (0..bundle_items())
+                            .map(|_| msg::place(0, order(side, a.addr)))
+                            .collect();
+                        signed_native(
+                            a,
+                            n,
+                            framework::module_id::EXCHANGE,
+                            &msg::bundle(&items).expect("bundle"),
+                        )
+                    } else if clob {
                         // Even accounts sell, odd buy, all at one price: every order crosses.
                         let side = if i % 2 == 0 { Side::Sell } else { Side::Buy };
                         signed_native(
@@ -217,7 +235,9 @@ fn build(mix: &str, accts: &[Account], per_acct: usize, ring: bool) -> Vec<Vec<T
 
 fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
     let accts = accounts(n_accts);
-    let per = (total / n_accts).max(1);
+    // In the `bundle` mix `total` counts ORDERS; each tx carries `bundle_items()` of them.
+    let weight = if mix == "bundle" { bundle_items() } else { 1 };
+    let per = (total / n_accts / weight).max(1);
     let txs = build(mix, &accts, per, ring);
     let n: usize = txs.iter().map(Vec::len).sum();
     let Rig { executor, exchange } = rig(&accts, n);
@@ -303,7 +323,8 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
     // Measurement spine (plan W0): where `execute_block` spends its time, per transaction,
     // from the executor's permanent stage recorder. Stderr so the CSV on stdout is unchanged;
     // `scripts/rig/summarize.py` and humans read the `stages,` lines.
-    let rate = |count: usize, secs: f64| count as f64 / secs;
+    // Rates are in ITEMS per second (orders for bundles, transactions otherwise).
+    let rate = |count: usize, secs: f64| (count * weight) as f64 / secs;
     let st = executor.stage_report();
     let (plan, dispatch, end_block, root) = st.us_per_tx();
     eprintln!(
