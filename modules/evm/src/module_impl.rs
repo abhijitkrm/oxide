@@ -12,7 +12,7 @@ use super::{
     Address, Arc, BLOCK_TIME_SECS, Balances, CHAIN_BLOCK_GAS_LIMIT, CacheDB, EmptyDB, Event,
     EvmModule, ExecError, HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS, Hash, Height,
     INTRINSIC_GAS_BASE, MODULE_ID, Module, PreverifiedTx, RejectCategory, SpecId, TxContext,
-    alloy_primitives_address, encode_trie_leaf, fee, persist, sparse_walk, trie, tx, versioned,
+    alloy_primitives_address, encode_trie_leaf, fee, persist, trie, tx, versioned,
 };
 
 impl Module for EvmModule {
@@ -603,58 +603,12 @@ impl Module for EvmModule {
         let db = framework::lock_state(&self.db);
         let mut storage_root_cache = framework::lock_state(&self.storage_root_cache);
 
+        let full_build = !*leaves_ready;
         if *leaves_ready {
             // Incremental patch — only `touched` accounts are
-            // re-encoded. `touched` is the complete modified set
-            // (populated from `EvmState::keys()` post-commit), so
-            // every changed account is patched; accounts absent
-            // from the cache were removed from state.
-            for (addr, hashed) in &touched_pairs {
-                let (addr, hashed) = (addr, *hashed);
-                // `NotExisting` tombstones (selfdestruct, or a revm
-                // `basic()` miss cached as absent) are NOT part of the
-                // state trie — committing them as leaves would put the
-                // root ahead of persisted state, which never carries
-                // them (flush emits `Delete`). Two nodes that read a
-                // missing account on different paths would then
-                // compute different roots from identical state.
-                if let Some(account) = db
-                    .cache
-                    .accounts
-                    .get(addr)
-                    .filter(|a| a.account_state != revm::database::AccountState::NotExisting)
-                    // EIP-158: a touched account that ends up empty
-                    // (nonce 0, balance 0, no code) is deleted from
-                    // the state trie — e.g. the coinbase when the
-                    // tip is zero. Keeping it would put an extra
-                    // leaf in the root every upstream client drops.
-                    .filter(|a| !a.info.is_empty())
-                {
-                    let storage_root = if account.storage.is_empty() {
-                        trie::EMPTY_ROOT
-                    } else {
-                        // Touched → always recompute the
-                        // storage root (its slots changed).
-                        let storage_iter = account
-                            .storage
-                            .iter()
-                            .filter(|(_, value)| !value.is_zero())
-                            .map(|(slot, value)| {
-                                (
-                                    alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()),
-                                    *value,
-                                )
-                            });
-                        let root = trie::storage_root(storage_iter);
-                        storage_root_cache.insert(*addr, root);
-                        root
-                    };
-                    leaves.insert(hashed, encode_trie_leaf(account, storage_root));
-                } else {
-                    leaves.remove(&hashed);
-                    storage_root_cache.remove(addr);
-                }
-            }
+            // re-encoded (see `patch_delta`).
+            let delta = Self::patch_delta(&db, &touched_pairs);
+            Self::apply_patch(&mut leaves, &mut storage_root_cache, delta);
         } else {
             // Full build — first call after construction or
             // `import_state`. Hashes and encodes every account once
@@ -781,68 +735,9 @@ impl Module for EvmModule {
         //   `retained_branches[empty]` doesn't exist; we fall back to
         //   feeding all leaves for that call, and `split()` repopulates
         //   `retained_branches` for the next call.
-        let mut hb = alloy_trie::HashBuilder::default().with_updates(true);
-
-        let is_full_build = !*leaves_ready;
-        let can_sparse = !is_full_build && !retained.is_empty();
-
-        if can_sparse {
-            // Sparse incremental walk — O(touched · log n).
-            let touched_hashes: std::collections::BTreeSet<alloy_primitives::B256> =
-                touched_keys.iter().copied().collect();
-            sparse_walk(
-                alloy_trie::Nibbles::default(),
-                &retained,
-                &leaves,
-                &touched_hashes,
-                &mut hb,
-            );
-        } else {
-            // Full build (or fallback when no retained branches):
-            // feed every leaf in sorted hashed-key order.
-            for (hashed_key, rlp) in leaves.iter() {
-                hb.add_leaf(alloy_trie::Nibbles::unpack(hashed_key), rlp);
-            }
-        }
-
-        let root = hb.root();
-        let (_, branch_updates) = hb.split();
-
-        if is_full_build {
-            // Full build: replace the entire retained map.
-            // `split()` returns `alloy_primitives::map::HashMap`
-            // (hashbrown, DefaultHashBuilder); convert to the std
-            // HashMap used by `retained_branches`.
-            *retained = branch_updates.into_iter().collect();
-            let max_len = retained.keys().map(alloy_trie::Nibbles::len).max().unwrap_or(0);
-            self.retained_depth.fetch_max(max_len, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            // Incremental build: remove stale branches on the
-            // touched path, then merge the rebuilt branches.
-            // A branch is "on the touched path" if its nibble
-            // prefix is a prefix of any touched hashed key. We
-            // check all 64 prefix lengths per touched key; only
-            // prefixes that exist in `retained` are removed.
-            let depth = self.retained_depth.load(std::sync::atomic::Ordering::Relaxed);
-            for hashed in &touched_keys {
-                let nibbles = alloy_trie::Nibbles::unpack(hashed);
-                for len in 0..=depth.min(nibbles.len().saturating_sub(1)) {
-                    retained.remove(&nibbles.slice(..len));
-                }
-            }
-            let mut new_depth = depth;
-            for (prefix, node) in branch_updates {
-                new_depth = new_depth.max(prefix.len());
-                retained.insert(prefix, node);
-            }
-            self.retained_depth.fetch_max(new_depth, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // Cache the state root for the next call's fast path.
-        *framework::lock_state(&self.cached_state_root) = Some(root);
-
-        // Convert the alloy B256 root to Oxide's Hash type.
-        Hash(root.0)
+        drop(db);
+        drop(storage_root_cache);
+        self.assemble_root(&leaves, &mut retained, &touched_keys, full_build)
     }
 
     /// Export the EVM's committed state for snapshot sync.

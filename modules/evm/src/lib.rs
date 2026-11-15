@@ -67,7 +67,7 @@ use parallel::{
     CoinbaseObs, InfoKey, MvDb, MvState, ObservedReads, SharedCacheDB, SpecTx,
     destructive_accounts, info_key,
 };
-use trie::{encode_trie_leaf, sparse_walk};
+use trie::encode_trie_leaf;
 use types::CHAIN_BLOCK_GAS_LIMIT;
 // rayon: parallel secp256k1 sender recovery in `handle_batch`.
 // 88% of per-tx cost is ECDSA recovery; parallelizing across cores
@@ -87,6 +87,7 @@ pub mod native_journal;
 pub mod overrides;
 mod parallel;
 mod persist;
+mod rootstage;
 pub mod precompiles;
 pub mod preinstalls;
 mod read;
