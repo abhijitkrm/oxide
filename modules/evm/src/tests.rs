@@ -4765,12 +4765,7 @@ fn light_batches_take_serial_lane_with_identical_results() {
         .iter()
         .map(|pv| {
             let s = tx::SignedTx::decode_raw(pv.raw).expect("decode");
-            Ok((
-                s,
-                revm::primitives::Address::from(pv.sender),
-                alloy_primitives::B256::ZERO,
-                Vec::new(),
-            ))
+            Ok((s, pv.sender, alloy_primitives::B256::ZERO, Vec::new()))
         })
         .collect();
     assert!(EvmModule::prefer_serial(&decoded), "plain transfers must prefer the serial lane");
@@ -4810,4 +4805,22 @@ fn contract_heavy_batches_still_speculate() {
         })
         .collect();
     assert!(!EvmModule::prefer_serial(&decoded), "calldata-carrying txs must keep speculating");
+}
+
+#[test]
+#[ignore = "micro-measurement: prints the cost of one sender recovery"]
+#[allow(clippy::cast_precision_loss)]
+fn measure_recover_sender_cost() {
+    let (pk, _) = test_keypair();
+    let raws: Vec<_> = (0..2000u64)
+        .map(|n| signed_transfer_tx(&pk, n, revm::primitives::Address::from([7; 20]), 1))
+        .collect();
+    let decoded: Vec<_> =
+        raws.iter().map(|r| tx::SignedTx::decode_raw(r).expect("decode")).collect();
+    let t = std::time::Instant::now();
+    for d in &decoded {
+        d.recover_sender().expect("recover");
+    }
+    let per = t.elapsed().as_secs_f64() * 1e6 / decoded.len() as f64;
+    eprintln!("recover_sender: {per:.1} us each, {:.0}/s per core", 1e6 / per);
 }
