@@ -4659,6 +4659,7 @@ fn fee_state_rehydrates_from_storage() {
 
 /// Deterministic per-block mutation: grow (new accounts), change
 /// balances, and delete (zero balance = EIP-158 empty) accounts.
+#[allow(clippy::cast_possible_truncation)]
 fn mutate_block(m: &EvmModule, addrs: &[primitives::Address], block: usize) {
     let n = addrs.len();
     for i in 0..60 {
@@ -4673,6 +4674,7 @@ fn mutate_block(m: &EvmModule, addrs: &[primitives::Address], block: usize) {
 }
 
 #[test]
+#[allow(clippy::cast_possible_truncation)]
 fn deferred_root_matches_sync_root_every_block() {
     let sync_m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
     let defer_m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
@@ -4707,14 +4709,20 @@ fn deferred_root_matches_sync_root_every_block() {
             assert_eq!(got, want, "deferred root diverged at height {h}");
         }
     }
-    // Sealed history must agree too (block hash covers the roots).
+    // Sealed history: receipts/tx roots agree exactly; the deferred
+    // header carries the state root of block h - ROOT_HEADER_LAG (zero
+    // before that), so its block hash intentionally differs.
     let s = framework::lock_state(&sync_m.history);
     let d = framework::lock_state(&defer_m.history);
+    let lag = crate::rootstage::ROOT_HEADER_LAG;
     for h in 2..height {
-        assert_eq!(
-            s.block(h).map(|b| (b.hash, b.state_root, b.receipts_root, b.tx_root)),
-            d.block(h).map(|b| (b.hash, b.state_root, b.receipts_root, b.tx_root)),
-            "sealed block {h} differs"
-        );
+        let (sb, db) = (s.block(h).expect("sync block"), d.block(h).expect("deferred block"));
+        assert_eq!((sb.receipts_root, sb.tx_root), (db.receipts_root, db.tx_root));
+        let want_header_root = if h > lag {
+            s.block(h - lag).expect("lagged sync block").state_root
+        } else {
+            alloy_primitives::B256::ZERO
+        };
+        assert_eq!(db.state_root, want_header_root, "header root of block {h}");
     }
 }

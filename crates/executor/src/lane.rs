@@ -9,7 +9,8 @@
 //! [`LaneDeath`] (declared in `lib.rs`) fails loudly rather than
 //! leaving finalized blocks unexecuted.
 
-use super::{Executor, FinalizedBlock, InsertRetained, LaneDeath};
+use super::{Executor, FinalizedBlock, InsertRetained, LaneDeath, ROOT_LANE_DEPTH};
+use crate::exec::StagedRoot;
 use std::sync::Arc;
 
 impl Executor {
@@ -58,6 +59,7 @@ impl Executor {
             let (lock, _cv) = &*sync;
             primitives::sync::lock_state(lock).lane_spawned = true;
         }
+        let root_tx = self.root_stage.then(|| self.spawn_root_stage(&weak, &sync));
         // Supervised + critical: this lane is the only path from
         // finalized block to executed state root. A panic here means
         // `attest_state`/`drain` can never complete — fail fast so the
@@ -130,6 +132,18 @@ impl Executor {
                             let (lock, _cv) = &*sync;
                             primitives::sync::lock_state(lock).in_flight = Some(height);
                         }
+                        if let Some(root_tx) = &root_tx {
+                            // Pipelined: hand the block's root inputs to the
+                            // root stage (blocks when it is ROOT_LANE_DEPTH
+                            // behind) and start the next block. `executed`
+                            // and `in_flight` are advanced by the root stage.
+                            let staged = executor.execute_block_staged(&block);
+                            assert!(
+                                root_tx.send((height, staged)).is_ok(),
+                                "executor: root stage thread died; halting the exec lane"
+                            );
+                            continue;
+                        }
                         let root = executor.execute_block(&block);
                         primitives::sync::lock_state(&executor.state_roots).insert_retained(
                             height,
@@ -150,6 +164,54 @@ impl Executor {
             },
         )
         .expect("spawn exec lane thread");
+    }
+
+    /// Spawn the root-stage thread (`docs/root-stage-spec.md`) and return
+    /// the bounded channel the exec stage feeds. The thread finishes each
+    /// block's root in height order, records it, and advances `executed`
+    /// (which therefore means "executed and rooted" on this path).
+    fn spawn_root_stage(
+        self: &Arc<Self>,
+        weak: &std::sync::Weak<Self>,
+        sync: &Arc<(std::sync::Mutex<super::ExecSync>, std::sync::Condvar)>,
+    ) -> std::sync::mpsc::SyncSender<(u64, StagedRoot)> {
+        // Root stage (docs/root-stage-spec.md): a second thread finishes
+        // each block's root while this lane executes the next block.
+        for module in self.modules.iter().flatten() {
+            module.set_root_deferral(true);
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, StagedRoot)>(ROOT_LANE_DEPTH);
+        let weak_root = weak.clone();
+        let sync_root = sync.clone();
+        primitives::supervision::spawn_supervised_pinned("root-stage", true, None, move || {
+            // Any exit marks the lane dead and wakes attesters.
+            let _death = LaneDeath { sync: sync_root.clone() };
+            while let Ok((height, staged)) = rx.recv() {
+                let Some(executor) = weak_root.upgrade() else { return };
+                {
+                    let (lock, _cv) = &*sync_root;
+                    primitives::sync::lock_state(lock).root_in_flight = Some(height);
+                }
+                let root = executor.finish_staged(&staged);
+                primitives::sync::lock_state(&executor.state_roots).insert_retained(
+                    height,
+                    root,
+                    executor.history_retention,
+                );
+                let (lock, cv) = &*sync_root;
+                {
+                    let mut s = primitives::sync::lock_state(lock);
+                    s.root_in_flight = None;
+                    if s.in_flight == Some(height) {
+                        s.in_flight = None;
+                    }
+                    s.executed = Some(height);
+                }
+                cv.notify_all();
+            }
+        })
+        .expect("spawn root stage thread");
+        tx
     }
 
     /// Drive every committed-but-unexecuted height through block
@@ -222,8 +284,13 @@ impl Executor {
         // `Some(h)` + no root = the worker died mid-mutation.
         let poisoned = {
             let (lock, _cv) = &*self.exec_sync;
-            let in_flight = primitives::sync::lock_state(lock).in_flight;
-            in_flight.filter(|h| !primitives::sync::lock_state(&self.state_roots).contains_key(h))
+            let s = primitives::sync::lock_state(lock);
+            let (exec_h, root_h) = (s.in_flight, s.root_in_flight);
+            drop(s);
+            exec_h
+                .into_iter()
+                .chain(root_h)
+                .find(|h| !primitives::sync::lock_state(&self.state_roots).contains_key(h))
         };
         if let Some(h) = poisoned {
             panic!(

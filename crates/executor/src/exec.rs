@@ -464,6 +464,16 @@ impl Executor {
     /// share one balance ledger, so "group then execute" was not
     /// equivalent to sequential execution.
     pub(crate) fn execute_block(&self, block: &FinalizedBlock) -> Hash {
+        let staged = self.execute_block_staged(block);
+        self.finish_staged(&staged)
+    }
+
+    /// Execution-stage half of [`Self::execute_block`]: everything up to
+    /// and including `end_block`/attendance and the nonce fold. Modules
+    /// that defer their root (see `Module::defers_root`) leave it for
+    /// [`Self::finish_staged`]; all others compute theirs here, because
+    /// they read live state that the next block will mutate.
+    pub(crate) fn execute_block_staged(&self, block: &FinalizedBlock) -> StagedRoot {
         // Coordinated halt: above the scheduled height the chain is
         // frozen — no begin/handle/end_block, no fee charge, no
         // attendance record. The returned root is the state at the
@@ -473,7 +483,7 @@ impl Executor {
         if let Some(halt) = self.halt_height()
             && block.height.value() > halt
         {
-            return self.state_root_at(halt);
+            return StagedRoot::Ready(self.state_root_at(halt));
         }
 
         // Single lock acquisition for the events vector: clear at start,
@@ -625,9 +635,9 @@ impl Executor {
         // account that ever transacted.
         self.stage_times.add_end_block(t_end.elapsed());
         let t_root = std::time::Instant::now();
-        let mut module_roots = Vec::new();
+        let mut module_roots: Vec<Option<Hash>> = Vec::new();
         for module in self.modules.iter().flatten() {
-            module_roots.push(module.state_root());
+            module_roots.push(if module.defers_root() { None } else { Some(module.state_root()) });
         }
         self.stage_times.add_state_root(t_root.elapsed());
         self.stage_times.add_block(block.txs.len());
@@ -658,7 +668,26 @@ impl Executor {
             committed.root = nonce_root;
         }
 
-        canonical_state_root(module_roots, nonce_root)
+        StagedRoot::Pending { height: block.height, module_roots, nonce_root }
+    }
+
+    /// Root-stage half: obtain each deferred module's root in module
+    /// order and assemble the canonical state root. For a block with no
+    /// deferred modules this is exactly the old tail of `execute_block`.
+    pub(crate) fn finish_staged(&self, staged: &StagedRoot) -> Hash {
+        match staged {
+            StagedRoot::Ready(h) => *h,
+            StagedRoot::Pending { height, module_roots, nonce_root } => {
+                let roots: Vec<Hash> = self
+                    .modules
+                    .iter()
+                    .flatten()
+                    .zip(module_roots.iter())
+                    .map(|(module, r)| r.unwrap_or_else(|| module.finish_root(*height)))
+                    .collect();
+                canonical_state_root(roots, *nonce_root)
+            }
+        }
     }
 
     /// Put back the preverify-cache entries this block did not consume.
@@ -722,4 +751,14 @@ impl Executor {
             outcomes.record(t.tx_hash, outcome);
         }
     }
+}
+
+/// What the execution stage hands the root stage for one block.
+#[derive(Debug)]
+pub(crate) enum StagedRoot {
+    /// The root is already known (coordinated-halt freeze).
+    Ready(Hash),
+    /// Per-module roots in module order (`None` = deferred, to be
+    /// obtained from `Module::finish_root`) plus the nonce root.
+    Pending { height: primitives::Height, module_roots: Vec<Option<Hash>>, nonce_root: Hash },
 }

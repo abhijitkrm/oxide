@@ -73,6 +73,12 @@ const MAX_RETAINED_HISTORY: usize = 4096;
 /// bounded enough that a stalled lane cannot hide.
 const EXEC_LANE_DEPTH: usize = 64;
 
+/// Blocks the exec stage may run ahead of the root stage (unit: blocks;
+/// `docs/root-stage-spec.md`). Deeper hides root-time jitter but holds more
+/// captured deltas and lengthens replay after a crash; shallower stalls the
+/// exec stage sooner.
+const ROOT_LANE_DEPTH: usize = 4;
+
 /// Insert-then-prune for height-keyed history maps: keeps the
 /// newest [`MAX_RETAINED_HISTORY`] entries by dropping the oldest.
 trait InsertRetained<K: Ord, V> {
@@ -1685,6 +1691,12 @@ struct ExecSync {
     /// already-mutated state and can produce a silently wrong root
     /// — the backlog drain must refuse rather than re-execute.
     in_flight: Option<u64>,
+    /// The height the root stage is finishing (`Some` only while a
+    /// module's commitment structure is mid-update). Same fail-closed
+    /// meaning as `in_flight`: a death with this set and no recorded
+    /// root leaves the trie partially updated, so the backlog drain
+    /// must refuse to replay.
+    root_in_flight: Option<u64>,
 }
 
 /// RAII marker that flags the execution lane dead when the worker
@@ -1903,6 +1915,10 @@ pub struct Executor {
     /// it). Validation (core in the online set) happens at config
     /// load, not here.
     exec_lane_core: Option<u32>,
+    /// Run the root computation on its own thread behind the exec lane
+    /// (`docs/root-stage-spec.md`). Off by default; set with
+    /// [`Executor::with_root_stage`] before `spawn_exec_lane`.
+    root_stage: bool,
 }
 
 mod app_iface;
@@ -1959,6 +1975,7 @@ impl Executor {
                     pending: std::collections::VecDeque::new(),
                     saturated: false,
                     in_flight: None,
+                    root_in_flight: None,
                 }),
                 std::sync::Condvar::new(),
             )),
@@ -1984,6 +2001,7 @@ impl Executor {
             history_retention: MAX_RETAINED_HISTORY,
             durability: None,
             exec_lane_core: None,
+            root_stage: false,
         }
     }
 
@@ -2052,6 +2070,18 @@ impl Executor {
             .num_threads(threads.max(1))
             .build_global()
             .map_err(|e| e.to_string())
+    }
+
+    /// Pipeline state-root computation behind execution
+    /// (`docs/root-stage-spec.md`): modules that support it defer their
+    /// root to a dedicated root thread, so the exec lane starts block
+    /// h+1 while block h is being rooted. Roots and attestations are
+    /// bit-identical to the synchronous path; only `executed` now means
+    /// "executed and rooted". Takes effect at `spawn_exec_lane`.
+    #[must_use]
+    pub fn with_root_stage(mut self, on: bool) -> Self {
+        self.root_stage = on;
+        self
     }
 
     /// Pin the exec lane to logical CPU `core` (hft-audit F-02).
