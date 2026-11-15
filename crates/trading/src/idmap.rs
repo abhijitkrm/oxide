@@ -66,6 +66,15 @@ pub struct IdMap {
     mask: u64,
     /// Live entry count (for capacity checks).
     len: u32,
+    /// Upper bound on any live entry's displacement from its home bucket
+    /// (unit: buckets). Raised on insert, never lowered: backward-shift only
+    /// moves entries toward home, so it stays a valid bound. `remove` uses it
+    /// to stop the cluster walk: an entry more than `max_disp` buckets past
+    /// the hole has its home past the hole and cannot move into it. Without
+    /// it every removal walked the whole cluster, and sequential ids make
+    /// the live set one contiguous cluster (O(live orders) per removal; the
+    /// top frame of a profile of the order-bundle benchmark).
+    max_disp: u32,
 }
 
 impl IdMap {
@@ -99,7 +108,7 @@ impl IdMap {
             // infallible for all valid configs.
             usize::try_from(size).expect("u64 pow2 fits usize: max_resting bounded to 2^20")
         ];
-        IdMap { slots, mask: size - 1, len: 0 }
+        IdMap { slots, mask: size - 1, len: 0, max_disp: 0 }
     }
 
     /// Number of live entries.
@@ -139,6 +148,8 @@ impl IdMap {
                 entry.key = key;
                 entry.slot = slot;
                 self.len += 1;
+                let disp = (bucket.wrapping_sub(key & self.mask)) & self.mask;
+                self.max_disp = self.max_disp.max(disp as u32);
                 return Ok(());
             }
             if entry.key == key {
@@ -212,11 +223,15 @@ impl IdMap {
         // Backward-shift: pull cluster members down into the hole.
         let mut hole = found;
         let mut probe = (hole + 1) & self.mask;
+        // Buckets scanned since the hole last moved; once it exceeds
+        // `max_disp` no later entry can move into the hole (see the field).
+        let mut since_hole = 0u32;
         loop {
             let entry = self.slots[probe as usize];
-            if entry.key == EMPTY_KEY {
+            if entry.key == EMPTY_KEY || since_hole >= self.max_disp {
                 break;
             }
+            since_hole += 1;
             // An entry may move up to `hole` iff its *home* bucket is
             // cyclically at-or-before `hole` (i.e. moving it does not
             // skip over its own probe path).
@@ -229,6 +244,7 @@ impl IdMap {
             if can_move {
                 self.slots[hole as usize] = entry;
                 hole = probe;
+                since_hole = 0;
             }
             probe = (probe + 1) & self.mask;
         }
@@ -298,6 +314,98 @@ mod tests {
         }
         for i in 80..100u64 {
             assert_eq!(m.get(i), Some(i as u32));
+        }
+    }
+
+    /// Reference implementation: the original unbounded backward-shift
+    /// (walks to the next empty slot). `remove` with the displacement bound
+    /// must leave a table that answers every lookup identically.
+    fn reference_remove(slots: &mut [Entry], mask: u64, key: u64) -> bool {
+        let mut bucket = key & mask;
+        let found = loop {
+            let e = slots[bucket as usize];
+            if e.key == key {
+                break bucket;
+            }
+            if e.key == EMPTY_KEY {
+                return false;
+            }
+            bucket = (bucket + 1) & mask;
+        };
+        let mut hole = found;
+        let mut probe = (hole + 1) & mask;
+        loop {
+            let entry = slots[probe as usize];
+            if entry.key == EMPTY_KEY {
+                break;
+            }
+            let ideal = entry.key & mask;
+            let can_move = if hole <= probe {
+                ideal <= hole || ideal > probe
+            } else {
+                ideal <= hole && ideal > probe
+            };
+            if can_move {
+                slots[hole as usize] = entry;
+                hole = probe;
+            }
+            probe = (probe + 1) & mask;
+        }
+        slots[hole as usize] = Entry { key: EMPTY_KEY, slot: 0 };
+        true
+    }
+
+    /// Random insert/remove streams (sequential ids, wrap-around, and
+    /// colliding random keys) must leave the bounded-walk table bit-identical
+    /// to the reference's, slot for slot.
+    #[test]
+    fn bounded_backward_shift_matches_reference() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..40 {
+            let cap = 64u32 << (round % 4);
+            let mut m = IdMap::with_capacity(cap);
+            let mut reference = m.slots.clone();
+            let mask = m.mask;
+            let mut live: Vec<u64> = Vec::new();
+            let mut counter = next() % 1_000;
+            for _ in 0..4_000 {
+                let r = next() % 100;
+                if r < 55 && u64::from(m.len()) * 2 < mask {
+                    // Mostly sequential ids, sometimes a colliding random key.
+                    let key = if r < 45 {
+                        counter
+                    } else {
+                        next() % (mask + 1) + (mask + 1) * (next() % 3)
+                    };
+                    counter += 1;
+                    if live.contains(&key) {
+                        continue;
+                    }
+                    if m.insert(key, 7).is_ok() {
+                        // Mirror the insert in the reference table (same probing).
+                        let mut b = key & mask;
+                        while reference[b as usize].key != EMPTY_KEY {
+                            b = (b + 1) & mask;
+                        }
+                        reference[b as usize] = Entry { key, slot: 7 };
+                        live.push(key);
+                    }
+                } else if !live.is_empty() {
+                    let at = (next() as usize) % live.len();
+                    let key = live.swap_remove(at);
+                    assert!(m.remove(key).is_ok());
+                    assert!(reference_remove(&mut reference, mask, key));
+                }
+                for (a, b) in m.slots.iter().zip(reference.iter()) {
+                    assert_eq!((a.key, a.slot), (b.key, b.slot), "tables diverged");
+                }
+            }
         }
     }
 
