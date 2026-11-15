@@ -382,11 +382,19 @@ pub struct ConsensusConfig {
     #[serde(default = "default_max_timeout_ms")]
     pub max_timeout_ms: u64,
 
-    /// Maximum block size in bytes. Default: 1 MiB.
+    /// Maximum block size in bytes. Default: 8 MiB. Origin: the 600M-gas default
+    /// below packs ~28.6k plain transfers at ~110 B = ~3.1 MB, so bytes must not bind
+    /// before gas (the old 1 MiB cap stopped blocks at ~9.5k transfers, ~200M gas).
+    /// Must stay below `network.max_message_bytes`.
     #[serde(default = "default_max_block_bytes")]
     pub max_block_bytes: u64,
 
-    /// Maximum block gas. Default: 1 billion gas.
+    /// Maximum block gas. Default: 600 million gas. Origin: the measured exec
+    /// ceiling is ~255k plain transfers/s on one lane (docs/devlog.md, EVM grid), so
+    /// a 100 ms block holds at most ~25.5k transfers = ~540M gas; 600M keeps ~10%
+    /// headroom without letting a proposer pack more than a lane can execute within
+    /// the block interval (the exec lane's back-pressure handles overshoot, at the
+    /// cost of latency). Governable at runtime via `chain.block_gas_limit`.
     #[serde(default = "default_max_block_gas")]
     pub max_block_gas: u64,
 }
@@ -398,10 +406,10 @@ fn default_max_timeout_ms() -> u64 {
     30_000
 }
 fn default_max_block_bytes() -> u64 {
-    1 << 20
+    8 << 20
 }
 fn default_max_block_gas() -> u64 {
-    1_000_000_000
+    600_000_000
 }
 
 impl Default for ConsensusConfig {

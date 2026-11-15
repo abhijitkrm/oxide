@@ -25024,3 +25024,14 @@ Throughput = min(gas_limit / 21,000 / block_time, ~255k exec ceiling). At the cu
 before it is CPU-bound: 14k tx/s at a 100 ms block, 71k at 20 ms. To feed the 255k exec ceiling: >= 270M gas at 50 ms or
 >= 540M gas at 100 ms blocks (exec must also fit inside the block interval: 55 ms for 300M). 1M tx/s of transfers is 21 Ggas/s,
 i.e. 2.1G gas per 100 ms block (exec 0.4 s per block at 4 us/tx: 4x too slow for one lane) plus ~34 cores of signatures.
+
+### Block budget defaults raised to the measured capacity (600M gas, 8 MiB)
+
+Decision (user, 15 Nov): raise gas to maximum capacity, then multi-core/multi-lane work. The node's effective budget is
+`consensus.max_block_gas` / `max_block_bytes` (the 30M figure was only the bare `Executor` default used by benches and
+tests; the node passes the config through `with_gas_limit`). Old defaults were 1G gas but **1 MiB bytes**, so bytes bound
+first at ~9.5k transfers (~200M gas). New defaults: gas 600M (a 100 ms block at the measured ~255k tx/s lane ceiling is ~25.5k
+transfers = 540M gas, plus ~10%), bytes 8 MiB (a 600M block of transfers is ~3.1 MB; stays under the 16 MiB message cap).
+Governable at runtime (`chain.block_gas_limit`). `chain_mix` now defaults to the same budget. Measured (laptop, 8 threads,
+400k signed transfers, 14 blocks of 28.5k): loop 126k tx/s synchronous, 176k with the root stage (42k at the start of the
+day, 4.2x); exec cost 3.97 us/tx.
