@@ -529,23 +529,7 @@ impl Executor {
         // for later blocks simply stay in the shared cache, where ingest
         // keeps adding to it. A hit still only means "this node verified
         // these exact bytes at ingest", so retention cannot change a result.
-        let mut preverify_cache: primitives::digest_map::DigestMap<[u8; 20]> = {
-            let mut shared = primitives::sync::lock_state(&self.preverify_cache);
-            // Bound stale entries (txs the pool evicted never execute):
-            // when the cache outgrows the pool capacity, drop it all; a
-            // miss only costs one signature recovery.
-            if shared.len() > self.preverify_cap {
-                shared.clear();
-            }
-            block
-                .txs
-                .iter()
-                .filter_map(|tx| {
-                    let h = Hasher::hash_one(Domain::Transaction, tx.as_bytes());
-                    shared.remove(&h).map(|sender| (h, sender))
-                })
-                .collect()
-        };
+        let mut preverify_cache = self.take_preverified_for(block);
 
         let mut skipped: Vec<(Hash, TxSkipReason)> = Vec::new();
         let t_plan = std::time::Instant::now();
@@ -707,6 +691,29 @@ impl Executor {
                 canonical_state_root(roots, *nonce_root)
             }
         }
+    }
+
+    /// Move this block's ingest-verified senders out of the shared cache
+    /// (see the comment at the call site in `execute_block_staged`).
+    fn take_preverified_for(
+        &self,
+        block: &FinalizedBlock,
+    ) -> primitives::digest_map::DigestMap<[u8; 20]> {
+        let mut shared = primitives::sync::lock_state(&self.preverify_cache);
+        // Bound stale entries (txs the pool evicted never execute):
+        // when the cache outgrows the pool capacity, drop it all; a
+        // miss only costs one signature recovery.
+        if shared.len() > self.preverify_cap {
+            shared.clear();
+        }
+        block
+            .txs
+            .iter()
+            .filter_map(|tx| {
+                let h = Hasher::hash_one(Domain::Transaction, tx.as_bytes());
+                shared.remove(&h).map(|sender| (h, sender))
+            })
+            .collect()
     }
 
     /// Record the finalized outcome for every tx in one module
