@@ -535,7 +535,7 @@ impl Executor {
         let t_plan = std::time::Instant::now();
         let mut runs =
             self.plan_block_runs(&block.txs, &mut local_nonce, &preverify_cache, &mut skipped);
-        self.stage_times.add_plan(t_plan.elapsed());
+        self.stage_times.add_plan(self.stage_done("exec_plan", t_plan));
         let t_dispatch = std::time::Instant::now();
 
         // Record finalized outcomes for txs that never reached a
@@ -604,7 +604,7 @@ impl Executor {
         // Publish all events from this block in one lock acquisition.
         primitives::sync::lock_state(&self.events).extend(block_events);
 
-        self.stage_times.add_dispatch(t_dispatch.elapsed());
+        self.stage_times.add_dispatch(self.stage_done("exec_dispatch", t_dispatch));
         let t_end = std::time::Instant::now();
         // end_block for all modules — same context as begin_block.
         // Module scheduled effects (liquidation sweeps, epoch work)
@@ -636,13 +636,13 @@ impl Executor {
         // post-block root (folded incrementally by `bump`), so this
         // block pays O(touched senders), not a full scan of every
         // account that ever transacted.
-        self.stage_times.add_end_block(t_end.elapsed());
+        self.stage_times.add_end_block(self.stage_done("exec_end_block", t_end));
         let t_root = std::time::Instant::now();
         let mut module_roots: Vec<Option<Hash>> = Vec::new();
         for module in self.modules.iter().flatten() {
             module_roots.push(if module.defers_root() { None } else { Some(module.state_root()) });
         }
-        self.stage_times.add_state_root(t_root.elapsed());
+        self.stage_times.add_state_root(self.stage_done("exec_state_root", t_root));
         self.stage_times.add_block(block.txs.len());
 
         // Push the fresh nonce anchors into the mempool — the live
@@ -691,6 +691,17 @@ impl Executor {
                 canonical_state_root(roots, *nonce_root)
             }
         }
+    }
+
+    /// Elapsed time of a phase that started at `started`, also reported to
+    /// the latency recorder (the SLO metrics of plan section W7) when one is
+    /// attached.
+    fn stage_done(&self, label: &'static str, started: std::time::Instant) -> std::time::Duration {
+        let d = started.elapsed();
+        if let Some(recorder) = &self.recorder {
+            recorder.record(label, d);
+        }
+        d
     }
 
     /// Move this block's ingest-verified senders out of the shared cache

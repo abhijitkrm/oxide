@@ -192,7 +192,11 @@ impl Executor {
                     let (lock, _cv) = &*sync_root;
                     primitives::sync::lock_state(lock).root_in_flight = Some(height);
                 }
+                let t_root = std::time::Instant::now();
                 let root = executor.finish_staged(&staged);
+                if let Some(recorder) = &executor.recorder {
+                    recorder.record("root_stage", t_root.elapsed());
+                }
                 primitives::sync::lock_state(&executor.state_roots).insert_retained(
                     height,
                     root,
