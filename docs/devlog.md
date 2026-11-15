@@ -24922,3 +24922,17 @@ integration `root_stage_lane_matches_synchronous_roots` (signed EVM+CLOB mix, ev
 Found on the way: the `chain_mix` finalize column in lane modes counts only enqueue time, so `loop_tps`
 (propose+finalize wall) is the honest column and is now printed on the `stages,` line. Next bound: the serial
 propose phase (~85k tx/s for EVM transfers).
+
+### Propose phase: 85-129k -> 720-815k tx/s (EVM transfers, laptop)
+
+Root cause of the "propose is slow" line in `chain_mix`: `Executor::ingest_tx` pushed txs through the intake ring
+without a gas estimate, so every pool entry carried `gas = 0`, and `Mempool::select_with_gas` (a pure byte-budget walk)
+selected and cloned the whole pool (60k of 200k txs per block with an 8 MB budget) only for `prepare_proposal`'s gas
+filter to keep 1,428 of them. Fixes: the ring now carries `(tx, gas)` (estimate computed at admission, ~0.1 us),
+`Mempool::submit_with_gas`, and `select_with_gas_cap(max_bytes, gas_cap)` which stops when the cap is exactly full or
+after `MAX_CONSECUTIVE_GAS_MISFITS` (256) positive-gas candidates in a row fail to fit (proposer-local policy; other nodes
+validate the gas limit, not the selection rule). Equivalence test `gas_capped_select_matches_select_all_then_filter`
+compares against select-all-then-filter at five caps. Blocks are unchanged (140 blocks of 1,428 txs before and after).
+Pipeline loop (propose+finalize wall), 8 threads, 200k signed EVM transfers: sync 42.0k -> 66.6k tx/s; with the root
+stage 74.5k -> 108.0k tx/s; total from the start of the day 42.0k -> 108.0k (2.6x). Execution itself (plan+dispatch+
+end_block) is now the bound at ~8 us/tx (125k tx/s) in root-stage mode.

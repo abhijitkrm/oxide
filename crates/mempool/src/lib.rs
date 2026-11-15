@@ -92,6 +92,14 @@ pub struct PreparedTx {
     pub gas: u64,
 }
 
+/// Consecutive positive-gas candidates that may fail the proposer's gas
+/// filter before `select_with_gas_cap` stops walking (unit: candidates).
+/// Origin: a 30M-gas block of 21k-gas transfers fills at ~1.4k txs, so 256
+/// misses means the block is full to within ~12 tx-gas of the cap; raising it
+/// only buys the chance to squeeze a smaller tx from deeper in the pool at
+/// the price of walking and cloning more of it.
+pub const MAX_CONSECUTIVE_GAS_MISFITS: usize = 256;
+
 /// The mempool: a fee-priority transaction pool with per-account nonce
 /// queues and dedup.
 ///
@@ -416,6 +424,20 @@ impl Mempool {
         self.insert_prepared(PreparedTx { tx, hash, sender, nonce, fee, gas: 0 })
     }
 
+    /// [`submit`](Self::submit) with the module's gas estimate supplied by
+    /// the caller (the single-tx intake computes it at admission), so the
+    /// entry is gas-capped by the proposer's walk like batch-intake entries.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`submit`](Self::submit).
+    pub fn submit_with_gas(&mut self, tx: TxBytes, gas: u64) -> Result<(), MempoolError> {
+        let bytes = tx.as_bytes();
+        let hash = Hasher::hash_one(Domain::Transaction, bytes);
+        let (sender, nonce, fee) = parse_tx(bytes).ok_or(MempoolError::Malformed)?;
+        self.insert_prepared(PreparedTx { tx, hash, sender, nonce, fee, gas })
+    }
+
     /// Submit a transaction whose hash, envelope fields, and gas
     /// estimate the caller already computed — the batch intake's
     /// parallel phase produces exactly this. Skips the per-tx
@@ -656,7 +678,27 @@ impl Mempool {
     /// The walk is identical to `select`'s; only the projection
     /// differs, so the two can never diverge on ORDER.
     pub fn select_with_gas(&mut self, max_bytes: u64) -> Vec<(TxBytes, u64)> {
+        self.select_with_gas_cap(max_bytes, u64::MAX)
+    }
+
+    /// [`select_with_gas`](Self::select_with_gas) that also stops walking
+    /// once the candidates' cached gas has filled `gas_cap`.
+    ///
+    /// The proposer's gas filter (`prepare_proposal`) keeps a candidate only
+    /// if the running gas total plus its gas fits the cap. Walking, cloning
+    /// and then discarding the rest of the pool is pure waste: with a 200k-tx
+    /// pool and 1.4k txs per gas-limited block it was ~99% of the proposal's
+    /// work (the measured 11 us/tx propose cost). The tracked total mirrors
+    /// the filter (add only when it fits). The walk ends when the cap is
+    /// exactly full, or after [`MAX_CONSECUTIVE_GAS_MISFITS`] positive-gas
+    /// candidates in a row failed to fit: a proposer-local policy (other
+    /// nodes validate the gas limit, not the selection rule) that can only
+    /// miss a smaller tx buried deeper than that run, never produce an
+    /// invalid block.
+    pub fn select_with_gas_cap(&mut self, max_bytes: u64, gas_cap: u64) -> Vec<(TxBytes, u64)> {
         let mut total_bytes = 0u64;
+        let mut passing_gas = 0u64;
+        let mut misfits = 0usize;
         // Sender-fair fee-priority selection: a max-heap of
         // (head fee density, sender) — the density of each sender's
         // lowest pending nonce. Repeatedly pop the highest-density
@@ -766,7 +808,18 @@ impl Mempool {
                     continue 'senders;
                 }
                 total_bytes += entry.size;
+                if entry.gas > 0 {
+                    if passing_gas.saturating_add(entry.gas) <= gas_cap {
+                        passing_gas += entry.gas;
+                        misfits = 0;
+                    } else {
+                        misfits += 1;
+                    }
+                }
                 selected_order.push(hash);
+                if passing_gas >= gas_cap || misfits >= MAX_CONSECUTIVE_GAS_MISFITS {
+                    break 'senders;
+                }
                 count += 1;
                 nonce = nonce.saturating_add(1);
             }
@@ -1158,6 +1211,50 @@ mod tests {
         assert_eq!(pool.len(), 1, "peek select leaves entries pooled");
         pool.remove_committed(&selected, 1);
         assert_eq!(pool.len(), 0, "finalization removes committed txs");
+    }
+
+    /// The gas-capped walk must produce exactly the block that selecting
+    /// everything and filtering by gas afterwards would (the filter is
+    /// `prepare_proposal`'s: keep a candidate iff the running total plus its
+    /// gas fits the cap), for pools whose misfit runs stay below the
+    /// consecutive-misfit stop.
+    #[test]
+    fn gas_capped_select_matches_select_all_then_filter() {
+        let build = || {
+            let mut pool = Mempool::new(10_000).with_max_pending_per_sender(1_000);
+            for sender in 1..=40u8 {
+                for nonce in 0..20u64 {
+                    // Deterministic varied gas in [1_000, 9_000], fee varied by sender.
+                    let gas = 1_000 + (u64::from(sender) * 37 + nonce * 911) % 8_000;
+                    let tx = build_tx(addr(sender), nonce, 100 + u64::from(sender), &[]);
+                    let prepared = {
+                        let b = tx.as_bytes();
+                        let hash = Hasher::hash_one(Domain::Transaction, b);
+                        let (s, n, f) = parse_tx(b).expect("parse");
+                        PreparedTx { tx, hash, sender: s, nonce: n, fee: f, gas }
+                    };
+                    pool.submit_prepared(prepared).expect("submit");
+                }
+            }
+            pool
+        };
+        let filter = |cands: Vec<(TxBytes, u64)>, cap: u64| {
+            let mut total = 0u64;
+            let mut out = Vec::new();
+            for (tx, gas) in cands {
+                if total.saturating_add(gas) > cap {
+                    continue;
+                }
+                total += gas;
+                out.push(tx);
+            }
+            out
+        };
+        for cap in [5_000u64, 40_000, 123_456, 700_000, u64::MAX] {
+            let all = filter(build().select_with_gas(u64::MAX), cap);
+            let capped = filter(build().select_with_gas_cap(u64::MAX, cap), cap);
+            assert_eq!(all, capped, "gas-capped selection diverged at cap {cap}");
+        }
     }
 
     /// Regression: the per-sender cap was only applied when building

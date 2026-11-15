@@ -1835,10 +1835,10 @@ pub struct Executor {
     /// This eliminates the per-tx `mempool.lock()` on the ingestion
     /// hot path — the mempool lock is only acquired once per
     /// `prepare_proposal` call, not once per tx.
-    mempool_intake_tx: std::sync::mpsc::SyncSender<TxBytes>,
+    mempool_intake_tx: std::sync::mpsc::SyncSender<(TxBytes, u64)>,
     /// The receiver side of the intake ring. Drained by
     /// `prepare_proposal` to flush buffered txs into the mempool.
-    mempool_intake_rx: std::sync::Mutex<std::sync::mpsc::Receiver<TxBytes>>,
+    mempool_intake_rx: std::sync::Mutex<std::sync::mpsc::Receiver<(TxBytes, u64)>>,
     /// H4/H5 fix: per-account executed-nonce map. Tracks the next
     /// expected nonce for each sender. Updated after `execute_block`
     /// completes for each tx that was executed.
