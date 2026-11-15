@@ -173,3 +173,32 @@ No phase starts before the previous gate passes unless this plan says so (consis
 3. Shadow-compare harness for the exchange executor; property tests; CI regression gate on three benches.
 4. Write the lagged-root spec (`docs/`), including state sync and light-client effects, for review.
 5. Finish the pre-flight; then request the box `user@host`.
+
+## 8. Status (15 Nov 2026, end of session 1)
+
+Measured on the laptop, signed transactions through the real executor, 8 threads (`chain_mix`, `scripts/bench-gate.sh`):
+
+| Metric | Start of day | Now |
+|---|---|---|
+| EVM transfers, pipeline loop (propose+finalize) | 42.0k tx/s | 120.8k tx/s (2.9x) |
+| EVM `end_block` | 6.6 us/tx | 2.0 us/tx (root stage) |
+| Propose phase (EVM transfers) | 85k tx/s | 720-950k tx/s |
+| CLOB at 100k accounts, loop | 138k tx/s | 237k tx/s (1.0x of 1k-account loop: 0.67) |
+| Admission (secp256k1 recovery) | 150k tx/s | 150k tx/s (now the cap; W2 addresses it) |
+
+| Workstream | State |
+|---|---|
+| W0 measurement spine | DONE for the executor: permanent stage recorder (`StageReport`, latency-recorder labels `exec_*`, `root_stage`), `stages,` line, lane modes, accounts axis, ratio gates in `scripts/bench-gate.sh` + nightly. TODO: markets/depth axes, CSV archive |
+| W1 correctness harness | PARTIAL: root-stage differentials (evm module + executor integration, mutation-checked), gas-capped select equivalence test. TODO: exchange executor shadow harness |
+| W2 intake | SPEC `docs/bundle-auth-spec.md`; gas estimate now carried through the intake ring; preverify cache O(block). TODO: bundle envelope implementation |
+| W3 execution | TODO: resident dense accounts, batch settlement (CLOB at 100k accounts still 0.67x of 1k: ~29k EVM accounts touched per block) |
+| W4 commitment | root stage IMPLEMENTED behind `with_root_stage` (default off; audit before default-on); sharded root, journal pipelining TODO |
+| W5 replication | NOT STARTED (needs multi-host; decision 5 says single node first) |
+| W6 EVM | propose fixed, end_block 3x cheaper; parallel dispatch granularity and per-tx 3.4 us dispatch TODO |
+| W7 production grade | PARTIAL: SLO labels, CI ratio gates. TODO: external security review, fuzz target for bundle decoder, soak, upgrade drills |
+| W8 rig/box | pre-flight dry run, bench audit and expected ranges still TODO; box skipped by decision |
+
+Phases: A mostly done; B started (propose/intake/root stage); C started (root stage, journal TODO); D, E, F need
+multi-host hardware, an external review, a geo testnet and soak time and are not achievable in a laptop session. The
+honest forward path to F is: W2 bundle envelope, W3 batch settlement and resident accounts, root stage default-on
+after audit, then an 8-core box to prove which stage is hardware-bound (decision 5).
