@@ -220,7 +220,15 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
     let per = (total / n_accts).max(1);
     let txs = build(mix, &accts, per, ring);
     let n: usize = txs.iter().map(Vec::len).sum();
-    let r = rig(&accts, n);
+    let Rig { executor, exchange } = rig(&accts, n);
+    // CHAIN_MIX_LANE: `sync` (default; finalize executes inline), `lane` (async exec lane) or
+    // `root` (exec lane + root stage thread, docs/root-stage-spec.md).
+    let lane_mode = std::env::var("CHAIN_MIX_LANE").unwrap_or_else(|_| "sync".into());
+    let executor = if lane_mode == "root" { executor.with_root_stage(true) } else { executor };
+    let executor = Arc::new(executor);
+    if lane_mode != "sync" {
+        executor.spawn_exec_lane();
+    }
 
     // Ingest: `threads` workers each take a contiguous slice of accounts.
     let chunk = n_accts.div_ceil(threads);
@@ -229,7 +237,7 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
         let hs: Vec<_> = txs
             .chunks(chunk)
             .map(|group| {
-                let ex = &r.executor;
+                let ex = &executor;
                 s.spawn(move || {
                     let mut ok = 0usize;
                     for list in group {
@@ -252,26 +260,35 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
     let mut executed_txs = 0usize;
     loop {
         let t = Instant::now();
-        let proposal = r.executor.prepare_proposal(&BUDGET);
+        let proposal = executor.prepare_proposal(&BUDGET);
         propose += t.elapsed().as_secs_f64();
         if proposal.txs.is_empty() {
             break;
         }
         executed_txs += proposal.txs.len();
         let t = Instant::now();
-        let _ = r.executor.process_proposal(&proposal);
+        let _ = executor.process_proposal(&proposal);
         let block = FinalizedBlock {
             context: types::BlockContext::default(),
             height: Height::new(height),
             txs: proposal.txs,
             signers: Vec::new(),
         };
-        let _ = r.executor.finalize_block(&block);
-        let _ = r.executor.attest_state(Height::new(height));
+        let _ = executor.finalize_block(&block);
+        if lane_mode == "sync" {
+            let _ = executor.attest_state(Height::new(height));
+        }
         finalize += t.elapsed().as_secs_f64();
         height += 1;
     }
 
+    // Lane modes: finalize_block only enqueues, so wait for the last height's attestation
+    // (executed, and rooted when the root stage is on) and charge the wait to `finalize`.
+    if lane_mode != "sync" {
+        let t = Instant::now();
+        let _ = executor.attest_state(Height::new(height - 1));
+        finalize += t.elapsed().as_secs_f64();
+    }
     // Native (CLOB) senders: the executor's nonce must have advanced by exactly their tx count.
     // EVM senders track nonces inside the EVM module, so for them we require that every
     // transaction was admitted and went through proposal and finalization.
@@ -281,28 +298,29 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
             .iter()
             .enumerate()
             .filter(|(i, _)| is_clob(mix, *i))
-            .all(|(_, a)| r.executor.executed_nonce_of(&a.addr) == per as u64);
-    let resting = r.exchange.resting_count(0);
+            .all(|(_, a)| executor.executed_nonce_of(&a.addr) == per as u64);
+    let resting = exchange.resting_count(0);
     // Measurement spine (plan W0): where `execute_block` spends its time, per transaction,
     // from the executor's permanent stage recorder. Stderr so the CSV on stdout is unchanged;
     // `scripts/rig/summarize.py` and humans read the `stages,` lines.
-    let st = r.executor.stage_report();
+    let rate = |count: usize, secs: f64| count as f64 / secs;
+    let st = executor.stage_report();
     let (plan, dispatch, end_block, root) = st.us_per_tx();
     eprintln!(
-        "stages,{mix},{threads},blocks={},txs={},plan_us={plan:.3},dispatch_us={dispatch:.3},end_block_us={end_block:.3},state_root_us={root:.3},serial_floor_tps={:.0}",
+        "stages,{mix},{threads},blocks={},txs={},plan_us={plan:.3},dispatch_us={dispatch:.3},end_block_us={end_block:.3},state_root_us={root:.3},serial_floor_tps={:.0},loop_tps={:.0}",
         st.blocks,
         st.txs,
         1e6 / (plan + end_block + root).max(1e-9),
+        rate(executed_txs, propose + finalize),
     );
-    let rate = |count: usize, secs: f64| count as f64 / secs;
     println!(
-        "{mix},{threads},{n},{:.0},{:.0},{:.0},{:.0},{},{resting},{}",
+        "{mix}/{lane_mode},{threads},{n},{:.0},{:.0},{:.0},{:.0},{},{resting},{}",
         rate(accepted, ingest),
         rate(executed_txs, propose),
         rate(executed_txs, finalize),
         rate(executed_txs, ingest + propose + finalize),
         if executed_ok { "all" } else { "MISMATCH" },
-        r.executor.exec_sig_reverifications(),
+        executor.exec_sig_reverifications(),
     );
 }
 

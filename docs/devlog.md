@@ -24910,3 +24910,15 @@ the plan: (1) lagged sharded root (W4, approved): the MPT update leaves the crit
 (W3): net balance deltas per account per block instead of per-order ledger writes cuts touched accounts, and a
 non-MPT commitment for the exchange's own balances removes the dependency. Gate: finalize tx/s at 100k accounts
 within 1.5x of the 1k-account figure (today 196k vs 357k = 1.8x).
+
+### Root stage implemented (off by default)
+
+`Executor::with_root_stage(true)` + `spawn_exec_lane`: a root thread behind the exec lane finishes each block's module
+roots (bounded channel `ROOT_LANE_DEPTH=4`); `executed` means executed-and-rooted; poison/fail-closed tracks
+`root_in_flight`. EVM: `end_block` seals/flushes on the exec stage, queues a `PatchDelta`, and `finish_root` folds the
+trie. Header `stateRoot` = root(h-4) in this mode (EIP-2935 forces it: see spec note). Gates: evm differential
+`deferred_root_matches_sync_root_every_block` (mutation-checked: dropping removals fails at height 2) and executor
+integration `root_stage_lane_matches_synchronous_roots` (signed EVM+CLOB mix, every height equal). Numbers in the spec.
+Found on the way: the `chain_mix` finalize column in lane modes counts only enqueue time, so `loop_tps`
+(propose+finalize wall) is the honest column and is now printed on the `stages,` line. Next bound: the serial
+propose phase (~85k tx/s for EVM transfers).

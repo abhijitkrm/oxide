@@ -1,7 +1,22 @@
 # Root stage: computing the state root off the execution path (spec, draft 15 Nov 2026)
 
-Status: DRAFT for review. Approved in principle by the user (15 Nov: "lagged sharded root: yes"); needs this spec
-reviewed and an audit before code. Implements plan W4 of `docs/hft-production-plan.md`.
+Status: steps 1-4 IMPLEMENTED behind `Executor::with_root_stage(true)` (default off); audit still required before
+default-on. Approved by the user 15 Nov ("lagged sharded root: yes", recommendations accepted).
+Implements plan W4 of `docs/hft-production-plan.md`.
+
+**Implementation note (supersedes Section 1's "EVM block record's state root is filled by the root stage" and open
+question 1).** The EVM block hash covers `stateRoot`, and EIP-2935 (Prague) writes the parent block hash into state at
+the start of the next block, so block h+1's execution depends on a hash that would contain root(h): a true data
+dependency that forbids overlapping root(h) with execute(h+1). Resolution (the "delayed state root" used by other
+deferred-execution EVM chains): with the root stage on, the header of block h carries the state root of block
+h - `ROOT_HEADER_LAG` (4; zero before that). The block is sealed, flushed and visible on the exec stage immediately (no
+RPC hiding needed); the root stage only folds the trie and publishes root(h) for attestations and for later headers.
+Attested roots are unchanged. Consequence: `eth_getBlockByNumber(h).stateRoot` is the root of h-4 in this mode.
+
+**Measured (laptop, `chain_mix`, 8 threads):** EVM transfers, pipeline loop 42.0k tx/s synchronous, 68.9k exec lane,
+74.5k with the root stage (execution capacity 1/(plan+dispatch+end_block) up from 80k to 125k tx/s; the loop is now
+bound by the serial propose phase, 85k tx/s). CLOB at 100k accounts: end_block 1.89 -> 0.73 us/tx, loop 138k -> 220k
+tx/s (+59%), within 1.6x of the 1k-account figure (352k).
 
 ## 0. What already exists (corrects an assumption in the plan)
 
