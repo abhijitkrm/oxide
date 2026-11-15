@@ -1,6 +1,8 @@
 # Multi-core, multi-lane EVM execution (spec, draft 15 Nov 2026)
 
-Status: DRAFT, nothing here is implemented except the pieces listed under "Already done". User decision (15 Nov): raise
+Status: 3.1 (lanes) and 3.2 (seal worker + lazy EIP-2935) IMPLEMENTED and differential-tested on the laptop (15 Nov);
+lanes are OFF by default because they did not pay here, the seal worker is on whenever the root stage is on. Speed claims for
+both await the x86 box. Results are in the "Built and measured" section at the end. User decision (15 Nov): raise
 the block budget to measured capacity (done: 600M gas, 8 MiB), then multi-core plus multi-lane work. This spec turns the
 laptop measurements into a core budget and a build order, and says what only the x86 box can settle.
 
@@ -94,3 +96,26 @@ signed by protocol, so 1M EVM tx/s is ~34 recovery cores regardless of executor 
 
 Root stage (state root off the exec lane), gas-capped proposal walk, preverify cache O(block), serial lane for light
 batches, one parallel tx-hash pass per block, block budget defaults at measured capacity, per-stage recorder and ratio gates.
+
+## 6. Built and measured (laptop, 15 Nov, 8 threads, 28.5k-tx blocks)
+
+**Lanes (3.1), `modules/evm/src/lanes.rs`, opt-in via `EvmModule::set_exec_lanes`.** Exact: differential tests compare per-tx
+events, state root, root vs a full rebuild, sealed block roots, the undo accumulator and the touched set against the serial
+lane for fresh-recipient, shared-recipient and (falling back) ring / unaffordable / pay-a-later-sender batches; removing the
+sender/recipient disjointness check fails the ring case. Result: **not faster here**. Phase timers: the parallel part is only
+2.0 ms per 28.5k-tx block (0.07 us/tx) while the serial merge into the global structures costs 25-30 ms (credit map clones 4.4,
+undo and touched sets 8.4, applying new accounts to the main cache 11-14, record preparation 5.8 even when parallel, history
+append 2.7). Per tx, the serial lane's ~1 us of bookkeeping into four global structures (account cache, `touched` BTreeSet,
+undo map, history) is the floor, not the ~0.3 us of arithmetic the lanes parallelize. Dispatch: 1.52-1.65 us/tx with lanes vs
+1.37-1.46 serial. To make lanes pay, those four structures must become per-lane or sharded with a parallel merge (a larger
+redesign); on a many-core box the parallel record preparation may already help, hence "opt-in, evaluate on the box".
+
+**Seal worker + lazy EIP-2935 (3.2), `modules/evm/src/rootstage.rs`.** The exec stage now only captures (patch delta, pending
+history, undo, gas) and hands the seal (header tries, history record, undo index, backend batch) to an `evm-seal` thread; the
+block hash needed by block h+1's parent-hash write is owed and settled at end of block for plain-transfer batches, or before
+the first batch that can execute contract code. The base-fee update uses the gas the exec stage recorded (it cannot wait for the
+seal). `executed` still means executed, sealed and rooted. Tests: worker vs inline seal over 14 blocks with heavy and light
+batches and a 3 ms seal delay that forces the lazy path (roots, sealed block hashes, history slot right after a contract batch);
+removing the pre-batch resolve fails the slot check. Result: `end_block` 2.0 -> 0.37 us/tx on the exec lane; transfers loop
+196k -> 226k tx/s (sync reference unchanged), 5.4x the 42k at the start of the day. Dispatch rises 1.45 -> 2.1 us/tx because the
+seal and root threads now compete for the laptop's six fast cores; the box is needed to see the true overlap.

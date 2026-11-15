@@ -50,11 +50,14 @@ impl PatchDelta {
 }
 
 use crate::EvmModule;
+use crate::history::Pending;
 use crate::trie::{self, encode_trie_leaf, sparse_walk};
+use crate::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
 use primitives::Hash;
 use revm::database::CacheDB;
 use revm::database_interface::EmptyDB;
 use revm::primitives::Address as EvmAddress;
+use std::sync::Arc;
 
 impl EvmModule {
     /// Re-encode every touched account into leaf/storage-root updates
@@ -240,6 +243,11 @@ use std::sync::{Condvar, Mutex};
 /// values only lengthen the staleness of `stateRoot` in headers.
 pub(crate) const ROOT_HEADER_LAG: u64 = 4;
 
+/// Seal jobs the exec stage may queue ahead of the seal worker (unit: blocks). The seal of
+/// block `h` must finish before block `h + 1` ends (its parent hash is written then), so more than
+/// one block of slack only hides jitter; it also bounds the captured per-block data held in memory.
+const SEAL_QUEUE_DEPTH: usize = 2;
+
 /// How the state root of a deferred block is obtained on the root stage.
 #[derive(Debug)]
 pub(crate) enum DeferredRoot {
@@ -273,6 +281,47 @@ pub(crate) struct RootStageState {
     pub unfinished: Mutex<usize>,
     /// Signalled whenever `rooted` grows or `unfinished` drops.
     pub progress: Condvar,
+    /// Seal jobs for the seal worker thread (`None`: no worker, seal inline).
+    pub seal_tx: Mutex<Option<std::sync::mpsc::SyncSender<SealJob>>>,
+    /// Seal progress: highest height submitted to / finished by the seal stage.
+    pub seal: Mutex<SealProgress>,
+    /// Signalled when `seal` advances.
+    pub seal_cv: Condvar,
+    /// Gas used by the block just ended, recorded on the exec stage for the base-fee update
+    /// (`end_block_ctx`), which cannot wait for the seal.
+    pub block_gas_used: Mutex<Option<u64>>,
+    /// Test hook: microseconds the seal worker sleeps before each seal, to keep a seal in flight
+    /// while the next block starts (exercises the lazy parent-hash write deterministically).
+    pub seal_delay_us: std::sync::atomic::AtomicU64,
+    /// Block whose EIP-2935 parent-hash write is still owed (lazy write; see
+    /// `resolve_pending_parent_hash`).
+    pub pending_parent: Mutex<Option<u64>>,
+}
+
+/// Heights the seal stage has been given and has completed.
+#[derive(Debug, Default)]
+pub(crate) struct SealProgress {
+    /// Highest height whose seal job was submitted.
+    pub submitted: Option<u64>,
+    /// Highest height sealed (history record, undo index and backend batch done).
+    pub sealed: Option<u64>,
+    /// The seal worker died; waiters must stop waiting and fail.
+    pub dead: bool,
+}
+
+/// What the seal stage needs for one block, captured as values on the exec stage.
+#[derive(Debug)]
+pub(crate) struct SealJob {
+    pub height: u64,
+    pub timestamp: u64,
+    pub coinbase: revm::primitives::Address,
+    pub gas_limit: u64,
+    pub base_fee: u64,
+    pub pending: Pending,
+    pub undo: crate::versioned::BlockUndo,
+    pub undo_blob: Option<Vec<u8>>,
+    /// Account flush batch for the backend, serialised on the exec stage.
+    pub flush_ops: Option<Vec<storage::Op>>,
 }
 
 impl RootStageState {
@@ -291,6 +340,27 @@ impl RootStageState {
                 .wait(n)
                 .unwrap_or_else(|_| panic!("state mutex poisoned: a holder panicked mid-mutation"));
         }
+    }
+
+    /// Block until the block at `height` is sealed (immediately if no seal job for it exists).
+    pub(crate) fn wait_sealed(&self, height: u64) {
+        let mut p = framework::lock_state(&self.seal);
+        loop {
+            if p.sealed.is_some_and(|s| s >= height) || p.submitted.is_none_or(|s| s < height) {
+                return;
+            }
+            assert!(!p.dead, "evm seal worker died while block {height} was unsealed");
+            p = self
+                .seal_cv
+                .wait(p)
+                .unwrap_or_else(|_| panic!("state mutex poisoned: a holder panicked mid-mutation"));
+        }
+    }
+
+    /// Whether block `height` is already sealed, or no seal job for it is outstanding.
+    pub(crate) fn sealed_or_idle(&self, height: u64) -> bool {
+        let p = framework::lock_state(&self.seal);
+        p.sealed.is_some_and(|s| s >= height) || p.submitted.is_none_or(|s| s < height)
     }
 
     /// Block until the root of `height` is finished and return it.
@@ -316,6 +386,8 @@ impl EvmModule {
     /// for the root stage as values. Never touches the trie.
     pub(crate) fn end_block_deferred(&self, height: u64) -> Vec<executor::Event> {
         let rs = &self.root_stage;
+        // The parent-hash write owed by `begin_block` must land before this block's state is captured.
+        self.resolve_pending_parent_hash();
         let ready = *framework::lock_state(&self.trie_leaves_ready);
         let root = if ready {
             let pairs: Vec<(EvmAddress, alloy_primitives::B256)> =
@@ -332,51 +404,89 @@ impl EvmModule {
             DeferredRoot::Precomputed(<Self as executor::Module>::state_root(self))
         };
 
+        // Everything the seal needs, captured now (the next block mutates all of it).
         let has_backend = framework::lock_state(&self.backend).is_some();
-        // Header root: lagged, so the block hash is known right now.
+        let timestamp = *framework::lock_state(&self.block_timestamp);
+        let coinbase = *framework::lock_state(&self.coinbase);
+        let pending = framework::lock_state(&self.history).take_pending();
+        *framework::lock_state(&rs.block_gas_used) = Some(pending.gas_used());
+        let undo = std::mem::take(&mut *framework::lock_state(&self.block_undo));
+        let undo_blob = has_backend.then(|| crate::persist::serialize_undo(&undo));
+        let flush_ops = has_backend.then(|| self.account_flush_ops());
+        let job = SealJob {
+            height,
+            timestamp,
+            coinbase,
+            gas_limit: self.block_gas_limit(),
+            base_fee: self.current_base_fee(),
+            pending,
+            undo,
+            undo_blob,
+            flush_ops,
+        };
+        framework::lock_state(&self.touched).clear();
+        framework::lock_state(&rs.seal).submitted = Some(height);
+        *framework::lock_state(&rs.unfinished) += 1;
+        framework::lock_state(&rs.queue).push_back(DeferredBlock { height, root });
+        // Hand the seal to its worker (back-pressure: the channel is bounded), or run it here
+        // when no worker is attached (unit tests driving the module directly).
+        let worker = framework::lock_state(&rs.seal_tx).clone();
+        match worker {
+            Some(tx) => assert!(tx.send(job).is_ok(), "evm seal worker thread died"),
+            None => self.process_seal_job(job),
+        }
+        Vec::new()
+    }
+
+    /// Seal stage: header roots, history record, undo index and backend batch for one block.
+    /// The header carries the root of block `height - ROOT_HEADER_LAG` (zero before that), which
+    /// the root stage produces; this waits for it.
+    pub(crate) fn process_seal_job(&self, job: SealJob) {
+        let rs = &self.root_stage;
+        let height = job.height;
+        let delay = rs.seal_delay_us.load(Ordering::Relaxed);
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(delay));
+        }
+        let has_backend = job.flush_ops.is_some();
         let header_root = if height > ROOT_HEADER_LAG {
             rs.wait_rooted(height - ROOT_HEADER_LAG)
         } else {
             alloy_primitives::B256::ZERO
         };
-        let timestamp = *framework::lock_state(&self.block_timestamp);
-        let coinbase = *framework::lock_state(&self.coinbase);
         let (sealed_block, evicted) = {
             let mut history = framework::lock_state(&self.history);
-            let pending = history.take_pending();
-            let roots = crate::history::History::roots_of(&pending);
+            let roots = crate::history::History::roots_of(&job.pending);
             let evicted = history.seal_taken(
                 height,
-                timestamp,
-                self.block_gas_limit(),
-                self.current_base_fee(),
-                coinbase,
+                job.timestamp,
+                job.gas_limit,
+                job.base_fee,
+                job.coinbase,
                 header_root,
                 roots,
-                pending,
+                job.pending,
             );
             // The clone feeds only the backend batch below; at 28k txs per block it costs
             // ~3 ms, so skip it when no backend is attached.
             (has_backend.then(|| history.block(height).cloned()).flatten(), evicted)
         };
-        let undo = std::mem::take(&mut *framework::lock_state(&self.block_undo));
-        let undo_blob = has_backend.then(|| crate::persist::serialize_undo(&undo));
         let pruned_undo = {
             let mut versioned = framework::lock_state(&self.versioned);
-            versioned.push(height, undo);
+            versioned.push(height, job.undo);
             let history = framework::lock_state(&self.history);
             history.blocks_floor().map_or_else(Vec::new, |floor| versioned.prune_below(floor))
         };
         let mut backend_guard = framework::lock_state(&self.backend);
         if let Some(ref mut backend) = *backend_guard {
-            let mut ops = self.account_flush_ops();
+            let mut ops = job.flush_ops.unwrap_or_default();
             if let Some(b) = sealed_block {
                 ops.push(storage::Op::Set {
                     key: crate::persist::block_key(height),
                     value: crate::persist::serialize_block(&b),
                 });
             }
-            if let Some(blob) = undo_blob {
+            if let Some(blob) = job.undo_blob {
                 ops.push(storage::Op::Set { key: crate::persist::undo_key(height), value: blob });
             }
             for h in evicted {
@@ -388,10 +498,95 @@ impl EvmModule {
             let _ = self.flush_pending(backend.as_mut(), ops);
         }
         drop(backend_guard);
-        framework::lock_state(&self.touched).clear();
-        *framework::lock_state(&rs.unfinished) += 1;
-        framework::lock_state(&rs.queue).push_back(DeferredBlock { height, root });
-        Vec::new()
+        framework::lock_state(&rs.seal).sealed = Some(height);
+        rs.seal_cv.notify_all();
+    }
+
+    /// Spawn the seal worker (called through `Module::spawn_workers` by the executor when the
+    /// root stage is on). The thread holds only a `Weak`, so it ends when the module is dropped.
+    pub(crate) fn spawn_seal_worker(self: &std::sync::Arc<Self>) {
+        let rs = &self.root_stage;
+        let mut slot = framework::lock_state(&rs.seal_tx);
+        if slot.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<SealJob>(SEAL_QUEUE_DEPTH);
+        *slot = Some(tx);
+        drop(slot);
+        let weak = std::sync::Arc::downgrade(self);
+        let spawned = std::thread::Builder::new().name("evm-seal".into()).spawn(move || {
+            /// Marks the worker dead on any exit so waiters fail instead of hanging.
+            struct Guard(std::sync::Weak<EvmModule>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    if let Some(m) = self.0.upgrade() {
+                        framework::lock_state(&m.root_stage.seal).dead = true;
+                        m.root_stage.seal_cv.notify_all();
+                    }
+                }
+            }
+            let _guard = Guard(weak.clone());
+            while let Ok(job) = rx.recv() {
+                let Some(module) = weak.upgrade() else { return };
+                module.process_seal_job(job);
+            }
+        });
+        assert!(spawned.is_ok(), "spawn evm seal worker");
+    }
+
+    /// Write block `h`'s parent hash into the EIP-2935 history-storage contract's ring buffer
+    /// (see `begin_block`: the write a geth system call performs before any transaction).
+    pub(crate) fn write_parent_hash(&self, h: u64, parent_hash: alloy_primitives::B256) {
+        let mut db_guard = framework::lock_state(&self.db);
+        let db = Arc::make_mut(&mut *db_guard);
+        framework::lock_state(&self.block_undo)
+            .capture(HISTORY_STORAGE_ADDRESS, db.cache.accounts.get(&HISTORY_STORAGE_ADDRESS));
+        let account = db.cache.accounts.entry(HISTORY_STORAGE_ADDRESS).or_insert_with(|| {
+            revm::database::DbAccount {
+                info: revm::database::state::AccountInfo {
+                    balance: revm::primitives::U256::ZERO,
+                    nonce: 0,
+                    code_hash: revm::primitives::KECCAK_EMPTY,
+                    account_id: None,
+                    code: Some(revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::new())),
+                },
+                account_state: revm::database::AccountState::Touched,
+                storage: revm::primitives::HashMap::default(),
+            }
+        });
+        let slot = revm::primitives::U256::from((h - 1) % HISTORY_SERVE_WINDOW);
+        let value = revm::primitives::U256::from_be_bytes(parent_hash.0);
+        // Sparse-storage invariant: a zero write deletes —
+        // "slot = 0" and "slot absent" are the same MPT
+        // state. A parent hash is a keccak output (never
+        // zero in practice), but keep the rule uniform.
+        if value.is_zero() {
+            account.storage.remove(&slot);
+        } else {
+            account.storage.insert(slot, value);
+        }
+        account.account_state = revm::database::AccountState::Touched;
+        drop(db_guard);
+        framework::lock_state(&self.touched).insert(HISTORY_STORAGE_ADDRESS);
+    }
+
+    /// Apply the EIP-2935 parent-hash write that `begin_block` deferred, waiting for the parent's
+    /// seal if it is still in flight. No-op when nothing is owed.
+    ///
+    /// Block `h`'s write needs the hash of block `h - 1`, which covers the receipts and
+    /// transactions roots the seal worker is still computing. A block of plain value transfers
+    /// cannot read the history contract, so its transactions run first and the write lands before
+    /// the end-of-block capture; any other batch calls this before it executes. The final state
+    /// is identical to writing at `begin_block`.
+    pub(crate) fn resolve_pending_parent_hash(&self) {
+        let Some(h) = framework::lock_state(&self.root_stage.pending_parent).take() else {
+            return;
+        };
+        self.root_stage.wait_sealed(h - 1);
+        let parent_hash = framework::lock_state(&self.history).block(h - 1).map(|b| b.hash);
+        if let Some(parent_hash) = parent_hash {
+            self.write_parent_hash(h, parent_hash);
+        }
     }
 
     /// Root-stage half: fold the oldest deferred block into the trie and
@@ -420,6 +615,9 @@ impl EvmModule {
                 rooted.pop_first();
             }
         }
+        // `executed` (the executor watermark) means executed, sealed and rooted: snapshots,
+        // RPC and attestations rely on it.
+        rs.wait_sealed(height);
         {
             let mut n = framework::lock_state(&rs.unfinished);
             *n = n.saturating_sub(1);

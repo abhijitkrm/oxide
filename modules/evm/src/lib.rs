@@ -1392,6 +1392,12 @@ impl EvmModule {
         self.parallel_reexecs.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Test hook: make the seal worker sleep `us` microseconds before each seal.
+    #[doc(hidden)]
+    pub fn set_seal_delay_for_test(&self, us: u64) {
+        self.root_stage.seal_delay_us.store(us, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Number of batches that ran on sender-partitioned lanes.
     #[doc(hidden)]
     pub fn lane_batches_for_test(&self) -> u64 {

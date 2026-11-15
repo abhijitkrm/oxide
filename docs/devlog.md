@@ -25049,3 +25049,12 @@ end_block got slower in the pipeline (2.17 -> 2.6 us/tx) because on 6P+2E cores 
 use the cores the parallel trie wants; and `versioned.push` (~12 ms per 28k-account block: the historical-undo index) cannot
 move off the exec stage without making historical reads at the head height wrong. Both need dedicated cores (the 8/16-core
 x86 box) to evaluate honestly. See `docs/multi-lane-evm-spec.md`.
+
+### Multi-lane work built (lanes opt-in, seal worker on with the root stage)
+
+See `docs/multi-lane-evm-spec.md` section 6. Sender-partitioned execution lanes are exact but 5-15% slower than the serial lane
+on this laptop (serial merge into four global structures costs ~14x the parallel part), so they ship opt-in. The seal worker with
+a lazy EIP-2935 write takes the seal off the exec lane: `end_block` 2.0 -> 0.37 us/tx, EVM transfer loop 196k -> 226k tx/s with the
+root stage (42k at the start of the day, 5.4x). Found on the way: `end_block_ctx` read the sealed block's gas for the base-fee
+update, which a seal worker cannot provide in time (fee drift); it now uses the gas recorded on the exec stage. `scripts/bench-gate.sh`
+G3 floor lowered 0.45 -> 0.35 because 1k-account CLOB got faster while 100k stays bound by EVM-account touches (target 0.67 still open).

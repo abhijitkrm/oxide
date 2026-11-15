@@ -197,6 +197,13 @@ pub struct ExecutedBlock {
     pub traces: Vec<Option<crate::trace::CallFrame>>,
 }
 
+impl Pending {
+    /// Total gas used by the block's recorded transactions (what the sealed header reports).
+    pub(crate) fn gas_used(&self) -> u64 {
+        Receipt::cumulative_gas(&self.receipts).last().copied().unwrap_or(0)
+    }
+}
+
 /// Per-block accumulator used between `begin_block` and `end_block`.
 /// `record` appends; `seal_block` folds it into an [`ExecutedBlock`].
 #[derive(Debug, Default)]

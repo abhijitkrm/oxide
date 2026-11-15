@@ -10,9 +10,9 @@
 
 use super::{
     Address, Arc, BLOCK_TIME_SECS, Balances, CHAIN_BLOCK_GAS_LIMIT, CacheDB, EmptyDB, Event,
-    EvmModule, ExecError, HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS, Hash, Height,
-    INTRINSIC_GAS_BASE, MODULE_ID, Module, PreverifiedTx, RejectCategory, SpecId, TxContext,
-    alloy_primitives_address, encode_trie_leaf, fee, persist, trie, tx, versioned,
+    EvmModule, ExecError, Hash, Height, INTRINSIC_GAS_BASE, MODULE_ID, Module, PreverifiedTx,
+    RejectCategory, SpecId, TxContext, alloy_primitives_address, encode_trie_leaf, fee, persist,
+    trie, tx, versioned,
 };
 
 impl Module for EvmModule {
@@ -66,44 +66,15 @@ impl Module for EvmModule {
         // gate: a pre-Prague spec must not mutate this storage or the
         // state root diverges from the real fork.
         if h > 0 && self.spec.is_enabled_in(SpecId::PRAGUE) {
-            let parent_hash = framework::lock_state(&self.history).block(h - 1).map(|b| b.hash);
-            if let Some(parent_hash) = parent_hash {
-                let mut db_guard = framework::lock_state(&self.db);
-                let db = Arc::make_mut(&mut *db_guard);
-                framework::lock_state(&self.block_undo).capture(
-                    HISTORY_STORAGE_ADDRESS,
-                    db.cache.accounts.get(&HISTORY_STORAGE_ADDRESS),
-                );
-                let account =
-                    db.cache.accounts.entry(HISTORY_STORAGE_ADDRESS).or_insert_with(|| {
-                        revm::database::DbAccount {
-                            info: revm::database::state::AccountInfo {
-                                balance: revm::primitives::U256::ZERO,
-                                nonce: 0,
-                                code_hash: revm::primitives::KECCAK_EMPTY,
-                                account_id: None,
-                                code: Some(revm::bytecode::Bytecode::new_raw(
-                                    revm::primitives::Bytes::new(),
-                                )),
-                            },
-                            account_state: revm::database::AccountState::Touched,
-                            storage: revm::primitives::HashMap::default(),
-                        }
-                    });
-                let slot = revm::primitives::U256::from((h - 1) % HISTORY_SERVE_WINDOW);
-                let value = revm::primitives::U256::from_be_bytes(parent_hash.0);
-                // Sparse-storage invariant: a zero write deletes —
-                // "slot = 0" and "slot absent" are the same MPT
-                // state. A parent hash is a keccak output (never
-                // zero in practice), but keep the rule uniform.
-                if value.is_zero() {
-                    account.storage.remove(&slot);
-                } else {
-                    account.storage.insert(slot, value);
+            // With the seal stage on, the parent's hash may still be in flight: owe the write
+            // (`resolve_pending_parent_hash`) instead of waiting for it here.
+            if self.root_stage.is_enabled() && !self.root_stage.sealed_or_idle(h - 1) {
+                *framework::lock_state(&self.root_stage.pending_parent) = Some(h);
+            } else {
+                let parent_hash = framework::lock_state(&self.history).block(h - 1).map(|b| b.hash);
+                if let Some(parent_hash) = parent_hash {
+                    self.write_parent_hash(h, parent_hash);
                 }
-                account.account_state = revm::database::AccountState::Touched;
-                drop(db_guard);
-                framework::lock_state(&self.touched).insert(HISTORY_STORAGE_ADDRESS);
             }
         }
     }
@@ -158,7 +129,11 @@ impl Module for EvmModule {
     /// (a governance block-budget change moves the fee with it).
     fn end_block_ctx(&self, height: Height, ctx: &types::BlockContext) -> Vec<Event> {
         self.end_block(height);
-        let gas_used = {
+        let gas_used = if self.root_stage.is_enabled() {
+            // The seal may still be in flight on its worker; the exec stage recorded the block's
+            // gas at `end_block` (the fee transition must not wait for the seal).
+            framework::lock_state(&self.root_stage.block_gas_used).take()
+        } else {
             let history = framework::lock_state(&self.history);
             history.block(height.value()).map(|b| b.gas_used)
         };
@@ -314,6 +289,8 @@ impl Module for EvmModule {
     }
 
     fn handle(&self, _ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+        // A transaction may read the history contract: settle the owed parent-hash write first.
+        self.resolve_pending_parent_hash();
         self.handle_inner(msg).map(|(events, _)| events)
     }
 
@@ -331,6 +308,7 @@ impl Module for EvmModule {
     /// Individual transactions may fail independently. A failed
     /// transaction does not abort the batch.
     fn handle_batch(&self, msgs: &[(TxContext, &[u8])]) -> Vec<Result<Vec<Event>, ExecError>> {
+        self.resolve_pending_parent_hash();
         // Borrow the raw RLP bytes from each (ctx, payload) pair —
         // no per-tx clone. The payload IS the RLP-encoded signed
         // transaction.
@@ -398,6 +376,7 @@ impl Module for EvmModule {
         // explicit rather than passing an arbitrary tx's context.
         let ctx = TxContext { sender: primitives::Address([0u8; 20]), nonce: 0, fee: 0 };
         let _ = ctxs;
+        self.resolve_pending_parent_hash();
         // Convert the executor's `PreverifiedTx` (generic [u8; 20]
         // sender) to the EVM's `PreverifiedTx` (revm Address sender).
         // The raw bytes stay borrowed — no per-tx clone.
@@ -557,8 +536,16 @@ impl Module for EvmModule {
     fn set_root_deferral(&self, on: bool) {
         if !on {
             self.root_stage.wait_drained();
+            // Dropping the sender ends the seal worker (if any).
+            *framework::lock_state(&self.root_stage.seal_tx) = None;
         }
         self.root_stage.enabled.store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    fn spawn_workers(self: Arc<Self>) {
+        if self.root_stage.is_enabled() {
+            self.spawn_seal_worker();
+        }
     }
 
     fn defers_root(&self) -> bool {

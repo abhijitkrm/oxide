@@ -179,6 +179,7 @@ impl Executor {
         // each block's root while this lane executes the next block.
         for module in self.modules.iter().flatten() {
             module.set_root_deferral(true);
+            Arc::clone(module).spawn_workers();
         }
         let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, StagedRoot)>(ROOT_LANE_DEPTH);
         let weak_root = weak.clone();

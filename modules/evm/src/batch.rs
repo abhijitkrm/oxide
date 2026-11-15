@@ -602,6 +602,7 @@ impl EvmModule {
         if msgs.is_empty() {
             return Vec::new();
         }
+        self.resolve_pending_parent_hash();
 
         // Phase 1: decode + recover all senders in parallel.
         // Same as handle_batch — rayon parallelizes the 88%-of-cost
@@ -717,6 +718,11 @@ impl EvmModule {
         // per-tx work (~1 us) is smaller than the contention it creates.
         // Blocks with enough contract-touching transactions keep
         // speculating, where revm time (10-50 us/tx) dominates.
+        // A batch of plain transfers cannot read the history contract, so the owed EIP-2935 write
+        // can wait for end of block (`resolve_pending_parent_hash`); anything else settles it first.
+        if !Self::all_plain_transfers(&decoded) {
+            self.resolve_pending_parent_hash();
+        }
         if Self::prefer_serial(&decoded) {
             // Sender-partitioned lanes when the batch qualifies (they hand the batch
             // back untouched otherwise); the serial lane is the reference.
@@ -731,6 +737,20 @@ impl EvmModule {
             return self.execute_decoded(ctx, decoded);
         }
         self.execute_parallel_decoded(ctx, decoded)
+    }
+
+    /// Whether every transaction in the batch is a decoded plain value transfer (a call with no
+    /// calldata, access list or authorisations): such a batch cannot execute contract code, so
+    /// it cannot read the history-storage contract.
+    pub(crate) fn all_plain_transfers(decoded: &[DecodedTx]) -> bool {
+        decoded.iter().all(|d| {
+            d.as_ref().is_ok_and(|(signed, ..)| {
+                matches!(signed.to(), tx::TxKind::Call(_))
+                    && signed.data().is_empty()
+                    && signed.access_list().is_empty()
+                    && signed.authorization_list().is_empty()
+            })
+        })
     }
 
     /// Whether a decoded batch is light enough that the serial lane beats

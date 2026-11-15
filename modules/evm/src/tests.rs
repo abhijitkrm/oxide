@@ -5002,3 +5002,93 @@ fn lanes_fall_back_and_match_on_non_qualifying_batches() {
     mixed[3] = lane_transfer(&sc.keys[3].0, 0, revm::primitives::Address::from(sc.keys[50].1.0), 5);
     assert!(!run_lane_differential(&sc, true, &mixed), "payment to a sender must fall back");
 }
+
+// ── Seal worker + lazy EIP-2935 write (docs/multi-lane-evm-spec.md §3.2) ──
+
+/// A deferred module fed a stream of blocks, once with the seal run inline and once on the seal
+/// worker thread. Roots, sealed blocks (block hashes cover the lagged header root and the
+/// receipts/transactions roots) and the EIP-2935 history slot must be identical, including
+/// blocks whose transactions read the history contract (they force the owed parent-hash write
+/// before executing) and blocks of plain transfers (the write lands at end of block).
+#[test]
+#[allow(clippy::cast_possible_truncation)]
+fn seal_worker_and_lazy_parent_hash_match_inline_seal() {
+    let keys: Vec<([u8; 32], Address)> = (0..8).map(|_| test_keypair()).collect();
+    let evm = |a: Address| revm::primitives::Address::from(a.0);
+    let history_addr = Address(HISTORY_STORAGE_ADDRESS.0.into());
+    let build = |worker: bool| -> Arc<EvmModule> {
+        let m = Arc::new(EvmModule::new(1, 7_000_000_000));
+        for (_, a) in &keys {
+            fund(&m, a);
+        }
+        executor::Module::set_root_deferral(m.as_ref(), true);
+        if worker {
+            executor::Module::spawn_workers(Arc::clone(&m));
+        }
+        m
+    };
+    let inline = build(false);
+    let worker = build(true);
+    // Keep each seal in flight while the next block begins, so the parent-hash write is owed.
+    worker.set_seal_delay_for_test(3_000);
+    let slot_of = |h: u64| U256::from((h - 1) % HISTORY_SERVE_WINDOW);
+
+    let mut inline_roots = Vec::new();
+    let mut worker_roots = Vec::new();
+    for h in 1..=14u64 {
+        let heavy = h % 3 == 0;
+        let mut txs = Vec::new();
+        for (i, (pk, _)) in keys.iter().enumerate() {
+            let nonce = h - 1;
+            let to = revm::primitives::Address::from([0x40 + (i as u8); 20]);
+            txs.push(if heavy && i == 0 {
+                // Calldata: not a plain transfer, so the owed parent-hash write must land first.
+                signed_tx(pk, nonce, tx::TxKind::Call(evm(Address([0x99; 20]))), &[1, 2, 3])
+            } else {
+                lane_transfer(pk, nonce, to, 1)
+            });
+        }
+        let mut slots = Vec::new();
+        for (m, roots) in [(&inline, &mut inline_roots), (&worker, &mut worker_roots)] {
+            m.begin_block(Height::new(h));
+            let pvs: Vec<_> =
+                m.preverify_batch(&txs).into_iter().map(|r| r.expect("preverify")).collect();
+            m.handle_batch_parallel_preverified(&dummy_ctx(), &pvs);
+            if heavy {
+                // Right after a contract-touching batch the slot must already hold the parent hash.
+                slots.push(m.storage_at(&history_addr, &slot_of(h)));
+            }
+            m.end_block(Height::new(h));
+            roots.push(h);
+        }
+        if heavy && h > 1 {
+            assert_eq!(slots[0], slots[1], "history slot at block {h} after a contract batch");
+            assert_ne!(slots[1], U256::ZERO, "the parent hash must have been written");
+        }
+        // Finish roots in windows of 3 (the root stage lags execution).
+        if h % 3 == 0 {
+            for hh in (h - 2)..=h {
+                let a = executor::Module::finish_root(inline.as_ref(), Height::new(hh));
+                let b = executor::Module::finish_root(worker.as_ref(), Height::new(hh));
+                assert_eq!(a, b, "state root of block {hh}");
+            }
+        }
+    }
+    // Blocks 13 and 14 are still waiting for their roots (and, on the worker, their seals).
+    for hh in 13..=14u64 {
+        let a = executor::Module::finish_root(inline.as_ref(), Height::new(hh));
+        let b = executor::Module::finish_root(worker.as_ref(), Height::new(hh));
+        assert_eq!(a, b, "state root of block {hh}");
+    }
+    let (hi, hw) = (framework::lock_state(&inline.history), framework::lock_state(&worker.history));
+    for h in 1..=14u64 {
+        let (a, b) = (hi.block(h).expect("inline block"), hw.block(h).expect("worker block"));
+        assert_eq!(
+            (a.hash, a.state_root, a.tx_root, a.receipts_root, a.gas_used),
+            (b.hash, b.state_root, b.tx_root, b.receipts_root, b.gas_used),
+            "sealed block {h}"
+        );
+    }
+    drop((hi, hw));
+    let _ = (inline_roots, worker_roots);
+}
