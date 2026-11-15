@@ -283,6 +283,17 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
             .filter(|(i, _)| is_clob(mix, *i))
             .all(|(_, a)| r.executor.executed_nonce_of(&a.addr) == per as u64);
     let resting = r.exchange.resting_count(0);
+    // Measurement spine (plan W0): where `execute_block` spends its time, per transaction,
+    // from the executor's permanent stage recorder. Stderr so the CSV on stdout is unchanged;
+    // `scripts/rig/summarize.py` and humans read the `stages,` lines.
+    let st = r.executor.stage_report();
+    let (plan, dispatch, end_block, root) = st.us_per_tx();
+    eprintln!(
+        "stages,{mix},{threads},blocks={},txs={},plan_us={plan:.3},dispatch_us={dispatch:.3},end_block_us={end_block:.3},state_root_us={root:.3},serial_floor_tps={:.0}",
+        st.blocks,
+        st.txs,
+        1e6 / (plan + end_block + root).max(1e-9),
+    );
     let rate = |count: usize, secs: f64| count as f64 / secs;
     println!(
         "{mix},{threads},{n},{:.0},{:.0},{:.0},{:.0},{},{resting},{}",

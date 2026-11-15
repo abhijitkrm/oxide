@@ -1780,6 +1780,8 @@ pub struct Executor {
     /// the block, or an evicted entry). Zero in steady state; a large
     /// value means block execution is paying signature recovery serially.
     sig_reverifications: std::sync::atomic::AtomicU64,
+    /// Cumulative per-phase `execute_block` time (see [`StageTimes`]).
+    stage_times: StageTimes,
     /// Minimum batch size to use the parallel speculative execution
     /// path. Configurable via [`Executor::with_config`]. Default:
     /// [`DEFAULT_PARALLEL_THRESHOLD`] (32 txs). Lowered from 100
@@ -1942,6 +1944,7 @@ impl Executor {
             preverify_cache: Mutex::new(primitives::digest_map::DigestMap::default()),
             preverify_cap: max_mempool_entries,
             sig_reverifications: std::sync::atomic::AtomicU64::new(0),
+            stage_times: StageTimes::default(),
             parallel_threshold,
             recorder: None,
             mempool_intake_tx: intake_tx,
@@ -1981,6 +1984,15 @@ impl Executor {
     #[must_use]
     pub fn exec_sig_reverifications(&self) -> u64 {
         self.sig_reverifications.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Cumulative `execute_block` phase times since construction.
+    /// Cheap (a few relaxed atomic adds per block); the measurement
+    /// spine of `docs/hft-production-plan.md` W0 reads it to print a
+    /// cost-per-transaction table per stage.
+    #[must_use]
+    pub fn stage_report(&self) -> StageReport {
+        self.stage_times.snapshot()
     }
 
     /// Size the mempool-intake rayon pool to `threads` (hft-audit-2
@@ -2325,3 +2337,104 @@ struct AcceptedTx {
 
 #[cfg(test)]
 mod tests;
+
+/// Cumulative per-phase time of `execute_block`, in nanoseconds.
+///
+/// Phases (all serial wall time on the executing thread, summed over
+/// blocks): `plan` (per-tx gates in `plan_block_runs`), `dispatch`
+/// (module execution of every run, parallel inside), `end_block`
+/// (module `end_block_ctx` plus attendance), `state_root` (the
+/// executor's own root assembly after `end_block`, which is cheap when
+/// a module already computed its root in `end_block`). Each counter is
+/// one relaxed `fetch_add` per block: the cost is below measurement
+/// noise, so the recorder stays on in production, which is what lets
+/// the SLO metrics of plan section W7 read the same numbers.
+#[derive(Debug, Default)]
+pub struct StageTimes {
+    plan_ns: std::sync::atomic::AtomicU64,
+    dispatch_ns: std::sync::atomic::AtomicU64,
+    end_block_ns: std::sync::atomic::AtomicU64,
+    state_root_ns: std::sync::atomic::AtomicU64,
+    blocks: std::sync::atomic::AtomicU64,
+    txs: std::sync::atomic::AtomicU64,
+}
+
+/// A point-in-time copy of [`StageTimes`]; subtract two snapshots to
+/// get one measurement window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StageReport {
+    /// Nanoseconds in `plan_block_runs`.
+    pub plan_ns: u64,
+    /// Nanoseconds dispatching runs to modules.
+    pub dispatch_ns: u64,
+    /// Nanoseconds in module `end_block` plus attendance.
+    pub end_block_ns: u64,
+    /// Nanoseconds assembling the state root after `end_block`.
+    pub state_root_ns: u64,
+    /// Blocks executed.
+    pub blocks: u64,
+    /// Transactions in those blocks (as proposed, executed or not).
+    pub txs: u64,
+}
+
+impl StageReport {
+    /// `self - earlier`, saturating, for a measurement window.
+    #[must_use]
+    pub fn since(&self, earlier: &Self) -> Self {
+        Self {
+            plan_ns: self.plan_ns.saturating_sub(earlier.plan_ns),
+            dispatch_ns: self.dispatch_ns.saturating_sub(earlier.dispatch_ns),
+            end_block_ns: self.end_block_ns.saturating_sub(earlier.end_block_ns),
+            state_root_ns: self.state_root_ns.saturating_sub(earlier.state_root_ns),
+            blocks: self.blocks.saturating_sub(earlier.blocks),
+            txs: self.txs.saturating_sub(earlier.txs),
+        }
+    }
+
+    /// Microseconds per transaction for each phase:
+    /// `(plan, dispatch, end_block, state_root)`.
+    #[must_use]
+    pub fn us_per_tx(&self) -> (f64, f64, f64, f64) {
+        let n = self.txs.max(1) as f64 * 1_000.0;
+        (
+            self.plan_ns as f64 / n,
+            self.dispatch_ns as f64 / n,
+            self.end_block_ns as f64 / n,
+            self.state_root_ns as f64 / n,
+        )
+    }
+}
+
+impl StageTimes {
+    fn bump(counter: &std::sync::atomic::AtomicU64, d: std::time::Duration) {
+        let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        counter.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(crate) fn add_plan(&self, d: std::time::Duration) {
+        Self::bump(&self.plan_ns, d);
+    }
+    pub(crate) fn add_dispatch(&self, d: std::time::Duration) {
+        Self::bump(&self.dispatch_ns, d);
+    }
+    pub(crate) fn add_end_block(&self, d: std::time::Duration) {
+        Self::bump(&self.end_block_ns, d);
+    }
+    pub(crate) fn add_state_root(&self, d: std::time::Duration) {
+        Self::bump(&self.state_root_ns, d);
+    }
+    pub(crate) fn add_block(&self, txs: usize) {
+        self.blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.txs.fetch_add(txs as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn snapshot(&self) -> StageReport {
+        use std::sync::atomic::Ordering::Relaxed;
+        StageReport {
+            plan_ns: self.plan_ns.load(Relaxed),
+            dispatch_ns: self.dispatch_ns.load(Relaxed),
+            end_block_ns: self.end_block_ns.load(Relaxed),
+            state_root_ns: self.state_root_ns.load(Relaxed),
+            blocks: self.blocks.load(Relaxed),
+            txs: self.txs.load(Relaxed),
+        }
+    }
+}

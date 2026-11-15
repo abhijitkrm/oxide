@@ -518,8 +518,11 @@ impl Executor {
             std::mem::take(&mut *primitives::sync::lock_state(&self.preverify_cache));
 
         let mut skipped: Vec<(Hash, TxSkipReason)> = Vec::new();
+        let t_plan = std::time::Instant::now();
         let mut runs =
             self.plan_block_runs(&block.txs, &mut local_nonce, &preverify_cache, &mut skipped);
+        self.stage_times.add_plan(t_plan.elapsed());
+        let t_dispatch = std::time::Instant::now();
 
         // Record finalized outcomes for txs that never reached a
         // module. These are the only outcomes a submitter can get
@@ -588,6 +591,8 @@ impl Executor {
         // Publish all events from this block in one lock acquisition.
         primitives::sync::lock_state(&self.events).extend(block_events);
 
+        self.stage_times.add_dispatch(t_dispatch.elapsed());
+        let t_end = std::time::Instant::now();
         // end_block for all modules — same context as begin_block.
         // Module scheduled effects (liquidation sweeps, epoch work)
         // emit events that land in the block log AFTER every tx
@@ -618,10 +623,14 @@ impl Executor {
         // post-block root (folded incrementally by `bump`), so this
         // block pays O(touched senders), not a full scan of every
         // account that ever transacted.
+        self.stage_times.add_end_block(t_end.elapsed());
+        let t_root = std::time::Instant::now();
         let mut module_roots = Vec::new();
         for module in self.modules.iter().flatten() {
             module_roots.push(module.state_root());
         }
+        self.stage_times.add_state_root(t_root.elapsed());
+        self.stage_times.add_block(block.txs.len());
 
         // Push the fresh nonce anchors into the mempool — the live
         // update path the pool's `executed_nonces` anchoring was
