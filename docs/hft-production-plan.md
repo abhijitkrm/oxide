@@ -106,8 +106,9 @@ Each lists the change, the gate that proves it, and the evidence class (laptop =
 - Gate: cost/item flat from 128 to 1M traders and 8 to 100 markets (within 1.5x); shadow equality (W1).
 
 ### W4. Commitment and persistence (spec in `docs/` first: it changes attestation, state sync, light clients)
-- Lagged state root: header at h commits to root of h-k; root, history seal and persistence computed on a worker
-  pipelined with h+1; backpressure rule and snapshot-at-executed-height defined in the spec.
+- Root stage (`docs/root-stage-spec.md`): correction to the first draft. Oxide already executes after consensus (exec lane,
+  roots attested in later proposals, `EXEC_LANE_DEPTH` back-pressure), so no header change is needed; the root
+  computation is split from execution inside the lane and pipelined (bit-identical roots).
 - Sharded root: account buckets rehashed only when changed, shard roots combined; EVM MPT root keeps bit-identical
   Ethereum semantics, computed off the critical path (and the 16-way top-nibble parallel hash remains an option).
 - NVMe journal, group commit, pipelined durable ack, durable deferred chunks, background snapshots, recovery =
