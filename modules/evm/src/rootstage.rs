@@ -332,6 +332,7 @@ impl EvmModule {
             DeferredRoot::Precomputed(<Self as executor::Module>::state_root(self))
         };
 
+        let has_backend = framework::lock_state(&self.backend).is_some();
         // Header root: lagged, so the block hash is known right now.
         let header_root = if height > ROOT_HEADER_LAG {
             rs.wait_rooted(height - ROOT_HEADER_LAG)
@@ -354,10 +355,11 @@ impl EvmModule {
                 roots,
                 pending,
             );
-            (history.block(height).cloned(), evicted)
+            // The clone feeds only the backend batch below; at 28k txs per block it costs
+            // ~3 ms, so skip it when no backend is attached.
+            (has_backend.then(|| history.block(height).cloned()).flatten(), evicted)
         };
         let undo = std::mem::take(&mut *framework::lock_state(&self.block_undo));
-        let has_backend = framework::lock_state(&self.backend).is_some();
         let undo_blob = has_backend.then(|| crate::persist::serialize_undo(&undo));
         let pruned_undo = {
             let mut versioned = framework::lock_state(&self.versioned);

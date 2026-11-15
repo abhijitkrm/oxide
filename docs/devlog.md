@@ -25035,3 +25035,17 @@ transfers = 540M gas, plus ~10%), bytes 8 MiB (a 600M block of transfers is ~3.1
 Governable at runtime (`chain.block_gas_limit`). `chain_mix` now defaults to the same budget. Measured (laptop, 8 threads,
 400k signed transfers, 14 blocks of 28.5k): loop 126k tx/s synchronous, 176k with the root stage (42k at the start of the
 day, 4.2x); exec cost 3.97 us/tx.
+
+### EVM exec lane: hash once, clone only for the backend (loop 176k -> 196k tx/s)
+
+At 28.5k txs per block (600M gas) the per-block serial work was visible: `plan` hashed every tx (0.2 us) and
+`take_preverified_for` hashed it again; the sealed-block clone for persistence cost ~3 ms per block even with no backend.
+Now one parallel BLAKE3 pass per block (>= 512 txs) feeds both, and the clone is skipped without a backend. plan 0.35 -> 0.11
+us/tx, end_block 2.17 -> 2.0; transfers with the root stage: loop 176k -> 196k tx/s (sync 126k -> 136k); exec lane 3.57 us/tx
+(~280k tx/s).
+Tried and reverted: a parallel ordered trie for the receipts/transactions roots (subtries split by the keys' shared nibble
+prefix, differential-tested bit-identical over 0..70k items): 3-4x faster in isolation (46 -> 10 ms for 28.5k items) but 
+end_block got slower in the pipeline (2.17 -> 2.6 us/tx) because on 6P+2E cores the root-stage and ingest threads already
+use the cores the parallel trie wants; and `versioned.push` (~12 ms per 28k-account block: the historical-undo index) cannot
+move off the exec stage without making historical reads at the head height wrong. Both need dedicated cores (the 8/16-core
+x86 box) to evaluate honestly. See `docs/multi-lane-evm-spec.md`.

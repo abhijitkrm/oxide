@@ -195,19 +195,18 @@ impl Executor {
     pub(crate) fn plan_block_runs<'b>(
         &self,
         txs: &'b [TxBytes],
+        tx_hashes: &[Hash],
         local_nonce: &mut BlockNonces<'_>,
         preverify_cache: &primitives::digest_map::DigestMap<[u8; 20]>,
         skipped: &mut Vec<(Hash, TxSkipReason)>,
     ) -> Vec<(u8, Vec<GroupedTx<'b>>)> {
         let mut runs: Vec<(u8, Vec<GroupedTx<'b>>)> = Vec::new();
         let mut cumulative_gas: u64 = 0;
-        for tx in txs {
+        for (tx, &tx_hash) in txs.iter().zip(tx_hashes) {
             let bytes = tx.as_bytes();
-            // Hash once up front: grouped txs already paid for this
-            // hash (preverify key), and skipped txs need it for the
-            // outcome record. Skips are rare in honest traffic, so
-            // the extra hash on a dropped tx costs nothing real.
-            let tx_hash = Hasher::hash_one(Domain::Transaction, bytes);
+            // `tx_hash` was computed once for the whole block (see `hash_block_txs`):
+            // grouped txs reuse it as the preverify key, and skipped txs need it for
+            // the outcome record.
             let Some(ctx) = parse_tx_context(bytes) else {
                 skipped.push((tx_hash, TxSkipReason::Malformed));
                 continue;
@@ -529,12 +528,21 @@ impl Executor {
         // for later blocks simply stay in the shared cache, where ingest
         // keeps adding to it. A hit still only means "this node verified
         // these exact bytes at ingest", so retention cannot change a result.
-        let mut preverify_cache = self.take_preverified_for(block);
+        // One BLAKE3 hash per tx, computed once (in parallel for big blocks) and shared by
+        // the preverify-cache take and the planner; at 28k txs per block the two serial
+        // passes cost ~11 ms.
+        let tx_hashes = Self::hash_block_txs(&block.txs);
+        let mut preverify_cache = self.take_preverified_for(&tx_hashes);
 
         let mut skipped: Vec<(Hash, TxSkipReason)> = Vec::new();
         let t_plan = std::time::Instant::now();
-        let mut runs =
-            self.plan_block_runs(&block.txs, &mut local_nonce, &preverify_cache, &mut skipped);
+        let mut runs = self.plan_block_runs(
+            &block.txs,
+            &tx_hashes,
+            &mut local_nonce,
+            &preverify_cache,
+            &mut skipped,
+        );
         self.stage_times.add_plan(self.stage_done("exec_plan", t_plan));
         let t_dispatch = std::time::Instant::now();
 
@@ -704,11 +712,23 @@ impl Executor {
         d
     }
 
+    /// `Domain::Transaction` hash of every tx in a block, in block order. Parallel
+    /// above [`PAR_HASH_MIN_TXS`] (hashing is ~0.2 us per tx, independent per tx).
+    fn hash_block_txs(txs: &[types::TxBytes]) -> Vec<Hash> {
+        use rayon::prelude::*;
+        let h = |tx: &types::TxBytes| Hasher::hash_one(Domain::Transaction, tx.as_bytes());
+        if txs.len() >= PAR_HASH_MIN_TXS {
+            txs.par_iter().map(h).collect()
+        } else {
+            txs.iter().map(h).collect()
+        }
+    }
+
     /// Move this block's ingest-verified senders out of the shared cache
     /// (see the comment at the call site in `execute_block_staged`).
     fn take_preverified_for(
         &self,
-        block: &FinalizedBlock,
+        tx_hashes: &[Hash],
     ) -> primitives::digest_map::DigestMap<[u8; 20]> {
         let mut shared = primitives::sync::lock_state(&self.preverify_cache);
         // Bound stale entries (txs the pool evicted never execute):
@@ -717,14 +737,7 @@ impl Executor {
         if shared.len() > self.preverify_cap {
             shared.clear();
         }
-        block
-            .txs
-            .iter()
-            .filter_map(|tx| {
-                let h = Hasher::hash_one(Domain::Transaction, tx.as_bytes());
-                shared.remove(&h).map(|sender| (h, sender))
-            })
-            .collect()
+        tx_hashes.iter().filter_map(|h| shared.remove(h).map(|sender| (*h, sender))).collect()
     }
 
     /// Record the finalized outcome for every tx in one module
@@ -772,3 +785,7 @@ pub(crate) enum StagedRoot {
     /// obtained from `Module::finish_root`) plus the nonce root.
     Pending { height: primitives::Height, module_roots: Vec<Option<Hash>>, nonce_root: Hash },
 }
+
+/// Smallest block (unit: txs) whose tx hashes are computed on the rayon pool; below
+/// it the hand-off costs more than the ~0.2 us per hash it saves.
+const PAR_HASH_MIN_TXS: usize = 512;

@@ -468,6 +468,7 @@ impl Module for EvmModule {
         // concurrently. Lock order is unchanged (`history` is taken
         // only for the trie computation; `state_root` takes its own
         // locks and never `history`).
+        let has_backend_early = framework::lock_state(&self.backend).is_some();
         let (root, roots) = rayon::join(
             || self.state_root(),
             || framework::lock_state(&self.history).pending_roots(),
@@ -488,7 +489,9 @@ impl Module for EvmModule {
             // Clone the sealed record for persistence — the clone is
             // once per block (cold path) and keeps the backend write
             // off the history lock's critical section.
-            let sealed = history.block(height.value()).cloned();
+            // Clone only when a backend will persist it (~3 ms per 28k-tx block).
+            let sealed =
+                has_backend_early.then(|| history.block(height.value()).cloned()).flatten();
             (sealed, evicted)
         };
 
