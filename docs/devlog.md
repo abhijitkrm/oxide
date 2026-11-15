@@ -24879,3 +24879,19 @@ treats CPU-per-input as the honest throughput number.
 ### Study of the Go reference chain and the production/HFT plan
 
 Read the reference's design docs, practices checklist, box report and harness layout (not its keeper code line by line). Result: `docs/hft-production-plan.md`. Neither stack has shown 10M items/s end to end (the reference: ~1.1M/s measured, one 32-core node, signed, persisted). Our edge is the engine and EVM execution; theirs is method (per-item budget, traders x markets matrix, shadow-equal gates, lagged root, invalid-run rules). New data point: `chain_mix --mix clob`, laptop, 8 ingest threads, 200k signed orders: admission 153k/s (secp256k1 recovery bound), propose 873k/s, finalize 343k/s.
+
+### W0 first readings: CLOB cost per tx is not flat in account count
+
+`chain_mix --mix clob`, laptop, 8 ingest threads, 200k signed orders, new `StageTimes` recorder (us per tx):
+
+| accounts | plan | dispatch | end_block | finalize tx/s | total tx/s |
+|---|---|---|---|---|---|
+| 1,000 | 0.64 | 1.31 | 0.02 | 357k | 95.9k |
+| 10,000 | 0.64 | 1.07 | 0.18 | 361k | 95.7k |
+| 100,000 | 0.65 | 1.27 | 1.90 | 196k | 72.7k |
+
+At 100k accounts `end_block` grows 100x and finalize drops 45% (the reference stack saw the same shape: cost per
+item rising with trader count). EVM transfers for comparison: plan 0.34, dispatch 4.8, end_block 6.6 us. Next:
+find what the exchange does per touched account in `end_block` at scale (suspect per-account work rather than per
+order) and make it per-change. A clippy failure (cast_precision_loss) slipped into the first commit of the recorder
+because the gate was run without checking its exit code in the same command as the commit; fixed in the next commit.

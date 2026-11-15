@@ -2393,6 +2393,8 @@ impl StageReport {
 
     /// Microseconds per transaction for each phase:
     /// `(plan, dispatch, end_block, state_root)`.
+    // Reporting only: u64 -> f64 loses precision above 2^52 ns (52 days), irrelevant here.
+    #[allow(clippy::cast_precision_loss)]
     #[must_use]
     pub fn us_per_tx(&self) -> (f64, f64, f64, f64) {
         let n = self.txs.max(1) as f64 * 1_000.0;
