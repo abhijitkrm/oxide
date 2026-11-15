@@ -17,6 +17,13 @@ use super::{
 use revm::database_interface::DatabaseRef;
 use revm::state::EvmState;
 
+/// A batch is "heavy" (worth speculating in parallel) when at least one in this
+/// many transactions carries calldata or creates a contract (unit: 1/N of the
+/// batch). Origin: laptop, 8 threads: plain-transfer blocks run 2.5x faster
+/// serially (1.4 vs 3.4 us/tx); revm-bound txs (10-50 us) gain from
+/// speculation. Raising N sends more mixed blocks down the serial lane.
+const HEAVY_TX_SHARE_DENOM: usize = 4;
+
 /// The canonical account-info key at the commit point.
 ///
 /// Goes through `basic_ref` (not `cache.accounts.get`) so
@@ -702,7 +709,33 @@ impl EvmModule {
             })
             .collect();
 
+        // Speculative parallelism only pays when the transactions are heavy
+        // enough to amortize its fixed per-tx cost (a `CacheDB`/version-store
+        // wrapper, shared-lock traffic and a serial commit): measured on a
+        // laptop, a block of plain transfers costs ~1.4 us/tx on the serial
+        // lane and ~3.4 us/tx through speculation at 8 threads, because the
+        // per-tx work (~1 us) is smaller than the contention it creates.
+        // Blocks with enough contract-touching transactions keep
+        // speculating, where revm time (10-50 us/tx) dominates.
+        if Self::prefer_serial(&decoded) {
+            return self.execute_decoded(ctx, decoded);
+        }
         self.execute_parallel_decoded(ctx, decoded)
+    }
+
+    /// Whether a decoded batch is light enough that the serial lane beats
+    /// speculation: fewer than one in [`HEAVY_TX_SHARE_DENOM`] transactions
+    /// carries calldata or creates a contract (the ones that reach revm).
+    pub(crate) fn prefer_serial(decoded: &[DecodedTx]) -> bool {
+        let heavy = decoded
+            .iter()
+            .filter(|d| {
+                d.as_ref().is_ok_and(|(signed, ..)| {
+                    !matches!(signed.to(), tx::TxKind::Call(_)) || !signed.data().is_empty()
+                })
+            })
+            .count();
+        heavy.saturating_mul(HEAVY_TX_SHARE_DENOM) < decoded.len()
     }
 
     /// Shared parallel execution loop for decoded transactions.

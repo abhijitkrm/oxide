@@ -148,7 +148,11 @@ struct Rig {
 }
 
 fn rig(accts: &[Account], capacity: usize) -> Rig {
-    let mut executor = Executor::new(capacity + 100);
+    // CHAIN_MIX_PAR_THRESHOLD: runs of at least this many txs take the parallel path (default: executor's).
+    let mut executor = match std::env::var("CHAIN_MIX_PAR_THRESHOLD").ok().and_then(|v| v.parse().ok()) {
+        Some(t) => Executor::with_config(capacity + 100, t),
+        None => Executor::new(capacity + 100),
+    };
     let evm = Arc::new(EvmModule::new(1, 7_000_000_000));
     for a in accts {
         // Native ledger balance (fees, escrow, base custody) and EVM balance (transfers).

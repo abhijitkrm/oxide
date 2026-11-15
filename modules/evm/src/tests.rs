@@ -4726,3 +4726,88 @@ fn deferred_root_matches_sync_root_every_block() {
         assert_eq!(db.state_root, want_header_root, "header root of block {h}");
     }
 }
+
+// ── Serial lane for light batches (HEAVY_TX_SHARE_DENOM) ──────
+
+/// A block of plain transfers (ring: every account pays the next, the worst case
+/// for speculation) takes the serial lane through the preverified entry point;
+/// it must produce exactly the state, receipts and roots the speculative path
+/// produces for the same batch.
+#[test]
+fn light_batches_take_serial_lane_with_identical_results() {
+    let keys: Vec<([u8; 32], Address)> = (0..24).map(|_| test_keypair()).collect();
+    let evm = |a: Address| revm::primitives::Address::from(a.0);
+    let mut txs = Vec::new();
+    for nonce in 0..6u64 {
+        for (i, (pk, _)) in keys.iter().enumerate() {
+            let to = evm(keys[(i + 1) % keys.len()].1);
+            txs.push(signed_transfer_tx(pk, nonce, to, 1 + u128::from(nonce)));
+        }
+    }
+    let setup = || {
+        let m = EvmModule::new(1, 7_000_000_000);
+        for (_, a) in &keys {
+            fund(&m, a);
+        }
+        m.begin_block(Height::new(1));
+        m
+    };
+
+    let m_par = setup();
+    let par = m_par.handle_batch_parallel(&dummy_ctx(), &txs);
+    m_par.end_block(Height::new(1));
+
+    let m_pv = setup();
+    let pvs: Vec<_> =
+        m_pv.preverify_batch(&txs).into_iter().map(|r| r.expect("preverify")).collect();
+    // The classifier must route this batch to the serial lane.
+    let decoded: Vec<_> = pvs
+        .iter()
+        .map(|pv| {
+            let s = tx::SignedTx::decode_raw(pv.raw).expect("decode");
+            Ok((
+                s,
+                revm::primitives::Address::from(pv.sender),
+                alloy_primitives::B256::ZERO,
+                Vec::new(),
+            ))
+        })
+        .collect();
+    assert!(EvmModule::prefer_serial(&decoded), "plain transfers must prefer the serial lane");
+    let pv = m_pv.handle_batch_parallel_preverified(&dummy_ctx(), &pvs);
+    m_pv.end_block(Height::new(1));
+
+    assert_eq!(par.len(), pv.len());
+    for (i, (a, b)) in par.iter().zip(pv.iter()).enumerate() {
+        assert_eq!(a.is_ok(), b.is_ok(), "tx {i} outcome");
+    }
+    assert_eq!(executor::Module::state_root(&m_par), executor::Module::state_root(&m_pv));
+    let (hp, hv) = (framework::lock_state(&m_par.history), framework::lock_state(&m_pv.history));
+    let (bp, bv) = (hp.block(1).expect("par block"), hv.block(1).expect("pv block"));
+    assert_eq!(
+        (bp.receipts_root, bp.tx_root, bp.state_root),
+        (bv.receipts_root, bv.tx_root, bv.state_root)
+    );
+}
+
+/// Contract-touching batches keep speculating.
+#[test]
+fn contract_heavy_batches_still_speculate() {
+    let (pk, _) = test_keypair();
+    let evm = |a: Address| revm::primitives::Address::from(a.0);
+    let raws: Vec<Vec<u8>> = (0..8u64)
+        .map(|n| signed_tx(&pk, n, tx::TxKind::Call(evm(Address([9; 20]))), &[1, 2, 3]))
+        .collect();
+    let decoded: Vec<_> = raws
+        .iter()
+        .map(|r| {
+            Ok((
+                tx::SignedTx::decode_raw(r).expect("decode"),
+                revm::primitives::Address::ZERO,
+                alloy_primitives::B256::ZERO,
+                Vec::new(),
+            ))
+        })
+        .collect();
+    assert!(!EvmModule::prefer_serial(&decoded), "calldata-carrying txs must keep speculating");
+}
