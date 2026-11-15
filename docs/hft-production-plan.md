@@ -176,29 +176,42 @@ No phase starts before the previous gate passes unless this plan says so (consis
 
 ## 8. Status (15 Nov 2026, end of session 1)
 
-Measured on the laptop, signed transactions through the real executor, 8 threads (`chain_mix`, `scripts/bench-gate.sh`):
+Measured on the laptop (Apple M-series, 8 threads), signed transactions through the real `Executor` (no consensus, network
+or disk: those are workstreams W4/W5 and the box). `chain_mix`, `scripts/bench-gate.sh`:
 
 | Metric | Start of day | Now |
 |---|---|---|
-| EVM transfers, pipeline loop (propose+finalize) | 42.0k tx/s | 120.8k tx/s (2.9x) |
+| EVM transfers, pipeline loop (propose+finalize) | 42.0k tx/s | 121-136k tx/s (3x) |
 | EVM `end_block` | 6.6 us/tx | 2.0 us/tx (root stage) |
 | Propose phase (EVM transfers) | 85k tx/s | 720-950k tx/s |
-| CLOB at 100k accounts, loop | 138k tx/s | 237k tx/s (1.0x of 1k-account loop: 0.67) |
-| Admission (secp256k1 recovery) | 150k tx/s | 150k tx/s (now the cap; W2 addresses it) |
+| CLOB per-order tx, loop (1k accounts) | 261k tx/s | 434k tx/s |
+| CLOB per-order tx at 100k accounts, loop | 138k tx/s | 237k tx/s (0.5-0.67x of 1k accounts) |
+| Admission, per-order tx (secp256k1 recovery) | 150k tx/s | 150k tx/s (unchanged: the physics of one recovery per tx) |
+| Admission, 64-order bundle tx | n/a | 7.5-8.6M orders/s |
+| Bundle mix end-to-end (ingest+propose+exec), orders/s | 94k (per-order) | 1.34-1.61M (14-17x) |
+| Bundle mix execution loop | n/a | 1.6M sync / 2.0M root stage orders/s |
+
+Where the day's gains came from (each profiled, root-caused, differential-tested, devlogged): gas-capped proposal walk
+(the proposer cloned the whole pool per block), preverify cache O(block) not O(backlog), root stage (state root off the
+execution thread, EIP-2935-aware lagged header root), IdMap removal O(cluster) -> O(displacement) (sequential ids made the
+live set one cluster), lazy `CommittedMap` fold (two leaf hashes per mutation -> one per dirty key per root read), bundles
+(one signature recovery per 64 orders). Honest caveats: bundles change what a "transaction" is (orders/s, not tx/s);
+the reference stack's ~1.1M items/s is a replicated, persisted, 32-core number and ours is a single-process executor
+number, so the two are not comparable until W4/W5 land.
 
 | Workstream | State |
 |---|---|
-| W0 measurement spine | DONE for the executor: permanent stage recorder (`StageReport`, latency-recorder labels `exec_*`, `root_stage`), `stages,` line, lane modes, accounts axis, ratio gates in `scripts/bench-gate.sh` + nightly. TODO: markets/depth axes, CSV archive |
-| W1 correctness harness | PARTIAL: root-stage differentials (evm module + executor integration, mutation-checked), gas-capped select equivalence test. TODO: exchange executor shadow harness |
-| W2 intake | SPEC `docs/bundle-auth-spec.md`; gas estimate now carried through the intake ring; preverify cache O(block). TODO: bundle envelope implementation |
-| W3 execution | TODO: resident dense accounts, batch settlement (CLOB at 100k accounts still 0.67x of 1k: ~29k EVM accounts touched per block) |
-| W4 commitment | root stage IMPLEMENTED behind `with_root_stage` (default off; audit before default-on); sharded root, journal pipelining TODO |
+| W0 measurement spine | DONE for the executor: permanent stage recorder (`StageReport`, latency-recorder labels `exec_*`, `root_stage`), `stages,` line, lane modes (`CHAIN_MIX_LANE`), accounts axis, bundle mix, ratio gates G1-G4 in `scripts/bench-gate.sh` + nightly. TODO: markets/depth axes, CSV archive |
+| W1 correctness harness | PARTIAL: root-stage differentials (evm module + executor integration), gas-capped select equivalence, bundle-vs-separate equivalence, IdMap and CommittedMap reference-differential tests, all mutation-checked. TODO: full exchange executor shadow harness over generated streams |
+| W2 intake | bundles IMPLEMENTED (tag 19; `docs/bundle-auth-spec.md`): gas estimate carried through the intake ring; TODO: per-item fee model, decoder fuzz target, loadgen/SDK scheme, activation gate, gateway-certified bundles |
+| W3 execution | exchange exec now ~0.33 us/order in bundles; TODO: resident dense accounts, batch ledger deltas, per-market parallel exec (single exec thread is the bound at ~2M orders/s), CLOB-at-100k-accounts EVM-account touch cost |
+| W4 commitment | root stage IMPLEMENTED behind `with_root_stage` (default off; audit before default-on; `docs/root-stage-spec.md`); sharded root, journal pipelining TODO |
 | W5 replication | NOT STARTED (needs multi-host; decision 5 says single node first) |
-| W6 EVM | propose fixed, end_block 3x cheaper; parallel dispatch granularity and per-tx 3.4 us dispatch TODO |
-| W7 production grade | PARTIAL: SLO labels, CI ratio gates. TODO: external security review, fuzz target for bundle decoder, soak, upgrade drills |
+| W6 EVM | propose fixed, end_block 3x cheaper, dispatch 5.3 -> 3.4 us/tx; TODO: parallel dispatch granularity, gas-limit x block-time grid (decision 3) |
+| W7 production grade | PARTIAL: SLO labels, CI ratio gates. TODO: external security review, decoder fuzz targets, soak, upgrade drills |
 | W8 rig/box | pre-flight dry run, bench audit and expected ranges still TODO; box skipped by decision |
 
-Phases: A mostly done; B started (propose/intake/root stage); C started (root stage, journal TODO); D, E, F need
-multi-host hardware, an external review, a geo testnet and soak time and are not achievable in a laptop session. The
-honest forward path to F is: W2 bundle envelope, W3 batch settlement and resident accounts, root stage default-on
-after audit, then an 8-core box to prove which stage is hardware-bound (decision 5).
+Phases: A done except markets/depth axes; B in progress (intake, root stage, exchange exec); C started (root stage; journal
+TODO); D, E, F need multi-host hardware, an external review, a geo testnet and soak time and are not achievable in a laptop
+session. Forward path to F: batch ledger deltas and per-market parallel execution (W3) to lift the ~2M orders/s exec bound,
+root stage default-on after audit, then an 8-core box to prove which stage is hardware-bound (decision 5).
