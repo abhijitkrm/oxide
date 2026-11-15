@@ -114,6 +114,9 @@ struct CliConfig {
     worker_base_core: Option<u32>,
     sequencer_idle: matcher::SequencerIdle,
     journal: Option<matcher::cmdlog::JournalConfig>,
+    auth: matcher::auth::AuthConfig,
+    commit_batches: bool,
+    fund_loadgen_keys: bool,
 }
 
 /// Parse CLI flags into a `CliConfig`.
@@ -193,6 +196,14 @@ fn parse_cli() -> CliConfig {
         // (default 100000, 0 = never) is how often a checkpoint is
         // taken at a settlement seal. Typos are startup errors.
         journal: parse_journal(),
+        auth: parse_auth(),
+        // `--commit-batches`: submit committed batch settles (exchange tag
+        // 16) with a root over each batch's raw fills. Needs a chain that
+        // understands tag 16.
+        commit_batches: env::args().any(|a| a == "--commit-batches"),
+        // `--fund-loadgen-keys` (needs a `dev-identities` build): fund the
+        // publicly derivable identities `oxide-loadgen` signs with.
+        fund_loadgen_keys: env::args().any(|a| a == "--fund-loadgen-keys"),
         sequencer_idle: parse_flag_opt::<String>("--sequencer-idle").map_or_else(
             matcher::SequencerIdle::default,
             |v| {
@@ -276,7 +287,52 @@ fn build_server_config(cli: &CliConfig) -> ServerConfig {
         worker_base_core: cli.worker_base_core,
         sequencer_idle: cli.sequencer_idle,
         journal: cli.journal.clone(),
+        auth: cli.auth.clone(),
+        commit_batches: cli.commit_batches,
     }
+}
+
+/// Parse the `--auth*` flags: which order/action authentication scheme
+/// the matcher runs (see `matcher::auth`). Default is `ed25519_batch`,
+/// the historical behaviour.
+fn parse_auth() -> matcher::auth::AuthConfig {
+    use matcher::auth::{AuthConfig, AuthKind, Schemes};
+    let die = |what: &str, v: &str| -> ! {
+        eprintln!("error: {what}: '{v}'");
+        std::process::exit(1);
+    };
+    let mut cfg = AuthConfig::default();
+    if let Some(k) = parse_flag_opt::<String>("--auth") {
+        cfg.kind = AuthKind::parse(&k).unwrap_or_else(|v| {
+            die("--auth (use ed25519_batch, ed25519, evm, session_mac, certified, multi)", &v)
+        });
+    }
+    if let Some(list) = parse_flag_opt::<String>("--auth-schemes") {
+        cfg.schemes = Schemes::parse(&list)
+            .unwrap_or_else(|v| die("--auth-schemes (use ed25519,evm,mac,cert or all)", &v));
+    }
+    cfg.evm_threads = parse_flag("--evm-threads", 1usize).max(1);
+    cfg.audit_every = parse_flag("--audit-every", cfg.audit_every);
+    // Longest session lifetime in ms (default 24h; 0 removes the cap, which
+    // also allows sessions that never expire).
+    match parse_flag("--max-session-ttl-ms", 24 * 60 * 60 * 1000u64) {
+        0 => cfg.max_session_ttl_ms = None,
+        t => cfg.max_session_ttl_ms = Some(t),
+    }
+    // Provable gateway faults before a gateway is suspended (0 = never).
+    cfg.suspend_after = parse_flag("--gateway-suspend-after", cfg.suspend_after);
+    if let Some(keys) = parse_flag_opt::<String>("--gateway-keys") {
+        for k in keys.split(',').filter(|k| !k.is_empty()) {
+            let bytes = (0..k.len())
+                .step_by(2)
+                .map(|i| k.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
+                .collect::<Option<Vec<u8>>>()
+                .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                .unwrap_or_else(|| die("--gateway-keys (64 hex chars each, comma-separated)", k));
+            cfg.trusted_gateways.push(bytes);
+        }
+    }
+    cfg
 }
 
 /// Parse the `--journal-*` flags.
@@ -294,6 +350,28 @@ fn parse_journal() -> Option<matcher::cmdlog::JournalConfig> {
     };
     cfg.checkpoint_after_records = parse_flag("--journal-checkpoint-records", 100_000u64);
     Some(cfg)
+}
+
+/// Fund the benchmark identities `oxide-loadgen` signs with (ed25519-derived
+/// owners and EVM addresses for accounts `0..n`). DEVELOPMENT ONLY: these
+/// keys are publicly derivable, so anything funded here is spendable by anyone.
+#[cfg(feature = "dev-identities")]
+fn fund_loadgen_identities(n: usize, mut fund: impl FnMut(&primitives::Address)) {
+    eprintln!(
+        "oxide-matcher: WARNING --fund-loadgen-keys: funding {n} publicly derivable benchmark \
+         identities; never use this on a node that holds real value"
+    );
+    for i in 0..u32::try_from(n).unwrap_or(u32::MAX) {
+        fund(&matcher::loadkeys::ed_owner(i));
+        fund(&matcher::loadkeys::evm_address(i));
+    }
+}
+
+/// Refuse `--fund-loadgen-keys` in a build without the feature.
+#[cfg(not(feature = "dev-identities"))]
+fn fund_loadgen_identities(_n: usize, _fund: impl FnMut(&primitives::Address)) {
+    eprintln!("error: --fund-loadgen-keys needs a build with --features dev-identities");
+    std::process::exit(1);
 }
 
 /// Fund `n` accounts in a sharded balance cache, each with `DEFAULT_BALANCE`.
@@ -365,6 +443,8 @@ fn main() {
     println!("  WebSocket:       127.0.0.1:{}", cli.ws_port);
     println!("  batch interval:  {}ms", cli.batch_interval);
     println!("  chain ID:        {}", cli.chain_id);
+    println!("  auth scheme:     {:?}", cli.auth.kind);
+    println!("  commit batches:  {}", cli.commit_batches);
     if let Some(p) = &cli.nonce_state {
         println!("  nonce state:     {}", p.display());
     } else {
@@ -468,6 +548,9 @@ fn main() {
             );
             let balances = Arc::new(matcher::AtomicBalanceCache::new(cli.accounts_cap));
             fund_sharded(&balances, cli.accounts);
+            if cli.fund_loadgen_keys {
+                fund_loadgen_identities(cli.accounts, |a| balances.set(a, DEFAULT_BALANCE));
+            }
             println!("oxide-matcher: funded {} accounts with {DEFAULT_BALANCE} each", cli.accounts);
             let configs = build_market_configs(cli.markets);
             println!("oxide-matcher: spawning {} market worker threads...", configs.len());
@@ -480,10 +563,14 @@ fn main() {
             let mut server =
                 MatchingServer::with_risk_config(single_market_config(), cli.accounts, cli.risk);
             server.set_chain_id(cli.chain_id);
+            server.set_authenticator(cli.auth.build());
             if let Some(p) = &cli.nonce_state {
                 server.set_nonce_store(p.clone());
             }
             fund_server(&mut server, cli.accounts);
+            if cli.fund_loadgen_keys {
+                fund_loadgen_identities(cli.accounts, |a| server.fund_account(a, DEFAULT_BALANCE));
+            }
             println!("oxide-matcher: funded {} accounts with {DEFAULT_BALANCE} each", cli.accounts);
             runtime.block_on(run_server_ring(server, submitter, confirmer, config, sender));
         }
@@ -492,10 +579,14 @@ fn main() {
             let mut server =
                 MatchingServer::with_risk_config(single_market_config(), cli.accounts, cli.risk);
             server.set_chain_id(cli.chain_id);
+            server.set_authenticator(cli.auth.build());
             if let Some(p) = &cli.nonce_state {
                 server.set_nonce_store(p.clone());
             }
             fund_server(&mut server, cli.accounts);
+            if cli.fund_loadgen_keys {
+                fund_loadgen_identities(cli.accounts, |a| server.fund_account(a, DEFAULT_BALANCE));
+            }
             println!("oxide-matcher: funded {} accounts with {DEFAULT_BALANCE} each", cli.accounts);
             let shared = Arc::new(matcher::SharedMatcher::new(server));
             runtime.block_on(matcher::server::run_server(

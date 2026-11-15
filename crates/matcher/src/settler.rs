@@ -35,7 +35,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use exchange::BatchFillEntry;
-use primitives::fixed::{Price, Qty};
 use types::TxBytes;
 
 /// The settlement lane's failure classes — a typed boundary so a
@@ -176,6 +175,15 @@ pub struct SettleReport {
     /// `batch_rejected`, but the nonce was NOT consumed — the next
     /// sealed batch reuses it.
     pub dead_lettered: Option<String>,
+    /// The commitment over the raw fills of the batch submitted this
+    /// tick, when committed settlement is on (`BatchSettler::with_commitment`).
+    pub fills_root: Option<[u8; 32]>,
+    /// Pairs in a batch the chain rejected wholesale (`batch_rejected`),
+    /// so the operator log can say how many were lost.
+    pub rejected_pairs: usize,
+    /// Pairs from an oversized seal still waiting to be submitted in later
+    /// batches (see [`MAX_PAIRS_PER_BATCH`]).
+    pub deferred_pairs: usize,
 }
 
 /// A settlement envelope in flight — mempool-submitted (or
@@ -212,6 +220,23 @@ pub(crate) struct PendingBatch {
 /// the envelope stays pending so the operator can intervene and the
 /// settlement can eventually land when the chain recovers.
 pub(crate) const MAX_PENDING_RETRIES: u32 = 60;
+
+/// Most legs one settlement message may carry: the exchange rejects a batch
+/// above this as malformed, losing every fill in it, so the settler splits an
+/// oversized seal into batches of at most this many. Unit: legs (aggregated
+/// pairs). Origin: `exchange::MAX_BATCH_FILLS`.
+pub const MAX_PAIRS_PER_BATCH: usize = exchange::MAX_BATCH_FILLS;
+
+/// A batch ready to submit: its legs and the raw fills they aggregate from.
+type NextBatch = (Vec<BatchFillEntry>, Vec<crate::SettledFill>);
+
+/// One chunk of an oversized seal waiting for its turn: its legs, and (when
+/// commitments are on) exactly the raw fills those legs aggregate from, so the
+/// chunk's fills root is checkable against its legs by the dispute path.
+pub(crate) struct DeferredChunk {
+    entries: Vec<BatchFillEntry>,
+    fills: Vec<crate::SettledFill>,
+}
 
 /// Ticks to wait for an execution outcome before resubmitting the
 /// pending envelope: 100 (~10 s at the default interval).
@@ -250,33 +275,11 @@ pub(crate) fn is_retryable_skip(reason: executor::TxSkipReason) -> bool {
 pub(crate) fn aggregate_fills(
     fills: &[crate::SettledFill],
 ) -> Result<Vec<BatchFillEntry>, SettleError> {
-    let mut aggregated: std::collections::BTreeMap<
-        (u16, Price, exchange::OrderKey, exchange::OrderKey),
-        Qty,
-    > = std::collections::BTreeMap::new();
-    for f in fills {
-        let key = (
-            f.market,
-            f.price,
-            exchange::OrderKey { owner: f.buyer, client_id: f.buyer_id },
-            exchange::OrderKey { owner: f.seller, client_id: f.seller_id },
-        );
-        match aggregated.get_mut(&key) {
-            Some(q) => {
-                // A qty sum above u64::MAX is unreachable in practice
-                // (would require ~1.8e13 lots traded in one batch);
-                // fail loudly rather than saturate.
-                *q = Qty(q.0.checked_add(f.qty.0).ok_or(SettleError::AggregateOverflow)?);
-            }
-            None => {
-                aggregated.insert(key, f.qty);
-            }
-        }
-    }
-    Ok(aggregated
-        .into_iter()
-        .map(|((market, price, buy, sell), qty)| BatchFillEntry { market, price, qty, buy, sell })
-        .collect())
+    // The aggregation is defined once in `exchange::dispute`, so the
+    // legs the settler submits and the legs a dispute re-derives from
+    // the same raw fills are the same function of them.
+    let raw: Vec<exchange::dispute::RawFill> = fills.iter().map(crate::commit::to_raw).collect();
+    exchange::dispute::aggregate_raw_fills(&raw).map_err(|_| SettleError::AggregateOverflow)
 }
 
 /// The settler's secp256k1 identity for signing settlement
@@ -338,6 +341,14 @@ pub struct BatchSettler {
     /// (a restart mid-flight then falls back to the executor's
     /// `executed_nonce` resync on the next resolution).
     pub(crate) outbox: std::sync::Mutex<Option<SettlementOutbox>>,
+    /// Submit committed batch settles (exchange tag 16) carrying the
+    /// raw-fill root, instead of plain ones (tag 3). Off by default: the
+    /// chain must understand tag 16.
+    pub(crate) commit_batches: bool,
+    /// Chunks of an oversized seal not yet submitted, oldest first. In memory only:
+    /// a crash loses them (as it lost the whole batch before chunking, when the chain
+    /// rejected it). They are submitted before any newer seal.
+    pub(crate) deferred: std::sync::Mutex<std::collections::VecDeque<DeferredChunk>>,
 }
 
 impl BatchSettler {
@@ -375,6 +386,8 @@ impl BatchSettler {
             nonce: std::sync::atomic::AtomicU64::new(start_nonce),
             pending: std::sync::Mutex::new(None),
             outbox: std::sync::Mutex::new(None),
+            commit_batches: false,
+            deferred: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -393,6 +406,16 @@ impl BatchSettler {
         self.sender = crypto::secp::signable_pubkey_address(&privkey)
             .expect("settlement key must be a valid secp256k1 secret");
         self.signing = Some(SigningConfig { privkey: zeroize::Zeroizing::new(privkey), chain_id });
+        self
+    }
+
+    /// Attach a commitment over each batch's raw fills (exchange tag 16,
+    /// `crate::commit::fills_root`). The envelope nonce serves as the
+    /// batch sequence. Requires a chain that understands the committed
+    /// batch-settle message; legs settle identically either way.
+    #[must_use]
+    pub fn with_commitment(mut self) -> Self {
+        self.commit_batches = true;
         self
     }
 
@@ -457,7 +480,10 @@ impl BatchSettler {
                         report.failed_pairs =
                             events.iter().filter(|e| e.kind == "settlement_failed").count();
                     }
-                    Some(e) => report.batch_rejected = Some(e),
+                    Some(e) => {
+                        report.rejected_pairs = pair_count;
+                        report.batch_rejected = Some(e);
+                    }
                 }
             }
             executor::TxOutcome::Skipped { reason } if is_retryable_skip(reason) => {
@@ -477,6 +503,66 @@ impl BatchSettler {
             }
         }
         self.persist(guard.as_ref());
+    }
+
+    /// The legs (and their raw fills) of the next batch to submit: a deferred chunk of an
+    /// earlier oversized seal if one is waiting, otherwise a fresh seal of the order book,
+    /// of which only the first chunk is returned when it exceeds [`MAX_PAIRS_PER_BATCH`]
+    /// (the rest are queued). `None` when there is nothing to settle.
+    fn next_batch(&self) -> Result<Option<NextBatch>, SettleError> {
+        if let Some(d) = primitives::sync::lock_state(&self.deferred).pop_front() {
+            return Ok(Some((d.entries, d.fills)));
+        }
+        let fills = self.sealer.seal_batch();
+        if fills.is_empty() {
+            return Ok(None);
+        }
+        let all = aggregate_fills(&fills)?;
+        if all.len() <= MAX_PAIRS_PER_BATCH {
+            return Ok(Some((all, fills)));
+        }
+        let mut chunks = self.split_oversized(all, fills).into_iter();
+        let first = chunks.next().ok_or(SettleError::AggregateOverflow)?;
+        let mut queue = primitives::sync::lock_state(&self.deferred);
+        queue.extend(chunks);
+        eprintln!(
+            "batch settler: seal of {} pairs split into {} batches of at most {MAX_PAIRS_PER_BATCH}",
+            first.entries.len() + queue.iter().map(|c| c.entries.len()).sum::<usize>(),
+            queue.len() + 1,
+        );
+        Ok(Some((first.entries, first.fills)))
+    }
+
+    /// Split an oversized seal into chunks of at most [`MAX_PAIRS_PER_BATCH`] legs.
+    ///
+    /// Legs are independent (each consumes its own pair of registered orders), so
+    /// they may settle in any number of sequential batches. With commitments on, each
+    /// chunk carries exactly the raw fills its legs aggregate from, in seal order:
+    /// aggregation is per leg key, so re-aggregating a chunk's fills yields the
+    /// chunk's legs (tested), and the chunk's fills root stays disputable.
+    fn split_oversized(
+        &self,
+        all: Vec<BatchFillEntry>,
+        fills: Vec<crate::SettledFill>,
+    ) -> Vec<DeferredChunk> {
+        let mut chunks: Vec<DeferredChunk> = all
+            .chunks(MAX_PAIRS_PER_BATCH)
+            .map(|c| DeferredChunk { entries: c.to_vec(), fills: Vec::new() })
+            .collect();
+        if self.commit_batches {
+            let chunk_of: std::collections::BTreeMap<_, usize> = all
+                .iter()
+                .enumerate()
+                .map(|(i, e)| ((e.market, e.price, e.buy, e.sell), i / MAX_PAIRS_PER_BATCH))
+                .collect();
+            for f in fills {
+                let raw = crate::commit::to_raw(&f);
+                if let Some(&c) = chunk_of.get(&(raw.market, raw.price, raw.buy, raw.sell)) {
+                    chunks[c].fills.push(f);
+                }
+            }
+        }
+        chunks
     }
 
     /// Seal the current batch and submit it to consensus, then drive
@@ -550,25 +636,32 @@ impl BatchSettler {
             }
         }
 
-        // Seal the batch from the single order book.
-        let fills = self.sealer.seal_batch();
-
-        if fills.is_empty() {
+        // Chunks of an earlier oversized seal go first, so legs settle in seal order;
+        // otherwise seal the single order book (splitting it if it is oversized).
+        let Some((entries, fills)) = self.next_batch()? else {
             return Ok(report);
-        }
-
-        let entries = aggregate_fills(&fills)?;
+        };
         let pair_count = entries.len();
+        report.deferred_pairs =
+            primitives::sync::lock_state(&self.deferred).iter().map(|c| c.entries.len()).sum();
 
-        // Encode as a batch-settle message.
-        let module_payload = exchange::msg::batch_settle(&entries);
+        // Encode as a batch-settle message. With commitment on, the raw
+        // fills' root rides along and the envelope nonce is the batch
+        // sequence (read here, same value the envelope below uses).
+        let nonce = self.nonce.load(std::sync::atomic::Ordering::Relaxed);
+        let module_payload = if self.commit_batches {
+            let (root, raw) = crate::commit::fills_root(&fills);
+            report.fills_root = Some(root);
+            exchange::msg::batch_settle_committed(nonce, &root, raw, &entries)
+        } else {
+            exchange::msg::batch_settle(&entries)
+        };
 
         // Wrap in an Oxide transaction envelope. The nonce is READ
         // here, not consumed — it advances only when the confirmer
         // proves execution, so a rejected submission or a terminal
         // skip leaves the sequence contiguous for the retry (and for
         // the next batch).
-        let nonce = self.nonce.load(std::sync::atomic::Ordering::Relaxed);
         let fee = 100u64;
         let envelope = self.encode_envelope(nonce, fee, &module_payload)?;
 
@@ -639,6 +732,14 @@ impl BatchSettler {
         Ok(envelope)
     }
 
+    /// Pairs from an oversized seal still queued for later batches (see
+    /// [`MAX_PAIRS_PER_BATCH`]); zero in normal operation. Exposed for tests and
+    /// operator introspection.
+    #[must_use]
+    pub fn deferred_pairs(&self) -> usize {
+        primitives::sync::lock_state(&self.deferred).iter().map(|c| c.entries.len()).sum()
+    }
+
     /// Whether a batch is currently in flight (submitted or awaiting
     /// resubmission, but not yet resolved by an outcome). Exposed for
     /// tests and operator introspection.
@@ -660,7 +761,7 @@ impl BatchSettler {
                     if let Some(e) = &report.batch_rejected {
                         eprintln!(
                             "batch settler: CRITICAL — batch of {} pairs rejected at execution: {e}",
-                            report.submitted + report.confirmed
+                            report.rejected_pairs
                         );
                     }
                     if let Some(reason) = &report.dead_lettered {

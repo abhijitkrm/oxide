@@ -263,6 +263,38 @@ const TAG_LIST_MARKET: u8 = 2;
 /// is `[fill_count:4][fill entries...]`.
 const TAG_BATCH_SETTLE: u8 = 3;
 
+/// Committed batch-settle message tag: a [`TAG_BATCH_SETTLE`] body
+/// preceded by a commitment header, `[batch_seq:8][fills_root:32]
+/// [raw_fill_count:4]`, then the ordinary `[leg_count:4][legs...]`.
+/// The legs settle exactly as in tag 3 (same checks, same state
+/// changes). The chain additionally computes a root over the legs it
+/// applied and emits one `batch_commit` event carrying
+/// `batch_seq ‖ fills_root ‖ raw_fill_count ‖ legs_root ‖ leg_count`.
+///
+/// `legs_root` is chain-computed. `fills_root` is the settlement
+/// operator's attestation over the raw off-chain fill stream the legs
+/// were aggregated from; the chain cannot recompute it (it never sees
+/// the raw fills), but anyone holding the matcher's journal can replay
+/// it and compare. Tag 3 is unchanged and remains valid.
+const TAG_BATCH_SETTLE_COMMITTED: u8 = 16;
+
+/// Bond-deposit message tag (the settlement operator, while disputes
+/// are enabled): body `[amount:8 LE]`. See `dispute`.
+const TAG_BOND_DEPOSIT: u8 = 17;
+
+/// Dispute message tag: body `[batch_seq:8][raw_count:4][raw fills ×
+/// 82 B]`. Anyone may submit; proves a recorded committed batch's
+/// attestation false and slashes the operator. See `dispute`.
+const TAG_DISPUTE: u8 = 18;
+
+/// Length of the commitment header of a committed batch settle:
+/// `batch_seq` 8 + `fills_root` 32 + `raw_fill_count` 4.
+const BATCH_COMMIT_HEADER_LEN: usize = 8 + 32 + 4;
+
+/// Stream label of the legs commitment (keeps a legs root distinct from
+/// any other stream's root).
+pub const LEGS_STREAM_LABEL: &[u8] = b"oxide-exchange-legs-v1";
+
 /// Register-order message tag: puts an off-chain-matched order's
 /// authorization on-chain so batch-settle legs can reference it.
 /// Body: `[market:2][side:1][price:8][qty:8][client_id:8]` = 27
@@ -361,14 +393,31 @@ const TAG_CANCEL_LINKED: u8 = 14;
 /// `[market:1][order_id:8][price:8][qty:8][stp:1]` = 26 bytes.
 const TAG_AMEND: u8 = 15;
 
+/// Bundle message tag (`docs/bundle-auth-spec.md`): one signed transaction
+/// carrying many place/cancel/amend messages for the SIGNER's account. Body
+/// `[count:2 LE]` then `count` items of `[len:2 LE][message]`, where each
+/// message is an ordinary place, cancel or amend (tags 0, 1, 15). One
+/// signature recovery and one nonce cover the whole bundle, which is the
+/// point: signature recovery (~50 us) is the chain path's admission cap.
+const TAG_BUNDLE: u8 = 19;
+
+/// Most items in one bundle (unit: messages). Origin: spec section 2; 1,024
+/// items at one recovery is ~0.05 us/item of authentication. Raising it
+/// lengthens the time one tx holds the exchange lock inside a block.
+pub const MAX_BUNDLE_ITEMS: usize = 1_024;
+
+/// Largest bundle body (unit: bytes). Checked before any item executes, and
+/// by the mempool-side size limits before signature recovery.
+pub const MAX_BUNDLE_BYTES: usize = 128 * 1024;
+
 /// Size of a single fill entry in a batch-settle message:
 /// 2 + 8 + 8 + 20 + 8 + 20 + 8 = 74 bytes.
-const FILL_ENTRY_LEN: usize = 74;
+pub const FILL_ENTRY_LEN: usize = 74;
 
 /// Maximum number of fills in a single batch-settle message. Prevents
 /// a byzantine settlement operator from submitting a huge batch that
 /// causes excessive processing. `65_536` fills × 74 bytes = ~4.8 MiB.
-const MAX_BATCH_FILLS: usize = 65_536;
+pub const MAX_BATCH_FILLS: usize = 65_536;
 
 /// Maximum live registered orders module-wide.
 ///
@@ -470,6 +519,12 @@ pub struct ExchangeModule {
     /// batch settlement entirely (fail-closed) — an unconfigured
     /// operator must never be able to move balances.
     settlement_operator: Option<Address>,
+    /// Bond-and-dispute configuration (`dispute`); `None` (default)
+    /// leaves tag 16 without a bond requirement or retained records.
+    dispute: Option<dispute::DisputeConfig>,
+    /// Current block height, set by `begin_block`. Local bookkeeping
+    /// (re-derived every block), not committed state.
+    height: std::sync::atomic::AtomicU64,
     /// The validator-committee handle gating the `TAG_LIST_MARKET`
     /// transaction path. `None` (bare `new()`) means the tx path is
     /// *closed*: only the in-process `list_market` call (genesis /
@@ -654,6 +709,7 @@ type CommittedState = (
 
 mod codec;
 mod decode;
+pub mod dispute;
 mod handlers;
 mod module_impl;
 mod settle;
@@ -679,6 +735,8 @@ impl ExchangeModule {
             store: Mutex::new(framework::CommittedStore::new(store_leaf)),
             ledger: None,
             settlement_operator: None,
+            dispute: None,
+            height: std::sync::atomic::AtomicU64::new(0),
             committee: None,
             endorsements: framework::Endorsements::new(),
         }
@@ -950,6 +1008,24 @@ pub mod msg {
         msg
     }
 
+    /// Build a bundle message from already-built place/cancel/amend
+    /// messages. Returns `None` if the bundle would exceed
+    /// [`MAX_BUNDLE_ITEMS`] / [`MAX_BUNDLE_BYTES`] or an item is longer than
+    /// a `u16` length can express.
+    pub fn bundle(items: &[Vec<u8>]) -> Option<Vec<u8>> {
+        if items.len() > super::MAX_BUNDLE_ITEMS {
+            return None;
+        }
+        let mut msg = Vec::with_capacity(1 + 2 + items.iter().map(|i| 2 + i.len()).sum::<usize>());
+        msg.push(super::TAG_BUNDLE);
+        msg.extend_from_slice(&u16::try_from(items.len()).ok()?.to_le_bytes());
+        for item in items {
+            msg.extend_from_slice(&u16::try_from(item.len()).ok()?.to_le_bytes());
+            msg.extend_from_slice(item);
+        }
+        (msg.len() - 1 <= super::MAX_BUNDLE_BYTES).then_some(msg)
+    }
+
     /// Build an amend-order message (`docs/amend-spec.md`): resize or
     /// re-price the sender's resting order `order_id`.
     pub fn amend(
@@ -1070,6 +1146,54 @@ pub mod msg {
             msg.extend_from_slice(&f.buy.client_id.to_le_bytes());
             msg.extend_from_slice(&f.sell.owner.0);
             msg.extend_from_slice(&f.sell.client_id.to_le_bytes());
+        }
+        msg
+    }
+
+    /// Build a committed batch-settle message: the same legs as
+    /// [`batch_settle`], preceded by the commitment header (see
+    /// `TAG_BATCH_SETTLE_COMMITTED`). `fills_root` is the operator's
+    /// attestation over the `raw_fill_count` raw fills the legs were
+    /// aggregated from; `batch_seq` should be strictly increasing (the
+    /// settler uses its envelope nonce).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `fills` is empty (as [`batch_settle`]).
+    pub fn batch_settle_committed(
+        batch_seq: u64,
+        fills_root: &[u8; 32],
+        raw_fill_count: u32,
+        fills: &[crate::BatchFillEntry],
+    ) -> Vec<u8> {
+        let plain = batch_settle(fills);
+        let mut msg = Vec::with_capacity(plain.len() + super::BATCH_COMMIT_HEADER_LEN);
+        msg.push(super::TAG_BATCH_SETTLE_COMMITTED);
+        msg.extend_from_slice(&batch_seq.to_le_bytes());
+        msg.extend_from_slice(fills_root);
+        msg.extend_from_slice(&raw_fill_count.to_le_bytes());
+        msg.extend_from_slice(&plain[1..]); // drop tag 3, keep [count][legs]
+        msg
+    }
+
+    /// Build a bond deposit (`TAG_BOND_DEPOSIT`).
+    #[must_use]
+    pub fn bond_deposit(amount: u64) -> Vec<u8> {
+        let mut msg = vec![super::TAG_BOND_DEPOSIT];
+        msg.extend_from_slice(&amount.to_le_bytes());
+        msg
+    }
+
+    /// Build a dispute (`TAG_DISPUTE`) for `batch_seq` carrying the raw
+    /// fills the operator attested.
+    #[must_use]
+    pub fn dispute(batch_seq: u64, fills: &[crate::dispute::RawFill]) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(13 + fills.len() * crate::dispute::RAW_FILL_LEN);
+        msg.push(super::TAG_DISPUTE);
+        msg.extend_from_slice(&batch_seq.to_le_bytes());
+        msg.extend_from_slice(&u32::try_from(fills.len()).unwrap_or(u32::MAX).to_le_bytes());
+        for f in fills {
+            msg.extend_from_slice(&f.encode());
         }
         msg
     }

@@ -94,7 +94,7 @@ nightly adds fuzz and long simulations.
 ## Current status
 
 Phases 0–3 complete: oxideBFT + chain skeleton, EVM + storage
-(12.96 GG/s parallel vs the 1 GG/s gate), and the trading core
+(real revm about 2.5 GG/s parallel on an 8-core laptop vs the 1 GG/s gate; the 12.96 GG/s figure is the scheduler model, see devlog), and the trading core
 (engine 20.6M mixed ops/s single-core; ~3.7M orders/s chain-wide
 over oxideBFT vs the 1M gate). Phase 4 hardening is in progress:
 the fuzz campaign (11 targets, committed corpus, nightly CI), the
@@ -104,3 +104,16 @@ the external security review and the geo-distributed 20–50
 validator public testnet. See `plan.md` §13 for gate detail. Do
 not start Phase N+1 work before Phase N's gates pass unless the
 plan says otherwise.
+
+Throughput work toward the 10M orders/s and 1M EVM tx/s targets lives in
+**`docs/lanes-spec.md`** (swappable authentication, commitment and routing
+seams; `crates/lanes`) and is wired into the matcher service: order
+authentication is a runtime choice (`oxide-matcher --auth`: ed25519, EVM,
+session MAC, gateway certificate, or several), the settler can attach a
+per-batch fills root (`--commit-batches`, exchange tag 16), and the exchange
+has an opt-in bonded-operator dispute path (tags 17/18). Measured on a laptop
+the real TCP matcher does 72k orders/s with an ed25519 signature per order
+and 2.2M with session MACs (the multi-market service reaches 7.5M orders/s
+over 8 markets in process): authentication, not matching, is the service's
+limit. None of this is a multi-machine result yet. Add a `docs/devlog.md`
+entry for any change here, and keep `docs/lanes-spec.md` in step with the code.

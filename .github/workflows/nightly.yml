@@ -151,6 +151,10 @@ jobs:
           THROUGHPUT_TRADES=1_000_000 cargo test --release --workspace --locked \
             --features storage/redb,storage/rocksdb,storage/mdbx -- \
             --ignored --nocapture --test-threads=1 trading_throughput_smoke
+      - name: Chain-path ratio gates (root stage, propose, flat in accounts)
+        # Machine-independent ratios between two runs on the same host
+        # (scripts/bench-gate.sh); fails the job on a structural regression.
+        run: scripts/bench-gate.sh
       - name: Upload benchmark output
         if: always()
         uses: actions/upload-artifact@v4

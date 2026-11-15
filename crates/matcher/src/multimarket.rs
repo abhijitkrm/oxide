@@ -25,8 +25,8 @@ use crate::protocol::{
 };
 use crate::risk::{RiskConfig, RiskDecision, RiskEngine};
 use crate::settlement::{
-    LegCostAcc, LegId, NonceTracker, PRICE_SCALE, SettledFill, buy_reservation_refund,
-    evict_gone_client_ids, fill_parties, gone_makers,
+    LegCostAcc, LegId, NONCE_SHARDS, PRICE_SCALE, SettledFill, ShardedNonces,
+    buy_reservation_refund, evict_gone_client_ids, fill_parties, gone_makers,
 };
 use crate::{AtomicBalanceCache, BatchSealer, MatcherStats, wall_clock_ms};
 
@@ -168,11 +168,13 @@ pub struct MultiMarketMatcher {
     /// submission order as the admission order. (Races ACROSS
     /// concurrent `submit_batch` calls remain, which is correct —
     /// concurrent submissions have no defined order.)
-    pub(crate) nonces: Arc<std::sync::Mutex<NonceTracker>>,
+    pub(crate) nonces: Arc<ShardedNonces>,
     /// The chain ID order signatures are verified against — shared
     /// with every worker so transport-side and worker-side
     /// authentication can never disagree.
     pub(crate) chain_id: u64,
+    /// How requests become proof tokens (`auth` module).
+    auth: Arc<dyn crate::auth::Authenticator>,
 }
 
 impl MultiMarketMatcher {
@@ -298,17 +300,15 @@ impl MultiMarketMatcher {
         let mut market_senders = Vec::with_capacity(num_markets);
         let mut threads = Vec::with_capacity(num_markets);
         let mut ready_rxs = Vec::with_capacity(num_markets);
-        // The nonce tracker is SHARED across workers: nonces are
+        // The replay gate is SHARED across workers: nonces are
         // per-account, not per-market, so a replayed nonce must be
-        // rejected no matter which market it lands on. A short Mutex
-        // is acceptable — the check runs once per admission and the
-        // work already crosses an MPSC hop.
-        let nonces = Arc::new(std::sync::Mutex::new(NonceTracker::new()));
+        // rejected no matter which market it lands on. It is sharded by
+        // owner (`ShardedNonces`), so unrelated accounts never contend
+        // for one lock; an owner's own requests still serialize through
+        // its shard in call order.
+        let nonces = Arc::new(ShardedNonces::new(NONCE_SHARDS));
         if let Some(path) = nonce_store_path {
-            nonces
-                .lock()
-                .expect("nonce tracker mutex poisoned during construction")
-                .attach_store(path);
+            nonces.attach_store(path);
         }
 
         for (i, cfg) in configs.into_iter().enumerate() {
@@ -354,7 +354,15 @@ impl MultiMarketMatcher {
             }
         }
 
-        Ok(Self { market_senders, _threads: threads, num_markets, nonces, chain_id, recovery })
+        Ok(Self {
+            market_senders,
+            _threads: threads,
+            num_markets,
+            nonces,
+            chain_id,
+            auth: crate::auth::default_authenticator(),
+            recovery,
+        })
     }
 
     /// What each market worker recovered from its journal at start,
@@ -362,6 +370,20 @@ impl MultiMarketMatcher {
     #[must_use]
     pub fn recovery_reports(&self) -> &[RecoveryReport] {
         &self.recovery
+    }
+
+    /// Choose how requests are authenticated (see [`crate::auth`]).
+    /// Call before serving traffic; the default is ed25519 batch.
+    #[must_use]
+    pub fn with_authenticator(mut self, a: Arc<dyn crate::auth::Authenticator>) -> Self {
+        self.auth = a;
+        self
+    }
+
+    /// The configured authenticator (transports share it).
+    #[must_use]
+    pub fn authenticator(&self) -> Arc<dyn crate::auth::Authenticator> {
+        Arc::clone(&self.auth)
     }
 
     /// The chain ID order signatures are verified against —
@@ -394,6 +416,37 @@ impl MultiMarketMatcher {
     /// range, or if a market worker thread has died mid-batch.
     pub fn submit_batch(&self, orders: Vec<OrderRequest>) -> Vec<OrderResponse> {
         assert!(!orders.is_empty(), "batch must not be empty");
+        let authenticated = self.auth.orders(&orders, self.chain_id);
+        self.submit_authenticated(&orders, authenticated)
+    }
+
+    /// Submit a batch a trusted gateway has certified
+    /// ([`crate::auth::Certified`]): one certificate check plus a
+    /// deterministic audit sample instead of a verification per order.
+    /// A failed certificate or audit rejects the whole batch with
+    /// `BadSignature`; everything after authentication (nonce gate,
+    /// routing, execution) is identical to [`Self::submit_batch`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `orders` is empty, like [`Self::submit_batch`].
+    pub fn submit_batch_certified(
+        &self,
+        orders: Vec<OrderRequest>,
+        cert: &crate::auth::BatchCertificate,
+    ) -> Vec<OrderResponse> {
+        assert!(!orders.is_empty(), "batch must not be empty");
+        let authenticated = self.auth.certified_orders(&orders, cert, self.chain_id);
+        self.submit_authenticated(&orders, authenticated)
+    }
+
+    /// Everything after authentication: replay gate, routing by each
+    /// order's market, execution, aligned responses.
+    fn submit_authenticated(
+        &self,
+        orders: &[OrderRequest],
+        authenticated: Vec<Option<protocol::VerifiedOrder>>,
+    ) -> Vec<OrderResponse> {
         // Authenticate + replay-check every order on this thread, IN
         // BATCH ORDER. `positions[i]` records the original index of
         // admitted order i so its response lands in the right slot.
@@ -416,7 +469,6 @@ impl MultiMarketMatcher {
         // per-item afterwards, in batch order — verification ordering
         // relative to nonce consumption is unchanged (every signature
         // is proven before any nonce is consumed).
-        let authenticated = protocol::VerifiedOrder::batch_with_chain_id(&orders, self.chain_id);
         let mut verified: Vec<protocol::VerifiedOrder> = Vec::with_capacity(orders.len());
         for (i, item) in authenticated.into_iter().enumerate() {
             match item {
@@ -426,8 +478,7 @@ impl MultiMarketMatcher {
                     // and `pending` torn. Panic on poison (loud halt)
                     // rather than reject — a poisoned gate must not
                     // keep looking alive while refusing orders.
-                    let ok = primitives::sync::lock_state(&self.nonces)
-                        .check_and_consume(&vo.request().owner, vo.request().nonce);
+                    let ok = self.nonces.check_and_consume(&vo.request().owner, vo.request().nonce);
                     if ok {
                         positions.push(i);
                         verified.push(vo);
@@ -547,7 +598,7 @@ impl MultiMarketMatcher {
     /// Returns an `EngineError` rejection if the market worker thread
     /// has died.
     pub fn submit_action(&self, action: &ActionRequest) -> OrderResponse {
-        let Some(verified) = protocol::VerifiedAction::with_chain_id(*action, self.chain_id) else {
+        let Some(verified) = self.auth.action(*action, self.chain_id) else {
             return OrderResponse::rejected(RejectReason::BadSignature);
         };
         self.submit_verified_action(verified)
@@ -587,7 +638,7 @@ impl MultiMarketMatcher {
     /// nonce exactly as production does.
     #[doc(hidden)]
     pub fn bench_consume_nonce(&self, owner: &primitives::Address, nonce: u64) -> bool {
-        primitives::sync::lock_state(&self.nonces).check_and_consume(owner, nonce)
+        self.nonces.check_and_consume(owner, nonce)
     }
 
     /// Seal the settlement batch across ALL markets. Sends a `Seal`
@@ -605,7 +656,7 @@ impl MultiMarketMatcher {
         // skipping the durability checkpoint would keep the settler
         // running on a torn replay gate with a silently widening
         // restart-replay window.
-        primitives::sync::lock_state(&self.nonces).flush();
+        self.nonces.flush();
         // Fan out first, then collect (hft-audit-2 M-12). Sealing one
         // worker at a time made the settler wait out N round trips
         // back to back (128 by default), each queued behind that
@@ -708,7 +759,7 @@ pub(crate) struct MarketWorker {
     pub(crate) balances: Arc<AtomicBalanceCache>,
     /// Shared per-account replay gate — one sequence per owner
     /// across ALL markets (see `NonceTracker`).
-    pub(crate) nonces: Arc<std::sync::Mutex<NonceTracker>>,
+    pub(crate) nonces: Arc<ShardedNonces>,
     /// Per-market risk engine (rate limits, fat-finger, size caps).
     /// Per-market rather than shared: an account's rate/resting
     /// budget is scoped to this market's book.
@@ -775,7 +826,7 @@ impl MarketWorker {
     pub(crate) fn run(
         cfg: MarketConfig,
         balances: Arc<AtomicBalanceCache>,
-        nonces: Arc<std::sync::Mutex<NonceTracker>>,
+        nonces: Arc<ShardedNonces>,
         clock: Arc<dyn Fn() -> u64 + Send + Sync>,
         rx: std::sync::mpsc::Receiver<MarketMessage>,
         risk_config: crate::RiskConfig,
@@ -1122,7 +1173,7 @@ impl MarketWorker {
     pub(crate) fn check_nonce(&self, owner: &primitives::Address, nonce: u64) -> bool {
         // Panic-on-poison, matching `submit_batch`: a torn replay
         // gate halts loudly rather than looking alive-but-refusing.
-        primitives::sync::lock_state(&self.nonces).check_and_consume(owner, nonce)
+        self.nonces.check_and_consume(owner, nonce)
     }
 
     /// Submit one authenticated, nonce-consumed order: risk →

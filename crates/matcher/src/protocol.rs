@@ -465,6 +465,14 @@ impl VerifiedOrder {
         out
     }
 
+    /// Mint the proof for a request an [`crate::auth::Authenticator`] has
+    /// just authenticated. Crate-private: only code inside this crate that
+    /// has actually run a verification can produce the token, which keeps
+    /// the "type is the proof" property.
+    pub(crate) fn authenticated(req: OrderRequest) -> Self {
+        Self(req)
+    }
+
     /// The authenticated request.
     #[must_use]
     pub fn request(&self) -> &OrderRequest {
@@ -504,6 +512,12 @@ impl VerifiedAction {
     #[must_use]
     pub fn with_chain_id(req: ActionRequest, chain_id: u64) -> Option<Self> {
         if verify_action_with_chain_id(&req, chain_id) { Some(Self(req)) } else { None }
+    }
+
+    /// Mint the proof for an action an [`crate::auth::Authenticator`] has
+    /// just authenticated (crate-private, see `VerifiedOrder::authenticated`).
+    pub(crate) fn authenticated(req: ActionRequest) -> Self {
+        Self(req)
     }
 
     /// The authenticated request.

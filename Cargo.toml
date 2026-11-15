@@ -81,6 +81,8 @@ config = { path = "crates/config", version = "0.1.0" }
 metrics = { path = "crates/metrics", version = "0.1.0" }
 # HFT-grade matching engine core (plan.md §9.1; hot-path, std-only).
 trading = { path = "crates/trading", version = "0.1.0" }
+# Sharded, swappable lanes (authentication / commitment seams; docs/lanes-spec.md).
+lanes = { path = "crates/lanes", version = "0.1.0" }
 # Off-chain matching server (plan.md §9.5; accepts orders via binary TCP,
 # WebSocket, JSON-RPC, FIX; batches fills for on-chain settlement).
 matcher = { path = "crates/matcher", version = "0.1.0" }

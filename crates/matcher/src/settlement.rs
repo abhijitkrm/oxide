@@ -312,7 +312,7 @@ pub(crate) struct NonceTracker {
     /// an owner is always accepted). With it attached, the replay
     /// window shrinks to the admissions not yet `fdatasync`ed by the
     /// writer (see [`crate::nonce_wal`] for the crash story).
-    pub(crate) durability: Option<crate::nonce_wal::NonceDurability>,
+    pub(crate) durability: Option<DurabilityHandle>,
     /// Consumed `(owner, nonce)` pairs not yet handed to the writer.
     /// Only filled when `durability` is attached, so a memory-only
     /// gate pays nothing for it.
@@ -328,6 +328,155 @@ pub(crate) struct NonceTracker {
 /// means the reverse. `seal_batch` (the settler cadence) also hands
 /// off, so a quiet venue never sits on a partial buffer for long.
 pub(crate) const NONCE_FLUSH_EVERY: u32 = 64;
+
+/// How a tracker reaches its durability writer: it owns one (the
+/// single-market server, one tracker), or it shares one with the other
+/// shards of a [`ShardedNonces`] (one writer thread and one file for the
+/// whole gate, however many shards).
+pub(crate) enum DurabilityHandle {
+    /// A writer owned by this tracker alone.
+    Own(crate::nonce_wal::NonceDurability),
+    /// A writer shared by every shard. The mutex is touched once per
+    /// [`NONCE_FLUSH_EVERY`] admissions on a shard, not per order.
+    Shared(std::sync::Arc<std::sync::Mutex<crate::nonce_wal::NonceDurability>>),
+}
+
+impl DurabilityHandle {
+    fn take_buffer(&self, cap: usize) -> crate::nonce_wal::DeltaBatch {
+        match self {
+            Self::Own(d) => d.take_buffer(cap),
+            Self::Shared(d) => primitives::sync::lock_state(d).take_buffer(cap),
+        }
+    }
+
+    fn submit(&self, batch: crate::nonce_wal::DeltaBatch) {
+        match self {
+            Self::Own(d) => d.submit(batch),
+            Self::Shared(d) => primitives::sync::lock_state(d).submit(batch),
+        }
+    }
+
+    #[cfg(test)]
+    fn sync(&self) {
+        match self {
+            Self::Own(d) => d.sync(),
+            Self::Shared(d) => primitives::sync::lock_state(d).sync(),
+        }
+    }
+}
+
+/// Shards of the multi-market replay gate. Unit: shards. Nonces are per
+/// account, so an owner's state lives in exactly one shard (chosen by the
+/// first 8 bytes of its address, which are uniformly distributed for
+/// hash-derived addresses) and sharding changes no admission outcome.
+/// One shared lock capped the whole service at ~3-5M orders/s however many
+/// markets ran (measured: `nonce_contention`, `shards`); 64 shards make a
+/// collision between two submitters rare up to ~16 of them. More shards
+/// cost one empty map each and nothing on the hot path; fewer reintroduce
+/// contention.
+pub(crate) const NONCE_SHARDS: usize = 64;
+
+/// The multi-market replay gate: [`NonceTracker`]s sharded by owner so
+/// unrelated accounts never contend for the same lock.
+///
+/// Semantics are identical to one tracker (per-owner strictly increasing
+/// nonces; same-owner requests still serialize through one shard in call
+/// order, so batch-order admission is unchanged). Durability is one
+/// checkpoint and log for the whole gate, in the same on-disk format as a
+/// single tracker's, so the shard count is not part of the file format.
+pub(crate) struct ShardedNonces {
+    shards: Vec<std::sync::Mutex<NonceTracker>>,
+}
+
+impl ShardedNonces {
+    /// An empty gate with `n` shards (at least 1).
+    pub(crate) fn new(n: usize) -> Self {
+        Self { shards: (0..n.max(1)).map(|_| std::sync::Mutex::new(NonceTracker::new())).collect() }
+    }
+
+    fn index(&self, owner: &primitives::Address) -> usize {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&owner.0[..8]);
+        // The remainder is below `shards.len()`, so it always fits a `usize`.
+        usize::try_from(u64::from_le_bytes(b) % self.shards.len() as u64).unwrap_or(0)
+    }
+
+    /// As [`NonceTracker::check_and_consume`], on the owner's shard.
+    /// Panics on a poisoned shard (a torn replay gate must halt loudly,
+    /// never look alive while refusing or admitting wrongly).
+    pub(crate) fn check_and_consume(&self, owner: &primitives::Address, nonce: u64) -> bool {
+        primitives::sync::lock_state(&self.shards[self.index(owner)])
+            .check_and_consume(owner, nonce)
+    }
+
+    /// Hand every shard's buffered deltas to the writer (settler cadence).
+    pub(crate) fn flush(&self) {
+        for s in &self.shards {
+            primitives::sync::lock_state(s).flush();
+        }
+    }
+
+    /// Attach durable storage at `path` (checkpoint plus `<path>.wal`):
+    /// load every persisted nonce, split it across the shards, and start
+    /// ONE writer all shards share. Same fail-closed rules and file format
+    /// as [`NonceTracker::attach_store`]; a store written under a different
+    /// shard count (or by a single tracker) loads unchanged.
+    ///
+    /// # Panics
+    ///
+    /// If the store is corrupt or not writable: a replay gate that cannot
+    /// be kept durable must refuse to start, not silently reopen the
+    /// replay window.
+    pub(crate) fn attach_store(&self, path: std::path::PathBuf) {
+        let loaded = crate::nonce_wal::recover(&path)
+            .unwrap_or_else(|e| panic!("nonce store at {} is corrupt: {e}", path.display()));
+        let mut parts: Vec<HashMap<primitives::Address, u64>> =
+            (0..self.shards.len()).map(|_| HashMap::new()).collect();
+        // Max-merge (persisted state is a LOWER bound; never regress a
+        // watermark) of the persisted map and anything already in memory.
+        let merge = |owner: primitives::Address, nonce: u64, parts: &mut Vec<HashMap<_, u64>>| {
+            let e = parts[self.index(&owner)].entry(owner).or_insert(nonce);
+            *e = (*e).max(nonce);
+        };
+        for (owner, nonce) in loaded {
+            merge(owner, nonce, &mut parts);
+        }
+        for s in &self.shards {
+            let mut g = primitives::sync::lock_state(s);
+            g.flush();
+            g.durability = None;
+            for (o, n) in g.last_seen.drain() {
+                merge(o, n, &mut parts);
+            }
+        }
+        let full: HashMap<primitives::Address, u64> =
+            parts.iter().flat_map(|m| m.iter().map(|(k, v)| (*k, *v))).collect();
+        let writer = crate::nonce_wal::NonceDurability::start(path.clone(), full)
+            .unwrap_or_else(|e| panic!("nonce store at {} is not writable: {e}", path.display()));
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(writer));
+        for (s, part) in self.shards.iter().zip(parts) {
+            let mut g = primitives::sync::lock_state(s);
+            g.last_seen = part;
+            let handle = DurabilityHandle::Shared(std::sync::Arc::clone(&shared));
+            g.pending = handle.take_buffer(NONCE_FLUSH_EVERY as usize);
+            g.durability = Some(handle);
+        }
+    }
+
+    /// Test-only: hand off and block until the writer has everything.
+    #[cfg(test)]
+    pub(crate) fn sync_durable(&self) {
+        for s in &self.shards {
+            primitives::sync::lock_state(s).sync_durable();
+        }
+    }
+
+    /// Test-only: total consumed owners across shards.
+    #[cfg(test)]
+    pub(crate) fn owners(&self) -> usize {
+        self.shards.iter().map(|s| primitives::sync::lock_state(s).last_seen.len()).sum()
+    }
+}
 
 impl NonceTracker {
     /// Create an empty tracker.
@@ -365,7 +514,7 @@ impl NonceTracker {
                     panic!("nonce store at {} is not writable: {e}", path.display())
                 });
         self.pending = durability.take_buffer(NONCE_FLUSH_EVERY as usize);
-        self.durability = Some(durability);
+        self.durability = Some(DurabilityHandle::Own(durability));
     }
 
     /// Returns `true` and consumes `nonce` iff it is strictly
@@ -553,5 +702,122 @@ impl NonceStore {
             _ => std::path::Path::new("."),
         };
         std::fs::File::open(dir)?.sync_all()
+    }
+}
+
+#[cfg(test)]
+mod sharded_nonce_tests {
+    use super::*;
+    use primitives::Address;
+
+    fn owner(i: u64) -> Address {
+        // Spread across shards the way hash-derived addresses do.
+        let mut b = [0u8; 20];
+        b[..8].copy_from_slice(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+        b[8] = u8::try_from(i % 256).unwrap_or(0);
+        Address(b)
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("oxide-nonce-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("nonces")
+    }
+
+    /// Sharding must change no admission outcome: for any request sequence,
+    /// every shard count accepts and rejects exactly what one tracker does.
+    #[test]
+    fn matches_a_single_tracker_for_every_shard_count() {
+        let mut x = 0x1234_5678_9abc_def1u64;
+        let reqs: Vec<(Address, u64)> = (0..20_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (owner(x % 300), (x >> 20) % 40) // many replays and regressions
+            })
+            .collect();
+        let mut single = NonceTracker::new();
+        let want: Vec<bool> = reqs.iter().map(|(o, n)| single.check_and_consume(o, *n)).collect();
+        assert!(want.iter().any(|b| *b) && want.iter().any(|b| !*b));
+        for shards in [1, 2, 7, 64] {
+            let g = ShardedNonces::new(shards);
+            let got: Vec<bool> = reqs.iter().map(|(o, n)| g.check_and_consume(o, *n)).collect();
+            assert_eq!(got, want, "shards={shards}");
+            assert_eq!(g.owners(), single.last_seen.len());
+        }
+    }
+
+    /// Many threads racing on one owner and on disjoint owners: each nonce is
+    /// admitted at most once, and the final watermark is the highest tried.
+    #[test]
+    fn concurrent_admission_is_replay_safe() {
+        const N: u64 = 2_000;
+        let g = std::sync::Arc::new(ShardedNonces::new(NONCE_SHARDS));
+        let threads: Vec<_> = (0..8u64)
+            .map(|t| {
+                let g = std::sync::Arc::clone(&g);
+                std::thread::spawn(move || {
+                    let mut accepted_shared = 0u64;
+                    for n in 1..=N {
+                        accepted_shared += u64::from(g.check_and_consume(&owner(0), n));
+                        // A private owner per thread: every nonce must be admitted.
+                        assert!(g.check_and_consume(&owner(100 + t), n));
+                    }
+                    accepted_shared
+                })
+            })
+            .collect();
+        let accepted: u64 = threads.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!((1..=N).contains(&accepted), "each nonce at most once: {accepted}");
+        assert!(!g.check_and_consume(&owner(0), N), "watermark reached N");
+        assert!(g.check_and_consume(&owner(0), N + 1));
+    }
+
+    /// One checkpoint and log serve any shard count, and the format is the
+    /// single tracker's: a store survives a restart under a different shard
+    /// count, and is interchangeable with `NonceTracker`'s.
+    #[test]
+    fn durable_across_restarts_shard_counts_and_the_single_tracker() {
+        let path = tmp("durable");
+        {
+            let g = ShardedNonces::new(64);
+            g.attach_store(path.clone());
+            for i in 0..500u64 {
+                assert!(g.check_and_consume(&owner(i), 10 + i % 5));
+            }
+            g.sync_durable();
+        }
+        // Different shard count: every consumed nonce is still a replay.
+        {
+            let g = ShardedNonces::new(5);
+            g.attach_store(path.clone());
+            for i in 0..500u64 {
+                assert!(
+                    !g.check_and_consume(&owner(i), 10 + i % 5),
+                    "owner {i} must stay consumed"
+                );
+                assert!(g.check_and_consume(&owner(i), 100));
+            }
+            g.sync_durable();
+        }
+        // A single tracker loads what the sharded gate wrote.
+        {
+            let mut t = NonceTracker::new();
+            t.attach_store(path.clone());
+            for i in 0..500u64 {
+                assert!(!t.check_and_consume(&owner(i), 100));
+            }
+            assert!(t.check_and_consume(&owner(0), 101));
+            t.sync_durable();
+        }
+        // And the sharded gate loads what a single tracker wrote.
+        {
+            let g = ShardedNonces::new(16);
+            g.attach_store(path.clone());
+            assert!(!g.check_and_consume(&owner(0), 101));
+            assert!(g.check_and_consume(&owner(0), 102));
+        }
     }
 }

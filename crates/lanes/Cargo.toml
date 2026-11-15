@@ -1,0 +1,30 @@
+# Oxide blockchain — `lanes` crate
+# (workspace: github.com/abhijitkrm/oxide; bare-name convention per
+# docs/devlog.md session 2)
+#
+# Sharded, swappable execution lanes (docs/lanes-spec.md): the
+# authentication, fill-commitment and routing seams plus a trading
+# shard and an EVM-style account-range lane. A prototype crate: it
+# depends only on internal crates (`trading`, `crypto`, `primitives`)
+# so it adds no new third-party dependency.
+
+[package]
+name = "lanes"
+description = "Sharded execution lanes with swappable authentication, commitment and routing seams (docs/lanes-spec.md)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+primitives = { workspace = true }
+trading = { workspace = true }
+crypto = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "lanes"
+harness = false

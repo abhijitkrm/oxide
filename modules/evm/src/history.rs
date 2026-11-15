@@ -200,7 +200,7 @@ pub struct ExecutedBlock {
 /// Per-block accumulator used between `begin_block` and `end_block`.
 /// `record` appends; `seal_block` folds it into an [`ExecutedBlock`].
 #[derive(Debug, Default)]
-struct Pending {
+pub(crate) struct Pending {
     /// Transactions recorded so far this block (block order).
     txs: Vec<StoredTx>,
     /// Receipts in the same order as `txs`.
@@ -388,7 +388,97 @@ impl History {
         coinbase: Address,
         state_root: B256,
     ) -> Vec<u64> {
+        let roots = self.pending_roots();
+        self.seal_block_with_roots(
+            number, timestamp, gas_limit, base_fee, coinbase, state_root, roots,
+        )
+    }
+
+    /// `(receipts_root, transactions_root)` of the pending block.
+    ///
+    /// The two ordered tries are independent of each other and of the
+    /// state root, and each is O(txs) keccak work (~1.2 ms apiece for a
+    /// 1,428-transfer block on a laptop), so they are computed on two
+    /// rayon workers. The result is bit-identical to computing them one
+    /// after the other: each root is a pure function of the pending
+    /// block's receipts / raw transactions. Callers may run this
+    /// concurrently with the state-root update and hand the result to
+    /// [`Self::seal_block_with_roots`].
+    #[must_use]
+    pub fn pending_roots(&self) -> (B256, B256) {
+        rayon::join(
+            || receipts::receipts_root(&self.pending.receipts),
+            || {
+                if self.pending.raws.is_empty() {
+                    EMPTY_TRIE_ROOT
+                } else {
+                    alloy_trie::root::ordered_trie_root(&self.pending.raws)
+                }
+            },
+        )
+    }
+
+    /// [`Self::seal_block`] with the pending block's roots already
+    /// computed by [`Self::pending_roots`] (nothing may be pushed to
+    /// `pending` in between: `end_block` holds the execution barrier).
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal_block_with_roots(
+        &mut self,
+        number: u64,
+        timestamp: u64,
+        gas_limit: u64,
+        base_fee: u64,
+        coinbase: Address,
+        state_root: B256,
+        (receipts_root, tx_root): (B256, B256),
+    ) -> Vec<u64> {
         let pending = std::mem::take(&mut self.pending);
+        self.seal_taken(
+            number,
+            timestamp,
+            gas_limit,
+            base_fee,
+            coinbase,
+            state_root,
+            (receipts_root, tx_root),
+            pending,
+        )
+    }
+
+    /// Detach the pending accumulator (the block's txs, receipts, raws
+    /// and traces) so execution of the next block can start while this
+    /// one is sealed later by the root stage.
+    pub(crate) fn take_pending(&mut self) -> Pending {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// `(receipts_root, transactions_root)` of a detached block.
+    pub(crate) fn roots_of(pending: &Pending) -> (B256, B256) {
+        rayon::join(
+            || receipts::receipts_root(&pending.receipts),
+            || {
+                if pending.raws.is_empty() {
+                    EMPTY_TRIE_ROOT
+                } else {
+                    alloy_trie::root::ordered_trie_root(&pending.raws)
+                }
+            },
+        )
+    }
+
+    /// Seal a detached pending block (see [`Self::seal_block_with_roots`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn seal_taken(
+        &mut self,
+        number: u64,
+        timestamp: u64,
+        gas_limit: u64,
+        base_fee: u64,
+        coinbase: Address,
+        state_root: B256,
+        (receipts_root, tx_root): (B256, B256),
+        pending: Pending,
+    ) -> Vec<u64> {
         let cumulative = Receipt::cumulative_gas(&pending.receipts);
         let gas_used = cumulative.last().copied().unwrap_or(0);
         // The block bloom is the bitwise OR of all receipt blooms
@@ -399,14 +489,6 @@ impl History {
                 *b |= r;
             }
         }
-        let receipts_root = receipts::receipts_root(&pending.receipts);
-        // transactionsRoot: ordered trie over the *raw signed RLP*
-        // (Ethereum keys by index, values are the canonical encodings).
-        let tx_root = if pending.raws.is_empty() {
-            EMPTY_TRIE_ROOT
-        } else {
-            alloy_trie::root::ordered_trie_root(&pending.raws)
-        };
         // Parent linkage: the previously sealed block at `number - 1`.
         // `B256::ZERO` for the first sealed block (genesis-adjacent or
         // first block after a restart with a fresh history window).
@@ -1173,6 +1255,27 @@ impl EvmModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pending_roots` (the parallel pair) must equal the two roots
+    /// computed independently, and `seal_block` must seal exactly
+    /// what `seal_block_with_roots` does.
+    #[test]
+    fn pending_roots_match_independent_computation() {
+        let mut a = History::new(4);
+        let mut b = History::new(4);
+        for h in [&mut a, &mut b] {
+            for tag in 0..40u8 {
+                h.record(dummy_tx(tag), dummy_receipt(21_000), &[tag, tag ^ 0x5a], None);
+            }
+        }
+        let (r, t) = a.pending_roots();
+        assert_eq!(r, receipts::receipts_root(&a.pending.receipts));
+        assert_eq!(t, alloy_trie::root::ordered_trie_root(&a.pending.raws));
+        a.seal_block(1, 1, 30_000_000, 1, Address::ZERO, B256::ZERO);
+        let roots = b.pending_roots();
+        b.seal_block_with_roots(1, 1, 30_000_000, 1, Address::ZERO, B256::ZERO, roots);
+        assert_eq!(a.block(1).map(|x| x.hash), b.block(1).map(|x| x.hash));
+    }
 
     fn dummy_tx(hash_byte: u8) -> StoredTx {
         StoredTx {

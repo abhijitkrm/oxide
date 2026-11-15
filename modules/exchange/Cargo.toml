@@ -18,6 +18,10 @@ types = { workspace = true }
 executor = { workspace = true }
 framework = { workspace = true }
 trading = { workspace = true }
+# `lanes::commit::ByteStream`: the one streaming-commitment construction
+# shared with the matcher, so the root the settler attests and the root
+# the chain computes use the same function (docs/lanes-spec.md §7).
+lanes = { workspace = true }
 storage = { workspace = true }
 
 [dev-dependencies]

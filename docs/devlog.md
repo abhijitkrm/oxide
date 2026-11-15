@@ -24526,3 +24526,465 @@ absent here): `perf`, `heaptrack`, `strace`, `iostat`, `blktrace`, the Linux `/p
 branch of the sampler (field indices checked against `proc(5)` by hand), and the
 devnet/soak attach logic. Expect to fix small things on the first box minutes;
 run `QUICK=1 PROFILE_SPECS="storage:mmr" PROFILE_SECS=2 SECTIONS=profile` first.
+
+### Lanes: sharded, swappable authentication, commitment and EVM lanes (targets 10M orders/s, 1M EVM tx/s)
+
+Why: the user's targets are 10M orders/s and fills/s and 1M EVM tx/s (100M orders/s
+as design headroom). The per-item costs measured by the new `crypto` bench `budget`
+(M1, 1 core) say a single lane where every validator re-verifies everything cannot
+get there: secp256k1 recover 31 µs, ed25519 strict 46 µs, ed25519 batch(256) 16 µs,
+a BLAKE3 leaf 0.15 µs, a session-MAC 0.11 µs. 10M ed25519-batch orders/s is about
+156 cores of signature work alone; 1M EVM tx/s is about 31 cores for recovery alone.
+The engine itself (14.6M ops/s per core with the fold on) is not the limit.
+
+What landed: `docs/lanes-spec.md` and a prototype crate `lanes` (internal deps only):
+
+- `verify`: `Verifier` seam with `PerItem`, `Batched` (falls back to per-item),
+  `Certified` (gateway batch certificate, deterministic digest-seeded audit sample,
+  fail-closed on a bad cert/digest/audit), `SessionMac` (keyed BLAKE3, strictly
+  increasing counters).
+- `commit`: `FillCommit` seam with `PerFill`, `Stream`, `Merkle`.
+- `shard`: market-sharded trading lane over `MatchingEngine::apply_batch`.
+- `evm`: account-range lane, cross-lane credits, conservation property test.
+- Benches: `crypto/benches/budget.rs`, `lanes/benches/lanes.rs`; `rig-bench.sh`
+  sections `budget` and `lanes`.
+
+Findings:
+
+- Feeding the streaming hash 73 B per fill cost about 100 ns per fill, not the
+  ~15 ns I had estimated; buffering to 16 KiB per `update` cut it to about 58 ns
+  per fill (BLAKE3's multi-chunk SIMD path). Added cost over the bare engine, per
+  order: stream 35 ns, per-fill leaf 97 ns, merkle 183 ns.
+- Bug found by the property test (not review): cross-lane credit indices were
+  per-source, so a destination that sees only its own credits saw "gaps". Indices
+  are now per (source, destination) channel; spec corrected.
+- Mutation check: removing the sender debit makes the conservation test fail.
+- Swap safety is tested, not assumed: every authentication mode and every commit
+  mode yields the same lane output (digest, fills, resting) for the same orders.
+- Results: see spec §10. Session MAC + stream commit gives 12.5M orders/s on this
+  laptop on 8 shards; batched ed25519 per order gives 0.3M. The EVM lane mechanism
+  costs 13-35 ns per cross-lane credit against ~25 µs per real transaction.
+
+Not done, and not claimed: no consensus integration, no journal in the lane path, no
+network, no real EVM execution in the lane, no cross-lane contract calls, no
+session-open/scope enforcement or gateway slashing (hooks specified only). The
+100M figure is a design target, not a measurement.
+
+Box plan: `SECTIONS="env budget lanes"` is the short-box preset; it yields per-stage
+costs and the shard scaling curve on a many-core machine.
+
+### Lanes wired into the matcher and the settlement path (pluggable authentication, per-batch fill commitment)
+
+User direction: modular and swappable; operators choose the scheme and performance only
+sets the default. So every scheme is built and selected by config.
+
+**Authentication (matcher).** New `matcher::auth` with an `Authenticator` seam
+(`orders`, `action`, `certified_orders`, `open_session`, `close_session`) behind every
+admission path: `MatchingServer`, `RingMatcher`, `MultiMarketMatcher` and the TCP/WS/
+JSON-RPC/FIX transports (about 15 sites; no direct `VerifiedOrder::with_chain_id` calls
+remain outside `protocol`/`auth`). Schemes: ed25519 batch (default, bit-identical),
+ed25519 per-item, EVM secp256k1 recovery (parallel option), session MAC, gateway
+certificate with deterministic audit, and `Multi` over a chosen set. No wire change:
+each scheme uses a canonical shape of the existing `pubkey`/`signature` bytes; the nonce
+in the signed message stays the replay gate for all. Owner binding is enforced per scheme
+(ed25519 derived address, EVM recovered address, session owner).
+
+Findings and checks:
+- Mutation testing caught a gap in my own tests: removing the session owner check
+  survived because my "stolen owner" case changed the owner after MACing (MAC then failed
+  for an unrelated reason). The real threat is a session holder MACing correctly for an
+  account that is not the session's; the test now covers it (orders and actions).
+- The EVM scheme authenticates against the on-chain EOA address, which closes the
+  trading-key/ledger-key gap that `protocol.rs` documents for ed25519 trading keys.
+- Matcher admission, M1, orders/s on one thread: ed25519 per-item 20k, batch 56k, EVM
+  33k (124k on 4 threads), session MAC 4.8M, certificate (audit 1/64) 1.9M, mixed thirds 59k.
+- Default behaviour is unchanged: the whole matcher suite passes and a test asserts the
+  default authenticator equals `VerifiedOrder::batch_with_chain_id` on a mixed batch.
+
+**Lane-level verifiers (`lanes::verify`).** Added the EVM scheme (`EvmRecover`, optional
+threads), an `OwnerBound` decorator, `Multi` (per-item dispatch with an allow list), and a
+`VerifierConfig` that builds any of them at run time; the default is `Multi` with every
+scheme on. No accept-everything kind is configurable (`NoVerify` is a bench control).
+
+**Commitment (steps 2 and 3).** `matcher::commit::fills_root` folds the sealed fills into a
+root with `lanes::commit::ByteStream` (extracted from `Stream`, now labeled and
+count-bound). The settler can submit a committed batch settle (exchange tag 16:
+`[seq][fills_root][raw_count]` + the tag-3 body). The chain settles the legs identically and
+emits `batch_commit` carrying the operator's `fills_root` and its own `legs_root`. The
+chain only sees aggregated legs, which shaped the design: it can verify a root over what
+it applied, and only record the operator's attestation over the raw fills. End-to-end test:
+the settler's real payload is accepted by the real `ExchangeModule`.
+
+Not done: session open/close and certificate frames on the network transports, session
+expiry, netted-delta settlement with a dispute path (the step that would remove per-leg
+chain work), and journaling the fills root in the seal record (it is recomputable from the
+journal, so nothing is lost). The `--commit-batches` default is off; the chain must know tag 16.
+
+### Open items closed: control frames, session expiry and close, gateway faults, bonded operator and disputes
+
+Done, in the order the user asked ("do what is not done first"):
+
+- **Control frames** (`matcher::control`): session open/close and certified batches on the
+  binary TCP protocol (flag 0xFD; multi-market, mutex and ring servers) and session
+  open/close as JSON-RPC methods. `submit_batch` was split so a certified batch skips
+  per-order verification but shares everything after authentication.
+- **Session expiry**: the expiry is inside the owner's signed open; a default 24 h maximum
+  lifetime also refuses "never expires". Close is owner-signed (ed25519 or EVM), not
+  session-key-signed.
+- **Gateway faults**: a provable fault (valid certificate, matching digest, failing audited
+  order) is counted per gateway, hooks an operator callback (default: a stderr line), and
+  suspends the gateway after 3. Mutation checks: 5/5 caught.
+- **Bonded operator and disputes** (`exchange::dispute`, tags 17 and 18): bond, per-batch
+  records in the committed KV store (no snapshot layout change; verified by a snapshot
+  round-trip test), dispute with the raw fills, slash plus suspension, governed
+  reinstatement, pruning at `end_block`. Raw-fill encoding, label and aggregation are
+  defined once in the exchange and imported by the matcher. Mutation checks: 7/7 caught.
+
+Decision recorded: I did not build "netted-delta settlement". Per-account netting does not
+remove per-leg chain work because each leg still updates the registered orders' remaining
+quantity and escrow; real savings need order state off chain, which is a trust-model change
+(dispute over order state), not an optimization. The dispute path above is the part that
+makes the existing attestation enforceable.
+
+Still not done: WebSocket and FIX carriage of the control frames, persisted sessions (they
+live in memory), bond withdrawal, a CLI for the bond deposit.
+
+### Laptop TPS sweep (M1, 8 cores: 4 performance + 4 efficiency; 16 GB; everything in one machine)
+
+Run one bench at a time after the changes above. Engine digests still match matcher-rust
+on all seven workloads. Numbers are single runs on a laptop that also hosts the load
+generator; treat them as order-of-magnitude, not as gates.
+
+| Kind | Result |
+|---|---|
+| Matching engine, 1 core, fold off, native amend | W1 39M, W2 32M, W3 25M, W4 38M, W5-1k 57M, W5-100k 36M, W5-600k 11.5M ops/s |
+| Matching engine, 1 core, commitment fold on | 8-25M ops/s (W1/W3 ~8M, W5-1k 25M) |
+| matcher-rust, same workloads | W5-1k 101M, W5-100k 23M, W5-600k 12.9M ops/s |
+| Lane prototype, session MAC + stream commit, 8 shards | 12.5M-17M orders/s (two runs) |
+| Lane prototype, batched ed25519 per order, 8 shards | 0.3-0.4M orders/s |
+| Admission only, 1 thread (matcher auth bench) | ed25519 20k, ed25519 batch 56k, EVM 33k (124k on 4 threads), session MAC 4.8M, certified 1.9M |
+| **Real loopback TCP, multi-market matcher, 4 conns, batch 500, real matching** | ed25519 67k, ed25519 batch 185k, EVM 164k, **session MAC 1.81M**, **certified 1.85M**, multi (mixed schemes enabled) 184k orders/s |
+| Older service tests (sync/pipelined, single-market mutex, per-order ed25519) | 10-18k orders/s |
+| Journal (queued ack / durable ack) | 44.6k / 33.6k orders/s vs 40.4k with no journal |
+| EVM execution, sequential, per tx | 34 us/tx (29.7k tx/s); 87% of it is secp256k1 recovery (29.6 us) |
+| EVM batch, parallel (8 cores) | 113k tx/s at 10k txs (gate 109k tx/s, floor 60k) |
+| Executor pipeline (native txs) | 269k tx/s propose+execute; 347k tx/s execute only |
+| Node sustained pipeline (native staking txs, in process) | 560-620k tx/s |
+| Parallel scheduler on a MODELED Uniswap-style mix (a calibrated spin loop per tx, 59,850 gas/tx; not real EVM) | sequential 85k tx/s (5.0 modeled GG/s); parallel 8 threads 343-391k tx/s (20.5 modeled GG/s) |
+| Exchange batch settle | 1k distinct pairs 3.2M legs/s; 1k same pair 18M legs/s; 16k clustered 11M legs/s |
+| 4-validator local devnet over TCP | 4.0k tx/s sustained at 4k offered; collapsed to 0.9-2.8k above that (noisy, not a ceiling) |
+| Signatures (1 core) | secp256k1 recover 28.5-32 us, ed25519 strict 46 us, ed25519 batch 16 us, session MAC 0.12 us, BLS verify 772 us |
+
+Reading: the matching engine is not the service's limit. The service's limit is
+authentication: with a signature per order the real TCP path is 67k-185k orders/s even
+though the engine does tens of millions; with session MACs the same server does 1.8M
+orders/s on the same laptop while sharing cores with the load generator. EVM transactions
+are dominated by signature recovery (87%), so the EVM lane's lever is where recovery
+happens, not the execution engine.
+
+Caveats: not a multi-machine result; the devnet figure is unstable above 4k tx/s offered
+on this laptop and should not be quoted as a ceiling; criterion `elem/s` for the
+uniswap bench is mis-scaled, so tx/s above is computed from the measured times.
+
+### Before renting the box: Linux validation, the real-service shard bench, pinned separate-process load
+
+Goal: find bugs and bad assumptions on the laptop instead of on paid hours.
+
+**1. Linux in a container** (`scripts/rig/linux-smoke.sh`; Docker VM: 4 CPUs, 3.8 GB).
+Workspace tests (lanes, matcher, exchange, crypto, trading, primitives) pass on Linux
+including the SIGKILL crash test (5/5). Emulated x86-64: the `prefetch` feature compiles and
+the trading (67), crypto (60, asm keccak path) and lanes (22) tests pass. QUICK rig run on
+Linux completed with `taskset`, the `/proc` sampler, `iostat` and the crash loop working.
+Bugs it found (each would have cost box minutes):
+- `rig-bench.sh` called `git rev-parse` and `git worktree`, which fail on trees rsync'd without
+  `.git` (the ssh driver does exactly that), so every remote run died in the first second. Now
+  falls back to a recorded hash, and the patch-and-rebuild sweeps use plain tree copies.
+- `setup-linux.sh` used one `apt-get install` for everything (one missing package aborted all)
+  and trusted `command -v perf` (Ubuntu ships a wrapper that exists without working tools). Now
+  tiered, and checks `perf --version`.
+Not testable in a container: `perf` counters, real NVMe, x86 timing.
+
+**2. The real-service shard bench** (`cargo bench -p matcher --bench shards`; the production
+`MultiMarketMatcher`, one submitter per market, journal off/queued/durable). My hypothesis was
+that the shared replay gate caps the service at ~3-5M orders/s (the `nonce_contention` bench
+suggested it). Sharding the gate (64 shards by owner) changed nothing at first, so I profiled
+with `sample`: the real culprit was my bench's `AtomicBalanceCache::new(8)`, a capacity of 8
+accounts, which pushed every account onto the global-mutex sparse map. With a sized cache the
+service scales 1.8M, 3.6M, 6.3M, 7.5M orders/s over 1, 2, 4, 8 markets. The gate sharding is
+kept because a proper A/B (3 runs each) shows it matters once the real bottleneck is gone: 8
+markets 7.5M vs 4.6M with one shard (+64%).
+- **Correction**: the same capacity mistake was in `e2e_auth_tps`, so the published session
+  MAC (1.81M) and certified (1.85M) TCP figures were understated; corrected to 2.19M and 2.33M
+  (signature-bound rows unchanged). Fixed in docs and noted in `docs/lanes-spec.md` §10.1.
+- Durable ack does not scale with submitters here (~95k orders/s per market for 1, 4 or 16):
+  the worker blocks on one fsync (~5 ms on this laptop) per batch instead of group-committing
+  queued batches. Irrelevant on ~0.1 ms NVMe, binding on network disks. Pipelining the ack is
+  a known improvement, not built.
+- The bench's setup derived an address from a secret key per order (~20 us each); precomputed.
+
+**3. Separate processes** (`scripts/rig-bench.sh procs`). Found that the shipped
+`oxide-matcher` funded canonical `[index][0..]` addresses while `oxide-loadgen` signs with keys
+whose derived owners are hash addresses, so the pair could not trade. Added
+`matcher::loadkeys` (deterministic, publicly derivable identities; feature `dev-identities`,
+off in production), `oxide-matcher --fund-loadgen-keys`, and `oxide-loadgen --auth
+ed25519|evm|session_mac|certified` with `--print-gateway-key`. Loadgen now prepares every order
+before its clock starts (it used to sign inside the timed region) and counts rejections. The
+matcher restarts per run (replay gate is per process lifetime). Smoke on the laptop works for
+all four schemes with 0 rejections; the pinned many-core curve is for the rig.
+
+Still open: pipelined durable ack; the `procs`/`shards` sections are smoke-tested only; `perf`,
+heaptrack and blktrace paths remain unvalidated (no tools in the container).
+
+### Correction: what `uniswap_transfer` measures (2026-11-14)
+
+The `uniswap_transfer` bench is a synthetic scheduler benchmark: each transaction is a calibrated
+CPU spin loop (`NS_PER_GAS`) over a Uniswap-style gas mix, with no revm and no signature recovery
+(its own header says so). I labeled its rows "Uniswap-style EVM" in the laptop sweep and quoted its
+tx/s and GG/s as EVM figures. They are scheduler-scaling figures on a modeled workload. The real
+EVM execution numbers are `modules/evm` `tps_rw` (signed transfers through revm with sender
+recovery): 17.2k tx/s on one core of the 64-core EPYC, about 113k tx/s on the 8-core laptop. The
+project's older "12.96 GG/s parallel vs 1 GG/s gate" headline comes from the modeled bench; the
+real parallel figure is about 2.5 GG/s on the 8-core laptop (bench header). The rig summary now
+labels the two tables accordingly.
+
+### Fix: block execution re-recovered every pending signature (the "single-writer" CLOB ceiling)
+
+Measured on the 64-core box (`executor:chain_mix`, signed transactions through the real executor):
+EVM transfer admission scaled to 924k tx/s at 64 threads, but CLOB-order **block execution sat at
+18.3k tx/s (about 54 us per order) at every thread count**. I first called that single-writer
+execution. A profile of the execution phase (laptop, `sample`) showed secp256k1 recovery
+(`gej_double`, `ecmult`, `fe_sqrt`) inside block execution, and the laptop reproduced the shape:
+CLOB execution cost 2.0 us/tx up to ~20k transactions, then 10 us at 40k and 22 us at 80k.
+
+Root cause (`crates/executor/src/exec.rs`): `execute_block` moved the whole ingest-time
+preverify cache out with `mem::take`, consumed only the entries for that block's transactions,
+and dropped the rest when it returned. Every transaction waiting for a later block therefore
+lost its verified-sender entry, so `plan_block_runs` recovered each pending native transaction's
+EIP-712 signature again, serially, at execution. The field's own documentation said entries are
+removed *after the block containing the tx is finalized*; the code removed more.
+
+Fix: `restore_preverify_leftover` puts back every entry whose tx was not in the block (removing
+this block's own, since fee-paying native runs never consume theirs), bounded by the mempool
+capacity so stale entries cannot grow it without limit. A hit still means "this node verified
+these exact bytes at ingest", so retention changes no result, only skips a redundant recovery.
+New counter `Executor::exec_sig_reverifications()` (also printed by `chain_mix`) makes a miss
+visible. Tests: a 90-tx signed backlog over three blocks recovers 0 signatures at execution
+(60 without the fix: the mutant is caught), and a never-ingested tx is recovered exactly once.
+
+Laptop, CLOB, 8 ingest threads: 40k txs 97.7k -> 404.8k tx/s, 80k 46.0k -> 376.2k, 400k 31.1k ->
+299.7k; re-verified at execution 0. EVM transfers are unchanged (their parallel path already
+recovered senders with rayon): execution scales with threads (laptop 24k, 37k, 50k, 54k tx/s at
+1/2/4/8 rayon threads), and the box's flat 73.5k tx/s at 64 threads is a serial fraction in that
+path still to be profiled on the next box. The 64-core numbers in this devlog's earlier tables
+for CLOB execution (18.3k tx/s) are the pre-fix figures.
+
+### Fix: the settler could lose every fill of a busy interval (batches above 65,536 legs)
+
+Found while triaging a log line from the standalone matcher benchmark: `batch settler: CRITICAL -
+batch of 0 pairs rejected at execution: malformed transaction`. Two problems:
+- The "0 pairs" was a logging bug (`resolve_pending` only set the pair count on success).
+- The rejection was real: the exchange refuses a batch-settle message with more than
+  `MAX_BATCH_FILLS` (65,536) legs as malformed, and the settler sealed everything into ONE
+  message. Any interval that aggregates to more pairs (at the default 100 ms, above ~655k pairs/s,
+  always at benchmark rates) was rejected wholesale, with the documented outcome "fills lost
+  on-chain". A test using the real exchange module reproduces it.
+
+Fix: `settle_now` splits an oversized seal into batches of at most `MAX_PAIRS_PER_BATCH`
+(= `exchange::MAX_BATCH_FILLS`) legs and submits them in order through the existing
+one-in-flight pipeline; later chunks wait in a queue that is drained before any newer seal.
+With commitments on, each chunk carries a fills root over exactly the raw fills its legs aggregate
+from (aggregation is per leg key, so this is a partition), so every chunk stays disputable; a test
+runs each chunk through the real exchange and the dispute path. The rejected-pairs count is now
+reported. Mutation checks: no-split and unpartitioned-fills are both caught.
+
+Known limits, stated plainly:
+- The deferred queue is in memory. A crash loses unsent chunks (before this change the chain would
+  have rejected the whole batch, so this is strictly better, but it is not durable).
+- Settlement throughput is bounded by one in-flight batch at a time: at most 65,536 legs per
+  confirmed transaction. At the default cadence that is a ceiling of roughly 65k-650k legs/s
+  depending on block time, far below the matcher's order rate. Settlement, not matching, is the
+  next system-wide limit for the 10M orders/s target and needs pipelining or netting.
+
+### Diagnosis: why EVM block execution plateaus at ~73k tx/s (not fixed; next engineering item)
+
+After the preverify-cache fix, EVM transfers remained the slowest chain-path type: execution was
+flat at ~73.5k tx/s from 8 to 64 rayon threads on the 64-core box, and on the laptop it scaled only
+24k, 37k, 50k, 54k tx/s over 1/2/4/8 threads (Amdahl serial fraction about 40%).
+
+Per-phase timing of `execute_block` (temporary instrumentation, since reverted), laptop, a block of
+1,428 EVM transfers (the 30M block gas limit):
+
+| Phase | 1 rayon thread | 8 rayon threads |
+|---|---|---|
+| plan_block_runs (serial, per-tx gates) | 0.48 ms | 0.48 ms |
+| dispatch (the "parallel" EVM execution) | 4.3 ms | 4.6-5.1 ms |
+| end_block + attendance (EVM `end_block`: `state_root()` then history/undo/backend) | 6.7-8.6 ms | 6.7-8.6 ms |
+| state_root (executor call; cached by end_block) | ~0.01 ms | ~0.01 ms |
+
+Findings:
+- At this block size parallel dispatch is no faster than one thread (rayon task and merge overhead
+  eat the gain), and the block is dominated by **end_block, whose first act is the EVM module's
+  incremental Merkle-Patricia state-root update** (`module_impl.rs` `state_root()`, keccak over the
+  touched accounts' trie paths, serial). A `sample` of the execution phase agrees: keccak,
+  `alloy_trie::HashBuilder::update`, `ordered_trie_root` and `EvmModule::state_root` are the hot
+  non-idle frames.
+- Block size is gas-limited (1,428 transfers per 30M-gas block), so the per-block fixed work is paid
+  every ~1.4k transactions.
+
+Candidate fixes, in order of expected value (none done):
+1. Parallel state root: partition the touched leaves by the first nibble of `keccak(address)`,
+   hash the 16 subtries in parallel, combine at the root. The root is bit-identical by
+   construction (same MPT), so it must be proven by a differential test against the sequential
+   root; consensus-critical, hence not a pre-flight change.
+2. Pipeline the root off the critical path: the block attestation only needs the root of block h-1
+   when block h is proposed, so compute it on a worker while block h executes.
+3. Revisit `parallel_threshold` and per-group overhead for blocks near the gas limit.
+A 16- or 8-core x86 box is enough to measure any of these (the plateau already appears by 8
+threads).
+
+### EVM block execution: cheaper end_block (laptop finalize 60k -> 76k tx/s on 1,428-transfer blocks)
+
+Follow-up to the diagnosis above. Sub-timing inside the EVM `end_block` (temporary, reverted) on the
+`chain_mix --mix transfer` block: state_root 5.0 ms (patch 0.5 + sparse walk 3.0 + stale-branch
+removal 1.8), history seal and undo 3.3 ms (receipts and transactions ordered tries), nothing else.
+
+Changes (roots are bit-identical; all 221 evm tests and the sparse-vs-full differential suite pass,
+plus a new test that deepens the trie from 20 to ~11k accounts between rounds):
+- **Stale-branch removal bounded by `retained_depth`** (new field, only ever raised): the merge probed
+  all 64 prefix lengths per touched key against `retained_branches` (about 90k hash-map removals per
+  block, mostly absent keys). It now stops at the deepest key ever stored. 1.8 ms -> 0.2 ms.
+- **Each touched address hashed once** (was three keccaks: patch, touched set, removal).
+- **receipts_root and transactions_root computed on two rayon workers, concurrently with the
+  state-root update** (`History::pending_roots` + `seal_block_with_roots`; `seal_block` keeps its
+  signature). `end_block` 8.6 ms -> 4.6 ms at 8 rayon threads.
+
+Result, laptop, 200k signed transfers, 8 ingest threads: finalize 60.4k -> 75.6k tx/s at 8 rayon
+threads (61.3k -> 68.8k at 1). Still far from the 1M tx/s target: a block is now roughly plan 0.5 +
+dispatch ~3.5 (speculate 2.3 + commit 1.1) + end_block 4.6 ms.
+
+Dead end: sharding `MvState` (one global `RwLock` over the version maps) by address changed nothing
+(speculate 2.3 ms at 8 threads vs 1.9 ms at 1, before and after), so it was reverted. At ~1.3 us per
+transfer the speculation phase is too short for 8 workers to pay back task and cache-line overhead;
+the lock was not the cause.
+
+What is left is structural, not a micro-fix: per-block fixed work is serial, and the gas limit caps a
+block at ~1.4k transfers. The next real step is taking the state root off the critical path by letting
+block h's header commit to the root of h-k (lagged app hash, root computed on a worker while h+1
+executes). The Mint-Network evm-node `box/next` design doc `docs/clob-deferred-exec-design.md` does
+this (`CLOB_LAGGED_APP_HASH=k`, backpressure rule `E(H) >= H-k`, snapshots taken at an executed
+height); that is a protocol change (attestation, state sync, light clients) and needs its own spec in
+`docs/` first, so it is not done here. Their design also streams fills before the root commits and
+treats CPU-per-input as the honest throughput number.
+
+### Study of the Go reference chain and the production/HFT plan
+
+Read the reference's design docs, practices checklist, box report and harness layout (not its keeper code line by line). Result: `docs/hft-production-plan.md`. Neither stack has shown 10M items/s end to end (the reference: ~1.1M/s measured, one 32-core node, signed, persisted). Our edge is the engine and EVM execution; theirs is method (per-item budget, traders x markets matrix, shadow-equal gates, lagged root, invalid-run rules). New data point: `chain_mix --mix clob`, laptop, 8 ingest threads, 200k signed orders: admission 153k/s (secp256k1 recovery bound), propose 873k/s, finalize 343k/s.
+
+### W0 first readings: CLOB cost per tx is not flat in account count
+
+`chain_mix --mix clob`, laptop, 8 ingest threads, 200k signed orders, new `StageTimes` recorder (us per tx):
+
+| accounts | plan | dispatch | end_block | finalize tx/s | total tx/s |
+|---|---|---|---|---|---|
+| 1,000 | 0.64 | 1.31 | 0.02 | 357k | 95.9k |
+| 10,000 | 0.64 | 1.07 | 0.18 | 361k | 95.7k |
+| 100,000 | 0.65 | 1.27 | 1.90 | 196k | 72.7k |
+
+At 100k accounts `end_block` grows 100x and finalize drops 45% (the reference stack saw the same shape: cost per
+item rising with trader count). EVM transfers for comparison: plan 0.34, dispatch 4.8, end_block 6.6 us. Next:
+find what the exchange does per touched account in `end_block` at scale (suspect per-account work rather than per
+order) and make it per-change. A clippy failure (cast_precision_loss) slipped into the first commit of the recorder
+because the gate was run without checking its exit code in the same command as the commit; fixed in the next commit.
+
+### W0 finding: the CLOB path pays the EVM Merkle-Patricia root per touched account
+
+Per-module timing at 100k accounts (temporary, reverted): the exchange and attendance hooks cost nanoseconds; the
+`end_block` cost (1.9 us/tx, 40-65 ms per block) is the **EVM module's state-root update**. CLOB transactions
+move native-token balances (fees, escrow, settlement) through the EVM account store, the chain's single native
+ledger, so a 28k-order block touches ~29k EVM accounts (`touched=29355`) and the incremental MPT update pays
+~1.5-2 us per touched account at 100k+ accounts (about 40 ms per block, plus ~10 ms for the undo fold), even though
+no EVM transaction ran. With 1k accounts the same stage is 0.02 us/tx, which is why small-account benches never saw it.
+
+This is the structural reason cost per CLOB tx is not flat in trader count, and it names two fixes, both already in
+the plan: (1) lagged sharded root (W4, approved): the MPT update leaves the critical path; (2) batch-level settlement
+(W3): net balance deltas per account per block instead of per-order ledger writes cuts touched accounts, and a
+non-MPT commitment for the exchange's own balances removes the dependency. Gate: finalize tx/s at 100k accounts
+within 1.5x of the 1k-account figure (today 196k vs 357k = 1.8x).
+
+### Root stage implemented (off by default)
+
+`Executor::with_root_stage(true)` + `spawn_exec_lane`: a root thread behind the exec lane finishes each block's module
+roots (bounded channel `ROOT_LANE_DEPTH=4`); `executed` means executed-and-rooted; poison/fail-closed tracks
+`root_in_flight`. EVM: `end_block` seals/flushes on the exec stage, queues a `PatchDelta`, and `finish_root` folds the
+trie. Header `stateRoot` = root(h-4) in this mode (EIP-2935 forces it: see spec note). Gates: evm differential
+`deferred_root_matches_sync_root_every_block` (mutation-checked: dropping removals fails at height 2) and executor
+integration `root_stage_lane_matches_synchronous_roots` (signed EVM+CLOB mix, every height equal). Numbers in the spec.
+Found on the way: the `chain_mix` finalize column in lane modes counts only enqueue time, so `loop_tps`
+(propose+finalize wall) is the honest column and is now printed on the `stages,` line. Next bound: the serial
+propose phase (~85k tx/s for EVM transfers).
+
+### Propose phase: 85-129k -> 720-815k tx/s (EVM transfers, laptop)
+
+Root cause of the "propose is slow" line in `chain_mix`: `Executor::ingest_tx` pushed txs through the intake ring
+without a gas estimate, so every pool entry carried `gas = 0`, and `Mempool::select_with_gas` (a pure byte-budget walk)
+selected and cloned the whole pool (60k of 200k txs per block with an 8 MB budget) only for `prepare_proposal`'s gas
+filter to keep 1,428 of them. Fixes: the ring now carries `(tx, gas)` (estimate computed at admission, ~0.1 us),
+`Mempool::submit_with_gas`, and `select_with_gas_cap(max_bytes, gas_cap)` which stops when the cap is exactly full or
+after `MAX_CONSECUTIVE_GAS_MISFITS` (256) positive-gas candidates in a row fail to fit (proposer-local policy; other nodes
+validate the gas limit, not the selection rule). Equivalence test `gas_capped_select_matches_select_all_then_filter`
+compares against select-all-then-filter at five caps. Blocks are unchanged (140 blocks of 1,428 txs before and after).
+Pipeline loop (propose+finalize wall), 8 threads, 200k signed EVM transfers: sync 42.0k -> 66.6k tx/s; with the root
+stage 74.5k -> 108.0k tx/s; total from the start of the day 42.0k -> 108.0k (2.6x). Execution itself (plan+dispatch+
+end_block) is now the bound at ~8 us/tx (125k tx/s) in root-stage mode.
+
+### Preverify cache: O(block) instead of O(backlog) per block
+
+`execute_block` took the whole ingest-time signature cache and re-inserted the leftover per block (my earlier fix for
+re-recovering signatures): ~190k hash-map inserts per block at a 200k backlog (the top non-idle frame in a `sample`).
+Now only the block's own entries move out (one hash + one removal per tx), the rest stays in the shared cache, and the
+cache is cleared if it outgrows the pool capacity (stale entries for evicted txs). `dispatch` 5.3 -> 3.4 us/tx; loop
+(propose+finalize wall) EVM transfers 8 threads: sync 76k, root stage 121k tx/s (42k at the start of the day); CLOB
+at 100k accounts with the root stage 237k tx/s. Admission (secp256k1 recovery, ~145-155k tx/s on 8 threads) is now the
+pipeline's cap, which is exactly what bundle authentication (plan W2) addresses.
+
+### Bundles implemented (exchange tag 19): admission 150k -> 7.5-8.4M orders/s
+
+`docs/bundle-auth-spec.md` step 1 built: `msg::bundle`, `TAG_BUNDLE = 19`, `handle_bundle` (framing validated for the whole
+bundle first; allowed items place/cancel/amend; per-item rejection events; acts only for the signer), gas =
+1000 per item + bytes. Tests: bundle equals the same orders as separate transactions (events, state root, balances;
+mutation-checked by reversing item order), malformed bundles execute nothing, signer-only authority, gas per item.
+`chain_mix --mix bundle` (`BUNDLE_ITEMS`, default 64): 1.92M orders as 30k signed bundles, laptop, 8 threads, signed
+through the real executor: admission 7.5M (sync) / 8.4M (root stage) orders/s versus 137-153k for per-order
+transactions, end-to-end total 549-569k orders/s versus 94k. Execution is now the bound: dispatch 92-94 us per
+64-order bundle (1.4 us/order), in the serial exchange path with per-order escrow through the EVM ledger; that is
+workstream W3 (batch ledger deltas). Gate G4 in `scripts/bench-gate.sh` (bundle admission >= 10x per-order; 51x measured).
+Not yet done from the spec: fee model per item (the envelope fee is flat per tx), fuzz target for the decoder, wallet/SDK,
+loadgen scheme, activation-height gate.
+
+### Matching engine id map: O(cluster) removal fixed (bundle execution 2x)
+
+Profile of the bundle benchmark: the top non-idle frame was `trading::idmap::IdMap::remove`. The map uses the identity
+hash (sequential ids get perfect locality) but removal used backward-shift deletion that walks to the next EMPTY slot, and
+sequential ids make the live set one contiguous cluster, so every removal (every fill of a resting order, every cancel)
+cost O(live resting orders). Fix: a `max_disp` bound (largest displacement of any entry from its home bucket, raised on
+insert, never lowered) ends the walk when no later entry can move into the hole. The resulting table is slot-for-slot
+identical to the unbounded algorithm: `bounded_backward_shift_matches_reference` replays random insert/remove streams
+(sequential and colliding keys, wrap-around) against a copy of the old algorithm and compares every slot after every
+operation; mutation-checked (shrinking the bound by one fails it).
+Bundle mix (64 orders per signed tx, 1.92M orders, 8 threads, real executor): dispatch 92 -> 45 us per bundle, loop
+600k -> 1.05-1.13M orders/s, end-to-end total 549-569k -> 937-997k orders/s (per-order transactions at the start of the
+day: 94k). Remaining frames: the per-order ledger escrow and the committed-state fold (blake3 `committed_leaf`).
+
+### Committed-map fold made lazy: exchange execution 2x again
+
+Profile after the IdMap fix: blake3 `compress` (the `CommittedMap` XOR fold: two leaf hashes per mutation) was the top frame;
+an order touches several committed maps (base balances, holds, fee vault, registrations) and a bundle mutates the same keys
+dozens of times per block. `CommittedMap` now defers the fold (`LazyFold`): the first mutation of a key since the last root
+read remembers the leaf it had then (one hash), later mutations of that key cost one map lookup, and `root()` settles each
+dirty key once (XOR out the remembered leaf, XOR in the current one). The root is by definition unchanged;
+`committed_map_lazy_fold_matches_recomputed_root` interleaves insert/update/upsert/remove/root reads/removed-then-reinserted
+keys against `recomputed_root` over 30 random streams (mutation-checked: dropping the XOR-out fails it), and the golden roots in
+exchange/perps and every module's tests are unchanged. Mutators now require `K: Clone` (all keys are).
+Measured (laptop, 8 threads, real executor): bundle dispatch 45 -> 21 us per 64-order bundle; bundle loop 1.05-1.13M ->
+1.60M (sync) / 1.99M (root stage) orders/s; end-to-end 1.34M / 1.61M orders/s (per-order transactions at the start of the day:
+94k, 17x). Per-order CLOB transactions: dispatch 1.10 -> 0.43 us/tx, loop 237k -> 434k tx/s.

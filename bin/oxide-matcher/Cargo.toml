@@ -14,6 +14,11 @@ repository.workspace = true
 name = "oxide-matcher"
 path = "src/main.rs"
 
+[features]
+# `--fund-loadgen-keys`: fund the publicly derivable benchmark identities that
+# `oxide-loadgen` signs with. Off in a production build.
+dev-identities = ["matcher/dev-identities"]
+
 [dependencies]
 matcher = { workspace = true }
 # keystore: `--settlement-key-file` accepts encrypted OXKEY blobs.

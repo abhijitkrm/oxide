@@ -2763,3 +2763,407 @@ fn amend_conserves_value_over_random_ops() {
         }
     }
 }
+
+// ── committed batch settle (tag 16) ──────────────────────────────
+
+/// Two identical fixtures: one settles a batch with tag 3, the other the
+/// same legs with tag 16. State must match exactly (the commitment adds
+/// an event, never a state change), and the `batch_commit` event must
+/// carry the operator's root untouched plus a legs root that equals an
+/// independent recomputation.
+#[test]
+fn committed_batch_settle_changes_no_state_and_commits_the_legs() {
+    let fixture = || {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let mut ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.set_settlement_operator(addr(0xAA));
+        ex.list_market(test_cfg()).unwrap();
+        registered_pair(&ledger, &ex, 1_500_000_000, 1_000_000_000, 3_000);
+        (ledger, ex)
+    };
+    let legs = [leg(0, 1_000_000_000, 1_000, 1, 1, 9, 1), leg(0, 1_500_000_000, 2_000, 1, 1, 9, 1)];
+
+    let (ledger_a, ex_a) = fixture();
+    let plain = ex_a.handle(&ctx(0xAA), &msg::batch_settle(&legs)).unwrap();
+
+    let (ledger_b, ex_b) = fixture();
+    let fills_root = [0x77u8; 32];
+    let committed =
+        ex_b.handle(&ctx(0xAA), &msg::batch_settle_committed(41, &fills_root, 5, &legs)).unwrap();
+
+    for a in [1u8, 9] {
+        assert_eq!(ledger_a.balance(&addr(a)), ledger_b.balance(&addr(a)), "account {a}");
+    }
+    assert_eq!(ex_a.fee_vault(0), ex_b.fee_vault(0));
+    assert_eq!(committed.len(), plain.len() + 1);
+    assert_eq!(
+        committed[..plain.len()].iter().map(|e| (e.kind, e.data.clone())).collect::<Vec<_>>(),
+        plain.iter().map(|e| (e.kind, e.data.clone())).collect::<Vec<_>>(),
+        "legs settle with identical events"
+    );
+
+    let ev = committed.last().unwrap();
+    assert_eq!((ev.module, ev.kind), ("exchange", "batch_commit"));
+    assert_eq!(&ev.data[0..8], &41u64.to_le_bytes());
+    assert_eq!(&ev.data[8..40], &fills_root);
+    assert_eq!(&ev.data[40..44], &5u32.to_le_bytes());
+    // Independent recomputation of the legs root from the wire bytes.
+    let wire = msg::batch_settle(&legs);
+    let mut s = lanes::commit::ByteStream::new(crate::LEGS_STREAM_LABEL);
+    for chunk in wire[1 + 4..].as_chunks::<{ crate::FILL_ENTRY_LEN }>().0 {
+        s.push(chunk);
+    }
+    let (want_root, want_n) = s.finish();
+    assert_eq!(&ev.data[44..76], &want_root);
+    assert_eq!(&ev.data[76..80], &u32::try_from(want_n).unwrap().to_le_bytes());
+    assert_eq!(want_n, 2);
+}
+
+#[test]
+fn committed_batch_settle_keeps_every_plain_rejection() {
+    let ledger = Arc::new(framework::MemoryBalances::new());
+    let mut ex = ExchangeModule::with_ledger(ledger.clone());
+    ex.set_settlement_operator(addr(0xAA));
+    ex.list_market(test_cfg()).unwrap();
+    registered_pair(&ledger, &ex, 1_500_000_000, 1_000_000_000, 3_000);
+    let legs = [leg(0, 1_000_000_000, 1_000, 1, 1, 9, 1)];
+    let good = msg::batch_settle_committed(1, &[0; 32], 1, &legs);
+
+    // Not the operator.
+    assert!(ex.handle(&ctx(1), &good).is_err());
+    // Header truncated.
+    assert!(ex.handle(&ctx(0xAA), &good[..20]).is_err());
+    // Leg bytes truncated (count says 1, body is short).
+    assert!(ex.handle(&ctx(0xAA), &good[..good.len() - 1]).is_err());
+    // Nothing settled by any of the failures: the good one still works.
+    let ev = ex.handle(&ctx(0xAA), &good).unwrap();
+    assert_eq!(ev.last().unwrap().kind, "batch_commit");
+}
+
+// ── bonded operator and disputes ─────────────────────────────────
+
+mod disputes {
+    use super::*;
+    use crate::dispute::{
+        DisputeConfig, REINSTATE_PARAM, RawFill, aggregate_raw_fills, legs_root, raw_fills_root,
+    };
+    use executor::Event;
+    use framework::ParameterSink;
+    use primitives::Height;
+
+    const OP: u8 = 0xAA;
+    const CHALLENGER: u8 = 7;
+    const BOND: u64 = 5_000;
+
+    fn key(owner: u8, id: u64) -> crate::OrderKey {
+        crate::OrderKey { owner: addr(owner), client_id: id }
+    }
+
+    /// Two raw fills on one registered pair that aggregate into one leg
+    /// of 3 000 qty at price 1.0e9.
+    fn raw_fills() -> Vec<RawFill> {
+        let f = |qty| RawFill {
+            market: 0,
+            price: Price(1_000_000_000),
+            qty: Qty(qty),
+            buy: key(1, 1),
+            sell: key(9, 1),
+            quote_amount: qty * 10,
+        };
+        vec![f(1_000), f(2_000)]
+    }
+
+    fn fixture(window: u64) -> (Arc<framework::MemoryBalances>, ExchangeModule) {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let mut ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.set_settlement_operator(addr(OP));
+        ex.set_dispute_config(DisputeConfig { min_bond: 1_000, window_blocks: window });
+        ex.list_market(test_cfg()).unwrap();
+        registered_pair(&ledger, &ex, 1_500_000_000, 1_000_000_000, 3_000);
+        ledger.mint(&addr(OP), 20_000);
+        (ledger, ex)
+    }
+
+    fn deposit_bond(ex: &ExchangeModule, amount: u64) -> Result<Vec<Event>, ExecError> {
+        ex.handle(&ctx(OP), &msg::bond_deposit(amount))
+    }
+
+    /// Post a committed batch: `attested` is the raw set the operator
+    /// claims, `applied` the legs it actually submits.
+    fn post(
+        ex: &ExchangeModule,
+        seq: u64,
+        attested: &[RawFill],
+        applied: &[crate::BatchFillEntry],
+    ) -> Result<Vec<Event>, ExecError> {
+        let (root, n) = raw_fills_root(attested);
+        ex.handle(&ctx(OP), &msg::batch_settle_committed(seq, &root, n, applied))
+    }
+
+    fn honest_legs() -> Vec<crate::BatchFillEntry> {
+        aggregate_raw_fills(&raw_fills()).unwrap()
+    }
+
+    #[test]
+    fn honest_batch_survives_a_dispute_and_the_bond_is_untouched() {
+        let (_ledger, ex) = fixture(10);
+        deposit_bond(&ex, BOND).unwrap();
+        post(&ex, 1, &raw_fills(), &honest_legs()).unwrap();
+        assert!(ex.has_batch_record(1));
+
+        let err = ex.handle(&ctx(CHALLENGER), &msg::dispute(1, &raw_fills())).unwrap_err();
+        assert!(format!("{err:?}").contains("consistent"), "{err:?}");
+        assert_eq!(ex.operator_bond(), BOND);
+        assert!(!ex.operator_suspended());
+        assert!(ex.has_batch_record(1), "a failed dispute leaves the record");
+    }
+
+    #[test]
+    fn a_lying_operator_is_slashed_suspended_and_can_be_reinstated() {
+        let (ledger, ex) = fixture(10);
+        deposit_bond(&ex, BOND).unwrap();
+        // Attests the full 3 000 qty of fills but settles only the first 1 000.
+        let mut partial = honest_legs();
+        partial[0].qty = Qty(1_000);
+        post(&ex, 1, &raw_fills(), &partial).unwrap();
+
+        let challenger_before = ledger.balance(&addr(CHALLENGER));
+        let ev = ex.handle(&ctx(CHALLENGER), &msg::dispute(1, &raw_fills())).unwrap();
+        let slash = ev.iter().find(|e| e.kind == "operator_slashed").expect("slash event");
+        assert_eq!(&slash.data[0..8], &1u64.to_le_bytes());
+        assert_eq!(&slash.data[28..36], &BOND.to_le_bytes());
+        // Conservation: the whole bond moved from module custody to the challenger.
+        assert_eq!(ledger.balance(&addr(CHALLENGER)), challenger_before + BOND);
+        assert_eq!(ex.operator_bond(), 0);
+        assert!(ex.operator_suspended());
+        assert!(!ex.has_batch_record(1), "a proven record is consumed");
+
+        // A suspended operator cannot settle by any path.
+        assert!(post(&ex, 2, &raw_fills(), &honest_legs()).is_err());
+        assert!(ex.handle(&ctx(OP), &msg::batch_settle(&honest_legs())).is_err());
+        // A second dispute for the same batch finds nothing to dispute.
+        assert!(ex.handle(&ctx(CHALLENGER), &msg::dispute(1, &raw_fills())).is_err());
+
+        // Governance reinstates; the plain path works again (no bond needed
+        // for tag 3), while committed settles still need a fresh bond.
+        ex.apply_param(REINSTATE_PARAM, &[]).unwrap();
+        assert!(!ex.operator_suspended());
+        assert!(post(&ex, 3, &raw_fills(), &honest_legs()).is_err(), "no bond left");
+        deposit_bond(&ex, BOND).unwrap();
+        post(&ex, 3, &raw_fills(), &honest_legs()).unwrap();
+    }
+
+    #[test]
+    fn a_dispute_that_proves_nothing_changes_nothing() {
+        let (_ledger, ex) = fixture(10);
+        deposit_bond(&ex, BOND).unwrap();
+        let mut partial = honest_legs();
+        partial[0].qty = Qty(1_000);
+        post(&ex, 1, &raw_fills(), &partial).unwrap();
+        let root_before = ex.state_root();
+
+        // Fills that are not the attested ones.
+        let mut tampered = raw_fills();
+        tampered[0].qty = Qty(999);
+        let e = ex.handle(&ctx(CHALLENGER), &msg::dispute(1, &tampered)).unwrap_err();
+        assert!(format!("{e:?}").contains("attested root"), "{e:?}");
+        // Wrong count, unknown batch, malformed body.
+        assert!(ex.handle(&ctx(CHALLENGER), &msg::dispute(1, &raw_fills()[..1])).is_err());
+        assert!(ex.handle(&ctx(CHALLENGER), &msg::dispute(99, &raw_fills())).is_err());
+        let mut short = msg::dispute(1, &raw_fills());
+        short.pop();
+        assert!(ex.handle(&ctx(CHALLENGER), &short).is_err());
+
+        assert_eq!(ex.state_root(), root_before, "failed disputes mutate nothing");
+        assert_eq!(ex.operator_bond(), BOND);
+        assert!(!ex.operator_suspended());
+    }
+
+    #[test]
+    fn bond_gates_committed_settles_and_sequences_are_unique() {
+        let (ledger, ex) = fixture(10);
+        // No bond yet.
+        assert!(post(&ex, 1, &raw_fills(), &honest_legs()).is_err());
+        // Only the operator may bond, and only what it holds.
+        assert!(ex.handle(&ctx(CHALLENGER), &msg::bond_deposit(100)).is_err());
+        assert!(deposit_bond(&ex, 0).is_err());
+        assert!(deposit_bond(&ex, 1_000_000).is_err(), "cannot bond more than the balance");
+        assert_eq!(ex.operator_bond(), 0);
+        // Bond below the minimum still does not unlock settling.
+        deposit_bond(&ex, 999).unwrap();
+        assert!(post(&ex, 1, &raw_fills(), &honest_legs()).is_err());
+        let before = ledger.balance(&addr(OP));
+        deposit_bond(&ex, 1).unwrap();
+        assert_eq!(ledger.balance(&addr(OP)), before - 1, "the bond is debited from the operator");
+        post(&ex, 1, &raw_fills(), &honest_legs()).unwrap();
+        // The same sequence cannot be recorded twice.
+        assert!(post(&ex, 1, &raw_fills(), &honest_legs()).is_err());
+    }
+
+    #[test]
+    fn records_expire_after_the_window_and_pruning_bounds_state() {
+        let (_ledger, ex) = fixture(5);
+        deposit_bond(&ex, BOND).unwrap();
+        let mut partial = honest_legs();
+        partial[0].qty = Qty(1_000);
+        ex.begin_block(Height::new(100));
+        post(&ex, 1, &raw_fills(), &partial).unwrap();
+        for h in 100..=105 {
+            ex.begin_block(Height::new(h));
+            ex.end_block(Height::new(h));
+        }
+        assert!(ex.has_batch_record(1), "still inside the window at height 105");
+        ex.begin_block(Height::new(106));
+        ex.end_block(Height::new(106));
+        assert!(!ex.has_batch_record(1), "pruned once the window passed");
+        // Too late to dispute.
+        assert!(ex.handle(&ctx(CHALLENGER), &msg::dispute(1, &raw_fills())).is_err());
+        assert!(!ex.operator_suspended());
+    }
+
+    #[test]
+    fn disputes_disabled_is_exactly_the_old_behaviour() {
+        let fixture_plain = |committed: bool| {
+            let ledger = Arc::new(framework::MemoryBalances::new());
+            let mut ex = ExchangeModule::with_ledger(ledger.clone());
+            ex.set_settlement_operator(addr(OP));
+            ex.list_market(test_cfg()).unwrap();
+            registered_pair(&ledger, &ex, 1_500_000_000, 1_000_000_000, 3_000);
+            let legs = honest_legs();
+            if committed {
+                post(&ex, 1, &raw_fills(), &legs).unwrap();
+            } else {
+                ex.handle(&ctx(OP), &msg::batch_settle(&legs)).unwrap();
+            }
+            ex
+        };
+        // Without a dispute config a committed settle writes no state at all.
+        assert_eq!(fixture_plain(true).state_root(), fixture_plain(false).state_root());
+        let ex = fixture_plain(true);
+        assert!(!ex.has_batch_record(1));
+        assert!(ex.handle(&ctx(OP), &msg::bond_deposit(1)).is_err());
+        assert!(ex.handle(&ctx(CHALLENGER), &msg::dispute(1, &raw_fills())).is_err());
+    }
+
+    #[test]
+    fn records_and_bond_are_committed_and_survive_a_snapshot() {
+        let (ledger, ex) = fixture(50);
+        deposit_bond(&ex, BOND).unwrap();
+        let root_empty = fixture(50).1.state_root();
+        let mut partial = honest_legs();
+        partial[0].qty = Qty(1_000);
+        post(&ex, 1, &raw_fills(), &partial).unwrap();
+        assert_ne!(ex.state_root(), root_empty, "bond and record are in the state root");
+
+        // Round-trip through a snapshot into a fresh module.
+        let snap = ex.export_state().expect("snapshot");
+        let mut fresh = ExchangeModule::with_ledger(ledger.clone());
+        fresh.set_settlement_operator(addr(OP));
+        fresh.set_dispute_config(DisputeConfig { min_bond: 1_000, window_blocks: 50 });
+        fresh.import_state(&snap).expect("import");
+        assert_eq!(fresh.state_root(), ex.state_root());
+        assert_eq!(fresh.operator_bond(), BOND);
+        assert!(fresh.has_batch_record(1));
+        // And the restored module can still adjudicate the dispute.
+        let ev = fresh.handle(&ctx(CHALLENGER), &msg::dispute(1, &raw_fills())).unwrap();
+        assert!(ev.iter().any(|e| e.kind == "operator_slashed"));
+        let _ = legs_root(&honest_legs());
+    }
+}
+
+// ── Bundles (docs/bundle-auth-spec.md) ───────────────────────────
+
+/// A mixed stream of places (crossing and resting) and cancels, as separate messages.
+fn bundle_stream() -> Vec<Vec<u8>> {
+    let mut items = Vec::new();
+    for i in 0..30u64 {
+        let side = if i % 2 == 0 { Side::Sell } else { Side::Buy };
+        // Alternating prices around a crossing point so some fill and some rest.
+        items.push(msg::place(0, limit(side, 480 + (i * 7) % 40, 1 + i % 3, 9)));
+    }
+    // Cancels of order ids that may or may not exist (rejections must match too).
+    for id in [1u64, 2, 3, 999] {
+        items.push(msg::cancel(0, OrderId(id)));
+    }
+    items
+}
+
+#[test]
+fn bundle_equals_separate_transactions() {
+    let items = bundle_stream();
+
+    let (ledger_a, ex_a) = ledger_and_exchange();
+    let mut sep_events = Vec::new();
+    for item in &items {
+        match ex_a.handle(&ctx(9), item) {
+            Ok(evs) => sep_events.extend(evs.into_iter().map(|e| (e.kind, e.data))),
+            Err(_) => sep_events.push(("rejected", Vec::new())),
+        }
+    }
+
+    let (ledger_b, ex_b) = ledger_and_exchange();
+    let bundle = msg::bundle(&items).expect("bundle");
+    let evs = ex_b.handle(&ctx(9), &bundle).expect("bundle handled");
+    let bundle_events: Vec<_> = evs
+        .into_iter()
+        .map(|e| {
+            if e.kind == "bundle_item_rejected" {
+                ("rejected", Vec::new())
+            } else {
+                (e.kind, e.data)
+            }
+        })
+        .collect();
+
+    assert_eq!(sep_events, bundle_events, "events must match item for item");
+    assert_eq!(executor::Module::state_root(&ex_a), executor::Module::state_root(&ex_b));
+    assert_eq!(ledger_a.balance(&addr(9)), ledger_b.balance(&addr(9)));
+    assert_eq!(ex_a.base_balance(addr(9), 0), ex_b.base_balance(addr(9), 0));
+}
+
+#[test]
+fn malformed_bundles_execute_nothing() {
+    let (_ledger, ex) = ledger_and_exchange();
+    let root = executor::Module::state_root(&ex);
+    let good = msg::place(0, limit(Side::Sell, 600, 1, 9));
+    let bundle = msg::bundle(&[good.clone(), good.clone()]).expect("bundle");
+
+    // Truncated, trailing garbage, zero count, wrong tag inside, oversize count.
+    let mut truncated = bundle.clone();
+    truncated.truncate(truncated.len() - 3);
+    let mut trailing = bundle.clone();
+    trailing.push(0);
+    let zero = vec![super::TAG_BUNDLE, 0, 0];
+    let mut bad_tag = msg::bundle(&[vec![super::TAG_LIST_MARKET, 1, 2]]).expect("bundle");
+    bad_tag[0] = super::TAG_BUNDLE;
+    let huge = vec![super::TAG_BUNDLE, 0xFF, 0xFF];
+    for m in [truncated, trailing, zero, bad_tag, huge] {
+        assert!(matches!(ex.handle(&ctx(9), &m), Err(ExecError::Malformed)));
+    }
+    assert_eq!(executor::Module::state_root(&ex), root, "no item may execute");
+    assert!(msg::bundle(&vec![good; super::MAX_BUNDLE_ITEMS + 1]).is_none());
+}
+
+#[test]
+fn bundle_acts_only_for_the_signer() {
+    // Another trader's resting order cannot be cancelled by a bundle signed by someone else.
+    let (_ledger, ex) = ledger_and_exchange();
+    ex.handle(&ctx(9), &msg::place(0, limit(Side::Sell, 700, 1, 9))).unwrap();
+    let before = executor::Module::state_root(&ex);
+    let evs = ex
+        .handle(&ctx(1), &msg::bundle(&[msg::cancel(0, OrderId(0))]).unwrap())
+        .expect("bundle handled");
+    assert!(evs.iter().any(|e| e.kind == "bundle_item_rejected"));
+    assert_eq!(executor::Module::state_root(&ex), before);
+}
+
+#[test]
+fn bundle_gas_charges_the_base_cost_per_item() {
+    let (_ledger, ex) = ledger_and_exchange();
+    let one = msg::place(0, limit(Side::Sell, 600, 1, 9));
+    let n = 64usize;
+    let bundle = msg::bundle(&vec![one.clone(); n]).expect("bundle");
+    let single = executor::Module::estimate_gas(&ex, &one);
+    let bundled = executor::Module::estimate_gas(&ex, &bundle);
+    assert!(bundled >= 1000 * n as u64 && bundled >= single * (n as u64) / 2);
+}

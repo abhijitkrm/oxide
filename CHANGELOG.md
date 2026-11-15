@@ -10,7 +10,94 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ## [Unreleased]
 
+### Added
+
+- **Matcher: session and certificate frames, expiry, gateway suspension**
+  (binary TCP control frames `0xFD`, JSON-RPC `oxide_openSession` /
+  `oxide_closeSession`; `--max-session-ttl-ms`, `--gateway-suspend-after`).
+  Sessions expire (default maximum 24 h) and only the owner's key can close
+  one. A trusted gateway that vouches for a bad order is counted and, after
+  three provable faults, suspended.
+  - **In plain words:** a trader can sign in once over the network, trade with
+    cheap authenticated orders for a limited time, and revoke the session
+    with their main key. A gateway that signs for bad orders gets cut off.
+
+- **Exchange: bonded settlement operator and disputes** (`TAG_BOND_DEPOSIT`
+  17, `TAG_DISPUTE` 18; off unless configured). Anyone holding the matcher's
+  fills can prove an operator's committed batch false within a window; the
+  operator's bond goes to the challenger and the operator is suspended.
+  - **In plain words:** the fingerprint on each settlement batch now has money
+    behind it. If the operator's claim about what it matched doesn't fit what
+    it settled, whoever checks gets the operator's deposit.
+
+- **Matcher: pluggable order authentication** (`matcher::auth`; `--auth`,
+  `--auth-schemes`, `--evm-threads`, `--gateway-keys`, `--audit-every`).
+  Choose ed25519 (batched or per-order), EVM secp256k1 signatures, session
+  MACs, gateway-certified batches, or several at once. The default is the
+  existing batched ed25519, unchanged. No wire-format change.
+  - **In plain words:** operators decide how traders prove who they are.
+    A trader can sign every order with their Ethereum key, or sign in once and
+    send cheap authenticated orders (about 240x cheaper to check than a
+    signature per order on the test laptop). Nothing changes unless you
+    choose a different scheme.
+
+- **Settlement: committed batch settle** (`--commit-batches`; exchange message
+  tag 16). Each settlement batch carries a root over the raw fills and the chain
+  records it with its own root over the legs it applied in a `batch_commit`
+  event. Legs settle exactly as before; the default is off.
+  - **In plain words:** every settlement batch now leaves a fingerprint on the
+    chain that an auditor can check against the matcher's journal.
+
+- **`lanes` crate and `docs/lanes-spec.md`: sharded, swappable lanes**
+  (prototype, not wired into consensus). Authentication
+  (per-item, batched, gateway-certified, session MAC), fill commitment
+  (per-fill, stream, Merkle), a market-sharded trading lane, and an
+  account-range EVM-style lane with cross-lane credits and a conservation
+  test. Benches `crypto:budget` and `lanes:lanes` measure the per-stage cost
+  and the shard scaling; `scripts/rig-bench.sh` gains `budget` and `lanes`.
+  - **In plain words:** the road to 10M orders/s and 1M EVM tx/s is to stop
+    every validator re-checking every signature and to split the work into
+    parallel lanes. On a laptop the trading lane reaches 12.5M orders/s with
+    cheap session authentication, but only 0.3M with a signature per order.
+    This is the building block and its measurements, not a running network.
+
+### Fixed
+
+- **Settler: an oversized seal is split instead of rejected** (`matcher`). A settlement
+  interval that aggregated to more than 65,536 pairs was sent as one message the exchange
+  refuses as malformed, losing every fill in it. It is now split into batches within the
+  limit (with per-chunk commitments when enabled), and the rejected-batch log reports the
+  real pair count.
+  - **In plain words:** on a very busy market the settlement step could throw away a whole
+    interval of trades; it now sends them in several pieces.
+
 ### Performance
+
+- **Executor: block execution no longer re-recovers pending signatures** (`executor`;
+  no format or result change). Each block dropped the ingest-time verified-sender cache
+  entries of every transaction still waiting for a later block, so native signed
+  transactions (e.g. CLOB orders) in blocks 2, 3, ... were recovered again, serially,
+  during execution. Entries are now kept (bounded by the mempool capacity). Signed CLOB
+  orders execute 4-10x faster in the laptop benchmark (40k: 98k -> 405k tx/s; 400k: 31k
+  -> 300k tx/s).
+  - **In plain words:** the chain was checking each order's signature a second time,
+    one at a time, for everything but the first block's worth of orders. It now remembers
+    the check it already did.
+
+- **Matcher: the multi-market replay gate is sharded by owner** (`matcher`;
+  no wire or file-format change). The gate was one mutex taken per order;
+  it is now 64 shards with identical per-owner semantics. With 8 markets the
+  in-process service goes from 4.6M to 7.5M orders/s (three runs each).
+  - **In plain words:** all markets used to queue behind one lock to check
+    "have I seen this order number before"; unrelated accounts no longer wait
+    for each other.
+
+- **Load generation: `oxide-loadgen --auth ed25519|evm|session_mac|certified`**
+  builds and signs every order before its clock starts (the old figure
+  included signing time), counts rejections, and pairs with
+  `oxide-matcher --fund-loadgen-keys` (a `dev-identities` build; publicly
+  derivable keys, development only). `cargo bench -p matcher --bench shards`
+  measures the real multi-market service across markets and journal modes.
 
 - **Matching engine: the committed-state fold is computed lazily**
   (`trading`, `framework`). Resting-order changes no longer hash on

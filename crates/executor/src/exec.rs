@@ -106,6 +106,11 @@ impl Executor {
                 return Ok(true);
             }
         }
+        // Past the cache: this recovery runs inside the (serial) block-planning loop when
+        // `verified` is Some, i.e. at execution. Count it so a cache miss is visible.
+        if verified.is_some() {
+            self.sig_reverifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let Some(sig_bytes) = envelope_signature(bytes) else {
             return Err("malformed: truncated envelope signature");
         };
@@ -459,6 +464,16 @@ impl Executor {
     /// share one balance ledger, so "group then execute" was not
     /// equivalent to sequential execution.
     pub(crate) fn execute_block(&self, block: &FinalizedBlock) -> Hash {
+        let staged = self.execute_block_staged(block);
+        self.finish_staged(&staged)
+    }
+
+    /// Execution-stage half of [`Self::execute_block`]: everything up to
+    /// and including `end_block`/attendance and the nonce fold. Modules
+    /// that defer their root (see `Module::defers_root`) leave it for
+    /// [`Self::finish_staged`]; all others compute theirs here, because
+    /// they read live state that the next block will mutate.
+    pub(crate) fn execute_block_staged(&self, block: &FinalizedBlock) -> StagedRoot {
         // Coordinated halt: above the scheduled height the chain is
         // frozen — no begin/handle/end_block, no fee charge, no
         // attendance record. The returned root is the state at the
@@ -468,7 +483,7 @@ impl Executor {
         if let Some(halt) = self.halt_height()
             && block.height.value() > halt
         {
-            return self.state_root_at(halt);
+            return StagedRoot::Ready(self.state_root_at(halt));
         }
 
         // Single lock acquisition for the events vector: clear at start,
@@ -507,14 +522,21 @@ impl Executor {
         // the loop consults it to skip re-verifying envelope
         // signatures that were already verified at mempool
         // admission, and the dispatch loop below consumes it.
-        // (`mem::take` swaps in an empty map — zero-copy, one lock
-        // acquisition for the whole block.)
-        let mut preverify_cache =
-            std::mem::take(&mut *primitives::sync::lock_state(&self.preverify_cache));
+        // Only THIS block's entries move out (one lock, one hash and one
+        // removal per tx): taking the whole cache and re-inserting the
+        // leftover per block was O(pending txs) per block — ~190k hash-map
+        // inserts per block at a 200k backlog. Entries for txs that wait
+        // for later blocks simply stay in the shared cache, where ingest
+        // keeps adding to it. A hit still only means "this node verified
+        // these exact bytes at ingest", so retention cannot change a result.
+        let mut preverify_cache = self.take_preverified_for(block);
 
         let mut skipped: Vec<(Hash, TxSkipReason)> = Vec::new();
+        let t_plan = std::time::Instant::now();
         let mut runs =
             self.plan_block_runs(&block.txs, &mut local_nonce, &preverify_cache, &mut skipped);
+        self.stage_times.add_plan(self.stage_done("exec_plan", t_plan));
+        let t_dispatch = std::time::Instant::now();
 
         // Record finalized outcomes for txs that never reached a
         // module. These are the only outcomes a submitter can get
@@ -569,6 +591,10 @@ impl Executor {
                 self.record_group_outcomes(&group, results, &mut block_events);
             }
         }
+        // Keep the ingest-time verification of every transaction still waiting for a LATER
+        // block. Taking the whole cache above and dropping what is left made every block after
+        // the first re-recover each pending native tx's signature serially in
+        // `plan_block_runs` (~50 us each: the measured 18k tx/s CLOB ceiling).
         if !dispatch_skipped.is_empty() {
             let mut outcomes = primitives::sync::lock_state(&self.tx_outcomes);
             for (hash, reason) in dispatch_skipped {
@@ -578,6 +604,8 @@ impl Executor {
         // Publish all events from this block in one lock acquisition.
         primitives::sync::lock_state(&self.events).extend(block_events);
 
+        self.stage_times.add_dispatch(self.stage_done("exec_dispatch", t_dispatch));
+        let t_end = std::time::Instant::now();
         // end_block for all modules — same context as begin_block.
         // Module scheduled effects (liquidation sweeps, epoch work)
         // emit events that land in the block log AFTER every tx
@@ -608,10 +636,14 @@ impl Executor {
         // post-block root (folded incrementally by `bump`), so this
         // block pays O(touched senders), not a full scan of every
         // account that ever transacted.
-        let mut module_roots = Vec::new();
+        self.stage_times.add_end_block(self.stage_done("exec_end_block", t_end));
+        let t_root = std::time::Instant::now();
+        let mut module_roots: Vec<Option<Hash>> = Vec::new();
         for module in self.modules.iter().flatten() {
-            module_roots.push(module.state_root());
+            module_roots.push(if module.defers_root() { None } else { Some(module.state_root()) });
         }
+        self.stage_times.add_state_root(self.stage_done("exec_state_root", t_root));
+        self.stage_times.add_block(block.txs.len());
 
         // Push the fresh nonce anchors into the mempool — the live
         // update path the pool's `executed_nonces` anchoring was
@@ -639,7 +671,60 @@ impl Executor {
             committed.root = nonce_root;
         }
 
-        canonical_state_root(module_roots, nonce_root)
+        StagedRoot::Pending { height: block.height, module_roots, nonce_root }
+    }
+
+    /// Root-stage half: obtain each deferred module's root in module
+    /// order and assemble the canonical state root. For a block with no
+    /// deferred modules this is exactly the old tail of `execute_block`.
+    pub(crate) fn finish_staged(&self, staged: &StagedRoot) -> Hash {
+        match staged {
+            StagedRoot::Ready(h) => *h,
+            StagedRoot::Pending { height, module_roots, nonce_root } => {
+                let roots: Vec<Hash> = self
+                    .modules
+                    .iter()
+                    .flatten()
+                    .zip(module_roots.iter())
+                    .map(|(module, r)| r.unwrap_or_else(|| module.finish_root(*height)))
+                    .collect();
+                canonical_state_root(roots, *nonce_root)
+            }
+        }
+    }
+
+    /// Elapsed time of a phase that started at `started`, also reported to
+    /// the latency recorder (the SLO metrics of plan section W7) when one is
+    /// attached.
+    fn stage_done(&self, label: &'static str, started: std::time::Instant) -> std::time::Duration {
+        let d = started.elapsed();
+        if let Some(recorder) = &self.recorder {
+            recorder.record(label, d);
+        }
+        d
+    }
+
+    /// Move this block's ingest-verified senders out of the shared cache
+    /// (see the comment at the call site in `execute_block_staged`).
+    fn take_preverified_for(
+        &self,
+        block: &FinalizedBlock,
+    ) -> primitives::digest_map::DigestMap<[u8; 20]> {
+        let mut shared = primitives::sync::lock_state(&self.preverify_cache);
+        // Bound stale entries (txs the pool evicted never execute):
+        // when the cache outgrows the pool capacity, drop it all; a
+        // miss only costs one signature recovery.
+        if shared.len() > self.preverify_cap {
+            shared.clear();
+        }
+        block
+            .txs
+            .iter()
+            .filter_map(|tx| {
+                let h = Hasher::hash_one(Domain::Transaction, tx.as_bytes());
+                shared.remove(&h).map(|sender| (h, sender))
+            })
+            .collect()
     }
 
     /// Record the finalized outcome for every tx in one module
@@ -676,4 +761,14 @@ impl Executor {
             outcomes.record(t.tx_hash, outcome);
         }
     }
+}
+
+/// What the execution stage hands the root stage for one block.
+#[derive(Debug)]
+pub(crate) enum StagedRoot {
+    /// The root is already known (coordinated-halt freeze).
+    Ready(Hash),
+    /// Per-module roots in module order (`None` = deferred, to be
+    /// obtained from `Module::finish_root`) plus the nonce root.
+    Pending { height: primitives::Height, module_roots: Vec<Option<Hash>>, nonce_root: Hash },
 }

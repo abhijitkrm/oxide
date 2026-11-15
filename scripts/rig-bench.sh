@@ -17,6 +17,36 @@
 #   fold     FOLD_LOG_CAP and block-size sweeps (fold on)
 #   journal  ack policy overhead (off/queued/durable), CHUNK_BYTES sweep,
 #            crash-test loop, recovery time vs journal size
+#   budget   per-item cost of each authentication/commit stage per core and its
+#            thread scaling (secp256k1 recover, ed25519 strict/batch, BLAKE3 leaf,
+#            session MAC) and the cores needed for 1M EVM tx/s, 10M and 100M
+#            orders/s (crates/crypto/benches/budget.rs; docs/lanes-spec.md §8), plus
+#            the matcher's per-scheme admission cost (crates/matcher/benches/auth.rs)
+#   lanes    sharded trading lane + EVM lane prototypes: orders/s vs shard count
+#            and verifier mode (crates/lanes/benches/lanes.rs)
+#   shards   the REAL multi-market matcher (one worker per market) driven by one
+#            submitter per market, session-MAC auth, journal off/queued/durable,
+#            markets 1..NPROC/2 (crates/matcher/benches/shards.rs): the service's
+#            shard-scaling curve including the journal on the disk under test
+#   procs    the real binaries as SEPARATE pinned processes: oxide-matcher on cores
+#            0..S-1 and oxide-loadgen on a disjoint core set, per auth scheme
+#            (ed25519, evm, session_mac, certified) at S = 1,2,4,.. up to half the
+#            cores; the loadgen builds and signs everything before its clock starts,
+#            so the curve is the server's (crates/matcher/benches/shards.rs is the
+#            in-process counterpart; e2e is the single-process one)
+#   e2e      real loopback TCP through the matcher service for every auth scheme
+#            (crates/matcher/tests/e2e_auth_tps.rs), repeated at 4/8/16/32/64 cores
+#            via taskset so the curve shows how the whole service scales
+#   summary  assemble summary.md (scaling tables, cores-needed-for-target
+#            extrapolation) from the files above (scripts/rig/summarize.py)
+#   chainmix signed transactions through the real executor by type: EVM transfers,
+#            CLOB orders (exchange place) and a mix; admission (signature recovery)
+#            at 1..64 threads, then proposal and block execution timed separately,
+#            plus a batch-size sweep (crates/executor/benches/chain_mix.rs)
+#   evmscale parallel EVM at 1..64 cores with the thread count set to the core count
+#            (OXIDE_EVM_THREADS for the executor's OCC scheduler; the evm module's
+#            rayon batch follows the core set), unlike the old scaling loop whose
+#            bench hard-coded 8 threads
 #   scaling  parallel-EVM, multi-market matcher, ring, hashing benches
 #   profile  CPU flamegraphs + top-function tables (perf record, frame pointers),
 #            peak RSS/page-faults/ctx-switches per run (/usr/bin/time), heap
@@ -29,7 +59,15 @@
 #   soak     scripts/soak-test.sh (long; never in the default set) with the same
 #            per-process sampler and `docker stats` series; flags RSS leak slopes
 #
+# One-box preset (about 3 hours; everything that needs only one machine):
+#   scripts/rig-bench.sh single-box          # = env budget lanes e2e scaling journal profile summary
+#   QUICK=1 scripts/rig-bench.sh single-box  # 5-minute smoke test of the script first
+#
+# Short-box preset (about 30 min, the measurements that decide the design):
+#   SECTIONS="env budget lanes" THREADS="1 2 4 8 16 32" scripts/rig-bench.sh
+#
 # Environment:
+#   THREADS         thread counts for budget/lanes scaling (default: 1 2 4 8 up to nproc)
 #   PROFILE_SECS    seconds each profiled bench runs under perf (default: 15)
 #   PROFILE_SPECS   space-separated pkg:bench list to profile (default: every bench)
 #   OUT             results directory
@@ -47,9 +85,15 @@
 # records what it can see but cannot fix it for you.
 set -euo pipefail
 
+# Non-interactive ssh shells do not source ~/.cargo/env: without it every build
+# below fails and the sections that rebuild (profile, procs) skip silently.
+command -v cargo >/dev/null 2>&1 || { [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; } || true
+command -v cargo >/dev/null 2>&1 || { echo "rig-bench: cargo not found (run scripts/rig/setup-linux.sh)" >&2; exit 1; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-SHA="$(git rev-parse --short HEAD)"
+# The tree may have been rsync'd without .git (scripts/rig/remote.sh, the Linux
+# container smoke test): fall back to the hash the sync recorded.
+SHA="$(git rev-parse --short HEAD 2>/dev/null || cat "$ROOT/.rig-sha" 2>/dev/null || echo nogit)"
 HOST="$(hostname -s)"
 OUT="${OUT:-$ROOT/rig-results/$HOST-$SHA-$(date +%Y%m%d-%H%M%S)}"
 CORES="${CORES:-2}"
@@ -67,10 +111,20 @@ done
 # Pin a command to $CORES when taskset exists (Linux); run bare otherwise.
 pin() { if command -v taskset >/dev/null 2>&1; then taskset -c "$CORES" "$@"; else "$@"; fi; }
 log() { printf '\n== %s\n' "$*" | tee -a "$OUT/session.log"; }
-run() { # run <outfile> <cmd...> — tee stdout+stderr
+run() { # run <outfile> <cmd...> — tee stdout+stderr; a failing command is recorded, never fatal
     local f="$OUT/$1"; shift
     echo "\$ $*" | tee -a "$OUT/session.log" >>"$f"
-    "$@" 2>&1 | tee -a "$f" >>"$OUT/session.log"
+    # `|| rc=...` keeps `set -e` + `pipefail` from ending the script on a failing bench
+    # (the status line is evaluated for this very pipeline, so PIPESTATUS is still valid).
+    local rc=0
+    "$@" 2>&1 | tee -a "$f" >>"$OUT/session.log" || rc="${PIPESTATUS[0]}"
+    # Benches carry hard gates (e.g. tps_rw's 60k tx/s floor) that legitimately fail at low
+    # core counts: record the exit status and carry on instead of letting `set -e` end the run.
+    if [ "$rc" -ne 0 ]; then
+        echo "(exit $rc: $*)" | tee -a "$f" >>"$OUT/session.log"
+        echo "$1 :: exit $rc" >>"$OUT/failed_steps.txt"
+    fi
+    return 0
 }
 # Build a bench once and print its executable path (cargo prints it on stderr).
 bench_bin() { # bench_bin <package> <bench> [extra cargo args...]
@@ -79,11 +133,22 @@ bench_bin() { # bench_bin <package> <bench> [extra cargo args...]
         sed -n 's/.*Executable .*(\(.*\))/\1/p' | tail -1
 }
 
-SECTIONS="${SECTIONS:-${*:-env corpus fold journal scaling profile}}"
+if [ "${1:-}" = "single-box" ] && [ -z "${SECTIONS:-}" ]; then
+    SECTIONS="env budget lanes shards procs e2e evmscale chainmix scaling journal profile summary"
+else
+    SECTIONS="${SECTIONS:-${*:-env corpus fold journal scaling profile}}"
+fi
 want() { case " $SECTIONS " in *" $1 "*) return 0 ;; esac; return 1; }
 
 
 have() { command -v "$1" >/dev/null 2>&1; }
+# Copy the source tree (no build output, no VCS) to $1: a scratch tree for the
+# sweeps that patch a constant and rebuild. A plain copy, not `git worktree`, so
+# it works on trees that were rsync'd without .git.
+copy_tree() {
+    mkdir -p "$1"
+    tar -C "$ROOT" --exclude=./target --exclude=./rig-results --exclude=./.git -cf - . | tar -C "$1" -xf -
+}
 SAMPLER="$ROOT/scripts/rig/sampler.py"
 # sampler_start <name> <match>... ; sampler_stop — per-process time series
 SAMPLER_PID=""
@@ -107,7 +172,7 @@ iostat_stop() { [ -n "$IOSTAT_PID" ] && { kill "$IOSTAT_PID" 2>/dev/null || true
 
 # ── env ─────────────────────────────────────────────────────────────
 {
-    echo "git: $(git rev-parse HEAD) $(git status --porcelain | wc -l | tr -d ' ') dirty files"
+    echo "git: $(git rev-parse HEAD 2>/dev/null || cat "$ROOT/.rig-sha" 2>/dev/null || echo unknown) $(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') dirty files"
     echo "rustc: $(rustc --version)  cargo: $(cargo --version)"
     uname -a
     if [ -r /proc/cpuinfo ]; then
@@ -213,7 +278,7 @@ fi
 sweep_const() { # sweep_const <file> <regex-for-line> <name> <values...>
     local file="$1" pat="$2" name="$3"; shift 3
     local wt="$OUT/worktree-$name"
-    git worktree add --detach "$wt" HEAD >/dev/null 2>&1 || true
+    copy_tree "$wt"
     for v in "$@"; do
         sed -E "s/$pat/\\1$v\\2/" "$ROOT/$file" >"$wt/$file"
         local bin; bin="$(cd "$wt" && bench_bin_in "$name")"
@@ -222,7 +287,7 @@ sweep_const() { # sweep_const <file> <regex-for-line> <name> <values...>
             pin "$bin" "$CORPUS/$w" --fold --reps "$REPS" 2>&1 | tee -a "$OUT/${name}_sweep.txt" >>"$OUT/session.log"
         done
     done
-    git worktree remove --force "$wt" >/dev/null 2>&1 || true
+    rm -rf "$wt"
 }
 bench_bin_in() { CARGO_TARGET_DIR="$OUT/target-$1" cargo bench -p trading --bench corpus --no-run 2>&1 |
     sed -n 's/.*Executable .*(\(.*\))/\1/p' | tail -1; }
@@ -266,7 +331,7 @@ if want journal; then
     done
     log "journal: CHUNK_BYTES sweep (rebuilds)"
     JW="$OUT/worktree-chunk"
-    git worktree add --detach "$JW" HEAD >/dev/null 2>&1 || true
+    copy_tree "$JW"
     for kb in 64 256 1024; do
         sed -E "s/(pub const CHUNK_BYTES: usize = )[^;]+(;)/\\1$kb * 1024\\2/" \
             crates/matcher/src/journal.rs >"$JW/crates/matcher/src/journal.rs"
@@ -274,7 +339,7 @@ if want journal; then
         (cd "$JW" && CARGO_TARGET_DIR="$OUT/target-chunk" cargo test -p matcher --release --lib \
             journal_overhead -- --ignored --nocapture 2>&1) | tee -a "$OUT/journal_chunk.txt" >>"$OUT/session.log"
     done
-    git worktree remove --force "$JW" >/dev/null 2>&1 || true
+    rm -rf "$JW"
     log "journal: raw fsync cost on this disk"
     if command -v fio >/dev/null 2>&1; then
         run fsync_fio.txt fio --name=fsync --directory="$JOURNAL_DIR" --rw=write --bs=64k --size=256m \
@@ -284,27 +349,179 @@ if want journal; then
     fi
 fi
 
+# ── budget ──────────────────────────────────────────────────────────
+if want budget; then
+    log "budget: per-stage cost per core and thread scaling"
+    NPROC="$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null) || echo 4)"
+    if [ -z "${THREADS:-}" ]; then
+        THREADS=""; t=1
+        while [ "$t" -le "$NPROC" ]; do THREADS="$THREADS $t"; t=$((t * 2)); done
+        if [ "$((t / 2))" -ne "$NPROC" ]; then THREADS="$THREADS $NPROC"; fi
+    fi
+    TLIST="$(echo $THREADS | tr ' ' ',')"
+    SECS=2; [ "$QUICK" = 1 ] && SECS=0.3
+    run budget.csv cargo bench -p crypto --bench budget -- --secs "$SECS" --threads "$TLIST"
+    # Admission cost per authentication scheme through the matcher's own
+    # authenticators (ed25519 per-item/batch, EVM recover, session MAC,
+    # gateway certificate, mixed).
+    run auth.csv cargo bench -p matcher --bench auth -- --secs "$SECS" --threads "$TLIST"
+fi
+
+# ── lanes ───────────────────────────────────────────────────────────
+if want lanes; then
+    log "lanes: seam matrix on 1 shard, shard scaling, EVM lane scaling"
+    NPROC="${NPROC:-$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null) || echo 4)}"
+    if [ -z "${THREADS:-}" ]; then
+        THREADS=""; t=1
+        while [ "$t" -le "$NPROC" ]; do THREADS="$THREADS $t"; t=$((t * 2)); done
+        if [ "$((t / 2))" -ne "$NPROC" ]; then THREADS="$THREADS $NPROC"; fi
+    fi
+    SECS=3; [ "$QUICK" = 1 ] && SECS=0.3
+    run lanes.csv cargo bench -p lanes --bench lanes -- --secs "$SECS" \
+        --shards "$(echo $THREADS | tr ' ' ',')"
+fi
+
+# ── shards ──────────────────────────────────────────────────────────
+# Each market costs a worker thread plus a submitter thread, so the market
+# steps stop at half the cores.
+if want shards; then
+    NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
+    MK=""; m=1
+    while [ "$m" -le "$((NCPU / 2))" ] || [ -z "$MK" ]; do MK="$MK,$m"; m=$((m * 2)); done
+    MK="${MK#,}"
+    SORD=200000; SSUB="1,8"; [ "$QUICK" = 1 ] && { SORD=20000; MK="1,2"; SSUB="1"; }
+    log "shards: real matcher scaling, markets $MK, journal on $JOURNAL_DIR"
+    mkdir -p "$JOURNAL_DIR/shards"
+    run shards.csv cargo bench -p matcher --bench shards -- --markets "$MK" \
+        --journal off,queued,durable --sub "$SSUB" --orders "$SORD" --dir "$JOURNAL_DIR/shards"
+fi
+
+# ── procs ───────────────────────────────────────────────────────────
+# Real binaries, separate processes, disjoint core sets. Matcher state (the
+# replay gate) is per process lifetime, so the matcher restarts for every
+# (cores, scheme) run: nonces from the previous run would be rejected.
+if want procs; then
+    NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
+    log "procs: oxide-matcher + oxide-loadgen as pinned separate processes"
+    cargo build --release -p oxide-matcher --features dev-identities -p oxide-loadgen 2>&1 | tail -2 | tee -a "$OUT/session.log"
+    TD="${CARGO_TARGET_DIR:-$ROOT/target}"   # honour a custom target dir
+    MBIN="$TD/release/oxide-matcher"; LBIN="$TD/release/oxide-loadgen"
+    GW="$("$LBIN" --print-gateway-key)"
+    # oxide-matcher refuses to start without a settlement key (there is no default).
+    # A throwaway random one is fine here: nothing this bench settles has value.
+    SKEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+    PPORT=39000
+    SLOW=200000; FAST=2000000
+    STEPS="1 2 4 8 16 32 64"
+    [ "$QUICK" = 1 ] && { SLOW=20000; FAST=20000; STEPS="1 2"; }
+    for S in $STEPS; do
+        [ "$S" -gt "$((NCPU / 2))" ] && [ "$S" -gt 1 ] && break
+        C="${CLIENT_CORES:-$S}"; [ "$((S + C))" -gt "$NCPU" ] && C=$((NCPU - S)); [ "$C" -lt 1 ] && C=1
+        SRV_SET="0-$((S - 1))"; CLI_SET="$S-$((S + C - 1))"
+        if ! command -v taskset >/dev/null 2>&1; then SRV_SET=""; CLI_SET=""; fi
+        for scheme in ed25519 evm session_mac certified; do
+            N=$SLOW; case "$scheme" in session_mac|certified) N=$FAST ;; esac
+            ACCTS=$((C * 2 * 64))
+            MLOG="$OUT/procs_matcher_${S}_${scheme}.log"
+            if [ -n "$SRV_SET" ]; then PIN_S="taskset -c $SRV_SET"; PIN_C="taskset -c $CLI_SET"; else PIN_S=""; PIN_C=""; fi
+            # shellcheck disable=SC2086
+            $PIN_S "$MBIN" --mode multi --markets "$S" --accounts "$ACCTS" --accounts-cap 262144 \
+                --tcp-port "$PPORT" --jsonrpc-port $((PPORT + 1)) --fix-port $((PPORT + 2)) --ws-port $((PPORT + 3)) \
+                --auth multi --gateway-keys "$GW" --audit-every 64 --fund-loadgen-keys \
+                --settlement-key "$SKEY" >"$MLOG" 2>&1 &
+            MPID=$!
+            for _ in $(seq 1 100); do (echo >/dev/tcp/127.0.0.1/$PPORT) 2>/dev/null && break; sleep 0.2; done
+            echo "# server cores=$S ($SRV_SET) client cores=$C ($CLI_SET) scheme=$scheme orders=$N" >>"$OUT/procs.txt"
+            # shellcheck disable=SC2086
+            $PIN_C "$LBIN" --port "$PPORT" --orders "$N" --accounts "$ACCTS" --connections $((C * 2)) \
+                --batch 500 --markets "$S" --auth "$scheme" 2>&1 | tee -a "$OUT/procs.txt" >>"$OUT/session.log" || true
+            kill "$MPID" 2>/dev/null || true; wait "$MPID" 2>/dev/null || true
+            sleep 1
+        done
+    done
+fi
+
+# ── e2e ─────────────────────────────────────────────────────────────
+# Real loopback TCP through the matcher for every authentication scheme.
+# The test process (server + load generator together) is confined to the
+# first N cores with taskset, so each step shows how the whole service
+# scales; on a one-box rig the load generator shares those cores, which
+# understates the server (note it when quoting).
+if want e2e; then
+    NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
+    log "e2e: real TCP per auth scheme, core steps up to $NCPU"
+    TBIN="$(cargo test -p matcher --release --test e2e_auth_tps --no-run 2>&1 |
+        sed -n 's/.*Executable .*(\(.*\))/\1/p' | tail -1)"
+    ORDERS=200000; [ "$QUICK" = 1 ] && ORDERS=20000
+    for c in 4 8 16 32 64 128; do
+        [ "$c" -gt "$NCPU" ] && break
+        echo "# cores=$c" >>"$OUT/e2e_auth.txt"
+        if command -v taskset >/dev/null 2>&1; then
+            AUTH_ORDERS=$ORDERS run e2e_auth.txt taskset -c "0-$((c-1))" "$TBIN" --ignored --nocapture
+        else
+            AUTH_ORDERS=$ORDERS run e2e_auth.txt "$TBIN" --ignored --nocapture
+            break
+        fi
+    done
+fi
+
+# ── chainmix ────────────────────────────────────────────────────────
+if want chainmix; then
+    NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
+    log "chainmix: signed EVM transfers / CLOB orders / mix through the real executor"
+    CMB="$(bench_bin executor chain_mix)"
+    CTH="1,2,4,8,16,32,64"; CTX=400000; CAC=4096; SWEEP="20000 100000 400000 1000000"
+    [ "$QUICK" = 1 ] && { CTH="1,2"; CTX=20000; CAC=256; SWEEP="10000"; }
+    echo "# thread scaling, $CTX txs, $CAC accounts" >>"$OUT/chain_mix.csv"
+    run chain_mix.csv "$CMB" --bench --mix transfer,clob,mixed --txs "$CTX" --threads "$CTH" --accounts "$CAC"
+    echo "# batch-size sweep (clob, ingest threads = $NCPU)" >>"$OUT/chain_mix.csv"
+    for n in $SWEEP; do
+        run chain_mix.csv "$CMB" --bench --mix clob --txs "$n" --threads "$((NCPU > 64 ? 64 : NCPU))" --accounts "$CAC"
+    done
+fi
+
+# ── evmscale ────────────────────────────────────────────────────────
+if want evmscale; then
+    NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
+    CRIT="${CRIT_ARGS:---warm-up-time 1 --measurement-time 3 --sample-size 10}"
+    SCORES="1 2 4 8 16 32 64 128"; ESIZES="2000,20000,100000"
+    [ "$QUICK" = 1 ] && { CRIT="--warm-up-time 1 --measurement-time 1 --sample-size 10"; SCORES="1 2"; ESIZES="500,2000"; }
+    log "evmscale: parallel EVM at 1..$NCPU cores (threads = cores)"
+    EBIN="$(bench_bin executor uniswap_transfer)"
+    TBIN="$(bench_bin evm tps_rw)"
+    for c in $SCORES; do
+        [ "$c" -gt "$NCPU" ] && break
+        PIN=""; command -v taskset >/dev/null 2>&1 && PIN="taskset -c 0-$((c - 1))"
+        echo "# cores=$c" >>"$OUT/scaling_evm_parallel.txt"
+        # shellcheck disable=SC2086
+        OXIDE_EVM_THREADS=$c OXIDE_EVM_SIZES=$ESIZES run scaling_evm_parallel.txt $PIN "$EBIN" --bench parallel_ $CRIT
+        echo "# cores=$c" >>"$OUT/scaling_evm_batch.txt"
+        # shellcheck disable=SC2086
+        RAYON_NUM_THREADS=$c run scaling_evm_batch.txt $PIN "$TBIN" --bench batch_parallel $CRIT
+    done
+fi
+
 # ── scaling ─────────────────────────────────────────────────────────
 if want scaling; then
     NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
+    # Criterion's defaults (100 samples, 5 s each) make this section an hour on a
+    # big box; these keep the medians usable. Override with CRIT_ARGS.
+    CRIT="${CRIT_ARGS:---warm-up-time 1 --measurement-time 2 --sample-size 20}"
+    SCORES="1 2 4 8 16 32 64 128"
+    [ "$QUICK" = 1 ] && { CRIT="--warm-up-time 1 --measurement-time 1 --sample-size 10"; SCORES="1 2"; }
     log "scaling: parallel EVM vs cores ($NCPU online)"
-    EBIN="$(bench_bin executor uniswap_transfer)"
-    for c in 1 2 4 8 16 32; do
-        [ "$c" -gt "$NCPU" ] && break
-        if command -v taskset >/dev/null 2>&1; then
-            run scaling_evm.txt taskset -c "0-$((c-1))" "$EBIN" --bench
-        else
-            RAYON_NUM_THREADS=$c run scaling_evm.txt "$EBIN" --bench
-        fi
-        echo "(cores=$c above)" >>"$OUT/scaling_evm.txt"
-    done
+    # (the parallel-EVM core sweep moved to the evmscale section: this loop used a
+    # bench that hard-coded 8 threads and could not scale past 8 cores)
     log "scaling: matcher benches (multi-market, balance contention, nonce, ring, allocs)"
     for b in matcher_throughput balance_contention nonce_contention ring alloc_accounting; do
-        run "scaling_matcher_$b.txt" cargo bench -p matcher --bench "$b"
+        # shellcheck disable=SC2086
+        run "scaling_matcher_$b.txt" cargo bench -p matcher --bench "$b" -- $CRIT
     done
     log "scaling: hashing / signature benches (leaf hash, BLS, tx recovery)"
-    for b in hash bls tx_recover; do run "scaling_crypto_$b.txt" cargo bench -p crypto --bench "$b"; done
-    run scaling_pipeline.txt cargo bench -p executor --bench block_pipeline
+    # shellcheck disable=SC2086
+    for b in hash bls tx_recover; do run "scaling_crypto_$b.txt" cargo bench -p crypto --bench "$b" -- $CRIT; done
+    # shellcheck disable=SC2086
+    run scaling_pipeline.txt cargo bench -p executor --bench block_pipeline -- $CRIT
 fi
 
 # ── profile ─────────────────────────────────────────────────────────
@@ -462,6 +679,13 @@ if want soak; then
     [ -n "${DSTAT:-}" ] && kill "$DSTAT" 2>/dev/null || true
     sampler_stop
     echo "RSS leak slopes: see proc_soak.summary.txt (LEAK SUSPECT = growth > 1%/h of mean RSS)" | tee -a "$OUT/session.log"
+fi
+
+# ── summary ─────────────────────────────────────────────────────────
+if want summary; then
+    log "summary: assembling summary.md"
+    python3 "$ROOT/scripts/rig/summarize.py" "$OUT" | tee "$OUT/summary.md" >/dev/null || true
+    echo "see $OUT/summary.md" | tee -a "$OUT/session.log"
 fi
 
 log "done: results in $OUT"

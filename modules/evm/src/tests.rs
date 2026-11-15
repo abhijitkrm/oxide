@@ -3057,6 +3057,36 @@ fn sparse_root_matches_full_multiple_rounds() {
     }
 }
 
+/// The stale-branch removal is bounded by `retained_depth`; a trie
+/// that deepens sharply between blocks (20 accounts, then thousands
+/// inserted per round) must still match a full rebuild every round —
+/// a bound that lagged the true depth would leave stale branches.
+#[test]
+fn sparse_root_matches_full_while_trie_deepens() {
+    let m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
+    let addrs = make_addrs(12_000);
+    for a in &addrs[..20] {
+        m.fund_account_for_test(a, 1_000_000);
+    }
+    executor::Module::state_root(&m); // full build at depth ~2
+    let mut next = 20usize;
+    for (round, grow) in [200usize, 1_500, 3_000, 6_000].into_iter().enumerate() {
+        for a in &addrs[next..next + grow] {
+            m.mark_touched_for_test(a);
+            m.fund_account_for_test(a, 1_000_000);
+        }
+        // Re-touch a few old accounts too so shallow branches rebuild.
+        for a in &addrs[..10] {
+            m.mark_touched_for_test(a);
+            m.fund_account_for_test(a, 2_000_000 + round as u128);
+        }
+        next += grow;
+        let root = executor::Module::state_root(&m);
+        let truth = full_rebuild_root(&m);
+        assert_eq!(root, truth, "sparse root must match full rebuild at round {round}");
+    }
+}
+
 /// Sparse root must match full rebuild after account insertion
 /// (new account not in the previous build).
 #[test]
@@ -4619,4 +4649,80 @@ fn fee_state_rehydrates_from_storage() {
     // block, not the seed.
     let m2 = EvmModule::with_storage(1, 9_999, m.backend_for_test());
     assert_eq!(m2.base_fee(), 875, "reloaded fee matches the evolved value");
+}
+
+// ───────────────────────────────────────────────────────────
+// Root stage (docs/root-stage-spec.md): deferred roots must equal
+// the synchronous roots bit for bit, for every block, including
+// blocks executed ahead of the root stage.
+// ───────────────────────────────────────────────────────────
+
+/// Deterministic per-block mutation: grow (new accounts), change
+/// balances, and delete (zero balance = EIP-158 empty) accounts.
+#[allow(clippy::cast_possible_truncation)]
+fn mutate_block(m: &EvmModule, addrs: &[primitives::Address], block: usize) {
+    let n = addrs.len();
+    for i in 0..60 {
+        let idx = (block * 37 + i * 11) % n;
+        let balance = match (block + i) % 7 {
+            0 => 0, // deletes the leaf
+            _ => 1_000_000 + (block * 1000 + i) as u128,
+        };
+        m.mark_touched_for_test(&addrs[idx]);
+        m.fund_account_for_test(&addrs[idx], balance);
+    }
+}
+
+#[test]
+#[allow(clippy::cast_possible_truncation)]
+fn deferred_root_matches_sync_root_every_block() {
+    let sync_m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
+    let defer_m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
+    let addrs = make_addrs(3_000);
+    for a in &addrs[..2_000] {
+        sync_m.fund_account_for_test(a, 1_000_000);
+        defer_m.fund_account_for_test(a, 1_000_000);
+    }
+    // Block 1 does the full build on both (the deferred module computes
+    // it synchronously because the trie is not built yet).
+    executor::Module::end_block(&sync_m, primitives::Height::new(1));
+    let r1 = executor::Module::state_root(&sync_m);
+    executor::Module::set_root_deferral(&defer_m, true);
+    executor::Module::end_block(&defer_m, primitives::Height::new(1));
+    assert_eq!(executor::Module::finish_root(&defer_m, primitives::Height::new(1)), r1);
+
+    // Then run in windows of 4 blocks: execute all four (the root stage
+    // lags), then finish them in order.
+    let mut height = 2u64;
+    for _window in 0..6 {
+        let mut expect = Vec::new();
+        for _ in 0..4 {
+            mutate_block(&sync_m, &addrs, height as usize);
+            mutate_block(&defer_m, &addrs, height as usize);
+            executor::Module::end_block(&sync_m, primitives::Height::new(height));
+            expect.push((height, executor::Module::state_root(&sync_m)));
+            executor::Module::end_block(&defer_m, primitives::Height::new(height));
+            height += 1;
+        }
+        for (h, want) in expect {
+            let got = executor::Module::finish_root(&defer_m, primitives::Height::new(h));
+            assert_eq!(got, want, "deferred root diverged at height {h}");
+        }
+    }
+    // Sealed history: receipts/tx roots agree exactly; the deferred
+    // header carries the state root of block h - ROOT_HEADER_LAG (zero
+    // before that), so its block hash intentionally differs.
+    let s = framework::lock_state(&sync_m.history);
+    let d = framework::lock_state(&defer_m.history);
+    let lag = crate::rootstage::ROOT_HEADER_LAG;
+    for h in 2..height {
+        let (sb, db) = (s.block(h).expect("sync block"), d.block(h).expect("deferred block"));
+        assert_eq!((sb.receipts_root, sb.tx_root), (db.receipts_root, db.tx_root));
+        let want_header_root = if h > lag {
+            s.block(h - lag).expect("lagged sync block").state_root
+        } else {
+            alloy_primitives::B256::ZERO
+        };
+        assert_eq!(db.state_root, want_header_root, "header root of block {h}");
+    }
 }

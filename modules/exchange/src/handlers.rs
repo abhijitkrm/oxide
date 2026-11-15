@@ -8,12 +8,12 @@
 //! (`release_maker_holds`), so conservation is auditable here.
 
 use super::{
-    Address, CANCEL_LINKED_BODY_LEN, CANCEL_REGISTERED_BODY_LEN, CUSTODY_BODY_LEN, Event,
-    ExchangeModule, ExecError, FILL_ENTRY_LEN, Inner, LINK_BODY_LEN, LINKED_CUSTODY_BODY_LEN,
-    LinkedEntry, MAX_BATCH_FILLS, MAX_REGISTERED_ORDERS, MarketConfig, OrderKey, OrderType,
-    PRICE_SCALE, Price, Qty, REGISTER_BODY_LEN, REGISTER_LINKED_BODY_LEN, RegisteredOrder,
-    RejectCategory, Reserved, SWEEP_LINKED_BODY_LEN, Side, TradingError, TxContext, qty_add,
-    qty_sub,
+    Address, BATCH_COMMIT_HEADER_LEN, CANCEL_LINKED_BODY_LEN, CANCEL_REGISTERED_BODY_LEN,
+    CUSTODY_BODY_LEN, Event, ExchangeModule, ExecError, FILL_ENTRY_LEN, Inner, LINK_BODY_LEN,
+    LINKED_CUSTODY_BODY_LEN, LinkedEntry, MAX_BATCH_FILLS, MAX_REGISTERED_ORDERS, MarketConfig,
+    OrderKey, OrderType, PRICE_SCALE, Price, Qty, REGISTER_BODY_LEN, REGISTER_LINKED_BODY_LEN,
+    RegisteredOrder, RejectCategory, Reserved, SWEEP_LINKED_BODY_LEN, Side, TradingError,
+    TxContext, qty_add, qty_sub,
 };
 use crate::codec::{
     amended_event, cancel_event, decode_side, encode_side, fill_event, outcome_event, pair_event,
@@ -25,6 +25,69 @@ use crate::settle::{
 };
 
 impl ExchangeModule {
+    /// Handle a bundle (`docs/bundle-auth-spec.md`): validate the framing of
+    /// the whole bundle first (atomic: a malformed bundle executes nothing),
+    /// then run each place/cancel/amend item in order for the signer. A
+    /// rejected item does not abort the bundle; it is reported as a
+    /// `bundle_item_rejected` event carrying the item index and reason, so
+    /// the outcome equals sending the items as separate transactions.
+    pub(crate) fn handle_bundle(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        if body.len() > crate::MAX_BUNDLE_BYTES || body.len() < 2 {
+            return Err(ExecError::Malformed);
+        }
+        let count = usize::from(u16::from_le_bytes([body[0], body[1]]));
+        if count == 0 || count > crate::MAX_BUNDLE_ITEMS {
+            return Err(ExecError::Malformed);
+        }
+        // Pass 1: framing only (cheap, allocation-free); items are not executed
+        // unless every length is consistent and every tag is allowed.
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(count);
+        let mut at = 2usize;
+        for _ in 0..count {
+            let len_end = at.checked_add(2).ok_or(ExecError::Malformed)?;
+            let len = usize::from(u16::from_le_bytes([
+                *body.get(at).ok_or(ExecError::Malformed)?,
+                *body.get(at + 1).ok_or(ExecError::Malformed)?,
+            ]));
+            let end = len_end.checked_add(len).ok_or(ExecError::Malformed)?;
+            let item = body.get(len_end..end).ok_or(ExecError::Malformed)?;
+            match item.first() {
+                Some(&(crate::TAG_PLACE | crate::TAG_CANCEL | crate::TAG_AMEND)) => {}
+                _ => return Err(ExecError::Malformed),
+            }
+            spans.push((len_end, end));
+            at = end;
+        }
+        if at != body.len() {
+            return Err(ExecError::Malformed);
+        }
+        // Pass 2: execute in order for the signer.
+        let mut events = Vec::new();
+        for (i, (start, end)) in spans.into_iter().enumerate() {
+            let item = &body[start..end];
+            let (tag, rest) = (item[0], &item[1..]);
+            let result = match tag {
+                crate::TAG_PLACE => self.handle_place(ctx, rest, inner),
+                crate::TAG_CANCEL => self.handle_cancel(ctx, rest, inner),
+                _ => self.handle_amend(ctx, rest, inner),
+            };
+            match result {
+                Ok(evs) => events.extend(evs),
+                Err(e) => {
+                    let mut data = u16::try_from(i).unwrap_or(u16::MAX).to_le_bytes().to_vec();
+                    data.extend_from_slice(format!("{e:?}").as_bytes());
+                    events.push(Event { module: "exchange", kind: "bundle_item_rejected", data });
+                }
+            }
+        }
+        Ok(events)
+    }
+
     /// Handle a cancel-order message (extracted from `handle`):
     /// remove the resting order and release its reservation — quote
     /// for buys, base for sells — exactly once.
@@ -1376,6 +1439,60 @@ impl ExchangeModule {
     ///
     /// `inner` is the already-held module lock (batch settle never
     /// mutates the books — only the registered-order map).
+    /// Handle a committed batch settle: settle the legs exactly as
+    /// [`Self::handle_batch_settle`] (same authorization, validation and
+    /// state changes) and append one `batch_commit` event with the
+    /// operator's `fills_root` and the root the chain computed over the
+    /// legs it applied. Anything the plain handler rejects is rejected
+    /// here with the same error, before any event.
+    pub(crate) fn handle_batch_settle_committed(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        let header = body.get(..BATCH_COMMIT_HEADER_LEN).ok_or(ExecError::Malformed)?;
+        let rest = &body[BATCH_COMMIT_HEADER_LEN..];
+        let batch_seq =
+            u64::from_le_bytes(header[0..8].try_into().map_err(|_| ExecError::Malformed)?);
+        // Authorization first, so an unauthorized sender learns nothing
+        // about bond or sequence state.
+        if self.settlement_operator != Some(ctx.sender) {
+            return Err(ExecError::rejected(
+                RejectCategory::Unauthorized,
+                "unauthorized settlement operator",
+            ));
+        }
+        self.pre_committed_settle(batch_seq)?;
+        let mut events = self.handle_batch_settle(ctx, rest, inner)?;
+        // `handle_batch_settle` has validated `rest` as `[count][legs]`
+        // with exactly `count * FILL_ENTRY_LEN` bytes of legs.
+        let legs = &rest[4..];
+        let mut stream = lanes::commit::ByteStream::new(crate::LEGS_STREAM_LABEL);
+        let (entries, _) = legs.as_chunks::<FILL_ENTRY_LEN>();
+        for leg in entries {
+            stream.push(leg);
+        }
+        let (legs_root, leg_count) = stream.finish();
+        let mut fills_root = [0u8; 32];
+        fills_root.copy_from_slice(&header[8..40]);
+        let raw_count =
+            u32::from_le_bytes(header[40..44].try_into().map_err(|_| ExecError::Malformed)?);
+        self.record_committed_settle(
+            batch_seq,
+            fills_root,
+            raw_count,
+            legs_root,
+            u32::try_from(leg_count).unwrap_or(u32::MAX),
+        );
+        let mut data = Vec::with_capacity(BATCH_COMMIT_HEADER_LEN + 32 + 4);
+        data.extend_from_slice(header); // seq ‖ fills_root ‖ raw_fill_count
+        data.extend_from_slice(&legs_root);
+        data.extend_from_slice(&u32::try_from(leg_count).unwrap_or(u32::MAX).to_le_bytes());
+        events.push(Event { module: "exchange", kind: "batch_commit", data });
+        Ok(events)
+    }
+
     pub(crate) fn handle_batch_settle(
         &self,
         ctx: &TxContext,
@@ -1390,6 +1507,7 @@ impl ExchangeModule {
                 "unauthorized settlement operator",
             ));
         }
+        self.require_operator_active()?;
         let fill_count = usize::try_from(u32::from_le_bytes(
             body.get(0..4)
                 .ok_or(ExecError::Malformed)?

@@ -3748,3 +3748,55 @@ fn crash_mid_journal_append_ignores_torn_tail() {
     assert_eq!(exec3.state_root_at(3), honest_tip);
     assert_eq!(*primitives::sync::lock_state(&counter3.count), 4, "0..3 applied once each");
 }
+
+/// A backlog of signed native transactions executed over several blocks must not re-recover
+/// a single signature at execution: ingest already verified them, and the cache entries for
+/// transactions still waiting for a later block must survive the earlier blocks. (Before the
+/// fix each block took the whole cache and dropped what it did not use, so every block after
+/// the first re-recovered every pending signature serially: ~50 us per tx, the measured
+/// 18k tx/s ceiling for CLOB orders.)
+#[test]
+fn preverify_cache_survives_blocks_so_later_blocks_recover_no_signatures() {
+    let mut executor = test_executor(1000);
+    let counter = Arc::new(CounterModule::new());
+    executor.register_module(counter.clone());
+
+    let n = 90usize;
+    for _ in 0..n {
+        let (tx, _sender) = signed_counter_tx(1, 0, b"inc");
+        assert!(matches!(executor.ingest_tx(tx), MempoolAck::Accepted));
+    }
+    let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+    let proposal = executor.prepare_proposal(&budget);
+    assert_eq!(proposal.txs.len(), n);
+    for (height, chunk) in proposal.txs.chunks(30).enumerate() {
+        executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(height as u64),
+            txs: chunk.to_vec(),
+            signers: Vec::new(),
+        });
+    }
+    assert_eq!(*primitives::sync::lock_state(&counter.count), n as u64, "every tx executed");
+    assert_eq!(
+        executor.exec_sig_reverifications(),
+        0,
+        "no signature may be recovered at execution for txs this node admitted"
+    );
+}
+
+/// The converse, so the counter is trustworthy: a transaction this node never ingested has no
+/// cache entry and IS recovered at execution (exactly once).
+#[test]
+fn a_tx_this_node_never_ingested_is_recovered_once_at_execution() {
+    let mut executor = test_executor(100);
+    executor.register_module(Arc::new(CounterModule::new()));
+    let (tx, _sender) = signed_counter_tx(1, 0, b"inc");
+    executor.finalize_block(&FinalizedBlock {
+        context: types::BlockContext::default(),
+        height: Height::new(0),
+        txs: vec![tx],
+        signers: Vec::new(),
+    });
+    assert_eq!(executor.exec_sig_reverifications(), 1);
+}

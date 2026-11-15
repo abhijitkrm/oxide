@@ -73,6 +73,12 @@ const MAX_RETAINED_HISTORY: usize = 4096;
 /// bounded enough that a stalled lane cannot hide.
 const EXEC_LANE_DEPTH: usize = 64;
 
+/// Blocks the exec stage may run ahead of the root stage (unit: blocks;
+/// `docs/root-stage-spec.md`). Deeper hides root-time jitter but holds more
+/// captured deltas and lengthens replay after a crash; shallower stalls the
+/// exec stage sooner.
+const ROOT_LANE_DEPTH: usize = 4;
+
 /// Insert-then-prune for height-keyed history maps: keeps the
 /// newest [`MAX_RETAINED_HISTORY`] entries by dropping the oldest.
 trait InsertRetained<K: Ord, V> {
@@ -1196,6 +1202,29 @@ pub trait Module: Send + Sync {
     /// Compute the module's state root (over its storage subtree).
     fn state_root(&self) -> Hash;
 
+    /// Switch the module's root-stage deferral (`docs/root-stage-spec.md`).
+    ///
+    /// When on, `end_block` captures what the block's root needs as values
+    /// and returns without touching the commitment structure; the root
+    /// stage later calls [`Self::finish_root`] once per block, strictly in
+    /// height order, on a single thread. Turning it off drains pending
+    /// blocks first. Modules that cannot defer ignore this (default).
+    fn set_root_deferral(&self, _on: bool) {}
+
+    /// Whether `end_block` currently defers this module's root, so the
+    /// executor must obtain it from [`Self::finish_root`] rather than
+    /// [`Self::state_root`].
+    fn defers_root(&self) -> bool {
+        false
+    }
+
+    /// Root-stage half of a deferred block: finish it and return the
+    /// module's state root for `height`, equal to the synchronous root.
+    /// Only called for modules whose [`Self::defers_root`] is true.
+    fn finish_root(&self, _height: Height) -> Hash {
+        self.state_root()
+    }
+
     /// Export the module's full committed state for snapshot sync.
     ///
     /// Returns `None` if — and only if — the module carries no
@@ -1662,6 +1691,12 @@ struct ExecSync {
     /// already-mutated state and can produce a silently wrong root
     /// — the backlog drain must refuse rather than re-execute.
     in_flight: Option<u64>,
+    /// The height the root stage is finishing (`Some` only while a
+    /// module's commitment structure is mid-update). Same fail-closed
+    /// meaning as `in_flight`: a death with this set and no recorded
+    /// root leaves the trie partially updated, so the backlog drain
+    /// must refuse to replay.
+    root_in_flight: Option<u64>,
 }
 
 /// RAII marker that flags the execution lane dead when the worker
@@ -1770,6 +1805,18 @@ pub struct Executor {
     /// re-borrowed from the block's tx at execution time, so no
     /// per-tx `Vec<u8>` is ever cloned into or out of this cache.
     preverify_cache: Mutex<primitives::digest_map::DigestMap<[u8; 20]>>,
+    /// Most entries the preverify cache may hold: the mempool's capacity,
+    /// the most pending transactions that can legitimately be waiting for
+    /// a later block. Beyond it, unused entries are dropped after a block
+    /// (the pre-fix behaviour) instead of retained.
+    preverify_cap: usize,
+    /// Count of envelope signatures recovered AT EXECUTION because the
+    /// ingest-time cache had no entry (a gossip race, a tx first seen in
+    /// the block, or an evicted entry). Zero in steady state; a large
+    /// value means block execution is paying signature recovery serially.
+    sig_reverifications: std::sync::atomic::AtomicU64,
+    /// Cumulative per-phase `execute_block` time (see [`StageTimes`]).
+    stage_times: StageTimes,
     /// Minimum batch size to use the parallel speculative execution
     /// path. Configurable via [`Executor::with_config`]. Default:
     /// [`DEFAULT_PARALLEL_THRESHOLD`] (32 txs). Lowered from 100
@@ -1788,10 +1835,10 @@ pub struct Executor {
     /// This eliminates the per-tx `mempool.lock()` on the ingestion
     /// hot path — the mempool lock is only acquired once per
     /// `prepare_proposal` call, not once per tx.
-    mempool_intake_tx: std::sync::mpsc::SyncSender<TxBytes>,
+    mempool_intake_tx: std::sync::mpsc::SyncSender<(TxBytes, u64)>,
     /// The receiver side of the intake ring. Drained by
     /// `prepare_proposal` to flush buffered txs into the mempool.
-    mempool_intake_rx: std::sync::Mutex<std::sync::mpsc::Receiver<TxBytes>>,
+    mempool_intake_rx: std::sync::Mutex<std::sync::mpsc::Receiver<(TxBytes, u64)>>,
     /// H4/H5 fix: per-account executed-nonce map. Tracks the next
     /// expected nonce for each sender. Updated after `execute_block`
     /// completes for each tx that was executed.
@@ -1868,6 +1915,10 @@ pub struct Executor {
     /// it). Validation (core in the online set) happens at config
     /// load, not here.
     exec_lane_core: Option<u32>,
+    /// Run the root computation on its own thread behind the exec lane
+    /// (`docs/root-stage-spec.md`). Off by default; set with
+    /// [`Executor::with_root_stage`] before `spawn_exec_lane`.
+    root_stage: bool,
 }
 
 mod app_iface;
@@ -1924,12 +1975,16 @@ impl Executor {
                     pending: std::collections::VecDeque::new(),
                     saturated: false,
                     in_flight: None,
+                    root_in_flight: None,
                 }),
                 std::sync::Condvar::new(),
             )),
             events: Mutex::new(Vec::new()),
             tx_outcomes: Mutex::new(TxOutcomeStore::default()),
             preverify_cache: Mutex::new(primitives::digest_map::DigestMap::default()),
+            preverify_cap: max_mempool_entries,
+            sig_reverifications: std::sync::atomic::AtomicU64::new(0),
+            stage_times: StageTimes::default(),
             parallel_threshold,
             recorder: None,
             mempool_intake_tx: intake_tx,
@@ -1946,6 +2001,7 @@ impl Executor {
             history_retention: MAX_RETAINED_HISTORY,
             durability: None,
             exec_lane_core: None,
+            root_stage: false,
         }
     }
 
@@ -1960,6 +2016,24 @@ impl Executor {
     pub fn with_chain_id(mut self, chain_id: u64) -> Self {
         self.chain_id = chain_id;
         self
+    }
+
+    /// Signatures recovered at block execution because the ingest-time
+    /// cache missed (see the `sig_reverifications` field). Exposed for
+    /// tests and benches: it should stay 0 for transactions this node
+    /// admitted itself.
+    #[must_use]
+    pub fn exec_sig_reverifications(&self) -> u64 {
+        self.sig_reverifications.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Cumulative `execute_block` phase times since construction.
+    /// Cheap (a few relaxed atomic adds per block); the measurement
+    /// spine of `docs/hft-production-plan.md` W0 reads it to print a
+    /// cost-per-transaction table per stage.
+    #[must_use]
+    pub fn stage_report(&self) -> StageReport {
+        self.stage_times.snapshot()
     }
 
     /// Size the mempool-intake rayon pool to `threads` (hft-audit-2
@@ -1996,6 +2070,18 @@ impl Executor {
             .num_threads(threads.max(1))
             .build_global()
             .map_err(|e| e.to_string())
+    }
+
+    /// Pipeline state-root computation behind execution
+    /// (`docs/root-stage-spec.md`): modules that support it defer their
+    /// root to a dedicated root thread, so the exec lane starts block
+    /// h+1 while block h is being rooted. Roots and attestations are
+    /// bit-identical to the synchronous path; only `executed` now means
+    /// "executed and rooted". Takes effect at `spawn_exec_lane`.
+    #[must_use]
+    pub fn with_root_stage(mut self, on: bool) -> Self {
+        self.root_stage = on;
+        self
     }
 
     /// Pin the exec lane to logical CPU `core` (hft-audit F-02).
@@ -2304,3 +2390,106 @@ struct AcceptedTx {
 
 #[cfg(test)]
 mod tests;
+
+/// Cumulative per-phase time of `execute_block`, in nanoseconds.
+///
+/// Phases (all serial wall time on the executing thread, summed over
+/// blocks): `plan` (per-tx gates in `plan_block_runs`), `dispatch`
+/// (module execution of every run, parallel inside), `end_block`
+/// (module `end_block_ctx` plus attendance), `state_root` (the
+/// executor's own root assembly after `end_block`, which is cheap when
+/// a module already computed its root in `end_block`). Each counter is
+/// one relaxed `fetch_add` per block: the cost is below measurement
+/// noise, so the recorder stays on in production, which is what lets
+/// the SLO metrics of plan section W7 read the same numbers.
+#[derive(Debug, Default)]
+pub struct StageTimes {
+    plan_ns: std::sync::atomic::AtomicU64,
+    dispatch_ns: std::sync::atomic::AtomicU64,
+    end_block_ns: std::sync::atomic::AtomicU64,
+    state_root_ns: std::sync::atomic::AtomicU64,
+    blocks: std::sync::atomic::AtomicU64,
+    txs: std::sync::atomic::AtomicU64,
+}
+
+/// A point-in-time copy of [`StageTimes`]; subtract two snapshots to
+/// get one measurement window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StageReport {
+    /// Nanoseconds in `plan_block_runs`.
+    pub plan_ns: u64,
+    /// Nanoseconds dispatching runs to modules.
+    pub dispatch_ns: u64,
+    /// Nanoseconds in module `end_block` plus attendance.
+    pub end_block_ns: u64,
+    /// Nanoseconds assembling the state root after `end_block`.
+    pub state_root_ns: u64,
+    /// Blocks executed.
+    pub blocks: u64,
+    /// Transactions in those blocks (as proposed, executed or not).
+    pub txs: u64,
+}
+
+impl StageReport {
+    /// `self - earlier`, saturating, for a measurement window.
+    #[must_use]
+    pub fn since(&self, earlier: &Self) -> Self {
+        Self {
+            plan_ns: self.plan_ns.saturating_sub(earlier.plan_ns),
+            dispatch_ns: self.dispatch_ns.saturating_sub(earlier.dispatch_ns),
+            end_block_ns: self.end_block_ns.saturating_sub(earlier.end_block_ns),
+            state_root_ns: self.state_root_ns.saturating_sub(earlier.state_root_ns),
+            blocks: self.blocks.saturating_sub(earlier.blocks),
+            txs: self.txs.saturating_sub(earlier.txs),
+        }
+    }
+
+    /// Microseconds per transaction for each phase:
+    /// `(plan, dispatch, end_block, state_root)`.
+    // Reporting only: u64 -> f64 loses precision above 2^52 ns (52 days), irrelevant here.
+    #[allow(clippy::cast_precision_loss)]
+    #[must_use]
+    pub fn us_per_tx(&self) -> (f64, f64, f64, f64) {
+        let n = self.txs.max(1) as f64 * 1_000.0;
+        (
+            self.plan_ns as f64 / n,
+            self.dispatch_ns as f64 / n,
+            self.end_block_ns as f64 / n,
+            self.state_root_ns as f64 / n,
+        )
+    }
+}
+
+impl StageTimes {
+    fn bump(counter: &std::sync::atomic::AtomicU64, d: std::time::Duration) {
+        let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        counter.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(crate) fn add_plan(&self, d: std::time::Duration) {
+        Self::bump(&self.plan_ns, d);
+    }
+    pub(crate) fn add_dispatch(&self, d: std::time::Duration) {
+        Self::bump(&self.dispatch_ns, d);
+    }
+    pub(crate) fn add_end_block(&self, d: std::time::Duration) {
+        Self::bump(&self.end_block_ns, d);
+    }
+    pub(crate) fn add_state_root(&self, d: std::time::Duration) {
+        Self::bump(&self.state_root_ns, d);
+    }
+    pub(crate) fn add_block(&self, txs: usize) {
+        self.blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.txs.fetch_add(txs as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn snapshot(&self) -> StageReport {
+        use std::sync::atomic::Ordering::Relaxed;
+        StageReport {
+            plan_ns: self.plan_ns.load(Relaxed),
+            dispatch_ns: self.dispatch_ns.load(Relaxed),
+            end_block_ns: self.end_block_ns.load(Relaxed),
+            state_root_ns: self.state_root_ns.load(Relaxed),
+            blocks: self.blocks.load(Relaxed),
+            txs: self.txs.load(Relaxed),
+        }
+    }
+}

@@ -172,7 +172,12 @@ impl Executor {
         // thread holds the test's main loop. `try_send` breaks the
         // deadlock: a full intake returns `Rejected` (backpressure)
         // instead of blocking forever. The caller can retry later.
-        match self.mempool_intake_tx.try_send(tx) {
+        // The module's gas estimate rides with the tx (about 0.1 us) so the
+        // proposer's gas cap can stop its walk early; without it every pool
+        // entry carried gas 0 and each proposal cloned the pool up to the
+        // byte budget just to keep ~1% of it.
+        let gas = module.estimate_gas(payload);
+        match self.mempool_intake_tx.try_send((tx, gas)) {
             Ok(()) => {
                 if let Some((tx_hash, sender)) = cacheable {
                     // Only the sender is cached — the payload is
@@ -302,8 +307,8 @@ impl AppInterface for Executor {
         {
             let rx = primitives::sync::lock_state(&self.mempool_intake_rx);
             let mut pool = primitives::sync::lock_state(&self.mempool);
-            while let Ok(tx) = rx.try_recv() {
-                let _ = pool.submit(tx);
+            while let Ok((tx, gas)) = rx.try_recv() {
+                let _ = pool.submit_with_gas(tx, gas);
             }
         }
         // Coordinated halt: once the next height is past the
@@ -323,7 +328,12 @@ impl AppInterface for Executor {
             // re-parsing the envelope and re-estimating per
             // candidate (~0.42µs/tx; ~17ms per proposal at a 40k-tx
             // backlog, the largest term in this path).
-            primitives::sync::lock_state(&self.mempool).select_with_gas(budget.max_bytes)
+            // The gas cap is applied inside the walk too (see
+            // `select_with_gas_cap`): without it every proposal cloned the
+            // whole pool up to the byte budget and kept ~1% of it.
+            let gas_cap = budget.max_gas.min(self.block_gas_limit());
+            primitives::sync::lock_state(&self.mempool)
+                .select_with_gas_cap(budget.max_bytes, gas_cap)
         };
         // Enforce the block gas limit at proposal time. The binding
         // constraint is `min(budget.max_gas, block_gas_limit)` —
