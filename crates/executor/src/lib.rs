@@ -1196,6 +1196,29 @@ pub trait Module: Send + Sync {
     /// Compute the module's state root (over its storage subtree).
     fn state_root(&self) -> Hash;
 
+    /// Switch the module's root-stage deferral (`docs/root-stage-spec.md`).
+    ///
+    /// When on, `end_block` captures what the block's root needs as values
+    /// and returns without touching the commitment structure; the root
+    /// stage later calls [`Self::finish_root`] once per block, strictly in
+    /// height order, on a single thread. Turning it off drains pending
+    /// blocks first. Modules that cannot defer ignore this (default).
+    fn set_root_deferral(&self, _on: bool) {}
+
+    /// Whether `end_block` currently defers this module's root, so the
+    /// executor must obtain it from [`Self::finish_root`] rather than
+    /// [`Self::state_root`].
+    fn defers_root(&self) -> bool {
+        false
+    }
+
+    /// Root-stage half of a deferred block: finish it and return the
+    /// module's state root for `height`, equal to the synchronous root.
+    /// Only called for modules whose [`Self::defers_root`] is true.
+    fn finish_root(&self, _height: Height) -> Hash {
+        self.state_root()
+    }
+
     /// Export the module's full committed state for snapshot sync.
     ///
     /// Returns `None` if — and only if — the module carries no

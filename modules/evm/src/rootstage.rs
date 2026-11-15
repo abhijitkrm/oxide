@@ -121,6 +121,23 @@ impl EvmModule {
 
     /// Apply a [`PatchDelta`](PatchDelta) to the leaf map and
     /// the storage-root cache.
+    pub(crate) fn apply_patch_ref(
+        leaves: &mut std::collections::BTreeMap<alloy_primitives::B256, Vec<u8>>,
+        storage_root_cache: &mut std::collections::HashMap<EvmAddress, alloy_primitives::B256>,
+        delta: &PatchDelta,
+    ) {
+        for up in &delta.upserts {
+            if let Some(root) = up.storage_root {
+                storage_root_cache.insert(up.addr, root);
+            }
+            leaves.insert(up.hashed, up.leaf.clone());
+        }
+        for (addr, hashed) in &delta.removals {
+            leaves.remove(hashed);
+            storage_root_cache.remove(addr);
+        }
+    }
+
     pub(crate) fn apply_patch(
         leaves: &mut std::collections::BTreeMap<alloy_primitives::B256, Vec<u8>>,
         storage_root_cache: &mut std::collections::HashMap<
@@ -226,4 +243,207 @@ impl EvmModule {
         Hash(root.0)
     }
 
+}
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
+
+use crate::history::Pending;
+
+/// How the state root of a deferred block is obtained on the root stage.
+#[derive(Debug)]
+pub(crate) enum DeferredRoot {
+    /// Computed synchronously on the execution stage (the first build
+    /// after construction or snapshot import, which must see the whole
+    /// cache). The root stage only seals.
+    Precomputed(Hash),
+    /// Leaf changes for the root stage to fold into the trie.
+    Patch(PatchDelta),
+}
+
+/// Everything the root stage needs to finish block `height`, captured
+/// as values on the execution stage at `end_block`.
+#[derive(Debug)]
+pub(crate) struct DeferredBlock {
+    pub height: u64,
+    pub root: DeferredRoot,
+    pub timestamp: u64,
+    pub gas_limit: u64,
+    pub base_fee: u64,
+    pub coinbase: revm::primitives::Address,
+    pub pending: Pending,
+    pub undo_blob: Option<Vec<u8>>,
+    /// Account flush batch for the backend, serialised on the execution
+    /// stage (it reads the live cache); `None` without a backend.
+    pub flush_ops: Option<Vec<storage::Op>>,
+}
+
+/// Root-stage bookkeeping owned by the EVM module.
+#[derive(Debug, Default)]
+pub(crate) struct RootStageState {
+    /// When set, `end_block` defers the root and sealing to
+    /// [`EvmModule::finish_root`].
+    pub enabled: AtomicBool,
+    /// Blocks awaiting `finish_root`, oldest first.
+    pub queue: Mutex<VecDeque<DeferredBlock>>,
+    /// Blocks pushed but not yet fully finished (queued or in progress).
+    pub unfinished: Mutex<usize>,
+    /// Signalled whenever `unfinished` drops.
+    pub drained: Condvar,
+}
+
+impl RootStageState {
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    /// Block until every deferred block has been finished. Used before a
+    /// full trie build or a snapshot, both of which need the trie to be
+    /// quiescent at a known height.
+    pub(crate) fn wait_drained(&self) {
+        let mut n = framework::lock_state(&self.unfinished);
+        while *n > 0 {
+            n = self.drained.wait(n).unwrap_or_else(|_| {
+                panic!("state mutex poisoned: a holder panicked mid-mutation")
+            });
+        }
+    }
+}
+
+impl EvmModule {
+    /// Execution-stage half of `end_block` in deferred mode: capture the
+    /// block's root inputs, pending history, undo and flush batch as
+    /// values and queue them. Never touches the trie.
+    pub(crate) fn end_block_deferred(&self, height: u64) -> Vec<executor::Event> {
+        let rs = &self.root_stage;
+        let ready = *framework::lock_state(&self.trie_leaves_ready);
+        let root = if ready {
+            let touched = framework::lock_state(&self.touched);
+            let pairs: Vec<(EvmAddress, alloy_primitives::B256)> =
+                touched.iter().map(|a| (*a, alloy_primitives::keccak256(a))).collect();
+            drop(touched);
+            let db = framework::lock_state(&self.db);
+            DeferredRoot::Patch(Self::patch_delta(&db, &pairs))
+        } else {
+            // First build (or after import): needs the whole cache and a
+            // quiescent trie, so it runs here, synchronously.
+            rs.wait_drained();
+            DeferredRoot::Precomputed(<Self as executor::Module>::state_root(self))
+        };
+        let timestamp = *framework::lock_state(&self.block_timestamp);
+        let coinbase = *framework::lock_state(&self.coinbase);
+        let pending = framework::lock_state(&self.history).take_pending();
+        let undo = std::mem::take(&mut *framework::lock_state(&self.block_undo));
+        let has_backend = framework::lock_state(&self.backend).is_some();
+        let undo_blob = has_backend.then(|| crate::persist::serialize_undo(&undo));
+        framework::lock_state(&self.versioned).push(height, undo);
+        let flush_ops = has_backend.then(|| self.account_flush_ops());
+        framework::lock_state(&self.touched).clear();
+        let block = DeferredBlock {
+            height,
+            root,
+            timestamp,
+            gas_limit: self.block_gas_limit(),
+            base_fee: self.current_base_fee(),
+            coinbase,
+            pending,
+            undo_blob,
+            flush_ops,
+        };
+        *framework::lock_state(&rs.unfinished) += 1;
+        framework::lock_state(&rs.queue).push_back(block);
+        Vec::new()
+    }
+
+    /// Root-stage half: fold the oldest deferred block into the trie,
+    /// seal it and flush its batch. Returns the block's state root, equal
+    /// to what the synchronous `end_block` + `state_root` would produce.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called with no deferred block queued or for the wrong
+    /// height (a stage-ordering bug), or on a poisoned module lock.
+    pub(crate) fn finish_root_deferred(&self, height: u64) -> primitives::Hash {
+        let rs = &self.root_stage;
+        let block = framework::lock_state(&rs.queue)
+            .pop_front()
+            .unwrap_or_else(|| panic!("evm root stage: finish_root({height}) with an empty queue"));
+        assert_eq!(block.height, height, "evm root stage: blocks finished out of order");
+
+        // The MPT update and the two header tries are independent.
+        let (state_root, roots) = rayon::join(
+            || match block.root {
+                DeferredRoot::Precomputed(h) => alloy_primitives::B256::from(h.0),
+                DeferredRoot::Patch(ref delta) => self.fold_patch(delta),
+            },
+            || crate::history::History::roots_of(&block.pending),
+        );
+        let (sealed_block, evicted, pruned_undo) = {
+            let mut history = framework::lock_state(&self.history);
+            let evicted = history.seal_taken(
+                height,
+                block.timestamp,
+                block.gas_limit,
+                block.base_fee,
+                block.coinbase,
+                state_root,
+                roots,
+                block.pending,
+            );
+            let sealed = history.block(height).cloned();
+            let pruned = {
+                let mut versioned = framework::lock_state(&self.versioned);
+                history
+                    .blocks_floor()
+                    .map_or_else(Vec::new, |floor| versioned.prune_below(floor))
+            };
+            (sealed, evicted, pruned)
+        };
+        let mut backend_guard = framework::lock_state(&self.backend);
+        if let Some(ref mut backend) = *backend_guard {
+            let mut ops = block.flush_ops.unwrap_or_default();
+            if let Some(b) = sealed_block {
+                ops.push(storage::Op::Set {
+                    key: crate::persist::block_key(height),
+                    value: crate::persist::serialize_block(&b),
+                });
+            }
+            if let Some(blob) = block.undo_blob {
+                ops.push(storage::Op::Set { key: crate::persist::undo_key(height), value: blob });
+            }
+            for h in evicted {
+                ops.push(storage::Op::Delete { key: crate::persist::block_key(h) });
+            }
+            for h in pruned_undo {
+                ops.push(storage::Op::Delete { key: crate::persist::undo_key(h) });
+            }
+            let _ = self.flush_pending(backend.as_mut(), ops);
+        }
+        drop(backend_guard);
+        {
+            let mut n = framework::lock_state(&rs.unfinished);
+            *n = n.saturating_sub(1);
+        }
+        rs.drained.notify_all();
+        primitives::Hash(state_root.0)
+    }
+
+    /// Apply a patch to the trie structures and return the new root.
+    fn fold_patch(&self, delta: &PatchDelta) -> alloy_primitives::B256 {
+        let mut leaves = framework::lock_state(&self.trie_leaves);
+        let mut retained = framework::lock_state(&self.retained_branches);
+        let mut cache = framework::lock_state(&self.storage_root_cache);
+        if delta.upserts.is_empty()
+            && delta.removals.is_empty()
+            && let Some(cached) = *framework::lock_state(&self.cached_state_root)
+        {
+            return cached;
+        }
+        let keys = delta.touched_keys();
+        Self::apply_patch_ref(&mut leaves, &mut cache, delta);
+        drop(cache);
+        let root = self.assemble_root(&leaves, &mut retained, &keys, false);
+        alloy_primitives::B256::from(root.0)
+    }
 }

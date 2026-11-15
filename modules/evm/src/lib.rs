@@ -628,6 +628,8 @@ pub struct EvmModule {
     /// and corrupt roots, hence it is maintained only through
     /// `fetch_max` on every insertion.
     retained_depth: std::sync::atomic::AtomicUsize,
+    /// Root-stage state (`docs/root-stage-spec.md`); inert unless enabled.
+    pub(crate) root_stage: rootstage::RootStageState,
     /// accounts were touched since the last computation, the cached
     /// root is returned directly (O(1) fast path).
     cached_state_root: Mutex<Option<alloy_primitives::B256>>,
@@ -709,6 +711,7 @@ impl EvmModule {
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
             retained_depth: std::sync::atomic::AtomicUsize::new(0),
+            root_stage: rootstage::RootStageState::default(),
             trie_leaves_ready: Mutex::new(false),
             cached_state_root: Mutex::new(None),
             exchange: Mutex::new(None),
@@ -747,6 +750,7 @@ impl EvmModule {
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
             retained_depth: std::sync::atomic::AtomicUsize::new(0),
+            root_stage: rootstage::RootStageState::default(),
             trie_leaves_ready: Mutex::new(false),
             cached_state_root: Mutex::new(None),
             exchange: Mutex::new(None),
@@ -812,6 +816,7 @@ impl EvmModule {
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
             retained_depth: std::sync::atomic::AtomicUsize::new(0),
+            root_stage: rootstage::RootStageState::default(),
             trie_leaves_ready: Mutex::new(false),
             cached_state_root: Mutex::new(None),
             exchange: Mutex::new(None),

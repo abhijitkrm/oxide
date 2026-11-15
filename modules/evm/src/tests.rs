@@ -4650,3 +4650,71 @@ fn fee_state_rehydrates_from_storage() {
     let m2 = EvmModule::with_storage(1, 9_999, m.backend_for_test());
     assert_eq!(m2.base_fee(), 875, "reloaded fee matches the evolved value");
 }
+
+// ───────────────────────────────────────────────────────────
+// Root stage (docs/root-stage-spec.md): deferred roots must equal
+// the synchronous roots bit for bit, for every block, including
+// blocks executed ahead of the root stage.
+// ───────────────────────────────────────────────────────────
+
+/// Deterministic per-block mutation: grow (new accounts), change
+/// balances, and delete (zero balance = EIP-158 empty) accounts.
+fn mutate_block(m: &EvmModule, addrs: &[primitives::Address], block: usize) {
+    let n = addrs.len();
+    for i in 0..60 {
+        let idx = (block * 37 + i * 11) % n;
+        let balance = match (block + i) % 7 {
+            0 => 0, // deletes the leaf
+            _ => 1_000_000 + (block * 1000 + i) as u128,
+        };
+        m.mark_touched_for_test(&addrs[idx]);
+        m.fund_account_for_test(&addrs[idx], balance);
+    }
+}
+
+#[test]
+fn deferred_root_matches_sync_root_every_block() {
+    let sync_m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
+    let defer_m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
+    let addrs = make_addrs(3_000);
+    for a in &addrs[..2_000] {
+        sync_m.fund_account_for_test(a, 1_000_000);
+        defer_m.fund_account_for_test(a, 1_000_000);
+    }
+    // Block 1 does the full build on both (the deferred module computes
+    // it synchronously because the trie is not built yet).
+    executor::Module::end_block(&sync_m, primitives::Height::new(1));
+    let r1 = executor::Module::state_root(&sync_m);
+    executor::Module::set_root_deferral(&defer_m, true);
+    executor::Module::end_block(&defer_m, primitives::Height::new(1));
+    assert_eq!(executor::Module::finish_root(&defer_m, primitives::Height::new(1)), r1);
+
+    // Then run in windows of 4 blocks: execute all four (the root stage
+    // lags), then finish them in order.
+    let mut height = 2u64;
+    for _window in 0..6 {
+        let mut expect = Vec::new();
+        for _ in 0..4 {
+            mutate_block(&sync_m, &addrs, height as usize);
+            mutate_block(&defer_m, &addrs, height as usize);
+            executor::Module::end_block(&sync_m, primitives::Height::new(height));
+            expect.push((height, executor::Module::state_root(&sync_m)));
+            executor::Module::end_block(&defer_m, primitives::Height::new(height));
+            height += 1;
+        }
+        for (h, want) in expect {
+            let got = executor::Module::finish_root(&defer_m, primitives::Height::new(h));
+            assert_eq!(got, want, "deferred root diverged at height {h}");
+        }
+    }
+    // Sealed history must agree too (block hash covers the roots).
+    let s = framework::lock_state(&sync_m.history);
+    let d = framework::lock_state(&defer_m.history);
+    for h in 2..height {
+        assert_eq!(
+            s.block(h).map(|b| (b.hash, b.state_root, b.receipts_root, b.tx_root)),
+            d.block(h).map(|b| (b.hash, b.state_root, b.receipts_root, b.tx_root)),
+            "sealed block {h} differs"
+        );
+    }
+}

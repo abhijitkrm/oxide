@@ -448,6 +448,9 @@ impl Module for EvmModule {
     }
 
     fn end_block(&self, height: Height) -> Vec<Event> {
+        if self.root_stage.is_enabled() {
+            return self.end_block_deferred(height.value());
+        }
         // Seal the executed-block history for RPC queries. Every
         // block seals an entry — including blocks with zero EVM txs —
         // so `eth_getBlockByNumber` can distinguish "empty block" from
@@ -546,6 +549,21 @@ impl Module for EvmModule {
 
         framework::lock_state(&self.touched).clear();
         Vec::new()
+    }
+
+    fn set_root_deferral(&self, on: bool) {
+        if !on {
+            self.root_stage.wait_drained();
+        }
+        self.root_stage.enabled.store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    fn defers_root(&self) -> bool {
+        self.root_stage.is_enabled()
+    }
+
+    fn finish_root(&self, height: Height) -> Hash {
+        self.finish_root_deferred(height.value())
     }
 
     #[allow(clippy::too_many_lines)]

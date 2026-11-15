@@ -200,7 +200,7 @@ pub struct ExecutedBlock {
 /// Per-block accumulator used between `begin_block` and `end_block`.
 /// `record` appends; `seal_block` folds it into an [`ExecutedBlock`].
 #[derive(Debug, Default)]
-struct Pending {
+pub(crate) struct Pending {
     /// Transactions recorded so far this block (block order).
     txs: Vec<StoredTx>,
     /// Receipts in the same order as `txs`.
@@ -433,6 +433,52 @@ impl History {
         (receipts_root, tx_root): (B256, B256),
     ) -> Vec<u64> {
         let pending = std::mem::take(&mut self.pending);
+        self.seal_taken(
+            number,
+            timestamp,
+            gas_limit,
+            base_fee,
+            coinbase,
+            state_root,
+            (receipts_root, tx_root),
+            pending,
+        )
+    }
+
+    /// Detach the pending accumulator (the block's txs, receipts, raws
+    /// and traces) so execution of the next block can start while this
+    /// one is sealed later by the root stage.
+    pub(crate) fn take_pending(&mut self) -> Pending {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// `(receipts_root, transactions_root)` of a detached block.
+    pub(crate) fn roots_of(pending: &Pending) -> (B256, B256) {
+        rayon::join(
+            || receipts::receipts_root(&pending.receipts),
+            || {
+                if pending.raws.is_empty() {
+                    EMPTY_TRIE_ROOT
+                } else {
+                    alloy_trie::root::ordered_trie_root(&pending.raws)
+                }
+            },
+        )
+    }
+
+    /// Seal a detached pending block (see [`Self::seal_block_with_roots`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn seal_taken(
+        &mut self,
+        number: u64,
+        timestamp: u64,
+        gas_limit: u64,
+        base_fee: u64,
+        coinbase: Address,
+        state_root: B256,
+        (receipts_root, tx_root): (B256, B256),
+        pending: Pending,
+    ) -> Vec<u64> {
         let cumulative = Receipt::cumulative_gas(&pending.receipts);
         let gas_used = cumulative.last().copied().unwrap_or(0);
         // The block bloom is the bitwise OR of all receipt blooms
