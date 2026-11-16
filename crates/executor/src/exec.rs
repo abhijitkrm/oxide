@@ -473,6 +473,13 @@ impl Executor {
     /// [`Self::finish_staged`]; all others compute theirs here, because
     /// they read live state that the next block will mutate.
     pub(crate) fn execute_block_staged(&self, block: &FinalizedBlock) -> StagedRoot {
+        let started = std::time::Instant::now();
+        let staged = self.execute_block_staged_inner(block);
+        self.stage_times.add_total(started.elapsed());
+        staged
+    }
+
+    fn execute_block_staged_inner(&self, block: &FinalizedBlock) -> StagedRoot {
         // Coordinated halt: above the scheduled height the chain is
         // frozen — no begin/handle/end_block, no fee charge, no
         // attendance record. The returned root is the state at the

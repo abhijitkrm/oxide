@@ -629,11 +629,11 @@ pub struct EvmModule {
     /// and corrupt roots, hence it is maintained only through
     /// `fetch_max` on every insertion.
     retained_depth: std::sync::atomic::AtomicUsize,
-    /// Run qualifying light batches on sender-partitioned lanes (see `lanes`). OFF by
-    /// default: exact (differential-tested) but, on the 8-thread laptop, not faster than the
-    /// serial lane for fresh-recipient transfers (the serial merge into the global account,
-    /// touched, undo and history structures costs as much as the ~0.3 us/tx of execution it
-    /// parallelizes). The serial lane stays the reference and the fallback.
+    /// Run qualifying light batches on sender-partitioned lanes (see `lanes`). On by default:
+    /// exact (differential-tested) and, since the merge was moved onto the lane threads, faster
+    /// than the serial lane (dispatch 1.36 -> 1.0 us/tx synchronous, 2.1 -> 1.4 with the root
+    /// stage; non-qualifying batches fall back at a cost of ~0.01 us/tx). The serial lane stays
+    /// the reference and the fallback.
     pub(crate) exec_lanes: std::sync::atomic::AtomicBool,
     /// Batches executed on lanes (test/bench instrumentation: a qualifying batch must
     /// use them, a non-qualifying one must not).
@@ -721,7 +721,7 @@ impl EvmModule {
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
             retained_depth: std::sync::atomic::AtomicUsize::new(0),
-            exec_lanes: std::sync::atomic::AtomicBool::new(false),
+            exec_lanes: std::sync::atomic::AtomicBool::new(true),
             lane_batches: std::sync::atomic::AtomicU64::new(0),
             root_stage: rootstage::RootStageState::default(),
             trie_leaves_ready: Mutex::new(false),
@@ -762,7 +762,7 @@ impl EvmModule {
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
             retained_depth: std::sync::atomic::AtomicUsize::new(0),
-            exec_lanes: std::sync::atomic::AtomicBool::new(false),
+            exec_lanes: std::sync::atomic::AtomicBool::new(true),
             lane_batches: std::sync::atomic::AtomicU64::new(0),
             root_stage: rootstage::RootStageState::default(),
             trie_leaves_ready: Mutex::new(false),
@@ -830,7 +830,7 @@ impl EvmModule {
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
             retained_depth: std::sync::atomic::AtomicUsize::new(0),
-            exec_lanes: std::sync::atomic::AtomicBool::new(false),
+            exec_lanes: std::sync::atomic::AtomicBool::new(true),
             lane_batches: std::sync::atomic::AtomicU64::new(0),
             root_stage: rootstage::RootStageState::default(),
             trie_leaves_ready: Mutex::new(false),

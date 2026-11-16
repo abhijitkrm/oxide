@@ -155,6 +155,8 @@ fn rig(accts: &[Account], capacity: usize) -> Rig {
             None => Executor::new(capacity + 100),
         };
     let evm = Arc::new(EvmModule::new(1, 7_000_000_000));
+    // CHAIN_MIX_EVM_LANES=0 turns the sender-partitioned execution lanes off (default: on).
+    evm.set_exec_lanes(std::env::var("CHAIN_MIX_EVM_LANES").map_or(true, |v| v != "0"));
     for a in accts {
         // Native ledger balance (fees, escrow, base custody) and EVM balance (transfers).
         framework::Balances::mint(evm.as_ref(), &a.addr, u64::MAX / 4);
@@ -291,7 +293,7 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
 
     // Propose + finalize until the mempool is drained.
     eprintln!("phase: execution start ({mix}, {threads} ingest threads)");
-    let (mut propose, mut finalize) = (0.0f64, 0.0f64);
+    let (mut propose, mut finalize, mut fin_call) = (0.0f64, 0.0f64, 0.0f64);
     let mut height = 1u64;
     let mut executed_txs = 0usize;
     loop {
@@ -310,7 +312,9 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
             txs: proposal.txs,
             signers: Vec::new(),
         };
+        let tf = Instant::now();
         let _ = executor.finalize_block(&block);
+        fin_call += tf.elapsed().as_secs_f64();
         if lane_mode == "sync" {
             let _ = executor.attest_state(Height::new(height));
         }
@@ -318,6 +322,11 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
         height += 1;
     }
 
+    eprintln!(
+        "finalize_block call time: {:.3} us/tx, propose {:.3} us/tx",
+        fin_call * 1e6 / executed_txs as f64,
+        propose * 1e6 / executed_txs as f64
+    );
     // Lane modes: finalize_block only enqueues, so wait for the last height's attestation
     // (executed, and rooted when the root stage is on) and charge the wait to `finalize`.
     if lane_mode != "sync" {
@@ -344,10 +353,11 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
     let st = executor.stage_report();
     let (plan, dispatch, end_block, root) = st.us_per_tx();
     eprintln!(
-        "stages,{mix},{threads},blocks={},txs={},plan_us={plan:.3},dispatch_us={dispatch:.3},end_block_us={end_block:.3},state_root_us={root:.3},serial_floor_tps={:.0},loop_tps={:.0}",
+        "stages,{mix},{threads},blocks={},txs={},plan_us={plan:.3},dispatch_us={dispatch:.3},end_block_us={end_block:.3},state_root_us={root:.3},serial_floor_tps={:.0},exec_total_us={:.3},loop_tps={:.0}",
         st.blocks,
         st.txs,
         1e6 / (plan + end_block + root).max(1e-9),
+        st.total_ns as f64 / (st.txs.max(1) as f64 * 1_000.0),
         rate(executed_txs, propose + finalize),
     );
     println!(
