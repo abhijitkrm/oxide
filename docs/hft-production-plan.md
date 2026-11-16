@@ -207,7 +207,7 @@ number, so the two are not comparable until W4/W5 land.
 | W3 execution | exchange exec now ~0.33 us/order in bundles; TODO: resident dense accounts, batch ledger deltas, per-market parallel exec (single exec thread is the bound at ~2M orders/s), CLOB-at-100k-accounts EVM-account touch cost |
 | W4 commitment | root stage IMPLEMENTED behind `with_root_stage` (default off; audit before default-on; `docs/root-stage-spec.md`); sharded root, journal pipelining TODO |
 | W5 replication | NOT STARTED (needs multi-host; decision 5 says single node first) |
-| W6 EVM | propose fixed, end_block 3x cheaper, dispatch 5.3 -> 3.4 us/tx; TODO: parallel dispatch granularity, gas-limit x block-time grid (decision 3) |
+| W6 EVM | propose fixed, end_block 3x cheaper, dispatch 5.3 -> 1.4 us/tx (serial lane for light batches), gas-limit x block-time grid measured (devlog). Binding limit is signature recovery (34 us/core): 8 cores ~200k tx/s, 1M tx/s needs ~34 cores. Block budget defaults raised to 600M gas / 8 MiB. Exec lane 3.57 us/tx (~280k tx/s), loop 196k tx/s with the root stage. Multi-lane work built: lanes (opt-in, exact, not faster on the laptop) and a seal worker with lazy EIP-2935 (end_block 2.0 -> 0.37 us/tx; loop 226k tx/s with the root stage). `docs/multi-lane-evm-spec.md`; speed claims need the x86 box |
 | W7 production grade | PARTIAL: SLO labels, CI ratio gates. TODO: external security review, decoder fuzz targets, soak, upgrade drills |
 | W8 rig/box | pre-flight dry run, bench audit and expected ranges still TODO; box skipped by decision |
 

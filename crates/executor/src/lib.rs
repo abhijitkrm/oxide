@@ -1218,6 +1218,11 @@ pub trait Module: Send + Sync {
         false
     }
 
+    /// Start the module's own stage workers (called once by the executor when the root stage
+    /// is on, after `set_root_deferral(true)`). The EVM starts its seal worker here. Default:
+    /// none, the module does its stage work inline.
+    fn spawn_workers(self: Arc<Self>) {}
+
     /// Root-stage half of a deferred block: finish it and return the
     /// module's state root for `height`, equal to the synchronous root.
     /// Only called for modules whose [`Self::defers_root`] is true.

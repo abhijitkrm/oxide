@@ -148,7 +148,12 @@ struct Rig {
 }
 
 fn rig(accts: &[Account], capacity: usize) -> Rig {
-    let mut executor = Executor::new(capacity + 100);
+    // CHAIN_MIX_PAR_THRESHOLD: runs of at least this many txs take the parallel path (default: executor's).
+    let mut executor =
+        match std::env::var("CHAIN_MIX_PAR_THRESHOLD").ok().and_then(|v| v.parse().ok()) {
+            Some(t) => Executor::with_config(capacity + 100, t),
+            None => Executor::new(capacity + 100),
+        };
     let evm = Arc::new(EvmModule::new(1, 7_000_000_000));
     for a in accts {
         // Native ledger balance (fees, escrow, base custody) and EVM balance (transfers).
@@ -244,6 +249,17 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
     // CHAIN_MIX_LANE: `sync` (default; finalize executes inline), `lane` (async exec lane) or
     // `root` (exec lane + root stage thread, docs/root-stage-spec.md).
     let lane_mode = std::env::var("CHAIN_MIX_LANE").unwrap_or_else(|_| "sync".into());
+    // CHAIN_MIX_GAS_LIMIT: the block gas limit (default: the node's 600M, `consensus.max_block_gas`). Together with the
+    // block interval it sets the transactions per block (plan: gas-limit x block-time grid).
+    let gas_limit = std::env::var("CHAIN_MIX_GAS_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(600_000_000);
+    let executor = executor.with_chain_params(Arc::new(types::ChainParams {
+        max_gas: std::sync::atomic::AtomicU64::new(gas_limit),
+        max_bytes: std::sync::atomic::AtomicU64::new(8 << 20),
+        min_fee: std::sync::atomic::AtomicU64::new(0),
+    }));
     let executor = if lane_mode == "root" { executor.with_root_stage(true) } else { executor };
     let executor = Arc::new(executor);
     if lane_mode != "sync" {

@@ -292,8 +292,8 @@ engine = "oxidebft"
 # Rule of thumb: base_timeout > 2 × worst-case RTT + jitter.
 base_timeout_ms = 5000
 max_timeout_ms = 60000
-max_block_bytes = 1048576
-max_block_gas = 1000000000
+max_block_bytes = 8388608
+max_block_gas = 600000000
 
 [executor]
 max_mempool_entries = 10000

@@ -24988,3 +24988,73 @@ exchange/perps and every module's tests are unchanged. Mutators now require `K: 
 Measured (laptop, 8 threads, real executor): bundle dispatch 45 -> 21 us per 64-order bundle; bundle loop 1.05-1.13M ->
 1.60M (sync) / 1.99M (root stage) orders/s; end-to-end 1.34M / 1.61M orders/s (per-order transactions at the start of the day:
 94k, 17x). Per-order CLOB transactions: dispatch 1.10 -> 0.43 us/tx, loop 237k -> 434k tx/s.
+
+### EVM side: serial lane for light batches, admission physics, gas-limit x block-time grid
+
+**1. Parallel dispatch.** Phase timers inside `execute_parallel_decoded` (1,428 transfers, 8 threads): speculation 2.5 ms
+with 15-19 ms of summed per-tx busy time (one tx costs ~1.05 us alone and ~10 us when 8 threads run), i.e. all workers busy
+but each tx ~10x slower: shared-structure contention (single `RwLock` version store, refcounts, allocator) swamps ~1 us of
+work. Sharding the store and mimalloc each changed nothing, so speculation does not scale for light transactions at this
+grain. The existing serial lane (`execute_decoded`: fast paths + revm under one lock, the reference the parallel path is
+tested against) costs 1.4 us/tx versus 3.4 us/tx through speculation. `handle_batch_parallel_preverified` now takes the
+serial lane unless at least 1 in `HEAVY_TX_SHARE_DENOM` (4) transactions carries calldata or creates a contract; contract-
+heavy blocks keep speculating (revm time 10-50 us/tx dominates there). Tests: light batch through both paths gives identical
+outcomes, state root and sealed roots (`light_batches_take_serial_lane_with_identical_results`); classifier tests.
+Plain-transfer loop with the root stage: 121-136k -> 141k tx/s; dispatch 3.4 -> 1.4 us/tx.
+
+**2. Serial phases / admission.** Per-tx serial cost on the exec lane is now plan 0.35 + dispatch 1.4 + end_block 2.1 (of which
+header tries `roots_of` 1.1 us/tx, trie patch 0.2) = ~3.9 us, a ~255k tx/s single-lane ceiling at large blocks. Admission is
+lower: one sender recovery is 34 us/core on this laptop (`measure_recover_sender_cost`), ingest costs 30 us per tx on one
+thread of which 29 us is the recovery (everything else < 1 us), and 8 mixed P/E cores give ~147k tx/s. So the EVM target is
+bound by signature physics, not by the executor: 1M tx/s needs ~30-35 cores of secp256k1 recovery alone, and an 8-core box tops
+out near 200k tx/s (16 cores ~450k). Exec-side pipelining of the header tries (needs a lazy EIP-2935 write, only forced when a
+block contains contract-touching txs) would lift the exec lane to ~430k tx/s but does not matter until >= 9 cores admit.
+
+**3. Gas-limit x block-time grid** (root stage, 8 threads, plain transfers, `CHAIN_MIX_GAS_LIMIT`):
+
+| Block gas limit | Txs/block | Exec us/tx | Exec ms/block | Loop tx/s |
+|---|---|---|---|---|
+| 30M | 1,428 | 5.15 | 7.4 | 131k |
+| 60M | 2,856 | 4.77 | 13.6 | 144k |
+| 150M | 7,140 | 4.06 | 29 | 165k |
+| 300M | 14,280 | 3.90 | 55.7 | 177k |
+| 1.5G | 71,400 | 4.07 | 290 | 170k |
+
+Throughput = min(gas_limit / 21,000 / block_time, ~255k exec ceiling). At the current 30M gas the chain is gas-bound long
+before it is CPU-bound: 14k tx/s at a 100 ms block, 71k at 20 ms. To feed the 255k exec ceiling: >= 270M gas at 50 ms or
+>= 540M gas at 100 ms blocks (exec must also fit inside the block interval: 55 ms for 300M). 1M tx/s of transfers is 21 Ggas/s,
+i.e. 2.1G gas per 100 ms block (exec 0.4 s per block at 4 us/tx: 4x too slow for one lane) plus ~34 cores of signatures.
+
+### Block budget defaults raised to the measured capacity (600M gas, 8 MiB)
+
+Decision (user, 15 Nov): raise gas to maximum capacity, then multi-core/multi-lane work. The node's effective budget is
+`consensus.max_block_gas` / `max_block_bytes` (the 30M figure was only the bare `Executor` default used by benches and
+tests; the node passes the config through `with_gas_limit`). Old defaults were 1G gas but **1 MiB bytes**, so bytes bound
+first at ~9.5k transfers (~200M gas). New defaults: gas 600M (a 100 ms block at the measured ~255k tx/s lane ceiling is ~25.5k
+transfers = 540M gas, plus ~10%), bytes 8 MiB (a 600M block of transfers is ~3.1 MB; stays under the 16 MiB message cap).
+Governable at runtime (`chain.block_gas_limit`). `chain_mix` now defaults to the same budget. Measured (laptop, 8 threads,
+400k signed transfers, 14 blocks of 28.5k): loop 126k tx/s synchronous, 176k with the root stage (42k at the start of the
+day, 4.2x); exec cost 3.97 us/tx.
+
+### EVM exec lane: hash once, clone only for the backend (loop 176k -> 196k tx/s)
+
+At 28.5k txs per block (600M gas) the per-block serial work was visible: `plan` hashed every tx (0.2 us) and
+`take_preverified_for` hashed it again; the sealed-block clone for persistence cost ~3 ms per block even with no backend.
+Now one parallel BLAKE3 pass per block (>= 512 txs) feeds both, and the clone is skipped without a backend. plan 0.35 -> 0.11
+us/tx, end_block 2.17 -> 2.0; transfers with the root stage: loop 176k -> 196k tx/s (sync 126k -> 136k); exec lane 3.57 us/tx
+(~280k tx/s).
+Tried and reverted: a parallel ordered trie for the receipts/transactions roots (subtries split by the keys' shared nibble
+prefix, differential-tested bit-identical over 0..70k items): 3-4x faster in isolation (46 -> 10 ms for 28.5k items) but 
+end_block got slower in the pipeline (2.17 -> 2.6 us/tx) because on 6P+2E cores the root-stage and ingest threads already
+use the cores the parallel trie wants; and `versioned.push` (~12 ms per 28k-account block: the historical-undo index) cannot
+move off the exec stage without making historical reads at the head height wrong. Both need dedicated cores (the 8/16-core
+x86 box) to evaluate honestly. See `docs/multi-lane-evm-spec.md`.
+
+### Multi-lane work built (lanes opt-in, seal worker on with the root stage)
+
+See `docs/multi-lane-evm-spec.md` section 6. Sender-partitioned execution lanes are exact but 5-15% slower than the serial lane
+on this laptop (serial merge into four global structures costs ~14x the parallel part), so they ship opt-in. The seal worker with
+a lazy EIP-2935 write takes the seal off the exec lane: `end_block` 2.0 -> 0.37 us/tx, EVM transfer loop 196k -> 226k tx/s with the
+root stage (42k at the start of the day, 5.4x). Found on the way: `end_block_ctx` read the sealed block's gas for the base-fee
+update, which a seal worker cannot provide in time (fee drift); it now uses the gas recorded on the exec stage. `scripts/bench-gate.sh`
+G3 floor lowered 0.45 -> 0.35 because 1k-account CLOB got faster while 100k stays bound by EVM-account touches (target 0.67 still open).

@@ -17,6 +17,13 @@ use super::{
 use revm::database_interface::DatabaseRef;
 use revm::state::EvmState;
 
+/// A batch is "heavy" (worth speculating in parallel) when at least one in this
+/// many transactions carries calldata or creates a contract (unit: 1/N of the
+/// batch). Origin: laptop, 8 threads: plain-transfer blocks run 2.5x faster
+/// serially (1.4 vs 3.4 us/tx); revm-bound txs (10-50 us) gain from
+/// speculation. Raising N sends more mixed blocks down the serial lane.
+const HEAVY_TX_SHARE_DENOM: usize = 4;
+
 /// The canonical account-info key at the commit point.
 ///
 /// Goes through `basic_ref` (not `cache.accounts.get`) so
@@ -595,6 +602,7 @@ impl EvmModule {
         if msgs.is_empty() {
             return Vec::new();
         }
+        self.resolve_pending_parent_hash();
 
         // Phase 1: decode + recover all senders in parallel.
         // Same as handle_batch — rayon parallelizes the 88%-of-cost
@@ -702,7 +710,62 @@ impl EvmModule {
             })
             .collect();
 
+        // Speculative parallelism only pays when the transactions are heavy
+        // enough to amortize its fixed per-tx cost (a `CacheDB`/version-store
+        // wrapper, shared-lock traffic and a serial commit): measured on a
+        // laptop, a block of plain transfers costs ~1.4 us/tx on the serial
+        // lane and ~3.4 us/tx through speculation at 8 threads, because the
+        // per-tx work (~1 us) is smaller than the contention it creates.
+        // Blocks with enough contract-touching transactions keep
+        // speculating, where revm time (10-50 us/tx) dominates.
+        // A batch of plain transfers cannot read the history contract, so the owed EIP-2935 write
+        // can wait for end of block (`resolve_pending_parent_hash`); anything else settles it first.
+        if !Self::all_plain_transfers(&decoded) {
+            self.resolve_pending_parent_hash();
+        }
+        if Self::prefer_serial(&decoded) {
+            // Sender-partitioned lanes when the batch qualifies (they hand the batch
+            // back untouched otherwise); the serial lane is the reference.
+            let decoded = if self.exec_lanes.load(std::sync::atomic::Ordering::Relaxed) {
+                match self.execute_lanes(decoded) {
+                    Ok(results) => return results,
+                    Err(back) => back,
+                }
+            } else {
+                decoded
+            };
+            return self.execute_decoded(ctx, decoded);
+        }
         self.execute_parallel_decoded(ctx, decoded)
+    }
+
+    /// Whether every transaction in the batch is a decoded plain value transfer (a call with no
+    /// calldata, access list or authorisations): such a batch cannot execute contract code, so
+    /// it cannot read the history-storage contract.
+    pub(crate) fn all_plain_transfers(decoded: &[DecodedTx]) -> bool {
+        decoded.iter().all(|d| {
+            d.as_ref().is_ok_and(|(signed, ..)| {
+                matches!(signed.to(), tx::TxKind::Call(_))
+                    && signed.data().is_empty()
+                    && signed.access_list().is_empty()
+                    && signed.authorization_list().is_empty()
+            })
+        })
+    }
+
+    /// Whether a decoded batch is light enough that the serial lane beats
+    /// speculation: fewer than one in [`HEAVY_TX_SHARE_DENOM`] transactions
+    /// carries calldata or creates a contract (the ones that reach revm).
+    pub(crate) fn prefer_serial(decoded: &[DecodedTx]) -> bool {
+        let heavy = decoded
+            .iter()
+            .filter(|d| {
+                d.as_ref().is_ok_and(|(signed, ..)| {
+                    !matches!(signed.to(), tx::TxKind::Call(_)) || !signed.data().is_empty()
+                })
+            })
+            .count();
+        heavy.saturating_mul(HEAVY_TX_SHARE_DENOM) < decoded.len()
     }
 
     /// Shared parallel execution loop for decoded transactions.
@@ -1362,6 +1425,24 @@ impl EvmModule {
         results
     }
 
+    /// The `evm_call` event for a finished transaction's receipt (shared by the serial
+    /// recording path and the lane path, which builds it in parallel).
+    pub(crate) fn evm_call_event(receipt: &receipts::Receipt, base_fee: u64) -> Event {
+        let status_str = if receipt.status { "success" } else { "revert" };
+        let contract_info =
+            receipt.contract_address.map(|a| format!(" contract={a}")).unwrap_or_default();
+        let log_count = receipt.logs.len();
+        Event {
+            module: "evm",
+            kind: "evm_call",
+            data: format!(
+                "gas_used={} status={} base_fee={} logs={}{}",
+                receipt.gas_used, status_str, base_fee, log_count, contract_info
+            )
+            .into_bytes(),
+        }
+    }
+
     /// Convert a revm `ExecutionResult` to a vector of Oxide events,
     /// recording the transaction into the executed-block history.
     ///
@@ -1392,23 +1473,7 @@ impl EvmModule {
                         call_trace,
                     );
                 }
-                let status_str = if receipt.status { "success" } else { "revert" };
-                let contract_info =
-                    receipt.contract_address.map(|a| format!(" contract={a}")).unwrap_or_default();
-                let log_count = receipt.logs.len();
-                Ok(vec![Event {
-                    module: "evm",
-                    kind: "evm_call",
-                    data: format!(
-                        "gas_used={} status={} base_fee={} logs={}{}",
-                        receipt.gas_used,
-                        status_str,
-                        self.current_base_fee(),
-                        log_count,
-                        contract_info
-                    )
-                    .into_bytes(),
-                }])
+                Ok(vec![Self::evm_call_event(&receipt, self.current_base_fee())])
             }
             Err(e) => Err(e),
         }
