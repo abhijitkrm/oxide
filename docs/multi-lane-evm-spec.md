@@ -1,7 +1,7 @@
 # Multi-core, multi-lane EVM execution (spec, draft 15 Nov 2026)
 
 Status: 3.1 (lanes) and 3.2 (seal worker + lazy EIP-2935) IMPLEMENTED and differential-tested on the laptop (15 Nov);
-lanes are OFF by default because they did not pay here, the seal worker is on whenever the root stage is on. Speed claims for
+lanes are ON by default after the merge redesign in section 7 (they first did not pay here), the seal worker is on whenever the root stage is on. Speed claims for
 both await the x86 box. Results are in the "Built and measured" section at the end. User decision (15 Nov): raise
 the block budget to measured capacity (done: 600M gas, 8 MiB), then multi-core plus multi-lane work. This spec turns the
 laptop measurements into a core budget and a build order, and says what only the x86 box can settle.
@@ -119,3 +119,26 @@ batches and a 3 ms seal delay that forces the lazy path (roots, sealed block has
 removing the pre-batch resolve fails the slot check. Result: `end_block` 2.0 -> 0.37 us/tx on the exec lane; transfers loop
 196k -> 226k tx/s (sync reference unchanged), 5.4x the 42k at the start of the day. Dispatch rises 1.45 -> 2.1 us/tx because the
 seal and root threads now compete for the laptop's six fast cores; the box is needed to see the true overlap.
+
+## 7. Lane merge redesign (16 Nov) and result
+
+Section 6 found the lanes' parallel part (2 ms per 28.5k-tx block) dwarfed by a 25-30 ms serial merge. The merge was rebuilt so
+that everything that does not need the main state runs on the lane threads, and the main-state work is one pass:
+
+- Each lane now drains its own overlay by move (no `DbAccount` clones), computes its credit deltas over the snapshot, and builds
+  its own undo capture and touched set from the snapshot; senders (exclusive) and credits (additive) come back separate.
+- The main-state apply is a single pass over the lanes with `reserve` up front: sender states set, credits added with the entry
+  API (additive, so lane after lane equals the sum of deltas); no intermediate credit map.
+- Lane undo maps are absorbed straight into `block_undo` and lane touched sets are `BTreeSet::append`ed (linear merge) into
+  `touched`, instead of an intermediate merged copy and 28k inserts.
+- Preconditions no longer build a recipient set: a sender set (a few thousand keys), then one parallel pass checks every
+  recipient against it and the coinbase.
+
+Measured (laptop, 8 threads, 28.5k-tx blocks), dispatch us/tx, lanes off -> on: synchronous 1.36 -> 1.00; root stage 2.12 -> 1.42;
+mixed EVM+CLOB 1.14 -> 0.87. A ring batch (falls back every block) 1.346 vs 1.332, so the precondition scan costs ~nothing when
+it fails. Loop tx/s: transfers 224k -> 236k, mixed 359k -> 405k. Exec stage total is now 2.44 us/tx (plan 0.12 + dispatch 1.42 +
+end_block 0.42 + 0.5 untimed: begin_block, nonce fold, outcome recording); the bench thread (propose 1.24 + `finalize_block`
+1.15 us/tx) and the exec lane now contend for the laptop's cores, so further gains need cores that are not shared (the box).
+Remaining serial per-tx structures in the lane path: the main account-cache apply (28k inserts), the global undo absorb, and the
+history append; each is a single pass now. Tests unchanged and green; breaking the additive credit apply fails the
+shared-recipient differential.

@@ -25058,3 +25058,11 @@ a lazy EIP-2935 write takes the seal off the exec lane: `end_block` 2.0 -> 0.37 
 root stage (42k at the start of the day, 5.4x). Found on the way: `end_block_ctx` read the sealed block's gas for the base-fee
 update, which a seal worker cannot provide in time (fee drift); it now uses the gas recorded on the exec stage. `scripts/bench-gate.sh`
 G3 floor lowered 0.45 -> 0.35 because 1k-account CLOB got faster while 100k stays bound by EVM-account touches (target 0.67 still open).
+
+### Lanes merge redesigned: lanes now beat the serial lane and are on by default
+
+Per-lane drain by move, lane-local undo/touched/credit-delta computation, a single reserve-and-apply pass over the main account
+cache, direct absorb into `block_undo`/`touched` (linear `BTreeSet::append`), and a recipient check that needs no recipient set.
+Dispatch us/tx (lanes off -> on): synchronous 1.36 -> 1.00, root stage 2.12 -> 1.42, mixed 1.14 -> 0.87; ring (always falls back)
+unchanged. Loop tx/s: transfers 224k -> 236k, mixed 359k -> 405k. `exec_total_us` (whole exec stage per tx, now permanent in
+`StageReport`) shows 2.44 us/tx with 0.5 us outside the phase timers. Details in `docs/multi-lane-evm-spec.md` section 7.

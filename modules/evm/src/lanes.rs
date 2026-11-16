@@ -51,13 +51,83 @@ struct PreparedRecord {
     event: Event,
 }
 
-/// One lane's output: per-tx results by canonical index, plus the lane's overlay.
+/// A sender's final state in a lane: `(address, balance, nonce, code_hash)`.
+type SenderState = (EvmAddress, U256, u64, alloy_primitives::B256);
+
+/// A non-sender account a lane loaded: `(address, account, credit delta over the snapshot)`.
+type Credit = (EvmAddress, revm::database::DbAccount, U256);
+
+/// One lane's output, built entirely on the lane's thread.
 struct LaneOut {
+    /// Per-tx results by canonical index.
     results: Vec<(usize, revm::context::result::ExecutionResult)>,
-    db: CacheDB<SharedCacheDB>,
+    /// Final states of this lane's senders (exclusive to the lane).
+    senders: Vec<SenderState>,
+    /// Every other account the lane loaded: `(address, account, credit delta over the snapshot)`.
+    credits: Vec<Credit>,
+    /// Pre-block values of the accounts the lane touched, first write wins.
+    undo: HashMap<EvmAddress, Option<versioned::UndoAccount>>,
+    /// Accounts the lane touched (senders and recipients).
+    touched: std::collections::BTreeSet<EvmAddress>,
 }
 
 impl EvmModule {
+    /// Run one lane: its senders' transactions in canonical sub-order on a private overlay of
+    /// `snapshot`, then its undo/touched capture and account classification. `None` aborts the
+    /// whole lane scheme (the caller falls back to the serial lane).
+    fn run_lane(
+        idxs: &[usize],
+        decoded: &[DecodedTx],
+        snapshot: &Arc<CacheDB<revm::database_interface::EmptyDB>>,
+        coinbase: EvmAddress,
+        base_fee: u64,
+        spec: revm::primitives::hardfork::SpecId,
+        senders: &HashSet<EvmAddress>,
+    ) -> Option<LaneOut> {
+        let mut db = CacheDB::new(SharedCacheDB(Arc::clone(snapshot)));
+        let mut results = Vec::with_capacity(idxs.len());
+        let mut lane_undo = versioned::BlockUndo::default();
+        let mut touched = std::collections::BTreeSet::new();
+        for &i in idxs {
+            let Ok((signed, caller, ..)) = &decoded[i] else { return None };
+            let r = Self::try_native_transfer(signed, *caller, &mut db, coinbase, base_fee, spec)?;
+            // Only a success is a plain transfer receipt; anything else belongs to revm.
+            if !matches!(r, revm::context::result::ExecutionResult::Success { .. }) {
+                return None;
+            }
+            results.push((i, r));
+            // Pre-block values come from the snapshot (the lane's overlay already holds
+            // post-transaction state); `capture` keeps the first.
+            lane_undo.capture(*caller, snapshot.cache.accounts.get(caller));
+            touched.insert(*caller);
+            if let tx::TxKind::Call(to) = signed.to() {
+                let to = EvmAddress::from(to.0);
+                lane_undo.capture(to, snapshot.cache.accounts.get(&to));
+                touched.insert(to);
+            }
+        }
+        let mut sender_states = Vec::new();
+        let mut credits = Vec::new();
+        for (addr, acct) in db.cache.accounts {
+            if senders.contains(&addr) {
+                sender_states.push((addr, acct.info.balance, acct.info.nonce, acct.info.code_hash));
+                continue;
+            }
+            let base = snapshot.cache.accounts.get(&addr).map_or(U256::ZERO, |a| a.info.balance);
+            // Credits only ever add; a smaller balance would mean the lane debited a non-sender,
+            // which the preconditions rule out.
+            let delta = acct.info.balance.checked_sub(base)?;
+            credits.push((addr, acct, delta));
+        }
+        Some(LaneOut {
+            results,
+            senders: sender_states,
+            credits,
+            undo: lane_undo.accounts,
+            touched,
+        })
+    }
+
     /// Whether `d` is a plain value transfer by shape (the preconditions that need
     /// no state): a call with empty calldata, access list and authorisations.
     fn is_plain_transfer(signed: &tx::SignedTx) -> bool {
@@ -86,20 +156,29 @@ impl EvmModule {
         }
         let coinbase = *framework::lock_state(&self.coinbase);
 
-        // Precondition 1 and 2 (shape and cross-lane independence).
+        // Precondition 1 and 2 (shape and cross-lane independence): the sender set first (a few
+        // thousand distinct keys), then every recipient is checked against it in parallel.
         let mut senders: HashSet<EvmAddress> = HashSet::new();
-        let mut recipients: HashSet<EvmAddress> = HashSet::new();
         for item in &decoded {
             let Ok((signed, caller, ..)) = item else { return Err(decoded) };
             if !Self::is_plain_transfer(signed) || *caller == coinbase {
                 return Err(decoded);
             }
-            senders.insert(*caller);
-            if let tx::TxKind::Call(to) = signed.to() {
-                recipients.insert(EvmAddress::from(to.0));
+            if !senders.contains(caller) {
+                senders.insert(*caller);
             }
         }
-        if recipients.contains(&coinbase) || !recipients.is_disjoint(&senders) {
+        let crosses = decoded.par_iter().any(|item| match item {
+            Ok((signed, ..)) => match signed.to() {
+                tx::TxKind::Call(to) => {
+                    let to = EvmAddress::from(to.0);
+                    to == coinbase || senders.contains(&to)
+                }
+                tx::TxKind::Create => true,
+            },
+            Err(_) => true,
+        });
+        if crosses {
             return Err(decoded);
         }
 
@@ -121,143 +200,95 @@ impl EvmModule {
         let base_fee = self.current_base_fee();
         let spec = self.spec;
 
-        // Run the lanes (read-only on the shared snapshot, private overlays).
+        // Run the lanes (read-only on the shared snapshot, private overlays). Everything that does
+        // not need the main state is built here, in parallel: the lane's results, its undo capture
+        // and touched set (from the snapshot, first write wins as in the serial lane), and its final
+        // account states split into exclusive sender states and additive credits.
         let outs: Option<Vec<LaneOut>> = lanes
             .par_iter()
             .map(|idxs| {
-                let mut db = CacheDB::new(SharedCacheDB(Arc::clone(&snapshot)));
-                let mut results = Vec::with_capacity(idxs.len());
-                for &i in idxs {
-                    let Ok((signed, caller, ..)) = &decoded[i] else { return None };
-                    let r = Self::try_native_transfer(
-                        signed, *caller, &mut db, coinbase, base_fee, spec,
-                    )?;
-                    // Only a success is a plain transfer receipt; anything else
-                    // belongs to revm.
-                    if !matches!(r, revm::context::result::ExecutionResult::Success { .. }) {
-                        return None;
-                    }
-                    results.push((i, r));
-                }
-                Some(LaneOut { results, db })
+                Self::run_lane(idxs, &decoded, &snapshot, coinbase, base_fee, spec, &senders)
             })
             .collect();
         let Some(outs) = outs else { return Err(decoded) };
 
-        // Merge preparation, still without touching the main state: sender states
-        // (exclusive), summed credit deltas for everything else.
-        let base_balance = |a: &EvmAddress| -> U256 {
-            snapshot.cache.accounts.get(a).map_or(U256::ZERO, |acc| acc.info.balance)
-        };
-        let mut sender_final: Vec<(EvmAddress, U256, u64, alloy_primitives::B256)> = Vec::new();
-        let mut credit: HashMap<EvmAddress, (revm::database::DbAccount, U256)> = HashMap::new();
-        for out in &outs {
-            for (addr, acct) in &out.db.cache.accounts {
-                if senders.contains(addr) {
-                    sender_final.push((
-                        *addr,
-                        acct.info.balance,
-                        acct.info.nonce,
-                        acct.info.code_hash,
-                    ));
-                    continue;
-                }
-                let base = base_balance(addr);
-                // Credits only ever add; a smaller balance would mean the lane
-                // debited a non-sender, which the preconditions rule out.
-                let Some(delta) = acct.info.balance.checked_sub(base) else {
-                    return Err(decoded);
-                };
-                let entry = credit.entry(*addr).or_insert_with(|| (acct.clone(), U256::ZERO));
-                entry.1 = entry.1.saturating_add(delta);
-                // Prefer a template that was actually modified (Touched).
-                if acct.account_state == revm::database::AccountState::Touched {
-                    entry.0.account_state = revm::database::AccountState::Touched;
-                    entry.0.info.code_hash = acct.info.code_hash;
-                }
-            }
-        }
-
-        // Per-tx results by canonical index, and the pre-block undo (from the
-        // snapshot, first write wins as in the serial lane).
+        // Per-tx results by canonical index (moved, not cloned).
         let mut results_by_idx: Vec<Option<revm::context::result::ExecutionResult>> =
-            vec![None; decoded.len()];
-        for out in &outs {
-            for (i, r) in &out.results {
-                results_by_idx[*i] = Some(r.clone());
+            (0..decoded.len()).map(|_| None).collect();
+        let mut total_accounts = 0usize;
+        let mut undo_guard = framework::lock_state(&self.block_undo);
+        let mut touched_guard = framework::lock_state(&self.touched);
+        let mut lane_states: Vec<(Vec<SenderState>, Vec<Credit>)> = Vec::with_capacity(outs.len());
+        for out in outs {
+            for (i, r) in out.results {
+                results_by_idx[i] = Some(r);
             }
-        }
-        let mut local_undo = versioned::BlockUndo::default();
-        let mut local_touched: HashSet<EvmAddress> = HashSet::new();
-        for item in &decoded {
-            let Ok((signed, caller, ..)) = item else { return Err(decoded) };
-            local_undo.capture(*caller, snapshot.cache.accounts.get(caller));
-            if let tx::TxKind::Call(to) = signed.to() {
-                let to = EvmAddress::from(to.0);
-                local_undo.capture(to, snapshot.cache.accounts.get(&to));
-                local_touched.insert(to);
+            // Cross-lane first-write-wins: lanes captured from the same snapshot, so any entry for
+            // an address is the same value; keep the first.
+            undo_guard.accounts.reserve(out.undo.len());
+            for (addr, entry) in out.undo {
+                undo_guard.accounts.entry(addr).or_insert(entry);
             }
-            local_touched.insert(*caller);
+            // `BTreeSet::append` merges two sorted sets linearly, far cheaper than 28k inserts.
+            let mut t = out.touched;
+            touched_guard.append(&mut t);
+            total_accounts += out.senders.len() + out.credits.len();
+            lane_states.push((out.senders, out.credits));
         }
-        local_undo.capture(coinbase, snapshot.cache.accounts.get(&coinbase));
-        local_touched.insert(coinbase);
+        // The coinbase receives every tip: capture/touch it once.
+        undo_guard.capture(coinbase, snapshot.cache.accounts.get(&coinbase));
+        touched_guard.insert(coinbase);
+        drop((undo_guard, touched_guard));
 
-        // Everything checked: release the lane overlays and the snapshot so the main
-        // state is uniquely owned, then apply.
-        drop(outs);
+        // Everything checked: release the snapshot so the main state is uniquely owned, then apply
+        // in one pass. Credits are additive, so applying lane after lane equals the sum of deltas.
         drop(snapshot);
         {
             let mut guard = framework::lock_state(&self.db);
             let db = Arc::make_mut(&mut *guard);
-            for (addr, balance, nonce, code_hash) in sender_final {
-                let slot = db.cache.accounts.entry(addr);
-                let acct = slot.or_insert_with(revm::database::DbAccount::new_not_existing);
-                acct.info.balance = balance;
-                acct.info.nonce = nonce;
-                acct.info.code_hash = if code_hash == revm::primitives::B256::ZERO {
-                    revm::primitives::KECCAK_EMPTY
-                } else {
-                    code_hash
-                };
-                acct.account_state = revm::database::AccountState::Touched;
-            }
-            for (addr, (template, delta)) in credit {
-                match db.cache.accounts.entry(addr) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        // An existing main-state entry keeps its storage and code; only
-                        // the fields the serial lane would change are updated. An
-                        // unmodified account (zero delta, not Touched) is left as is.
-                        if template.account_state == revm::database::AccountState::Touched {
-                            let acct = e.get_mut();
-                            acct.info.balance = acct.info.balance.saturating_add(delta);
-                            if acct.info.code_hash == revm::primitives::B256::ZERO {
-                                acct.info.code_hash = revm::primitives::KECCAK_EMPTY;
+            db.cache.accounts.reserve(total_accounts);
+            for (senders_state, credits) in lane_states {
+                for (addr, balance, nonce, code_hash) in senders_state {
+                    let acct = db
+                        .cache
+                        .accounts
+                        .entry(addr)
+                        .or_insert_with(revm::database::DbAccount::new_not_existing);
+                    acct.info.balance = balance;
+                    acct.info.nonce = nonce;
+                    acct.info.code_hash = if code_hash == revm::primitives::B256::ZERO {
+                        revm::primitives::KECCAK_EMPTY
+                    } else {
+                        code_hash
+                    };
+                    acct.account_state = revm::database::AccountState::Touched;
+                }
+                for (addr, lane_acct, delta) in credits {
+                    let touched = lane_acct.account_state == revm::database::AccountState::Touched;
+                    match db.cache.accounts.entry(addr) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            // An existing entry keeps its storage and code; only the fields the
+                            // serial lane would change are updated. An unmodified account (not
+                            // Touched) is left as is.
+                            if touched {
+                                let acct = e.get_mut();
+                                acct.info.balance = acct.info.balance.saturating_add(delta);
+                                if acct.info.code_hash == revm::primitives::B256::ZERO {
+                                    acct.info.code_hash = revm::primitives::KECCAK_EMPTY;
+                                }
+                                acct.account_state = revm::database::AccountState::Touched;
                             }
-                            acct.account_state = revm::database::AccountState::Touched;
                         }
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        // Absent from the main state: the serial lane would have created it
-                        // through `load_account` and modified it; the lane's copy is that
-                        // entry, with the balance replaced by the merged total.
-                        let mut acct = template;
-                        acct.info.balance = delta;
-                        e.insert(acct);
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            // Absent from the main state: the serial lane would have created it
+                            // through `load_account` and modified it; the lane's copy is that
+                            // entry (its balance is already base 0 + this lane's credits).
+                            e.insert(lane_acct);
+                        }
                     }
                 }
             }
         }
-        {
-            let mut touched = framework::lock_state(&self.touched);
-            touched.extend(local_touched);
-        }
-        {
-            let mut undo = framework::lock_state(&self.block_undo);
-            for (addr, entry) in local_undo.accounts {
-                undo.accounts.entry(addr).or_insert(entry);
-            }
-        }
-
         // Record in canonical order exactly as the serial lane does. Building each tx's
         // record, receipt and event is pure, so it runs in parallel; only the append to the
         // history (one lock, canonical order) is serial.

@@ -2413,6 +2413,7 @@ pub struct StageTimes {
     dispatch_ns: std::sync::atomic::AtomicU64,
     end_block_ns: std::sync::atomic::AtomicU64,
     state_root_ns: std::sync::atomic::AtomicU64,
+    total_ns: std::sync::atomic::AtomicU64,
     blocks: std::sync::atomic::AtomicU64,
     txs: std::sync::atomic::AtomicU64,
 }
@@ -2429,6 +2430,9 @@ pub struct StageReport {
     pub end_block_ns: u64,
     /// Nanoseconds assembling the state root after `end_block`.
     pub state_root_ns: u64,
+    /// Nanoseconds in the whole execution stage of a block (everything the phases above
+    /// cover plus `begin_block`, outcome recording and the nonce fold).
+    pub total_ns: u64,
     /// Blocks executed.
     pub blocks: u64,
     /// Transactions in those blocks (as proposed, executed or not).
@@ -2444,6 +2448,7 @@ impl StageReport {
             dispatch_ns: self.dispatch_ns.saturating_sub(earlier.dispatch_ns),
             end_block_ns: self.end_block_ns.saturating_sub(earlier.end_block_ns),
             state_root_ns: self.state_root_ns.saturating_sub(earlier.state_root_ns),
+            total_ns: self.total_ns.saturating_sub(earlier.total_ns),
             blocks: self.blocks.saturating_sub(earlier.blocks),
             txs: self.txs.saturating_sub(earlier.txs),
         }
@@ -2482,6 +2487,9 @@ impl StageTimes {
     pub(crate) fn add_state_root(&self, d: std::time::Duration) {
         Self::bump(&self.state_root_ns, d);
     }
+    pub(crate) fn add_total(&self, d: std::time::Duration) {
+        Self::bump(&self.total_ns, d);
+    }
     pub(crate) fn add_block(&self, txs: usize) {
         self.blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.txs.fetch_add(txs as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2493,6 +2501,7 @@ impl StageTimes {
             dispatch_ns: self.dispatch_ns.load(Relaxed),
             end_block_ns: self.end_block_ns.load(Relaxed),
             state_root_ns: self.state_root_ns.load(Relaxed),
+            total_ns: self.total_ns.load(Relaxed),
             blocks: self.blocks.load(Relaxed),
             txs: self.txs.load(Relaxed),
         }
