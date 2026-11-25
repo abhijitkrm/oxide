@@ -1356,6 +1356,8 @@ fn run_consensus_loop(
         // re-seated index, so a rotated epoch can't strand us on the
         // startup set's schedule (or our startup slot).
         let view = engine.current_view().value();
+        // The verify pool scales each peer's submit allowance with the chain's own view rate.
+        verify_pool.observe_view(view);
         // `view_justified` admits a TC-justified proposal, not just a
         // high-QC one: without it a fleet whose view-0 leader is dead
         // from boot livelocks — no QC can ever form, so `high_qc`
