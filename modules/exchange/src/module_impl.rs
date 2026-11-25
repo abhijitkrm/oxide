@@ -55,7 +55,19 @@ impl Module for ExchangeModule {
 
     /// Admission: a zero-fee order must be fundable by its sender (`admission.rs`).
     fn validate(&self, ctx: &TxContext, msg: &[u8]) -> Result<(), ExecError> {
-        self.admit_order(ctx, msg)
+        self.admit_order(ctx, msg, false)
+    }
+
+    /// The executor's admission entry: knows whether the sender has earlier transactions in flight (a
+    /// deposit followed at once by a sell must not be refused for want of custody that is about to land).
+    fn validate_in_flight(
+        &self,
+        ctx: &TxContext,
+        msg: &[u8],
+        _preverified: Option<&executor::PreverifiedTx<'_>>,
+        predecessors_in_flight: bool,
+    ) -> Result<(), ExecError> {
+        self.admit_order(ctx, msg, predecessors_in_flight)
     }
 
     fn begin_block(&self, height: Height) {
