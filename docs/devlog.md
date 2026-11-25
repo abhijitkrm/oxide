@@ -25596,3 +25596,19 @@ pool; and drops are silent (no counter): worth a metric.
 In plain words: a safety limit meant to stop one validator from flooding another assumed the chain was slow. When the chain got fast, honest traffic hit the limit every 128 blocks, a
 proposal was thrown away, and everyone waited two seconds. The limit now grows with how fast the chain is actually running, so honest validators are never throttled and an attacker
 cannot raise it.
+
+## 25 Nov 2026 — EVM lanes beyond 8 (branch `evm-lanes-cap`)
+
+The sender-partitioned EVM lanes (`modules/evm/src/lanes.rs`) were capped at 8 (`MAX_LANES`), so on a 64-core machine an EVM batch could use 8 cores. Two changes:
+- `MAX_LANES` 8 -> 64, with the rule as a pure function `lane_count_for(threads)` (one lane per rayon thread, 1..=64).
+- The sender-to-lane hash read three address bytes (0, 7, 19); with a few low bytes varying it reached at most 16 distinct lanes, harmless at 8 lanes but it would have left most of 64 empty
+  for benchmark accounts and any structured address set. Replaced by `lane_of_address`: all 20 bytes folded and run through a splitmix64 finalizer. My first replacement (a bare multiply) failed
+  the new spread test (a counter in the middle bytes landed in ONE lane: a multiply only carries information upward), which is why the test exists.
+
+Verification: `lane_count_follows_the_thread_count_up_to_the_cap`; `lane_assignment_spreads_structured_addresses_across_all_lanes` (three structured address families at 8, 24 and 64 lanes, 20,000 addresses
+each, every lane within 0.7-1.3x of the mean); `lanes_match_serial_at_every_lane_count`, the existing lane-vs-serial differential (outcomes, events, undo accumulator, touched set, state root,
+full-rebuild root, sealed block) run inside rayon pools of 2, 8, 24 and 64 threads (a pool may have more threads than cores, so the 64-lane layout is exercised on this 8-core laptop).
+Not measured: the throughput gain. It needs a machine with more than 8 cores; the 64-core run is Phase 2. The cap only matters when the pool has more threads than 8 and a batch has >= 512 txs.
+
+In plain words: the part of the engine that runs payments in parallel was limited to 8 workers however big the machine. It can now use up to 64, and the way payments are dealt out to workers no longer
+piles similar-looking accounts onto a few of them; tests confirm the results are identical to running one at a time.
