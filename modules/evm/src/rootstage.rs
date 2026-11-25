@@ -69,6 +69,7 @@ impl EvmModule {
     pub(crate) fn patch_delta(
         db: &CacheDB<EmptyDB>,
         touched_pairs: &[(EvmAddress, alloy_primitives::B256)],
+        tries: &mut crate::storage_trie::LargeStorageTries,
     ) -> PatchDelta {
         let mut delta = PatchDelta::with_capacity(touched_pairs.len());
         for (addr, hashed) in touched_pairs {
@@ -94,16 +95,9 @@ impl EvmModule {
                 let storage_root = if account.storage.is_empty() {
                     None
                 } else {
-                    // Touched -> always recompute the storage root
-                    // (its slots changed).
-                    let storage_iter = account
-                        .storage
-                        .iter()
-                        .filter(|(_, value)| !value.is_zero())
-                        .map(|(slot, value)| {
-                            (alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()), *value)
-                        });
-                    Some(trie::storage_root(storage_iter))
+                    // Touched -> its slots may have changed. Large accounts update only the changed
+                    // slots (`storage_trie`); small ones recompute in full. Same root either way.
+                    Some(tries.storage_root(addr, &account.storage))
                 };
                 delta.upserts.push(LeafUpsert {
                     addr: *addr,
@@ -112,6 +106,7 @@ impl EvmModule {
                     leaf: encode_trie_leaf(account, storage_root.unwrap_or(trie::EMPTY_ROOT)),
                 });
             } else {
+                tries.forget(addr);
                 delta.removals.push((*addr, *hashed));
             }
         }
@@ -396,7 +391,8 @@ impl EvmModule {
                     .map(|a| (*a, alloy_primitives::keccak256(a)))
                     .collect();
             let db = framework::lock_state(&self.db);
-            DeferredRoot::Patch(Self::patch_delta(&db, &pairs))
+            let mut tries = framework::lock_state(&self.large_storage);
+            DeferredRoot::Patch(Self::patch_delta(&db, &pairs, &mut tries))
         } else {
             // First build (or after import): needs the whole cache and a
             // quiescent trie, so it runs here, synchronously.

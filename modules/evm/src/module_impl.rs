@@ -615,7 +615,8 @@ impl Module for EvmModule {
         if *leaves_ready {
             // Incremental patch — only `touched` accounts are
             // re-encoded (see `patch_delta`).
-            let delta = Self::patch_delta(&db, &touched_pairs);
+            let mut tries = framework::lock_state(&self.large_storage);
+            let delta = Self::patch_delta(&db, &touched_pairs, &mut tries);
             Self::apply_patch(&mut leaves, &mut storage_root_cache, delta);
         } else {
             // Full build — first call after construction or
