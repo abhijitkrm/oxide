@@ -726,6 +726,7 @@ type CommittedState = (
     BTreeMap<Address, LinkedEntry>,
 );
 
+mod admission;
 mod book_view;
 mod codec;
 mod decode;
@@ -1392,3 +1393,5 @@ mod delegation_tests;
 mod lane_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod zero_fee_tests;

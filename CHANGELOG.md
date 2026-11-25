@@ -12,6 +12,15 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Exchange: orders are free, if you can fund them.** Place, cancel, amend, bundles and delegated
+  bundles now have a fee floor of 0 (new `Module::min_fee_for` hook); deposits, withdrawals,
+  delegations and the rest still pay the chain floor. So that free is not unbounded, an order is only
+  admitted if its sender can fund it (limit buys against the native balance, market buys need a
+  balance, sells need base custody, and every item of a delegated bundle must be authorized).
+  - **In plain words:** sending an order costs nothing as long as your account has the money (or the
+    asset) to back it; an order you could not afford is turned away at the door instead of taking up
+    space in a block. Moving money in or out still costs a fee.
+
 - **Exchange: delegated bundles, cheap authentication for many traders**
   (`TAG_DELEGATE` 20, `TAG_REVOKE_DELEGATE` 21, `TAG_DBUNDLE` 22;
   `docs/delegated-bundle-spec.md`). An owner delegates place/cancel rights on
