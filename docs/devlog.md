@@ -25612,3 +25612,20 @@ Not measured: the throughput gain. It needs a machine with more than 8 cores; th
 
 In plain words: the part of the engine that runs payments in parallel was limited to 8 workers however big the machine. It can now use up to 64, and the way payments are dealt out to workers no longer
 piles similar-looking accounts onto a few of them; tests confirm the results are identical to running one at a time.
+
+## 25 Nov 2026 — compact proposals: core + spec (branch `compact-proposals`, Phase 3 item 1)
+
+Phase 3 started with compact proposals. Each transaction reaches a follower twice (gossip, then inside the proposal), and at the throughput targets proposal bytes are the bulk traffic
+(10M orders/s is 270-470 MB/s of block data per leader link). Design in `docs/compact-proposals-spec.md`: the leader sends tx HASHES, the follower rebuilds the exact `Proposal` from its
+mempool, and the existing signed `body_hash` (BLAKE3 over the canonical `Proposal` encoding) verifies the rebuilt body, so no new trust assumption; missing transactions are fetched, then the full body.
+
+Built in this commit (pure, not wired): `crates/types/src/compact.rs` with `CompactProposal`, an allocation-safe codec, and `reconstruct(lookup) -> Complete | Missing(positions)`.
+Tests: round trip; rebuilt proposal equals the original byte for byte and hashes to the same `body_hash`; block order (not pool order) is preserved; every missing position reported; a wrong
+transaction behind a hash changes the `body_hash` (so the existing check rejects it); forged count bounded by bytes present; size ratios for the three payload shapes (EVM transfer >= 3x, 64-order bundle >= 40x,
+64-order delegated bundle >= 70x smaller). Mutation checks: reversing the rebuilt order fails 2 tests, dropping missing-detection fails 1. Added to the `types-decode` fuzz target: 8,975,491 runs in 61 s, no crash.
+
+Not done (the wiring, in the spec): message tags, `Mempool::get_by_hash` (only `contains` exists), the fetch path, the leader's compact-vs-full threshold, and the gates. Not measured: any throughput effect
+(bandwidth does not bind on loopback; the win shows on a real multi-machine link or at 10M orders/s).
+
+In plain words: instead of sending every transaction twice, the block leader will send a list of transaction fingerprints, and each validator will reassemble the block from transactions it already received,
+checking the result against the signed fingerprint of the whole block. This commit builds and tests the reassembly piece and writes down the rest of the plan.

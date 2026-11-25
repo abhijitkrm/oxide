@@ -8,6 +8,7 @@
 //! FinalizedBlock, etc.) that cross trust boundaries.
 
 use codec::{Decode, Reader};
+use types::compact::CompactProposal;
 use types::{
     BlockBudget, BlockRecord, CommitAck, FinalizedBlock, MempoolAck, Proposal, StateAttestation,
     TxBytes, Verdict,
@@ -22,6 +23,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     fuzz_decode::<TxBytes>(data);
     fuzz_decode::<BlockBudget>(data);
     fuzz_decode::<Proposal>(data);
+    fuzz_decode::<CompactProposal>(data);
     fuzz_decode::<Verdict>(data);
     fuzz_decode::<MempoolAck>(data);
     fuzz_decode::<FinalizedBlock>(data);
