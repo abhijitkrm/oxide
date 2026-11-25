@@ -25566,3 +25566,33 @@ Both touch consensus-critical paths; neither is worth doing before the multi-val
 Recommendation: skip item 4 for now, do item 5 (the unexplained 2 s stalls) next, and revisit 1 and 2 with Phase 2 data.
 
 In plain words: the signature checking was already mostly efficient; what remains is checking several signatures in one combined step, which would save little at 4 validators and much more at 30, so it waits for a measurement on a bigger test.
+
+## 25 Nov 2026 — the 3/4-validator "low-load" stall: root cause and fix (branch `bls-verify-once`)
+
+Symptom (box, 25 Nov): committees of 3 and 4 validators stalled for 2 s (one view timeout) every 127-128 views (heights 128, 255, ...), all validators at once, at LOW load, never at
+high load, never with 5-6 validators on 2 cores each. No slow syscalls, no log lines.
+
+Root cause: `VerifyPool::submit` allows each authenticated peer `VERIFY_SUBMIT_BUDGET_PER_SEC = 128` submissions per one-second window and silently drops the rest (`let _ =` at the call
+sites). The budget was sized as "~20x an honest peer's peak" assuming views take tens of milliseconds. On the box at low load the chain ran 100-160 views a second, so an honest peer's
+one job per view exceeded 128 a second; the window counter hit 128 after ~128 views, the next proposal was dropped, and every validator waited out the 2 s view timeout. The doc
+comment said dropped messages "re-arrive via gossip or sync", which is false for a proposal. Why only low load: at high load blocks are slower than 128 a second; why not 5-6 validators: 2-core
+validators were slower than 128 views a second. The strict >2/3 quorum at n=3 (all three votes) only made each drop fatal to the view.
+
+How it was found: the periodicity (128, a constant in `verify_pool.rs`), not tracing. Confirmed by experiment on the laptop (4 validators, 200 tx/s each, release build, 45 s):
+- shipped 128: 0 stalls (the laptop only reaches ~28 views a second, under the budget), so the box's fast chain was needed to trip it;
+- budget forced to 16: 17 stalls of 2.0-2.1 s (one of 4.1 s), every ~20 heights (22/24, 43/45, 63, 83, 103, 123, ...), 14-16 view timeouts on EVERY node, 325 blocks;
+- budget forced to 16 WITH the fix: 0 stalls, 0 view timeouts, 1,274 blocks.
+
+Fix: the allowance is `128 + 8 x views advanced in the last second` (`VERIFY_BUDGET_PER_VIEW = 8`, from the 8-frames-per-view figure in `VERIFY_INFLIGHT_PER_PEER`), measured from the
+engine's own view via `observe_view` (called every pump pass). A peer cannot raise it: only the engine's view change counts, each change counts once (a jump or a forged far-future view
+adds one), and a view that does not advance adds nothing. A flooder keeps the 128 base; an honest peer is never throttled however fast the chain runs.
+Tests (written first): honest peer at one job per view for 384 views is never throttled; a never-advancing view grants nothing; a million-view jump counts once. Mutation checks: removing
+the scaling term fails 1 test; counting the jump size fails 1 test (after strengthening the jump test, which first let that mutant survive).
+
+Not verified on the box (retired). The laptop reproduction forces the budget low to emulate the box's faster chain; the arithmetic and the periodicity match, but a rerun on a fast machine at
+low load with 3-4 validators should show zero view timeouts. Related, not changed: failed verifications do not feed peer reputation, so this budget is the only CPU flood control on the
+pool; and drops are silent (no counter): worth a metric.
+
+In plain words: a safety limit meant to stop one validator from flooding another assumed the chain was slow. When the chain got fast, honest traffic hit the limit every 128 blocks, a
+proposal was thrown away, and everyone waited two seconds. The limit now grows with how fast the chain is actually running, so honest validators are never throttled and an attacker
+cannot raise it.

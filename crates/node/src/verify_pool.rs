@@ -85,6 +85,20 @@ const VERIFY_INFLIGHT_PER_PEER: u32 = 8;
 /// worker time).
 const VERIFY_SUBMIT_BUDGET_PER_SEC: u32 = 128;
 
+/// Extra submissions per second a peer may make for each view the chain advanced in the last second.
+///
+/// Unit: jobs per peer per view. Origin: [`VERIFY_INFLIGHT_PER_PEER`]'s own estimate that one view's
+/// honest shape is at most 8 verifiable frames from a member (a proposal, a timeout, a QC, a TC,
+/// with headroom). Why it exists: the flat [`VERIFY_SUBMIT_BUDGET_PER_SEC`] assumed views take tens of
+/// milliseconds; on a fast chain (the 12-core box ran 100-160 views a second at low load) an honest
+/// peer's one job per view exceeded 128 a second, the budget ran dry every 128 views, a proposal was
+/// dropped and all validators waited out a 2 s view timeout. The allowance is
+/// `BASE + PER_VIEW * views/s`, so an honest peer is never throttled however fast the chain runs, while
+/// a flooder gains nothing: the view rate is measured from the engine, and advancing a view needs a
+/// quorum. Tradeoff: a higher value tolerates burstier honest peers but lets a flooder draw
+/// proportionally more worker time while the chain is fast.
+const VERIFY_BUDGET_PER_VIEW: u32 = 8;
+
 /// Worker threads the pool spawns by default.
 ///
 /// Unit: threads. Origin: BLS pairings are CPU-bound, so the pool
@@ -95,6 +109,49 @@ const VERIFY_SUBMIT_BUDGET_PER_SEC: u32 = 128;
 /// per-peer caps bound how much concurrent work can even exist).
 fn default_workers() -> usize {
     std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(1)).clamp(2, 8)
+}
+
+/// Views the chain advanced per second, over the current and previous one-second windows (the larger of
+/// the two, so a window boundary never dips the allowance).
+struct ViewRate {
+    last_view: Option<u64>,
+    window_start: std::time::Instant,
+    current: u32,
+    previous: u32,
+}
+
+impl ViewRate {
+    fn new() -> Self {
+        Self { last_view: None, window_start: std::time::Instant::now(), current: 0, previous: 0 }
+    }
+
+    /// Roll the window forward to `now`.
+    fn roll(&mut self, now: std::time::Instant) {
+        let elapsed = now.saturating_duration_since(self.window_start);
+        if elapsed >= std::time::Duration::from_secs(2) {
+            self.previous = 0;
+            self.current = 0;
+            self.window_start = now;
+        } else if elapsed >= std::time::Duration::from_secs(1) {
+            self.previous = self.current;
+            self.current = 0;
+            self.window_start = now;
+        }
+    }
+
+    fn observe(&mut self, view: u64, now: std::time::Instant) {
+        self.roll(now);
+        if self.last_view.is_some_and(|v| v != view) {
+            self.current = self.current.saturating_add(1);
+        }
+        self.last_view = Some(view);
+    }
+
+    /// Views per second, as the larger of the current and previous window's counts.
+    fn per_second(&mut self, now: std::time::Instant) -> u32 {
+        self.roll(now);
+        self.current.max(self.previous)
+    }
 }
 
 /// One unit of pooled verification work — a pure crypto closure.
@@ -231,6 +288,8 @@ pub(crate) struct VerifyPool {
     /// Per-peer submit-rate windows — `(window_start, count)`,
     /// reset after a second elapses.
     submit_budget: std::collections::HashMap<Vec<u8>, (std::time::Instant, u32)>,
+    /// How fast the chain is advancing views, for the submit allowance.
+    view_rate: ViewRate,
     /// Outstanding jobs total — the `VERIFY_QUEUE_CAP` accounting.
     queued_jobs: usize,
     /// Outstanding payload bytes — the `VERIFY_QUEUE_MAX_BYTES`
@@ -287,6 +346,7 @@ impl VerifyPool {
             results: done_rx,
             in_flight: std::collections::HashMap::new(),
             submit_budget: std::collections::HashMap::new(),
+            view_rate: ViewRate::new(),
             queued_jobs: 0,
             queued_bytes: 0,
         }
@@ -302,9 +362,11 @@ impl VerifyPool {
     /// [`VERIFY_INFLIGHT_PER_PEER`] outstanding jobs, its
     /// per-second submit budget is spent, the global queue is full
     /// by jobs or bytes, or the channel disconnected (pump
-    /// teardown). Dropping is always safe: every consensus message
-    /// re-arrives via gossip or sync, and an unsubmitted job
-    /// mutates nothing.
+    /// teardown). Dropping never corrupts state (an unsubmitted job
+    /// mutates nothing) but it is NOT free: a dropped proposal does not
+    /// re-arrive, so its view runs out the view timeout (2 s by default).
+    /// That is why the submit budget scales with the chain's view rate
+    /// ([`VERIFY_BUDGET_PER_VIEW`]) instead of being a flat number.
     pub(crate) fn submit(&mut self, peer: &[u8], payload_bytes: usize, task: VerifyTask) -> bool {
         let held = self.in_flight.get(peer).copied().unwrap_or(0);
         if held >= VERIFY_INFLIGHT_PER_PEER
@@ -318,7 +380,10 @@ impl VerifyPool {
         if budget.0.elapsed() >= std::time::Duration::from_secs(1) {
             *budget = (now, 0);
         }
-        if budget.1 >= VERIFY_SUBMIT_BUDGET_PER_SEC {
+        if budget.1
+            >= VERIFY_SUBMIT_BUDGET_PER_SEC
+                + VERIFY_BUDGET_PER_VIEW.saturating_mul(self.view_rate.per_second(now))
+        {
             return false;
         }
         // `try_send` is the backstop for the accounting: the counts
@@ -333,6 +398,13 @@ impl VerifyPool {
         self.queued_jobs += 1;
         self.queued_bytes = self.queued_bytes.saturating_add(payload_bytes);
         true
+    }
+
+    /// Tell the pool the engine's current view (the pump calls this every pass). Each CHANGE counts as one
+    /// advance, however large the jump, so a catch-up or a forged far-future view cannot inflate the
+    /// submit allowance. See [`VERIFY_BUDGET_PER_VIEW`].
+    pub(crate) fn observe_view(&mut self, view: u64) {
+        self.view_rate.observe(view, std::time::Instant::now());
     }
 
     /// Non-blocking drain — one completed job or `None`. Decrements
@@ -674,6 +746,81 @@ mod tests {
             }
         }
         assert_eq!(accepted, VERIFY_SUBMIT_BUDGET_PER_SEC);
+    }
+
+    /// The stall's root cause (box, 25 Nov): on a fast chain one honest job per view per peer exceeds a
+    /// flat 128/s, the budget ran dry every 128 views, a proposal was dropped and every validator waited
+    /// out a 2 s view timeout. The allowance must grow with the views the chain actually advances.
+    #[test]
+    fn budget_scales_with_the_views_the_chain_advances() {
+        let mut pool = VerifyPool::with_workers(2);
+        let honest = b"honest".to_vec();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut accepted = 0u32;
+        let jobs = VERIFY_SUBMIT_BUDGET_PER_SEC * 3;
+        for view in 1..=u64::from(jobs) {
+            pool.observe_view(view); // the chain advances one view per job, far faster than 128 a second
+            if pool.submit(&honest, 1, marker_job(false)) {
+                accepted += 1;
+            }
+            while pool.in_flight_of(&honest) > 0 {
+                while pool.try_recv().is_some() {}
+                std::thread::yield_now();
+                assert!(std::time::Instant::now() < deadline, "drain stalled");
+            }
+        }
+        assert_eq!(accepted, jobs, "an honest peer at one job per view is never throttled");
+    }
+
+    /// The scaling cannot be gamed by the submitter: the view counter only moves when the pump sees the
+    /// chain's view advance, so repeating the same view (or never advancing) leaves the flat base.
+    #[test]
+    fn a_view_that_does_not_advance_grants_nothing() {
+        let mut pool = VerifyPool::with_workers(2);
+        let byz = b"byz".to_vec();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut accepted = 0u32;
+        for _ in 0..(VERIFY_SUBMIT_BUDGET_PER_SEC + 50) {
+            pool.observe_view(7); // never changes
+            if pool.submit(&byz, 1, marker_job(false)) {
+                accepted += 1;
+            }
+            while pool.in_flight_of(&byz) > 0 {
+                while pool.try_recv().is_some() {}
+                std::thread::yield_now();
+                assert!(std::time::Instant::now() < deadline, "drain stalled");
+            }
+        }
+        assert_eq!(
+            accepted, VERIFY_SUBMIT_BUDGET_PER_SEC,
+            "a flooder with no view progress keeps the base cap"
+        );
+    }
+
+    /// A single view jump (catch-up after a gap, or a forged far-future view) counts as ONE advance, so it
+    /// cannot inflate the allowance.
+    #[test]
+    fn a_view_jump_counts_once() {
+        let mut pool = VerifyPool::with_workers(2);
+        let byz = b"byz".to_vec();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        pool.observe_view(1);
+        pool.observe_view(1_000_000); // one jump
+        let mut accepted = 0u32;
+        for _ in 0..(VERIFY_SUBMIT_BUDGET_PER_SEC + VERIFY_BUDGET_PER_VIEW + 50) {
+            if pool.submit(&byz, 1, marker_job(false)) {
+                accepted += 1;
+            }
+            while pool.in_flight_of(&byz) > 0 {
+                while pool.try_recv().is_some() {}
+                std::thread::yield_now();
+                assert!(std::time::Instant::now() < deadline, "drain stalled");
+            }
+        }
+        assert!(
+            accepted <= VERIFY_SUBMIT_BUDGET_PER_SEC + VERIFY_BUDGET_PER_VIEW,
+            "accepted {accepted}"
+        );
     }
 
     /// The global bound: enough distinct peers each filling their
