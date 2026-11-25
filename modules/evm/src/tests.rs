@@ -3954,13 +3954,16 @@ fn simulation_respects_wall_clock_timeout() {
     // until the gas cap without a deadline.
     let loop_contract = Address([0x99; 20]);
     let mut m = make_module();
-    m.set_sim_timeout(std::time::Duration::from_millis(50));
+    // 1 ms, not 50: the 30M-gas loop is ~2.5M iterations, which a fast core finishes in
+    // under 50 ms and would hit the gas cap first (seen on a Ryzen 9 7900); 1 ms is below
+    // the fastest plausible run so the deadline always fires first.
+    m.set_sim_timeout(std::time::Duration::from_millis(1));
     m.genesis_insert_account(&loop_contract, 0, 1, vec![0x5b, 0x60, 0x00, 0x56], Vec::new());
     let req =
         CallRequest { to: Some(loop_contract), gas: Some(30_000_000), ..CallRequest::default() };
     let started = std::time::Instant::now();
     let result = m.call_read(&req);
-    // The deadline inspector halts the interpreter within ~50ms
+    // The deadline inspector halts the interpreter within ~1ms
     // — not the seconds a 30M-gas loop would take.
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     match result {

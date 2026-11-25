@@ -25066,3 +25066,12 @@ cache, direct absorb into `block_undo`/`touched` (linear `BTreeSet::append`), an
 Dispatch us/tx (lanes off -> on): synchronous 1.36 -> 1.00, root stage 2.12 -> 1.42, mixed 1.14 -> 0.87; ring (always falls back)
 unchanged. Loop tx/s: transfers 224k -> 236k, mixed 359k -> 405k. `exec_total_us` (whole exec stage per tx, now permanent in
 `StageReport`) shows 2.44 us/tx with 0.5 us outside the phase timers. Details in `docs/multi-lane-evm-spec.md` section 7.
+
+## 25 Nov 2026 — first full test run on the Ryzen 9 7900 box: one CPU-speed-dependent test
+
+`cargo test --workspace --release` on the new box (12 cores / 24 threads) failed exactly one test,
+`simulation_respects_wall_clock_timeout`: a 30M-gas spin loop was expected to outlive a 50 ms deadline, but on this faster
+core it reached the gas cap first and returned `OutOfGas`. Not a product bug: the test's margin was machine-dependent.
+Fix: the deadline is 1 ms, below the fastest plausible loop time, so the deadline always fires first.
+
+In plain words: a test assumed the machine was slow enough; the new server is fast enough to break that assumption.
