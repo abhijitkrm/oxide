@@ -22,6 +22,10 @@ const ACCOUNTS: u8 = 40;
 const DEPOSIT: u64 = 1_000_000_000;
 /// Native balance each account starts with: far above any run's outflow, so the funds proof passes.
 const RICH: u64 = 1_000_000_000_000_000;
+/// Agent (gateway) addresses for delegated bundles: `AGENT_OK` holds delegations (some limited), the
+/// delegations to `AGENT_EXPIRED` have all expired.
+const AGENT_OK: u8 = 41;
+const AGENT_EXPIRED: u8 = 42;
 
 fn addr(b: u8) -> Address {
     Address([b; 20])
@@ -53,6 +57,21 @@ fn rig(lanes: bool, balance: u64) -> (Arc<MemoryBalances>, ExchangeModule) {
             let ctx = TxContext { sender: addr(a), nonce: 0, fee: 0 };
             ex.handle(&ctx, &msg::deposit_base(m, DEPOSIT)).expect("deposit base");
         }
+    }
+    // Agents pay envelope fees; owners delegate to them with assorted scopes (so delegated bundles
+    // exercise full, place-only, capped, expired and missing delegations).
+    for agent in [AGENT_OK, AGENT_EXPIRED] {
+        ledger.mint(&addr(agent), RICH);
+    }
+    for owner in 1..=ACCOUNTS {
+        let ctx = TxContext { sender: addr(owner), nonce: 0, fee: 0 };
+        if owner % 5 != 0 {
+            let flags = if owner % 3 == 0 { 1 } else { 3 };
+            let cap = if owner % 7 == 0 { 5 } else { 0 };
+            ex.handle(&ctx, &msg::delegate(addr(AGENT_OK), flags, u64::MAX, cap))
+                .expect("delegate");
+        }
+        ex.handle(&ctx, &msg::delegate(addr(AGENT_EXPIRED), 3, 0, 0)).expect("delegate expired");
     }
     (ledger, ex)
 }
@@ -113,6 +132,18 @@ fn gen_tx(rng: &mut Rng, market_span: u8) -> (Address, u64, Vec<u8>) {
     let sender = addr(1 + u8::try_from(rng.below(u64::from(ACCOUNTS))).unwrap());
     let market = u8::try_from(rng.below(u64::from(market_span))).unwrap();
     let fee = rng.below(3);
+    // A delegated bundle: the agent signs, items name assorted owners (some without a delegation).
+    if rng.below(8) == 0 {
+        let agent = if rng.below(6) == 0 { AGENT_EXPIRED } else { AGENT_OK };
+        let n = 1 + rng.below(6);
+        let mut items: Vec<(Address, Vec<u8>)> = Vec::new();
+        for _ in 0..n {
+            let owner = addr(1 + u8::try_from(rng.below(u64::from(ACCOUNTS))).unwrap());
+            let m = u8::try_from(rng.below(u64::from(market_span))).unwrap();
+            items.push((owner, item(rng, m)));
+        }
+        return (addr(agent), fee, msg::dbundle(&items).expect("dbundle"));
+    }
     let payload = match rng.below(20) {
         // Bundle of 1..6 items on one market (a rare one spans two markets).
         0..=4 => {
@@ -176,7 +207,7 @@ fn assert_same(
     what: &str,
 ) {
     assert_eq!(a.1.state_root(), b.1.state_root(), "{what}: module state root differs");
-    for acct in 1..=ACCOUNTS {
+    for acct in (1..=ACCOUNTS).chain([AGENT_OK, AGENT_EXPIRED]) {
         assert_eq!(
             a.0.balance(&addr(acct)),
             b.0.balance(&addr(acct)),
@@ -241,4 +272,42 @@ fn small_runs_stay_serial() {
     let mut rng = Rng(9);
     let few: Vec<_> = (0..20).map(|_| gen_tx(&mut rng, MARKETS)).collect();
     assert!(run_lanes(&ex, &ledger, &few).is_none());
+}
+
+#[test]
+fn an_unfunded_owner_in_a_delegated_bundle_declines_the_lane_path() {
+    // Everything in the run is funded except owner 1, whose balance is burned down to a few units. A
+    // delegated bundle by the agent places large buys for owner 1: the OWNER funds them, so the lane
+    // planner's funds proof must cover owners (not only envelope senders) and decline the run.
+    let (ledger, ex) = rig(true, RICH);
+    let keep = 10;
+    let burn = ledger.balance(&addr(1)) - keep;
+    ledger.debit(&addr(1), burn).expect("burn");
+    let mut rng = Rng(31);
+    // Direct orders from funded senders (never owner 1), spread over the markets.
+    let mut txs: Vec<(Address, u64, Vec<u8>)> = (0..700)
+        .map(|_| {
+            let sender = addr(2 + u8::try_from(rng.below(u64::from(ACCOUNTS - 1))).unwrap());
+            let market = u8::try_from(rng.below(u64::from(MARKETS))).unwrap();
+            (sender, 0, item(&mut rng, market))
+        })
+        .collect();
+    let big_buy = |m: u8| {
+        let mut o = order(&mut rng_clone(), OrderType::Limit);
+        o.side = Side::Buy;
+        (addr(1), msg::place(m, o))
+    };
+    // One market only: a bundle spanning every market would merge them into a single component and the
+    // run would decline for lack of parallelism before the funds proof is reached.
+    let items: Vec<_> = (0..4).map(|_| big_buy(0)).collect();
+    txs.push((addr(AGENT_OK), 0, msg::dbundle(&items).expect("dbundle")));
+    assert!(
+        run_lanes(&ex, &ledger, &txs).is_none(),
+        "owner 1 cannot fund the delegated buys: the run must decline"
+    );
+    assert_eq!(ex.lane_runs_for_test(), 0);
+}
+
+fn rng_clone() -> Rng {
+    Rng(12345)
 }

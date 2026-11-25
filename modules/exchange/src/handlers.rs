@@ -46,6 +46,14 @@ impl ExchangeModule {
         })
     }
 
+    /// The event a rejected bundle item produces: its index (`u16` LE) then the error text. One
+    /// definition shared by the serial path and the lane assembly so the two cannot differ.
+    pub(crate) fn item_rejected_event(index: usize, error: &ExecError) -> Event {
+        let mut data = u16::try_from(index).unwrap_or(u16::MAX).to_le_bytes().to_vec();
+        data.extend_from_slice(format!("{error:?}").as_bytes());
+        Event { module: "exchange", kind: "bundle_item_rejected", data }
+    }
+
     /// Validate a bundle's framing and return every item's `(start, end)` span in `body`
     /// (cheap, allocation-light; nothing is executed). Shared by the serial path and the lane
     /// planner so both agree on what is a well-formed bundle.
@@ -97,11 +105,7 @@ impl ExchangeModule {
             let result = exec_item(tag, rest);
             match result {
                 Ok(evs) => events.extend(evs),
-                Err(e) => {
-                    let mut data = u16::try_from(i).unwrap_or(u16::MAX).to_le_bytes().to_vec();
-                    data.extend_from_slice(format!("{e:?}").as_bytes());
-                    events.push(Event { module: "exchange", kind: "bundle_item_rejected", data });
-                }
+                Err(e) => events.push(Self::item_rejected_event(i, &e)),
             }
         }
         Ok(events)

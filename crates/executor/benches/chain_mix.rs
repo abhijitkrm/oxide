@@ -80,10 +80,15 @@ struct Account {
 }
 
 fn accounts(n: usize) -> Vec<Account> {
+    accounts_at(0, n)
+}
+
+/// `n` accounts with indices `start..start + n` (so gateways never collide with owners).
+fn accounts_at(start: usize, n: usize) -> Vec<Account> {
     // Keys derive from (seed, index), so two runs build byte-identical transactions: the `roots,`
     // line is then comparable across execution knobs. `CHAIN_MIX_SEED` varies the population.
     let seed: u64 = std::env::var("CHAIN_MIX_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-    (0..n)
+    (start..start + n)
         .map(|i| {
             let mut pre = b"chain_mix-account".to_vec();
             pre.extend_from_slice(&seed.to_le_bytes());
@@ -176,7 +181,7 @@ struct Rig {
     exchange: Arc<ExchangeModule>,
 }
 
-fn rig(accts: &[Account], capacity: usize) -> Rig {
+fn rig(accts: &[Account], gateways: &[Account], capacity: usize) -> Rig {
     // CHAIN_MIX_PAR_THRESHOLD: runs of at least this many txs take the parallel path (default: executor's).
     let mut executor =
         match std::env::var("CHAIN_MIX_PAR_THRESHOLD").ok().and_then(|v| v.parse().ok()) {
@@ -186,7 +191,7 @@ fn rig(accts: &[Account], capacity: usize) -> Rig {
     let evm = Arc::new(EvmModule::new(1, 7_000_000_000));
     // CHAIN_MIX_EVM_LANES=0 turns the sender-partitioned execution lanes off (default: on).
     evm.set_exec_lanes(std::env::var("CHAIN_MIX_EVM_LANES").map_or(true, |v| v != "0"));
-    for a in accts {
+    for a in accts.iter().chain(gateways) {
         // Native ledger balance (fees, escrow, base custody) and EVM balance (transfers).
         framework::Balances::mint(evm.as_ref(), &a.addr, u64::MAX / 4);
         evm.fund_account_for_test(&a.addr, 10u128.pow(22));
@@ -207,6 +212,15 @@ fn rig(accts: &[Account], capacity: usize) -> Rig {
             ex.handle(&ctx, &msg::deposit_base(market_of(i), 1 << 40)).expect("deposit base");
         }
     }
+    // Delegated-bundle mix: every owner delegates place+cancel to its gateway, which pays the fees.
+    if !gateways.is_empty() {
+        let opg = owners_per_gateway(accts.len(), gateways.len());
+        for (i, a) in accts.iter().enumerate() {
+            let gw = &gateways[(i / opg).min(gateways.len() - 1)];
+            let ctx = TxContext { sender: a.addr, nonce: 0, fee: 0 };
+            ex.handle(&ctx, &msg::delegate(gw.addr, 3, u64::MAX, 0)).expect("delegate");
+        }
+    }
     let exchange = Arc::new(ex);
     executor.register_module(exchange.clone());
     Rig { executor, exchange }
@@ -216,7 +230,7 @@ fn rig(accts: &[Account], capacity: usize) -> Rig {
 /// Whether account `i` sends CLOB orders in `mix` (the rest send EVM transfers).
 fn is_clob(mix: &str, i: usize) -> bool {
     match mix {
-        "transfer" => false,
+        "transfer" | "dbundle" => false,
         "clob" | "bundle" => true,
         _ => i % 4 >= 2, // mixed: half the senders trade
     }
@@ -225,6 +239,43 @@ fn is_clob(mix: &str, i: usize) -> bool {
 /// Orders per bundle transaction in the `bundle` mix (env `BUNDLE_ITEMS`, default 64).
 fn bundle_items() -> usize {
     std::env::var("BUNDLE_ITEMS").ok().and_then(|v| v.parse().ok()).unwrap_or(64)
+}
+
+/// Owners served by each gateway in the `dbundle` mix: an even count (a seller and its buyer share a
+/// market) of at least 2.
+fn owners_per_gateway(owners: usize, gateways: usize) -> usize {
+    ((owners / gateways.max(1)) & !1).max(2)
+}
+
+/// The `dbundle` mix: gateway `g` signs `per_gw` bundles, each carrying `bundle_items()` orders for the
+/// owners it serves (one delegated-bundle signature authenticates orders of many owners).
+fn build_dbundle(accts: &[Account], gateways: &[Account], per_gw: usize) -> Vec<Vec<TxBytes>> {
+    let opg = owners_per_gateway(accts.len(), gateways.len());
+    gateways
+        .iter()
+        .enumerate()
+        .map(|(g, gw)| {
+            let base = g * opg;
+            (0..per_gw as u64)
+                .map(|n| {
+                    let items: Vec<(Address, Vec<u8>)> = (0..bundle_items())
+                        .map(|j| {
+                            let i = (base + (n as usize * bundle_items() + j) % opg)
+                                .min(accts.len() - 1);
+                            let side = if i.is_multiple_of(2) { Side::Sell } else { Side::Buy };
+                            (accts[i].addr, msg::place(market_of(i), order(side, accts[i].addr)))
+                        })
+                        .collect();
+                    signed_native(
+                        gw,
+                        n,
+                        framework::module_id::EXCHANGE,
+                        &msg::dbundle(&items).expect("dbundle"),
+                    )
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn build(mix: &str, accts: &[Account], per_acct: usize, ring: bool) -> Vec<Vec<TxBytes>> {
@@ -275,12 +326,28 @@ fn build(mix: &str, accts: &[Account], per_acct: usize, ring: bool) -> Vec<Vec<T
 
 fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
     let accts = accounts(n_accts);
-    // In the `bundle` mix `total` counts ORDERS; each tx carries `bundle_items()` of them.
-    let weight = if mix == "bundle" { bundle_items() } else { 1 };
-    let per = (total / n_accts / weight).max(1);
-    let txs = build(mix, &accts, per, ring);
+    // `dbundle`: gateways (extra accounts) sign bundles for the owners; `CHAIN_MIX_GATEWAYS` of them.
+    let n_gw = if mix == "dbundle" {
+        std::env::var("CHAIN_MIX_GATEWAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32usize)
+            .max(1)
+    } else {
+        0
+    };
+    let gateways = accounts_at(n_accts, n_gw);
+    // In the `bundle`/`dbundle` mixes `total` counts ORDERS; each tx carries `bundle_items()` of them.
+    let weight = if mix == "bundle" || mix == "dbundle" { bundle_items() } else { 1 };
+    let senders = if mix == "dbundle" { n_gw } else { n_accts };
+    let per = (total / senders / weight).max(1);
+    let txs = if mix == "dbundle" {
+        build_dbundle(&accts, &gateways, per)
+    } else {
+        build(mix, &accts, per, ring)
+    };
     let n: usize = txs.iter().map(Vec::len).sum();
-    let Rig { executor, exchange } = rig(&accts, n);
+    let Rig { executor, exchange } = rig(&accts, &gateways, n);
     // CHAIN_MIX_LANE: `sync` (default; finalize executes inline), `lane` (async exec lane) or
     // `root` (exec lane + root stage thread, docs/root-stage-spec.md).
     let lane_mode = std::env::var("CHAIN_MIX_LANE").unwrap_or_else(|_| "sync".into());
@@ -306,7 +373,7 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
     // compete for cores, as on a live node); by default ingest finishes first and the loop
     // follows, which reports each stage's own ceiling.
     let concurrent = std::env::var("CHAIN_MIX_CONCURRENT").is_ok_and(|v| v == "1");
-    let chunk = n_accts.div_ceil(threads);
+    let chunk = txs.len().div_ceil(threads).max(1);
     let t0 = Instant::now();
     let accepted_ctr = std::sync::atomic::AtomicUsize::new(0);
     let finished = std::sync::atomic::AtomicUsize::new(0);
@@ -415,7 +482,8 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
             .iter()
             .enumerate()
             .filter(|(i, _)| is_clob(mix, *i))
-            .all(|(_, a)| executor.executed_nonce_of(&a.addr) == per as u64);
+            .all(|(_, a)| executor.executed_nonce_of(&a.addr) == per as u64)
+        && gateways.iter().all(|g| executor.executed_nonce_of(&g.addr) == per as u64);
     let resting: u32 =
         (0..markets()).map(|m| exchange.resting_count(u8::try_from(m).unwrap_or(0))).sum();
     // Exactness probe: the final chain state root and the exchange's own root. With a single ingest
