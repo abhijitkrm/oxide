@@ -44,8 +44,13 @@ def height(port):
     return int(v, 16) if v else None
 
 
-def block_txs(port, h):
-    v = rpc(port, "eth_getBlockTransactionCountByNumber", [hex(h)])
+SINK = "0x" + "77" * 20  # every injected transfer pays 1 wei to this address
+
+
+def executed_txs(port):
+    """Exact count of executed injected transfers: the sink's balance in wei (1 wei each). One RPC
+    call per sample (per-block count calls trip the RPC's per-IP rate limit at 100+ blocks/s)."""
+    v = rpc(port, "eth_getBalance", [SINK, "latest"])
     return int(v, 16) if v else None
 
 
@@ -105,25 +110,19 @@ def main():
         time.sleep(a.warmup)
 
         port = a.rpc_port
-        h_start = height(port)
+        h_start, tx_start = height(port), executed_txs(port)
         ticks0 = [cpu_ticks(p.pid) for p in procs]
         t_start = time.time()
-        seen, total_txs, per_block = h_start, 0, []
-        last_h, t_last = h_start, t_start
+        last_h, last_tx, t_last = h_start, tx_start, t_start
         end = t_start + a.duration
         while time.time() < end:
-            h = height(port)
-            if h is not None:
-                last_h, t_last = h, time.time()
-                while seen < h:
-                    seen += 1
-                    c = block_txs(port, seen)
-                    if c is not None:
-                        total_txs += c
-                        per_block.append(c)
-            time.sleep(0.2)
-        t_end = t_last
-        h_end = last_h
+            h, c = height(port), executed_txs(port)
+            if h is not None and c is not None:
+                last_h, last_tx, t_last = h, c, time.time()
+            time.sleep(0.5)
+        t_end, h_end = t_last, last_h
+        total_txs = (last_tx or 0) - (tx_start or 0)
+        per_block = []
         ticks1 = [cpu_ticks(p.pid) for p in procs]
         elapsed = t_end - t_start
         hz = os.sysconf("SC_CLK_TCK")
@@ -140,8 +139,7 @@ def main():
             "blocks": blocks, "blocks_per_s": round(blocks / elapsed, 2),
             "avg_block_ms": round(1000 * elapsed / blocks, 1) if blocks else None,
             "txs": total_txs, "tx_per_s": round(total_txs / elapsed),
-            "avg_tx_per_block": round(total_txs / max(len(per_block), 1), 1),
-            "max_tx_per_block": max(per_block) if per_block else 0,
+            "avg_tx_per_block": round(total_txs / blocks, 1) if blocks else None,
             "cpu_pct_of_pinned": cpu_pct, "end_heights": heights,
             "exited": dead,
             "max_height_lag": (max(heights) - min(heights)) if all(x is not None for x in heights) else None,
@@ -149,7 +147,7 @@ def main():
         print(f"{n} validators x {len(cpusets[0])} CPUs ({'cores+SMT' if a.smt else 'cores'}), offered "
               f"{a.rate:.0f}/validator ({a.rate * n:.0f} total)")
         print(f"  committed {res['tx_per_s']} tx/s, {res['blocks_per_s']} blocks/s "
-              f"(~{res['avg_block_ms']} ms/block, avg {res['avg_tx_per_block']} tx/block, max {res['max_tx_per_block']})")
+              f"(~{res['avg_block_ms']} ms/block, avg {res['avg_tx_per_block']} tx/block)")
         print(f"  CPU of pinned set: {cpu_pct}%  end heights {heights}")
         print("RESULT " + json.dumps(res))
     finally:
