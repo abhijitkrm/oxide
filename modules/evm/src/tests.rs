@@ -4985,6 +4985,89 @@ fn lanes_match_serial_with_shared_recipient_credits() {
 }
 
 #[test]
+fn lane_count_follows_the_thread_count_up_to_the_cap() {
+    use crate::lanes::lane_count_for;
+    assert_eq!(lane_count_for(0), 1, "never zero lanes");
+    assert_eq!(lane_count_for(1), 1);
+    assert_eq!(lane_count_for(8), 8);
+    assert_eq!(lane_count_for(24), 24, "the old cap of 8 left cores idle");
+    assert_eq!(lane_count_for(64), 64);
+    assert_eq!(lane_count_for(256), 64, "capped");
+}
+
+/// Structured addresses (a counter in a few bytes, the rest constant: exactly what benchmark and
+/// vanity accounts look like) must still spread across all lanes. The previous three-byte hash used
+/// at most 16 distinct lanes for these, harmless at 8 lanes and wasteful at 64.
+#[test]
+fn lane_assignment_spreads_structured_addresses_across_all_lanes() {
+    use crate::lanes::lane_of_address;
+    type Make = fn(u64) -> [u8; 20];
+    let sets: [(&str, Make); 3] = [
+        ("counter in bytes 0..8", |i| {
+            let mut a = [0u8; 20];
+            a[..8].copy_from_slice(&i.to_le_bytes());
+            a[19] = 0xEE;
+            a
+        }),
+        ("counter in the last bytes only", |i| {
+            let mut a = [0x11u8; 20];
+            a[16..].copy_from_slice(&u32::try_from(i).unwrap_or(u32::MAX).to_be_bytes());
+            a
+        }),
+        ("counter in the middle bytes only", |i| {
+            let mut a = [0x22u8; 20];
+            a[8..12].copy_from_slice(&u32::try_from(i).unwrap_or(u32::MAX).to_le_bytes());
+            a
+        }),
+    ];
+    for lanes_n in [8usize, 24, 64] {
+        for (name, make) in sets {
+            let mut counts = vec![0usize; lanes_n];
+            let total = 20_000u64;
+            for i in 0..total {
+                counts[lane_of_address(&revm::primitives::Address::from(make(i)), lanes_n)] += 1;
+            }
+            let (min, max) = (*counts.iter().min().unwrap(), *counts.iter().max().unwrap());
+            let mean = usize::try_from(total).unwrap_or(0) / lanes_n;
+            assert!(
+                min * 10 > mean * 7 && max * 10 < mean * 13,
+                "{name}, {lanes_n} lanes: min {min} max {max} mean {mean}"
+            );
+        }
+    }
+}
+
+/// Lanes equal serial execution for any lane count, including more lanes than this machine has
+/// cores (a rayon pool can have any number of threads), so the 64-core configuration is covered by
+/// the same differential harness as the 8-core one.
+#[test]
+fn lanes_match_serial_at_every_lane_count() {
+    for threads in [2usize, 8, 24, 64] {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("pool");
+        pool.install(|| {
+            let sc = LaneScenario::new(200);
+            let merchant = revm::primitives::Address::from([0xAB; 20]);
+            // Fresh recipients for the first rounds, a shared merchant for the last: both regimes.
+            let txs = lane_txs(&sc, 5, |i, n| {
+                if n < 3 {
+                    let mut a = [0u8; 20];
+                    a[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                    a[8..16].copy_from_slice(&n.to_le_bytes());
+                    a[19] = 0xEE;
+                    revm::primitives::Address::from(a)
+                } else {
+                    merchant
+                }
+            });
+            assert!(
+                run_lane_differential(&sc, true, &txs),
+                "{threads} threads: batch must use lanes"
+            );
+        });
+    }
+}
+
+#[test]
 fn lanes_fall_back_and_match_on_non_qualifying_batches() {
     let sc = LaneScenario::new(100);
     // Ring: every sender pays the next sender.

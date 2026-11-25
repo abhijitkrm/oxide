@@ -38,9 +38,39 @@ use crate::receipts;
 /// part of ~0.8 us per tx.
 pub(crate) const LANE_MIN_TXS: usize = 512;
 
-/// Most lanes a batch is split into (unit: lanes). More lanes than cores only add
-/// merge work; the cap also bounds the per-lane overlay memory.
-const MAX_LANES: usize = 8;
+/// Most lanes a batch is split into (unit: lanes). Origin: one lane per rayon thread is the point of
+/// the design (more lanes than cores only add merge work), and the old cap of 8 left 56 of 64 cores
+/// idle for EVM batches on a big machine; 64 covers the 64-96 core targets in `plan.md` Phase 2. The
+/// cap bounds the per-lane overlay memory (each lane holds its own account overlay) and the merge
+/// pass, which is linear in the number of lanes. Tradeoff of raising it further: more merge work and
+/// memory for cores that a batch of a few thousand txs cannot keep busy anyway (`LANE_MIN_TXS`).
+const MAX_LANES: usize = 64;
+
+/// Number of lanes for a pool of `threads` rayon threads: one per thread, at least 1, at most
+/// [`MAX_LANES`]. Pure so the rule is testable without a big machine.
+pub(crate) fn lane_count_for(threads: usize) -> usize {
+    threads.clamp(1, MAX_LANES)
+}
+
+/// The lane (0..`lanes_n`) a sender's transactions run in. Stable within a batch, which is all that
+/// is required (lanes only have to keep one sender's txs together and in order). Mixes the whole
+/// address: the previous hash read three bytes, so structured addresses (benchmark accounts that
+/// differ in a few low bytes, vanity prefixes) collapsed onto a handful of lanes, which does not
+/// matter with 8 lanes and wastes most of 64. Folding all 20 bytes through an avalanche finalizer
+/// spreads any structured set evenly.
+pub(crate) fn lane_of_address(addr: &EvmAddress, lanes_n: usize) -> usize {
+    let b = addr.as_slice();
+    let lo = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+    let hi = u64::from_le_bytes([b[12], b[13], b[14], b[15], b[16], b[17], b[18], b[19]]);
+    let mid = u64::from(u32::from_le_bytes([b[8], b[9], b[10], b[11]]));
+    // Fold the three parts together, then a full avalanche finalizer (splitmix64): a bare multiply only
+    // carries information upward, so a counter in the middle bytes never reached the bits read below.
+    let mut z = lo ^ hi.rotate_left(29) ^ mid.rotate_left(47);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    usize::try_from(z >> 32).unwrap_or(0) % lanes_n.max(1)
+}
 
 /// A transaction's finished history record, receipt and event, built off the serial path.
 struct PreparedRecord {
@@ -183,11 +213,8 @@ impl EvmModule {
         }
 
         // Partition by sender. The hash only has to be stable within the batch.
-        let lanes_n = rayon::current_num_threads().clamp(1, MAX_LANES);
-        let lane_of = |a: &EvmAddress| -> usize {
-            let b = a.as_slice();
-            (usize::from(b[0]) ^ (usize::from(b[7]) << 3) ^ (usize::from(b[19]) << 5)) % lanes_n
-        };
+        let lanes_n = lane_count_for(rayon::current_num_threads());
+        let lane_of = |a: &EvmAddress| -> usize { lane_of_address(a, lanes_n) };
         let mut lanes: Vec<Vec<usize>> = vec![Vec::new(); lanes_n];
         for (i, item) in decoded.iter().enumerate() {
             if let Ok((_, caller, ..)) = item {
