@@ -43,6 +43,10 @@
     clippy::too_many_lines
 )]
 
+/// The same allocator as the node binaries: the bench measures what a node would do.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Arc;
 use std::time::Instant;
 

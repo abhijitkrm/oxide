@@ -28,6 +28,8 @@ storage = { workspace = true }
 rayon = { workspace = true }
 
 [dev-dependencies]
+# mimalloc: the throughput bench runs under the same allocator as the node binaries (a library crate never sets one).
+mimalloc = { workspace = true }
 consensus = { workspace = true }
 criterion = "0.7.0"
 framework = { workspace = true }

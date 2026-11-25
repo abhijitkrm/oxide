@@ -37,6 +37,10 @@ use codec::{Decode, Encode};
 
 mod driver;
 
+/// The process allocator: mimalloc, not glibc malloc (see the workspace `mimalloc` entry for the measurements).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     // Supervision before anything can spawn: a panic on a critical
     // actor's thread aborts the process so the supervisor restarts a

@@ -171,6 +171,14 @@ zeroize = "1.9.0"
 # threadpool, mature, used by reth/Foundry.
 rayon = "1.12.0"
 
+# mimalloc: global allocator for the node BINARIES and the throughput bench (never a library). On a
+# 12-core box glibc malloc spent most of the delegated-bundle assemble phase in cross-thread frees (events
+# are allocated on lane threads and freed on others): loop throughput 5.7M -> 10.1M orders/s for delegated
+# bundles, +22% owner-signed bundles, +13% single signed orders, +5% EVM transfers (docs/devlog.md, 25 Nov).
+# jemalloc measured the same within noise. MIT, 0.1.52 published 2026-05-22; exact-pinned. default-features
+# off: no secure mode, no debug statistics.
+mimalloc = { version = "=0.1.52", default-features = false }
+
 # External storage adapters (plan.md §2.3: StorageBackend adapters).
 # redb is Apache-2.0 (GPL-3.0-compatible), pure Rust, ACID, LMDB-like.
 redb = "4.2.0"

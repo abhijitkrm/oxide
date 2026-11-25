@@ -57,6 +57,10 @@ const CERT_POLL_ATTEMPTS: u32 = 120;
 /// retry loop is cheap for the server.
 const CERT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// The process allocator: mimalloc, not glibc malloc (see the workspace `mimalloc` entry for the measurements).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     // Supervision before anything can spawn: a panic on a critical
     // actor's thread aborts the process so the supervisor restarts a

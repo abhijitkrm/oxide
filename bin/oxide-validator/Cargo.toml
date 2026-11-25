@@ -15,6 +15,8 @@ name = "oxide-validator"
 path = "src/main.rs"
 
 [dependencies]
+# mimalloc: global allocator (see the workspace entry): cross-thread frees dominated glibc malloc under load.
+mimalloc = { workspace = true }
 # keystore: `keygen --encrypt` writes OXKEY blobs and
 # `--signer-key-file` reads them.
 node = { workspace = true, features = ["keystore"] }
