@@ -52,7 +52,7 @@
 //! No adaptive limits or circuit breaker; those arrive in Phase 4+
 //! with the production networking stack.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
@@ -70,6 +70,66 @@ use crate::reputation::{PeerReputationStore, ReputationEvent};
 /// peers but less exposure.
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
+/// What an inbound payload is, as far as admission cares. The transport is payload-agnostic, so the node
+/// supplies a [`Classifier`]; without one every payload is [`MessageClass::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageClass {
+    /// Consensus protocol traffic (proposals, votes, certificates, timeouts): liveness depends on it arriving.
+    Consensus,
+    /// Everything else (transaction gossip, block sync, discovery).
+    Other,
+}
+
+/// Maps a raw payload to its [`MessageClass`] (cheap: the node reads the leading type byte).
+pub type Classifier = fn(&[u8]) -> MessageClass;
+
+/// One token bucket's shape, in bytes (one token per byte): burst `capacity` and sustained `refill_per_sec`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketSpec {
+    /// Burst size (bytes).
+    pub capacity: u64,
+    /// Sustained rate (bytes per second).
+    pub refill_per_sec: u64,
+}
+
+/// Per-peer ingress limits.
+///
+/// An UNTRUSTED peer (anyone not in the committee) has one strict bucket shared by everything it sends, the
+/// historical 10 MiB burst / 1 MiB/s. A TRUSTED peer (an authenticated committee member) is treated differently
+/// because its traffic is the chain itself: its consensus-class messages (proposals carry the block's
+/// transactions) bypass the gossip budget and are bounded only by a high hard cap, so a transaction-gossip
+/// flood can no longer starve its proposals and votes; its other traffic (tx gossip, block sync) gets a large
+/// budget sized for the throughput targets. Measured why: with the single 1 MiB/s bucket a 4-validator order
+/// run committed 97 orders/s (0.07 blocks/s) against 211,851 orders/s with the limit raised.
+#[derive(Debug, Clone, Copy)]
+pub struct IngressPolicy {
+    /// Unknown peers: one strict bucket for all traffic.
+    pub untrusted: BucketSpec,
+    /// Committee peers: transaction gossip, block sync and everything that is not consensus-class.
+    pub trusted_gossip: BucketSpec,
+    /// Committee peers: consensus-class messages. A hard cap against a faulty validator, never below the gossip budget.
+    pub trusted_consensus: BucketSpec,
+    /// Simultaneous connection cap.
+    pub max_connections: usize,
+}
+
+impl Default for IngressPolicy {
+    /// Origin: 1 MiB/s for strangers is the long-standing default. For committee links the budget must
+    /// carry the throughput targets: 1M tx/s of ~250-byte transactions is ~250 MB/s per link, and 10M
+    /// orders/s in bundles ~270-470 MB/s. 128 MiB/s sustained gossip (512 MiB burst) and a 512 MiB/s
+    /// consensus hard cap (1 GiB burst) leave headroom on a 10-gigabit link while still bounding a faulty peer.
+    /// Raise them with the network; both are configuration (`[network]`).
+    fn default() -> Self {
+        const MIB: u64 = 1024 * 1024;
+        Self {
+            untrusted: BucketSpec { capacity: 10 * MIB, refill_per_sec: MIB },
+            trusted_gossip: BucketSpec { capacity: 512 * MIB, refill_per_sec: 128 * MIB },
+            trusted_consensus: BucketSpec { capacity: 1024 * MIB, refill_per_sec: 512 * MIB },
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+        }
+    }
+}
+
 /// A unified admission control policy for inbound connections and
 /// messages.
 ///
@@ -81,8 +141,16 @@ const DEFAULT_MAX_CONNECTIONS: usize = 256;
 pub struct AdmissionControl {
     /// Peer reputation tracker (ban checks).
     reputation: PeerReputationStore,
-    /// Per-peer ingress rate limiter.
+    /// Per-peer ingress rate limiter for UNTRUSTED peers (and for payloads without a classifier).
     rate_limiter: RateLimiter,
+    /// Trusted peers' non-consensus traffic (tx gossip, block sync).
+    trusted_gossip_limiter: RateLimiter,
+    /// Trusted peers' consensus-class traffic: the high hard cap.
+    consensus_limiter: RateLimiter,
+    /// Authenticated committee peers.
+    trusted: HashSet<PeerId>,
+    /// Payload classifier supplied by the node; `None` classifies everything as `Other`.
+    classifier: Option<Classifier>,
     /// The maximum number of simultaneous connections.
     max_connections: usize,
     /// The current number of connections (tracked via admit/release).
@@ -93,12 +161,57 @@ impl AdmissionControl {
     /// Construct an admission control policy with default parameters.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_policy(IngressPolicy::default())
+    }
+
+    /// Construct an admission control with an explicit [`IngressPolicy`]. Nobody is trusted until
+    /// [`trust`](Self::trust) is called and no payload is consensus-class until
+    /// [`set_classifier`](Self::set_classifier) is called, so a policy without them behaves exactly like the
+    /// old single-bucket limiter for every peer.
+    #[must_use]
+    pub fn with_policy(policy: IngressPolicy) -> Self {
         Self {
             reputation: PeerReputationStore::new(),
-            rate_limiter: RateLimiter::new(),
-            max_connections: DEFAULT_MAX_CONNECTIONS,
+            rate_limiter: RateLimiter::with_capacity(
+                policy.untrusted.capacity,
+                policy.untrusted.refill_per_sec,
+            ),
+            trusted_gossip_limiter: RateLimiter::with_capacity(
+                policy.trusted_gossip.capacity,
+                policy.trusted_gossip.refill_per_sec,
+            ),
+            consensus_limiter: RateLimiter::with_capacity(
+                policy.trusted_consensus.capacity,
+                policy.trusted_consensus.refill_per_sec,
+            ),
+            trusted: HashSet::new(),
+            classifier: None,
+            max_connections: policy.max_connections,
             current_connections: 0,
         }
+    }
+
+    /// Install the payload classifier ([`admit_payload`](Self::admit_payload) uses it).
+    pub fn set_classifier(&mut self, classifier: Classifier) {
+        self.classifier = Some(classifier);
+    }
+
+    /// Mark `peer` as an authenticated committee member (see [`IngressPolicy`]).
+    pub fn trust(&mut self, peer: &PeerId) {
+        self.trusted.insert(peer.clone());
+    }
+
+    /// Mark every peer in `peers` as trusted.
+    pub fn trust_all<'a>(&mut self, peers: impl IntoIterator<Item = &'a PeerId>) {
+        for p in peers {
+            self.trust(p);
+        }
+    }
+
+    /// Whether `peer` is a trusted committee member.
+    #[must_use]
+    pub fn is_trusted(&self, peer: &PeerId) -> bool {
+        self.trusted.contains(peer)
     }
 
     /// Construct an admission control policy with a custom connection
@@ -111,12 +224,11 @@ impl AdmissionControl {
     /// * `rate_refill` — Token refill rate per peer (bytes/sec).
     #[must_use]
     pub fn with_limits(max_connections: usize, rate_capacity: u64, rate_refill: u64) -> Self {
-        Self {
-            reputation: PeerReputationStore::new(),
-            rate_limiter: RateLimiter::with_capacity(rate_capacity, rate_refill),
+        Self::with_policy(IngressPolicy {
+            untrusted: BucketSpec { capacity: rate_capacity, refill_per_sec: rate_refill },
             max_connections,
-            current_connections: 0,
-        }
+            ..IngressPolicy::default()
+        })
     }
 
     /// Check whether a new connection from `peer` should be admitted.
@@ -152,12 +264,32 @@ impl AdmissionControl {
     /// message). On failure due to rate limiting, the reputation is
     /// not changed (rate limiting is not misbehavior, just throttling).
     pub fn admit_message(&mut self, peer: &PeerId, bytes: usize) -> bool {
-        // Reject messages from banned peers.
+        self.admit_classed(peer, bytes, MessageClass::Other)
+    }
+
+    /// [`admit_message`](Self::admit_message) for a payload the classifier can read: this is the transport's
+    /// entry point. See [`IngressPolicy`] for what trusted peers get.
+    pub fn admit_payload(&mut self, peer: &PeerId, payload: &[u8]) -> bool {
+        let class = self.classifier.map_or(MessageClass::Other, |c| c(payload));
+        self.admit_classed(peer, payload.len(), class)
+    }
+
+    fn admit_classed(&mut self, peer: &PeerId, bytes: usize, class: MessageClass) -> bool {
+        // Reject messages from banned peers (trusted or not).
         if self.reputation.is_banned(peer) {
             return false;
         }
-        // Check rate limit.
-        if !self.rate_limiter.check(peer, bytes) {
+        // Rate limit: a trusted peer's consensus traffic has its own high cap, its other traffic a large
+        // gossip budget; everyone else shares one strict bucket.
+        let admitted = if self.trusted.contains(peer) {
+            match class {
+                MessageClass::Consensus => self.consensus_limiter.check(peer, bytes),
+                MessageClass::Other => self.trusted_gossip_limiter.check(peer, bytes),
+            }
+        } else {
+            self.rate_limiter.check(peer, bytes)
+        };
+        if !admitted {
             return false;
         }
         // Record positive reputation for valid message.
@@ -234,6 +366,21 @@ impl SharedAdmissionControl {
     /// See [`AdmissionControl::admit_message`].
     pub fn admit_message(&self, peer: &PeerId, bytes: usize) -> bool {
         primitives::sync::lock_state(&self.0).admit_message(peer, bytes)
+    }
+
+    /// Check an inbound payload, classified. See [`AdmissionControl::admit_payload`].
+    pub fn admit_payload(&self, peer: &PeerId, payload: &[u8]) -> bool {
+        primitives::sync::lock_state(&self.0).admit_payload(peer, payload)
+    }
+
+    /// Install the payload classifier. See [`AdmissionControl::set_classifier`].
+    pub fn set_classifier(&self, classifier: Classifier) {
+        primitives::sync::lock_state(&self.0).set_classifier(classifier);
+    }
+
+    /// Mark every peer in `peers` as trusted. See [`AdmissionControl::trust_all`].
+    pub fn trust_all<'a>(&self, peers: impl IntoIterator<Item = &'a PeerId>) {
+        primitives::sync::lock_state(&self.0).trust_all(peers);
     }
 
     /// Record a misbehavior event. See
@@ -563,5 +710,117 @@ mod tests {
         let _la = caps.try_acquire(a).expect("a's lease");
         assert!(caps.try_acquire(same_subnet).is_none(), "same /64 shares the bucket");
         assert!(caps.try_acquire(other_subnet).is_some(), "a different /64 has its own budget");
+    }
+
+    // ── Ingress policy: consensus traffic from trusted peers is not starved by gossip ──
+
+    /// Test classifier: first byte 0..=4 is consensus-class (proposal, vote, QC, timeout, TC), the rest is not.
+    fn classify(payload: &[u8]) -> MessageClass {
+        match payload.first() {
+            Some(0..=4) => MessageClass::Consensus,
+            _ => MessageClass::Other,
+        }
+    }
+
+    fn tx_gossip(len: usize) -> Vec<u8> {
+        let mut v = vec![5u8];
+        v.resize(len, 0);
+        v
+    }
+
+    fn proposal(len: usize) -> Vec<u8> {
+        let mut v = vec![0u8];
+        v.resize(len, 0);
+        v
+    }
+
+    /// The failure mode measured on the consensus bench: with ONE bucket per peer shared by every message,
+    /// a gossip flood empties it and the peer's proposals and votes are dropped too (the chain then stops:
+    /// 97 orders/s instead of 211,851). The policy must keep consensus messages from a trusted peer flowing.
+    #[test]
+    fn a_gossip_flood_cannot_starve_a_trusted_peers_consensus_messages() {
+        let mut ac = AdmissionControl::with_policy(IngressPolicy {
+            untrusted: BucketSpec { capacity: 1_000, refill_per_sec: 1 },
+            trusted_gossip: BucketSpec { capacity: 1_000, refill_per_sec: 1 },
+            trusted_consensus: BucketSpec { capacity: 1_000_000, refill_per_sec: 1_000_000 },
+            max_connections: 16,
+        });
+        ac.set_classifier(classify);
+        ac.trust(&peer(1));
+        // Flood tx gossip until the trusted gossip bucket is empty and drops.
+        let mut gossip_admitted = 0;
+        for _ in 0..50 {
+            gossip_admitted += usize::from(ac.admit_payload(&peer(1), &tx_gossip(100)));
+        }
+        assert!(gossip_admitted < 50, "the gossip bucket must still bound gossip");
+        // ... and a proposal right after is still delivered.
+        assert!(
+            ac.admit_payload(&peer(1), &proposal(400)),
+            "a trusted peer's proposal must not be dropped because its gossip budget is spent"
+        );
+    }
+
+    /// The exemption is for KNOWN validators only: the same flood-then-proposal from an unknown peer is
+    /// still throttled by its single strict bucket.
+    #[test]
+    fn an_untrusted_peer_keeps_the_strict_shared_bucket() {
+        let mut ac = AdmissionControl::with_policy(IngressPolicy {
+            untrusted: BucketSpec { capacity: 1_000, refill_per_sec: 1 },
+            trusted_gossip: BucketSpec { capacity: 1_000_000, refill_per_sec: 1_000_000 },
+            trusted_consensus: BucketSpec { capacity: 1_000_000, refill_per_sec: 1_000_000 },
+            max_connections: 16,
+        });
+        ac.set_classifier(classify);
+        for _ in 0..50 {
+            let _ = ac.admit_payload(&peer(9), &tx_gossip(100));
+        }
+        assert!(
+            !ac.admit_payload(&peer(9), &proposal(400)),
+            "an untrusted peer's consensus-class message gets no exemption"
+        );
+    }
+
+    /// Trusted does not mean unbounded: a faulty validator flooding consensus-class messages still hits the hard cap.
+    #[test]
+    fn the_consensus_hard_cap_still_bounds_a_faulty_validator() {
+        let mut ac = AdmissionControl::with_policy(IngressPolicy {
+            untrusted: BucketSpec { capacity: 1_000, refill_per_sec: 1 },
+            trusted_gossip: BucketSpec { capacity: 1_000, refill_per_sec: 1 },
+            trusted_consensus: BucketSpec { capacity: 5_000, refill_per_sec: 1 },
+            max_connections: 16,
+        });
+        ac.set_classifier(classify);
+        ac.trust(&peer(1));
+        let admitted = (0..100).filter(|_| ac.admit_payload(&peer(1), &proposal(1_000))).count();
+        assert_eq!(admitted, 5, "5,000 tokens of 1,000-byte consensus messages, no refill");
+    }
+
+    /// Bans still apply to everyone, trusted or not.
+    #[test]
+    fn a_banned_trusted_peer_is_still_dropped() {
+        let mut ac = AdmissionControl::new();
+        ac.set_classifier(classify);
+        ac.trust(&peer(1));
+        for _ in 0..100 {
+            ac.record_misbehavior(&peer(1), ReputationEvent::InvalidMessage);
+        }
+        assert!(ac.is_banned(&peer(1)));
+        assert!(!ac.admit_payload(&peer(1), &proposal(10)), "bans override the exemption");
+    }
+
+    /// The shipped defaults let a committee peer carry the data rate the throughput targets need (hundreds of
+    /// MB/s of block data), while an unknown peer keeps today's 1 MiB/s.
+    #[test]
+    fn default_policy_scales_trusted_links_and_keeps_untrusted_strict() {
+        let p = IngressPolicy::default();
+        assert_eq!(p.untrusted.refill_per_sec, 1024 * 1024, "unknown peers: unchanged 1 MiB/s");
+        assert!(
+            p.trusted_gossip.refill_per_sec >= 100 * 1024 * 1024,
+            "committee gossip: >= 100 MiB/s"
+        );
+        assert!(
+            p.trusted_consensus.refill_per_sec >= p.trusted_gossip.refill_per_sec,
+            "the consensus hard cap is never below the gossip budget"
+        );
     }
 }

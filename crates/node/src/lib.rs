@@ -48,6 +48,7 @@
 //!     verify_workers: None,
 //!     intake_threads: None,
 //!     rayon_threads: None,
+//!     exchange_markets: 1,
 //! };
 //! let mut node = Node::assemble(&config);
 //! // Drive consensus, inspect state, etc.

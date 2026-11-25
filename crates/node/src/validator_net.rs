@@ -44,6 +44,15 @@
 //! baked into the peer id would point at a different member the
 //! moment a removal reshuffled the committee; the address cannot.
 
+/// Admission classifier: consensus-protocol messages (leading type byte `MSG_PROPOSAL..=MSG_TC`) are
+/// [`p2p::admission::MessageClass::Consensus`]; transaction gossip and block sync are not.
+fn classify_payload(payload: &[u8]) -> p2p::admission::MessageClass {
+    match payload.first() {
+        Some(&(MSG_PROPOSAL..=MSG_TC)) => p2p::admission::MessageClass::Consensus,
+        _ => p2p::admission::MessageClass::Other,
+    }
+}
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -872,25 +881,31 @@ pub(crate) fn build_transport(
     );
     let transport_config =
         p2p::tcp::TcpTransportConfig { peer_auth: Some(auth), ..to_transport_config(network) };
-    // Admission control is always on in the shipped node: connection
-    // caps, per-peer ingress rate limits, and reputation bans are not
-    // optional defenses. Default limits (256 connections, 10 MiB
-    // burst / 1 MiB/s per peer) comfortably fit consensus traffic.
-    // `OXIDE_P2P_INGRESS_BYTES_PER_SEC` (harness/experiment knob, unset in production) overrides the
-    // per-peer ingress refill rate, with a burst of ten seconds' worth. The default refill of 1 MiB/s is
-    // shared by ALL of a peer's messages, proposals and votes included, so it caps a chain at roughly
-    // 4k tx/s per proposing peer (docs/devlog.md, consensus bench).
-    let admission = match std::env::var("OXIDE_P2P_INGRESS_BYTES_PER_SEC")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
+    // Admission control is always on in the shipped node: connection caps, per-peer ingress rate limits and
+    // reputation bans are not optional defenses. Policy (docs/devlog.md, "p2p ingress policy"): the peers in
+    // `peers` are the committee, authenticated by the signed greeting above, so they are TRUSTED: their
+    // consensus-class messages (proposal, vote, QC, timeout, TC) have their own high hard cap and can no
+    // longer be starved by a transaction-gossip flood, and their other traffic gets a large budget sized for
+    // the throughput targets. Anyone else (observers, strangers) keeps the strict 10 MiB burst / 1 MiB/s
+    // shared bucket. `OXIDE_P2P_INGRESS_BYTES_PER_SEC` (harness knob, unset in production) overrides the
+    // TRUSTED peers' gossip refill rate (burst = ten seconds' worth); the consensus hard cap stays at least
+    // that high. The committee set is read at startup: a peer added by a later rotation is untrusted
+    // until restart, which is the safe direction.
+    let mut policy = p2p::admission::IngressPolicy::default();
+    if let Some(rate) =
+        std::env::var("OXIDE_P2P_INGRESS_BYTES_PER_SEC").ok().and_then(|v| v.parse::<u64>().ok())
     {
-        Some(rate) => p2p::admission::SharedAdmissionControl::new(
-            p2p::admission::AdmissionControl::with_limits(256, rate.saturating_mul(10), rate),
-        ),
-        None => {
-            p2p::admission::SharedAdmissionControl::new(p2p::admission::AdmissionControl::new())
-        }
-    };
+        policy.trusted_gossip =
+            p2p::admission::BucketSpec { capacity: rate.saturating_mul(10), refill_per_sec: rate };
+        policy.trusted_consensus.refill_per_sec = policy.trusted_consensus.refill_per_sec.max(rate);
+        policy.trusted_consensus.capacity =
+            policy.trusted_consensus.capacity.max(rate.saturating_mul(10));
+    }
+    let admission = p2p::admission::SharedAdmissionControl::new(
+        p2p::admission::AdmissionControl::with_policy(policy),
+    );
+    admission.set_classifier(classify_payload);
+    admission.trust_all(peers.iter().map(|(id, _)| id));
     if let Some(tls_spec) = tls {
         let trusted_peers: Vec<(Vec<u8>, String)> = tls_spec
             .trusted_peer_certs
@@ -2883,6 +2898,20 @@ mod repair_tests {
     //! a canned HTTP peer serving manifest/cert/chunks, and the real
     //! `Executor::repair_import_snapshot` rebuild underneath.
     use super::*;
+
+    /// The admission classifier's boundary: exactly the five consensus-protocol tags are exempt from the
+    /// gossip budget; tx gossip, block sync, empty payloads and unknown tags are not.
+    #[test]
+    fn admission_classifier_exempts_only_consensus_tags() {
+        use p2p::admission::MessageClass::{Consensus, Other};
+        for tag in [MSG_PROPOSAL, MSG_VOTE, MSG_QC, MSG_TIMEOUT, MSG_TC] {
+            assert_eq!(classify_payload(&[tag, 1, 2]), Consensus, "tag {tag:#x}");
+        }
+        for tag in [MSG_TX, MSG_BLOCK_REQ, MSG_BLOCK_RESP, 0x08, 0xff] {
+            assert_eq!(classify_payload(&[tag, 1, 2]), Other, "tag {tag:#x}");
+        }
+        assert_eq!(classify_payload(&[]), Other);
+    }
     use ports::AppInterface;
     use primitives::{Epoch, Hash, Height, View};
     use std::io::{Read, Write};
