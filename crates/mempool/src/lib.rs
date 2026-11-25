@@ -438,6 +438,22 @@ impl Mempool {
         self.insert_prepared(PreparedTx { tx, hash, sender, nonce, fee, gas })
     }
 
+    /// [`submit_with_gas`](Self::submit_with_gas) with the transaction's hash supplied by the
+    /// caller (intake hashes once, in parallel across ingest threads); skips the serial re-hash.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`submit`](Self::submit).
+    pub fn submit_with_gas_hashed(
+        &mut self,
+        tx: TxBytes,
+        gas: u64,
+        hash: Hash,
+    ) -> Result<(), MempoolError> {
+        let (sender, nonce, fee) = parse_tx(tx.as_bytes()).ok_or(MempoolError::Malformed)?;
+        self.insert_prepared(PreparedTx { tx, hash, sender, nonce, fee, gas })
+    }
+
     /// Submit a transaction whose hash, envelope fields, and gas
     /// estimate the caller already computed — the batch intake's
     /// parallel phase produces exactly this. Skips the per-tx
@@ -867,8 +883,15 @@ impl Mempool {
     /// `TxBytes`: O(proposal txs) hashing on the proposal path —
     /// the same price `remove_committed` pays at finalization.
     pub fn note_proposed(&mut self, txs: &[TxBytes]) {
-        let set: DigestSet =
+        let hashes: Vec<Hash> =
             txs.iter().map(|tx| Hasher::hash_one(Domain::Transaction, tx.as_bytes())).collect();
+        self.note_proposed_hashed(hashes);
+    }
+
+    /// [`note_proposed`](Self::note_proposed) with the proposal's tx hashes already computed
+    /// (the executor hashes a proposal once, in parallel).
+    pub fn note_proposed_hashed(&mut self, hashes: Vec<Hash>) {
+        let set: DigestSet = hashes.into_iter().collect();
         self.proposed.push_back(set);
         while self.proposed.len() > MAX_IN_FLIGHT_PROPOSALS {
             self.proposed.pop_front();
@@ -929,9 +952,18 @@ impl Mempool {
     /// [`refresh_anchors`](Self::refresh_anchors), which needs the
     /// commit height to tell "still in the lane" from "resolved".
     pub fn remove_committed(&mut self, txs: &[TxBytes], height: u64) {
+        let hashes: Vec<Hash> =
+            txs.iter().map(|tx| Hasher::hash_one(Domain::Transaction, tx.as_bytes())).collect();
+        self.remove_committed_hashed(txs, &hashes, height);
+    }
+
+    /// [`remove_committed`](Self::remove_committed) with the block's tx hashes already computed
+    /// (`hashes[i]` is the hash of `txs[i]`; the executor hashes a block once, in parallel).
+    pub fn remove_committed_hashed(&mut self, txs: &[TxBytes], hashes: &[Hash], height: u64) {
+        debug_assert_eq!(txs.len(), hashes.len());
         self.proposed.pop_front();
-        for tx in txs {
-            let hash = Hasher::hash_one(Domain::Transaction, tx.as_bytes());
+        for (tx, hash) in txs.iter().zip(hashes) {
+            let hash = *hash;
             // Record the vacated nonce as committed-but-unexecuted so
             // `select` can bridge the phantom gap an execution-lane
             // lag would otherwise leave between the stale anchor and

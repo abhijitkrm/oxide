@@ -758,7 +758,7 @@ impl Executor {
 
     /// `Domain::Transaction` hash of every tx in a block, in block order. Parallel
     /// above [`PAR_HASH_MIN_TXS`] (hashing is ~0.2 us per tx, independent per tx).
-    fn hash_block_txs(txs: &[types::TxBytes]) -> Vec<Hash> {
+    pub(crate) fn hash_block_txs(txs: &[types::TxBytes]) -> Vec<Hash> {
         use rayon::prelude::*;
         let h = |tx: &types::TxBytes| Hasher::hash_one(Domain::Transaction, tx.as_bytes());
         if txs.len() >= PAR_HASH_MIN_TXS {
