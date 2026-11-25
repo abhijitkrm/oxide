@@ -15,6 +15,7 @@
 //! pinned by unit tests in this crate and round-tripped by the codec
 //! property tests.
 
+pub mod compact;
 pub(crate) mod gf256;
 pub mod rs;
 pub mod shard;
