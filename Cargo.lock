@@ -1797,6 +1797,7 @@ dependencies = [
  "framework",
  "mempool",
  "metrics",
+ "mimalloc",
  "ports",
  "primitives",
  "rayon",
@@ -2497,6 +2498,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "librocksdb-sys"
 version = "0.17.3+10.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2639,6 +2649,15 @@ name = "metrics"
 version = "0.1.0"
 dependencies = [
  "hdrhistogram",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
@@ -2924,6 +2943,7 @@ dependencies = [
  "crypto",
  "evm",
  "executor",
+ "mimalloc",
  "node",
  "primitives",
  "statesync",
@@ -2951,6 +2971,7 @@ dependencies = [
  "executor",
  "framework",
  "matcher",
+ "mimalloc",
  "node",
  "ports",
  "primitives",
@@ -3014,6 +3035,7 @@ dependencies = [
  "executor",
  "framework",
  "metrics",
+ "mimalloc",
  "node",
  "oxide-core",
  "p2p",

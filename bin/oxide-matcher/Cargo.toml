@@ -20,6 +20,8 @@ path = "src/main.rs"
 dev-identities = ["matcher/dev-identities"]
 
 [dependencies]
+# mimalloc: global allocator (see the workspace entry): cross-thread frees dominated glibc malloc under load.
+mimalloc = { workspace = true }
 matcher = { workspace = true }
 # keystore: `--settlement-key-file` accepts encrypted OXKEY blobs.
 node = { workspace = true, features = ["keystore"] }
