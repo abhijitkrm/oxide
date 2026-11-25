@@ -25333,3 +25333,30 @@ TLS issues), 0386 (tokio `AsyncFd` unsound), 0418 (libz-sys build script), 0544 
 
 In plain words: swapping the memory allocator the programs use made the same server about 30% faster for ordinary bundles, twice as
 fast for gateway-routed orders (now 8 to 9 million a second sustained) and 15% faster for EVM transfers, with no change to any result.
+
+## 25 Nov 2026 — zero-fee orders (branch `zero-fee-orders`)
+
+User decision: orders cost nothing as long as the sender has the balance to execute them; deposits, withdrawals and the like keep paying.
+
+Built: `Module::min_fee_for(payload)` (default `None` = the chain floor) is consulted by the executor's fee-floor gate; the exchange returns
+`Some(0)` for place, cancel, amend, bundle and delegated bundle. Free must not mean unbounded, so `Module::validate` (admission) now
+refuses an order its sender cannot fund: limit buys against the ledger (summed per payer, owners for a delegated bundle), market buys need
+a non-zero balance (their cost depends on the live book), sells need base custody (`try_lock` on the exchange's main lock, which execution
+holds for whole lane runs, so the check is skipped when it is busy), and every item of a delegated bundle must be authorized (same
+best-effort rule for the delegation store). Admission is a filter only: escrow at execution stays authoritative, and `process_proposal`
+does not call it, so a skipped check can waste block space but never funds.
+
+Tests: floor exemption table; funded/unfunded buy, sell without custody, market buy with no balance, truncated place; per-payer bundle
+and delegated-bundle checks; an end-to-end run through the executor with a chain floor of 5 (the order at fee 0 executes, the zero-fee
+deposit is skipped `FeeFloor`, the same deposit at fee 5 executes); an unfunded order refused at ingest. Three mutation checks fail as they
+should (orders not exempt, buy funds check removed, delegation check at admission removed).
+
+Cost on the box (ingest rate, 12 threads, 3 interleaved runs, main vs this branch): single signed orders 327-328k vs 324-327k/s; owner-signed
+bundles 17.0-18.3M vs 15.6-18.3M items/s; delegated bundles 14.4-16.0M vs 14.5-14.8M: within run-to-run noise.
+
+Known limits: the sell and delegation checks are skipped when their lock is busy; an order a free sender cannot afford at EXECUTION time
+(balance spent between admission and the block) still burns its block gas for nothing; the pool orders by fee density, so with every
+order at fee 0 there is no fee priority among them.
+
+In plain words: sending an order is free if your account can back it; moving funds still costs a fee; an order you could not pay for is
+turned away before it reaches a block.

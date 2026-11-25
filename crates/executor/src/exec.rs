@@ -276,7 +276,9 @@ impl Executor {
             // the account is exactly the reordering this plan
             // exists to eliminate. Self-funded modules (EVM: gas is
             // the fee) are exempt either way.
-            if !module.pays_own_fee() && ctx.fee < self.min_fee() {
+            // A module may exempt messages that are free by design (`Module::min_fee_for`).
+            let floor = module.min_fee_for(payload).unwrap_or_else(|| self.min_fee());
+            if !module.pays_own_fee() && ctx.fee < floor {
                 skipped.push((tx_hash, TxSkipReason::FeeFloor));
                 continue;
             }
