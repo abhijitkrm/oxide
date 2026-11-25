@@ -235,32 +235,86 @@ impl TxInject {
         sender: primitives::Address,
         chain_id: u64,
     ) -> Self {
-        let sink = alloy_primitives::Address::from([0x77; 20]);
+        Self {
+            sender,
+            anchor_module: Some(evm::MODULE_ID),
+            interval: Duration::from_secs_f64(1.0 / rate),
+            build: Box::new(move |nonce: u64| sign_evm_transfer(&key, &sender, chain_id, nonce)),
+        }
+    }
+
+    /// [`Self::evm_transfers`] with the first `count` envelopes signed up front, in parallel, so the
+    /// pump thread never signs while it is also driving consensus (signing is ~40 us per transaction:
+    /// at 25k tx/s it would eat the pump). Nonces past `count` fall back to signing on demand. Harness
+    /// use only (the throughput benches); memory is `count` x ~250 bytes.
+    ///
+    /// # Panics
+    /// As [`Self::evm_transfers`].
+    #[must_use]
+    pub fn evm_transfers_presigned(
+        rate: f64,
+        key: [u8; 32],
+        sender: primitives::Address,
+        chain_id: u64,
+        count: usize,
+    ) -> Self {
+        let workers = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let chunk = count.div_ceil(workers).max(1);
+        let mut pool: Vec<Vec<u8>> = Vec::with_capacity(count);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..count)
+                .step_by(chunk)
+                .map(|start| {
+                    let end = (start + chunk).min(count);
+                    let sender = &sender;
+                    s.spawn(move || {
+                        (start..end)
+                            .map(|n| sign_evm_transfer(&key, sender, chain_id, n as u64))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for h in handles {
+                pool.extend(h.join().expect("presign worker"));
+            }
+        });
         Self {
             sender,
             anchor_module: Some(evm::MODULE_ID),
             interval: Duration::from_secs_f64(1.0 / rate),
             build: Box::new(move |nonce: u64| {
-                let tx = evm::tx::TxLegacy {
-                    fields: evm::tx::TxFields {
-                        nonce,
-                        gas_limit: 21_000,
-                        to: evm::tx::TxKind::Call(sink),
-                        value: alloy_primitives::U256::from(1u64),
-                        data: alloy_primitives::Bytes::new(),
-                        chain_id,
-                    },
-                    gas_price: alloy_primitives::U256::from(10_000_000_000u64),
-                };
-                let signed =
-                    evm::tx::SignedTx::sign_legacy(tx, &key).expect("injection key must sign");
-                // The envelope fee field is exempted for EVM txs
-                // (`pays_own_fee` — gas covers it); the value
-                // mirrors `evm_workload`'s convention.
-                evm::wrap_evm_tx_envelope(&sender, nonce, 10_000_000_000, &signed.encode_to_bytes())
+                match usize::try_from(nonce).ok().and_then(|i| pool.get(i)) {
+                    Some(bytes) => bytes.clone(),
+                    None => sign_evm_transfer(&key, &sender, chain_id, nonce),
+                }
             }),
         }
     }
+}
+
+/// One signed EVM transfer envelope: a 21 000-gas legacy transfer of 1 wei to a fixed sink at 10 gwei
+/// (the bid `evm_workload` uses) wrapped in the standard EVM envelope. The envelope fee field is exempted
+/// for EVM txs (`pays_own_fee`, gas covers it); the value mirrors `evm_workload`'s convention.
+fn sign_evm_transfer(
+    key: &[u8; 32],
+    sender: &primitives::Address,
+    chain_id: u64,
+    nonce: u64,
+) -> Vec<u8> {
+    let sink = alloy_primitives::Address::from([0x77; 20]);
+    let tx = evm::tx::TxLegacy {
+        fields: evm::tx::TxFields {
+            nonce,
+            gas_limit: 21_000,
+            to: evm::tx::TxKind::Call(sink),
+            value: alloy_primitives::U256::from(1u64),
+            data: alloy_primitives::Bytes::new(),
+            chain_id,
+        },
+        gas_price: alloy_primitives::U256::from(10_000_000_000u64),
+    };
+    let signed = evm::tx::SignedTx::sign_legacy(tx, key).expect("injection key must sign");
+    evm::wrap_evm_tx_envelope(sender, nonce, 10_000_000_000, &signed.encode_to_bytes())
 }
 
 /// A funded secp256k1 account the pump submits equivocation
