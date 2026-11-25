@@ -25149,3 +25149,23 @@ market the lane path plans and then declines, which costs ~0.18 us/tx there (0.4
 In plain words: if traders send their orders in signed bundles and trade across several markets, the chain now matches them on
 several cores at once and reaches about 5.8 million orders a second on this 12-core server, with results provably identical to the
 single-core path. One signed order per transaction is still limited by signature checks, about 415 thousand a second.
+
+### Lane cap raised 8 -> 32; markets beyond 12 (25 Nov, same box and setup, bundle mix, median of 3, `matrix-lane-cap.log`)
+
+| Markets | Serial lane | Lanes, 12 threads | Lanes, 24 threads | dispatch us/bundle (lanes, 12) |
+|---|---|---|---|---|
+| 12 | 2.48M orders/s | 5.82M | 5.74M | 5.87 |
+| 16 | 2.44M | **5.97M** | 6.00M | 5.55 |
+| 32 | 2.37M | 5.65M | 5.88M | 5.31 |
+| 64 | 2.27M | 5.42M | 5.53M | 5.24 |
+| 256 | 1.85M | 3.54M | 3.62M | 5.21 |
+
+Chain and exchange roots are identical across lanes off / on / 24 threads at every market count (1 distinct pair each).
+Findings: the cap was not the limit: throughput plateaus at 5.5-6.0M orders/s from 12 to 64 markets and 24 threads add nothing. The
+lane phase itself is cheap (dispatch ~5 us per 64-order bundle); the exec stage's total is ~8.5 us per bundle, so the serial
+parts (executor plan 2.3 us, funds map, per-sender fee charge, merge, untimed block bookkeeping) set the ceiling near 7.5M
+orders/s, and the bench thread (propose + finalize) shares the cores. At 256 markets the exec stage total rises to 15.9 us
+(dispatch unchanged at 5.2): a cost that grows with the number of markets sits outside dispatch; not yet profiled.
+
+In plain words: using more than 12 markets works (up to 256) and gives the same ~6M orders a second; beyond that the extra
+cores sit idle because the single-threaded steps around the matching are now the limit, not the matching itself.
