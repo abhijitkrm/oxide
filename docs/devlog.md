@@ -25504,3 +25504,17 @@ Also fixed: the `node` crate doctest had not been updated for `NodeConfig.exchan
 
 In plain words: validators no longer rate-limit each other like strangers. Votes and proposals between committee members always get through, so a flood of
 transactions can't stall the chain, and committee links may carry the data rates the throughput targets need, while unknown peers stay tightly limited.
+
+## 25 Nov 2026 — block pacing knob (branch `block-pacing`)
+
+Added `[performance] min_block_interval_ms` (env `OXIDE_PERFORMANCE_MIN_BLOCK_INTERVAL_MS`): a leader waits until at least that long after its own previous proposal
+before proposing again (pure rule `pacing_remaining`, tested; view changes and heartbeats are not made faster or slower except that a paced leader's heartbeat also waits).
+Motivation: proposing the instant a QC lands builds blocks from one round trip's arrivals, paying the per-block fixed costs (BLS ~28%, history-trie Keccak ~14%) for few txs.
+
+Measured (laptop, 8 cores, 4 validators unpinned, EVM transfers presigned at 3,000 tx/s offered each, 20 s windows, interleaved, two runs per setting):
+0 ms: 8,055 and 8,332 tx/s; 20 ms: 8,421 and 8,403; 50 ms: 8,454 and 8,298; blocks 22.5-23 per second (about 44 ms apart), 367-372 tx per block in every run.
+No measurable difference (noise about 3%): rounds already take longer than the interval, so the floor never binds. This test cannot show whether pacing helps on a fast machine.
+
+Decision: default OFF (zero, behavior unchanged). The knob ships so the multi-core box run can A/B it where rounds are faster than the interval; set a default only after that.
+
+In plain words: a setting to make a validator wait a few milliseconds between blocks so each block holds more transactions. On the laptop it changed nothing, so it is off by default until it is tested on a faster machine.

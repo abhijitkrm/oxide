@@ -90,6 +90,33 @@ pub(crate) const MSG_BLOCK_RESP: u8 = 0x07; // certified-block serve (verified r
 /// blocks but closer to timeout churn.
 const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
 
+/// Default minimum gap between this validator's own proposals.
+///
+/// Unit: wall-clock time. Origin: docs/devlog.md "block pacing". Proposing the instant a QC lands makes
+/// blocks of whatever arrived in one round trip, so per-block fixed costs (BLS ~28%, state-root Keccak
+/// ~14% of CPU in the consensus bench) are paid for few transactions; a minimum interval would fill
+/// blocks. OFF by default (zero) because the A/B on a laptop (4 validators, 8 cores, 0/20/50 ms, two
+/// interleaved runs each) showed no difference: rounds there already take ~44 ms, so the floor never
+/// binds. Enable on a machine where rounds finish faster than the interval, after measuring.
+/// Tradeoff of a nonzero value: fuller blocks and less CPU per tx, but up to that much added block
+/// latency and a cap of 1/interval blocks/s per leader. Set via `[performance] min_block_interval_ms`.
+pub const DEFAULT_MIN_BLOCK_INTERVAL: Duration = Duration::ZERO;
+
+/// How much longer a leader must wait before proposing: zero if it has never proposed or the
+/// minimum interval has already elapsed since `last_proposal`.
+///
+/// Pure so the rule is testable; the pump loop calls it each pass before `propose`.
+fn pacing_remaining(
+    last_proposal: Option<std::time::Instant>,
+    now: std::time::Instant,
+    min_interval: Duration,
+) -> Duration {
+    match last_proposal {
+        Some(t) => min_interval.saturating_sub(now.saturating_duration_since(t)),
+        None => Duration::ZERO,
+    }
+}
+
 /// Minimum interval between outgoing block-fetch requests for the
 /// same gap (unit: wall-clock). The fetch trigger fires on every
 /// gapped proposal — at tip pace that's one per view — so without a
@@ -808,6 +835,7 @@ pub fn run(spec: ValidatorNetSpec) {
         evidence_reporter,
         node_config.chain_id,
         node_config.verify_workers,
+        node_config.min_block_interval_ms.map_or(DEFAULT_MIN_BLOCK_INTERVAL, Duration::from_millis),
     );
     // Flush any batched certified-record appends before the data
     // dir is handed to the snapshot exporter.
@@ -1157,6 +1185,7 @@ fn run_consensus_loop(
     evidence_reporter: Option<EvidenceReporter>,
     chain_id: u64,
     verify_workers: Option<usize>,
+    min_block_interval: Duration,
 ) {
     // (cap documented at module scope — `GOSSIP_SEEN_CAP`)
     // This pump re-attempts every un-voted pending proposal on each
@@ -1206,6 +1235,8 @@ fn run_consensus_loop(
     };
     let mut voted_views: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut proposed_views: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // When this validator last produced a proposal (block pacing, `min_block_interval`).
+    let mut last_proposal_at: Option<std::time::Instant> = None;
     let mut last_reported_height: u64 = 0;
     // View-change timeout tracking. The pacemaker has an internal
     // timeout duration (base 2s, exponential backoff). We track when
@@ -1329,7 +1360,12 @@ fn run_consensus_loop(
         // high-QC one: without it a fleet whose view-0 leader is dead
         // from boot livelocks — no QC can ever form, so `high_qc`
         // stays `None` and every later leader would wait forever.
-        if engine.is_leader() && !proposed_views.contains(&view) && engine.view_justified() {
+        if engine.is_leader()
+            && !proposed_views.contains(&view)
+            && engine.view_justified()
+            && pacing_remaining(last_proposal_at, std::time::Instant::now(), min_block_interval)
+                .is_zero()
+        {
             // Idle mode is an explicit heartbeat, not silence:
             // `propose()` returns None when no work is pending, but
             // a silent leader is indistinguishable from a dead one —
@@ -1349,6 +1385,7 @@ fn run_consensus_loop(
             });
             if let Some((header, proposal)) = produced {
                 progressed = true;
+                last_proposal_at = Some(std::time::Instant::now());
                 let proposal_view = header.view.value();
                 proposed_views.insert(proposal_view);
                 pending_proposals.push((header.clone(), proposal.clone()));
@@ -2898,6 +2935,25 @@ mod repair_tests {
     //! a canned HTTP peer serving manifest/cert/chunks, and the real
     //! `Executor::repair_import_snapshot` rebuild underneath.
     use super::*;
+
+    /// Block pacing: a leader that has never proposed is not delayed; one that proposed `d` ago waits the
+    /// rest of the interval; the wait never goes negative; a zero interval disables pacing.
+    #[test]
+    fn pacing_waits_out_the_minimum_interval() {
+        let t0 = std::time::Instant::now();
+        let iv = Duration::from_millis(20);
+        assert_eq!(pacing_remaining(None, t0, iv), Duration::ZERO);
+        assert_eq!(pacing_remaining(Some(t0), t0, iv), iv);
+        assert_eq!(
+            pacing_remaining(Some(t0), t0 + Duration::from_millis(15), iv),
+            Duration::from_millis(5)
+        );
+        assert_eq!(pacing_remaining(Some(t0), t0 + Duration::from_millis(20), iv), Duration::ZERO);
+        assert_eq!(pacing_remaining(Some(t0), t0 + Duration::from_secs(5), iv), Duration::ZERO);
+        assert_eq!(pacing_remaining(Some(t0), t0, Duration::ZERO), Duration::ZERO);
+        // A clock that appears to run backwards must not panic or stall the leader.
+        assert_eq!(pacing_remaining(Some(t0 + Duration::from_secs(1)), t0, iv), iv);
+    }
 
     /// The admission classifier's boundary: exactly the five consensus-protocol tags are exempt from the
     /// gossip budget; tx gossip, block sync, empty payloads and unknown tags are not.
