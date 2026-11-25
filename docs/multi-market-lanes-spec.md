@@ -1,6 +1,7 @@
 # Per-market parallel execution of the exchange (spec, draft 25 Nov 2026)
 
-Status: IMPLEMENTATION IN PROGRESS on branch `exchange-lanes`. User decision (25 Nov): "we have 12 cores, we are not running
+Status: IMPLEMENTED and measured on the box (25 Nov): bundle mix 2.5M -> 5.8M orders/s at 12 markets, roots identical lanes on/off;
+see `docs/devlog.md`. Single-order transactions gain nothing (signature-bound). User decision (25 Nov): "we have 12 cores, we are not running
 parallel matching?" then "yes" to building it. This is the chain-path counterpart of the EVM sender lanes
 (`docs/multi-lane-evm-spec.md`).
 

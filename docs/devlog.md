@@ -25110,3 +25110,42 @@ core it reached the gas cap first and returned `OutOfGas`. Not a product bug: th
 Fix: the deadline is 1 ms, below the fastest plausible loop time, so the deadline always fires first.
 
 In plain words: a test assumed the machine was slow enough; the new server is fast enough to break that assumption.
+
+## 25 Nov 2026 — per-market parallel execution of the exchange (branch `exchange-lanes`)
+
+User question: "we have 12 cores, we are not running parallel matching?" Correct for the chain path: the standalone engine scales
+(103M orders/s at 8 shards, 144M at 12, no auth, `engine-shards.csv`) but every exchange transaction ran on the single exec lane.
+Profile of that lane (bundle mix, exec-lane samples only): 82% in the exchange `handle`, of which the engine's `place` is ~24%;
+the rest is bookkeeping (ledger moves, settlement apply, custody maps, book fold hash).
+
+Built (`docs/multi-market-lanes-spec.md`): runs of limit/sell `place`, `cancel` and bundles of them execute in parallel per market
+component; the funds proof (every sender's balance covers the run's fees and buy reservations) makes ledger debits and credits
+commute, so per-account net deltas applied after the run equal the serial result. Anything else declines before touching state
+(amend, market buy, unfunded sender, single market, small run). The order logic is one body (`place_core`, `cancel_core`,
+`bundle_core`) over a `BookView` trait (serial maps or lane overlay), so the paths cannot drift. Executor gained
+`Module::handle_run_lanes`; fees are charged once per sender (they commute and cannot fail after the proof).
+
+Exactness: 4 differential tests (random multi-market runs, 6 seeds x 4 blocks: per-tx results and events, module state root,
+every ledger balance; decline cases; small runs). Mutation checks: dropping the funds proof fails the unfunded test, dropping
+the cross-market union fails the random differential. End to end through the executor with the real EVM fee module,
+`chain_mix` prints a `roots,` line and its keys are now seeded: lanes on/off give identical chain and exchange roots in every
+cell of the matrix below (3 repetitions each).
+
+Measured (Ryzen 9 7900, 12 ingest threads, root stage on, 512 accounts, median of 3, raw: `matrix-exchange-lanes.log`):
+
+| Mix | Markets | Lanes | dispatch us/order-batch | loop orders/s |
+|---|---|---|---|---|
+| bundle (64 orders per signed tx) | 1 | off / on | 19.95 / 20.08 | 2.63M / 2.60M |
+| bundle | 4 | off / on | 20.92 / 8.70 | 2.52M / **4.78M** |
+| bundle | 8 | off / on | 20.93 / 6.49 | 2.49M / **5.64M** |
+| bundle | 12 | off / on | 21.45 / 6.11 | 2.46M / **5.80M** |
+| single-order txs | 1, 4, 8, 12 | off / on | 0.43 / 0.42-0.61 | ~415k both |
+
+What this says: with bundles the chain path now does 5.8M orders/s at 12 markets (2.3x the serial lane), in process, no consensus.
+Single-order signed transactions gain nothing: they are bound by one signature recovery per order (about 415k/s on this box), and
+their per-transaction fixed work (planning, funds map, fee charge, merge) costs as much as the matching it parallelizes. At one
+market the lane path plans and then declines, which costs ~0.18 us/tx there (0.43 -> 0.61): an open item (decline earlier).
+
+In plain words: if traders send their orders in signed bundles and trade across several markets, the chain now matches them on
+several cores at once and reaches about 5.8 million orders a second on this 12-core server, with results provably identical to the
+single-core path. One signed order per transaction is still limited by signature checks, about 415 thousand a second.
