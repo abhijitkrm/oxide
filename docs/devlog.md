@@ -25199,3 +25199,31 @@ Still serial on the exec thread: exchange `state_root` (0.55 us/bundle, not defe
 In plain words: bundled orders now reach about 8.7 million a second on this server, up from 2.4 million before the parallel work and
 6 million at the start of today. Orders sent one at a time with their own signature, and ordinary EVM transfers, did not move: they
 are limited by checking one signature each, which this 12-core machine does about 320 thousand times a second.
+
+### Sustained throughput with ingest and execution sharing the cores (25 Nov, Ryzen 9 7900, 12 threads, root stage on)
+
+`chain_mix` gained `CHAIN_MIX_CONCURRENT=1` (ingest threads run while the propose/finalize loop drains the pool, one block per
+`CHAIN_MIX_BLOCK_MS`, default 50), `CHAIN_MIX_BLOCK_BYTES`, and a `wall,` line (first ingest to last rooted block). Earlier "loop"
+numbers ran ingest first and execution after, so they were each stage's own ceiling, not a sustained rate.
+
+Mempool hashing first (each tx was re-hashed with BLAKE3 in the intake drain, `note_proposed` and `remove_committed` on the serial
+proposer thread: 47% / 39% / 75% of those phases): the hash now rides the intake ring and proposals/blocks are hashed in parallel.
+Loop (execution loop alone) for bundles: 8.7M -> 11.9M orders/s; single signed orders 407k -> 474k/s; roots byte-identical.
+
+Sustained, concurrent (raw logs: `matrix-concurrent*.log`, `matrix-steady.log`, `matrix-ingest-sweep.log`):
+
+| Workload | Sustained | Notes |
+|---|---|---|
+| bundles (64 orders per signed tx), 16 markets, 60M orders, 50 ms blocks of 64 MiB | **9.1-9.4M orders/s** (6.4-6.6 s runs) | with the default 8 MiB block the same run caps at 5.98M: block bytes x block rate is a protocol limit (~27 bytes per order) |
+| bundles, lanes off | 2.84M orders/s | execution-bound |
+| one signed order per tx | ~300k orders/s (lanes on or off) | scales with ingest threads (121k at 4, 290k at 12): signature-bound |
+| EVM transfers | ~106-123k tx/s | plateaus from 8 ingest threads up: not signature-bound but exec stage at 7-8 us/tx under load (3.5 us alone) |
+
+Reading: 10M orders/s of bundles is reachable on 12 cores with blocks of ~64 MiB per 50 ms (a protocol parameter, and ~540 MB/s of
+transaction data on the wire). The two single-signature types are limited by CPU: a recovery is ~30 us of the ~40 us a transaction costs
+end to end, so 12 cores top out near 300-400k/s and the pipeline threads (exec, propose/finalize, root, seal) take cores from ingest.
+1M single-signed tx/s needs ~3x the cores or cheaper authentication (exchange orders: session/gateway keys; EVM transactions are
+signed by protocol).
+
+In plain words: sending orders in signed bundles, this server handles about 9 million a second end to end, while orders signed one by
+one top out near 300 thousand a second and ordinary EVM transfers near 120 thousand: the cost is checking each signature.
