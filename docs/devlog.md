@@ -25544,3 +25544,25 @@ Not yet measured end to end: validator CPU and orders/s through consensus on a m
 
 In plain words: every block used to re-add up all 8,191 entries of a bookkeeping contract to change one of them. It now remembers the previous result and fixes only the one
 entry that changed, about 20 times faster, and the answer is bit-for-bit the same.
+
+## 25 Nov 2026 — BLS per-block cost: what is already done and what is left (branch `bls-verify-once`, docs only)
+
+Phase 1 item 4 was "verify each QC once; batch vote verification", from the profile's BLS 28.5% (~3 ms of CPU per block). Reading the code first:
+- QC once: already done (audit N-4, `verified_qcs` memo): the formed QC, a same-epoch `deliver_qc` and the vote path's `high_qc` check share one pairing. Proposals verify off the pump in the verify pool.
+- Votes: already optimistic. `verify_per_vote` is false by default; votes are stored unverified and the QC's aggregate is checked ONCE with pre-decompressed keys (`buffered_aggregate_verifies`, S-9).
+- Left: each vote's execution attestation (`Vote.attestation_sig`, same message for the same (height, root)) is verified INDIVIDUALLY in the pool until the exec cert reaches quorum, and
+  a follower pays one pairing each for the proposal signature, the embedded QC and the exec cert (three separate pairing equations per block).
+
+Measured (laptop, one core, `cargo bench -p crypto --bench bls`): sign 310 us; verify 786 us; `aggregate_verify` 4 / 32 / 128 signers 786 / 1,151 / 2,492 us;
+`aggregate_verify_prepared` 4 / 32 / 128 signers 728 / 741 / 789 us. An aggregate over any committee size costs about one single verify.
+
+What that buys (arithmetic, not yet implemented):
+1. Aggregate-first attestation check (one prepared aggregate instead of quorum-1 individual verifies, fall back to individual on failure): saves ~0.8 ms per leader block at 4 validators
+   (~0.2 ms per block per validator on average, ~2% of CPU); at 32 validators ~16 ms per leader block, ~0.5 ms per block per validator. Cost: one pairing on the pump at the moment the QC forms
+   unless a pool job is added. Worth it for committees of 16+, marginal at 4.
+2. One multi-pairing batch (blst `verify_multiple_aggregate_signatures`, random scalars) for a follower's proposal signature + QC + exec cert: 4 Miller loops and one final exponentiation
+   instead of 6 and 3, roughly 1 ms of ~2.4 ms per follower block. Needs the verify pool to batch jobs of different kinds.
+Both touch consensus-critical paths; neither is worth doing before the multi-validator measurement (Phase 2) shows BLS still dominates at a realistic committee size.
+Recommendation: skip item 4 for now, do item 5 (the unexplained 2 s stalls) next, and revisit 1 and 2 with Phase 2 data.
+
+In plain words: the signature checking was already mostly efficient; what remains is checking several signatures in one combined step, which would save little at 4 validators and much more at 30, so it waits for a measurement on a bigger test.
