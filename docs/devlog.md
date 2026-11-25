@@ -25067,6 +25067,41 @@ Dispatch us/tx (lanes off -> on): synchronous 1.36 -> 1.00, root stage 2.12 -> 1
 unchanged. Loop tx/s: transfers 224k -> 236k, mixed 359k -> 405k. `exec_total_us` (whole exec stage per tx, now permanent in
 `StageReport`) shows 2.44 us/tx with 0.5 us outside the phase timers. Details in `docs/multi-lane-evm-spec.md` section 7.
 
+## 25 Nov 2026 — first box run: AMD Ryzen 9 7900 (12 cores / 24 threads, 93 GB), main at 39d7a60
+
+Raw logs: `docs/box-results/2026-11-25-ryzen9-7900/`. The box is a single homogeneous x86 machine (no P/E mix), Ubuntu, kernel 7.0.
+A software RAID resync (`md0_resync`) was running throughout, so no disk or journal figure is taken from this run.
+
+**Gates (fix-timeout-test = main + one test fix):** fmt, clippy `-D warnings` clean. `cargo test --workspace --release`:
+1,671 passed; the one failure (`simulation_respects_wall_clock_timeout`, a 50 ms deadline that a fast core beats) is fixed
+in PR "make the simulation timeout test independent of CPU speed". One matcher test, `market_data::tests::racing_update_is_broadcast_not_dropped`,
+spun for 11 minutes once inside the full-workspace run (165% CPU) and was killed by hand; alone it passed 20/20 and the matcher lib
+passed on re-run. Cause not found: open item, re-run the full suite several times before trusting it. `scripts/bench-gate.sh`
+(4 threads): G1 1.345, G2 6.68, G3 0.357 (floor 0.35, thin), G4 49.8, all pass.
+
+**Matrix (`chain_mix`, root stage on, 512 accounts, 100k txs in 4 blocks, median of 5, spread in the raw log):**
+
+| Workload | Threads | Lanes | dispatch us/tx | exec stage us/tx | loop tx/s |
+|---|---|---|---|---|---|
+| transfers | 12 | off | 2.94 | 4.22 | 181.8k |
+| transfers | 12 | on | 1.91 | 3.61 | 204.2k |
+| transfers | 24 | off | 2.95 | 4.23 | 181.2k |
+| transfers | 24 | on | 1.97 | 3.64 | 201.7k |
+| mixed EVM+CLOB | 12 | off | 1.50 | 2.42 | 279.5k |
+| mixed EVM+CLOB | 12 | on | 1.14 | 2.22 | 297.4k |
+| mixed EVM+CLOB | 24 | off | 1.47 | 2.44 | 277.0k |
+| mixed EVM+CLOB | 24 | on | 1.16 | 2.22 | 293.7k |
+
+What this says: lanes pay on the box too (transfer dispatch -35%, loop +12%; mixed dispatch -23%, loop +6%), the first
+independent confirmation of the laptop result. Going from 12 to 24 threads changes nothing, so the loop is bound by serial stages
+(exec lane at 3.6 us/tx is a ~277k tx/s ceiling; end_block rose to 1.2 us/tx with lanes on, the history/undo work now sits there),
+not by cores. The 1M EVM tx/s target is not reachable from here: admission alone needs ~34 recovery cores.
+Unexplained: transfer exec stage is 3.6 us/tx here against 2.4 us/tx on the laptop, although this CPU is faster per core.
+Candidates, none tested: allocator behaviour at 25k-tx blocks, the resync, memory placement. A run at 100k accounts (first
+attempt, `matrix-accounts100k.log`) was a different workload (dispatch 3.1 us/tx) and is kept apart.
+
+In plain words: the new server confirms the lane redesign helps (about 12% more EVM transfers per second), but the pipeline stops
+scaling at about 200k transfers/s no matter how many cores it gets, because a few single-threaded steps set the pace.
 ## 25 Nov 2026 — first full test run on the Ryzen 9 7900 box: one CPU-speed-dependent test
 
 `cargo test --workspace --release` on the new box (12 cores / 24 threads) failed exactly one test,

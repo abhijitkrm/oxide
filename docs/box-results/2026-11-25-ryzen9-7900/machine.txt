@@ -1,0 +1,6 @@
+CPU(s):                                  24
+Model name:                              AMD Ryzen 9 7900 12-Core Processor
+CPU(s) scaling MHz:                      59%
+L3 cache:                                64 MiB (2 instances)
+Mem:              93           1          85           0           6          91
+7.0.0-43-generic
