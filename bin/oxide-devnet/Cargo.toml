@@ -10,6 +10,8 @@ repository.workspace = true
 name = "oxide-devnet"
 path = "src/main.rs"
 [dependencies]
+# mimalloc: the same global allocator as the production binaries, so consensus benches measure what a node runs.
+mimalloc = { workspace = true }
 # devnet is the development binary — it funds derivable fixture
 # identities and signs smoke transactions as them, so it opts into
 # the dev-identities surface on both `node` and `crypto`. `keystore`

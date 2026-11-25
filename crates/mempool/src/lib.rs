@@ -797,6 +797,12 @@ impl Mempool {
                             .get(&sender)
                             .is_some_and(|cover| cover.contains_key(&nonce))
                     {
+                        // Stepping over covered nonces is only sound BEFORE this proposal holds one
+                        // of the sender's txs: after that, the hole would sit inside the proposal and
+                        // validators reject a proposal whose sender nonces are not contiguous.
+                        if count > 0 {
+                            break;
+                        }
                         nonce = nonce.saturating_add(1);
                         continue;
                     }
@@ -814,6 +820,10 @@ impl Mempool {
                 // this tx's position always resolves before any
                 // proposal carrying the later nonces commits.
                 if self.proposed.iter().any(|set| set.contains(&hash)) {
+                    // Same rule as above: no hole inside one proposal's chain for this sender.
+                    if count > 0 {
+                        break;
+                    }
                     nonce = nonce.saturating_add(1);
                     continue;
                 }
@@ -2054,5 +2064,32 @@ mod tests {
         pool.remove_committed(&[], 1);
         let fourth = pool.select(1 << 20);
         assert_eq!(nonces_of(&fourth), vec![1], "position 2 resolves on its own commit");
+    }
+
+    /// A proposal must never hold a hole inside one sender's nonce chain: validators reject a proposal
+    /// whose sender nonces are not contiguous ("nonce gap/reorder"), which costs the whole round. The
+    /// walk may step over nonces covered by uncommitted ancestors only BEFORE it has selected one of the
+    /// sender's txs; after that, a covered nonce ends the chain (found at 15% proposal rejections on the
+    /// consensus bench, `docs/devlog.md`).
+    #[test]
+    fn selection_never_leaves_a_hole_inside_a_senders_chain() {
+        let mut pool = Mempool::new(1024);
+        let sender = addr(1);
+        for nonce in (0..=5u64).chain(10..=15) {
+            pool.submit(build_tx(sender, nonce, 100, &[0])).unwrap();
+        }
+        // An uncommitted ancestor block carries nonces 6..=9 (so the pool never holds them).
+        let covered: Vec<TxBytes> = (6..=9u64).map(|n| build_tx(sender, n, 100, &[0])).collect();
+        pool.note_in_chain(&covered, 1);
+        let picked: Vec<u64> = pool
+            .select_with_gas_cap(1 << 20, 1 << 40)
+            .iter()
+            .filter_map(|(tx, _)| parse_tx(tx.as_bytes()).map(|(_, n, _)| n))
+            .collect();
+        assert!(
+            picked.windows(2).all(|w| w[1] == w[0] + 1),
+            "selected nonces must be contiguous within one proposal: {picked:?}"
+        );
+        assert_eq!(picked, (0..=5u64).collect::<Vec<_>>(), "the chain ends at the covered range");
     }
 }

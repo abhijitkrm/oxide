@@ -205,6 +205,10 @@ pub struct TxInject {
     /// closure owns the sender's secp256k1 key, chain id, module
     /// route, and payload template; the pump owns pacing.
     pub build: Box<dyn FnMut(u64) -> Vec<u8> + Send>,
+    /// Admit the node's own pre-signed envelopes through `Executor::ingest_tx_recovered` (the sender is
+    /// known: the injector signed them) instead of recovering every signature again on the pump thread.
+    /// The pre-signed harness mode sets it; peers still verify every gossiped copy in full.
+    pub recovered: bool,
 }
 
 impl TxInject {
@@ -235,32 +239,88 @@ impl TxInject {
         sender: primitives::Address,
         chain_id: u64,
     ) -> Self {
-        let sink = alloy_primitives::Address::from([0x77; 20]);
+        Self {
+            sender,
+            anchor_module: Some(evm::MODULE_ID),
+            interval: Duration::from_secs_f64(1.0 / rate),
+            build: Box::new(move |nonce: u64| sign_evm_transfer(&key, &sender, chain_id, nonce)),
+            recovered: false,
+        }
+    }
+
+    /// [`Self::evm_transfers`] with the first `count` envelopes signed up front, in parallel, so the
+    /// pump thread never signs while it is also driving consensus (signing is ~40 us per transaction:
+    /// at 25k tx/s it would eat the pump). Nonces past `count` fall back to signing on demand. Harness
+    /// use only (the throughput benches); memory is `count` x ~250 bytes.
+    ///
+    /// # Panics
+    /// As [`Self::evm_transfers`].
+    #[must_use]
+    pub fn evm_transfers_presigned(
+        rate: f64,
+        key: [u8; 32],
+        sender: primitives::Address,
+        chain_id: u64,
+        count: usize,
+    ) -> Self {
+        let workers = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let chunk = count.div_ceil(workers).max(1);
+        let mut pool: Vec<Vec<u8>> = Vec::with_capacity(count);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..count)
+                .step_by(chunk)
+                .map(|start| {
+                    let end = (start + chunk).min(count);
+                    let sender = &sender;
+                    s.spawn(move || {
+                        (start..end)
+                            .map(|n| sign_evm_transfer(&key, sender, chain_id, n as u64))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for h in handles {
+                pool.extend(h.join().expect("presign worker"));
+            }
+        });
         Self {
             sender,
             anchor_module: Some(evm::MODULE_ID),
             interval: Duration::from_secs_f64(1.0 / rate),
             build: Box::new(move |nonce: u64| {
-                let tx = evm::tx::TxLegacy {
-                    fields: evm::tx::TxFields {
-                        nonce,
-                        gas_limit: 21_000,
-                        to: evm::tx::TxKind::Call(sink),
-                        value: alloy_primitives::U256::from(1u64),
-                        data: alloy_primitives::Bytes::new(),
-                        chain_id,
-                    },
-                    gas_price: alloy_primitives::U256::from(10_000_000_000u64),
-                };
-                let signed =
-                    evm::tx::SignedTx::sign_legacy(tx, &key).expect("injection key must sign");
-                // The envelope fee field is exempted for EVM txs
-                // (`pays_own_fee` — gas covers it); the value
-                // mirrors `evm_workload`'s convention.
-                evm::wrap_evm_tx_envelope(&sender, nonce, 10_000_000_000, &signed.encode_to_bytes())
+                match usize::try_from(nonce).ok().and_then(|i| pool.get(i)) {
+                    Some(bytes) => bytes.clone(),
+                    None => sign_evm_transfer(&key, &sender, chain_id, nonce),
+                }
             }),
+            recovered: true,
         }
     }
+}
+
+/// One signed EVM transfer envelope: a 21 000-gas legacy transfer of 1 wei to a fixed sink at 10 gwei
+/// (the bid `evm_workload` uses) wrapped in the standard EVM envelope. The envelope fee field is exempted
+/// for EVM txs (`pays_own_fee`, gas covers it); the value mirrors `evm_workload`'s convention.
+fn sign_evm_transfer(
+    key: &[u8; 32],
+    sender: &primitives::Address,
+    chain_id: u64,
+    nonce: u64,
+) -> Vec<u8> {
+    let sink = alloy_primitives::Address::from([0x77; 20]);
+    let tx = evm::tx::TxLegacy {
+        fields: evm::tx::TxFields {
+            nonce,
+            gas_limit: 21_000,
+            to: evm::tx::TxKind::Call(sink),
+            value: alloy_primitives::U256::from(1u64),
+            data: alloy_primitives::Bytes::new(),
+            chain_id,
+        },
+        gas_price: alloy_primitives::U256::from(10_000_000_000u64),
+    };
+    let signed = evm::tx::SignedTx::sign_legacy(tx, key).expect("injection key must sign");
+    evm::wrap_evm_tx_envelope(sender, nonce, 10_000_000_000, &signed.encode_to_bytes())
 }
 
 /// A funded secp256k1 account the pump submits equivocation
@@ -719,8 +779,21 @@ pub(crate) fn build_transport(
     // caps, per-peer ingress rate limits, and reputation bans are not
     // optional defenses. Default limits (256 connections, 10 MiB
     // burst / 1 MiB/s per peer) comfortably fit consensus traffic.
-    let admission =
-        p2p::admission::SharedAdmissionControl::new(p2p::admission::AdmissionControl::new());
+    // `OXIDE_P2P_INGRESS_BYTES_PER_SEC` (harness/experiment knob, unset in production) overrides the
+    // per-peer ingress refill rate, with a burst of ten seconds' worth. The default refill of 1 MiB/s is
+    // shared by ALL of a peer's messages, proposals and votes included, so it caps a chain at roughly
+    // 4k tx/s per proposing peer (docs/devlog.md, consensus bench).
+    let admission = match std::env::var("OXIDE_P2P_INGRESS_BYTES_PER_SEC")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(rate) => p2p::admission::SharedAdmissionControl::new(
+            p2p::admission::AdmissionControl::with_limits(256, rate.saturating_mul(10), rate),
+        ),
+        None => {
+            p2p::admission::SharedAdmissionControl::new(p2p::admission::AdmissionControl::new())
+        }
+    };
     if let Some(tls_spec) = tls {
         let trusted_peers: Vec<(Vec<u8>, String)> = tls_spec
             .trusted_peer_certs
@@ -1852,7 +1925,12 @@ fn run_consensus_loop(
                 let tx_bytes = (inject.build)(*nonce);
                 inject_next += inject.interval;
                 emitted += 1;
-                match engine.submit_tx(types::TxBytes::new(tx_bytes.clone())) {
+                let ack = if inject.recovered {
+                    app.ingest_tx_recovered(types::TxBytes::new(tx_bytes.clone()), inject.sender.0)
+                } else {
+                    engine.submit_tx(types::TxBytes::new(tx_bytes.clone()))
+                };
+                match ack {
                     types::MempoolAck::Accepted => {
                         *nonce += 1;
                         fanout_tx(

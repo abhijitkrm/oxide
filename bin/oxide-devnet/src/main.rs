@@ -19,6 +19,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// The process allocator: mimalloc, as in the production binaries (see the workspace `mimalloc` entry).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     // Supervision before anything can spawn: a panic on a critical
     // actor's thread aborts the process so the supervisor restarts a
@@ -397,7 +401,19 @@ fn run_node(node_index_str: &str) {
             u8::try_from(node_index).expect("node index fits u8 for devnet test identities");
         let key = crypto::secp::test_identity_key(identity);
         let sender = crypto::secp::test_identity_address(identity).expect("valid devnet identity");
-        node::validator_net::TxInject::evm_transfers(rate, key, sender, cfg.node.chain_id)
+        // `--tx-inject-presign N` signs the first N envelopes up front, in parallel (throughput
+        // harnesses: keeps ~40 us of signing per tx off the consensus pump thread).
+        match node::cli::parse_cli_flag("--tx-inject-presign").and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(n) if n > 0 => node::validator_net::TxInject::evm_transfers_presigned(
+                rate,
+                key,
+                sender,
+                cfg.node.chain_id,
+                n,
+            ),
+            _ => node::validator_net::TxInject::evm_transfers(rate, key, sender, cfg.node.chain_id),
+        }
     });
 
     // Evidence reporter (S1): the devnet node's own funded test
