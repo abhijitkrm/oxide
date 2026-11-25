@@ -109,10 +109,12 @@ def main():
         ticks0 = [cpu_ticks(p.pid) for p in procs]
         t_start = time.time()
         seen, total_txs, per_block = h_start, 0, []
+        last_h, t_last = h_start, t_start
         end = t_start + a.duration
         while time.time() < end:
             h = height(port)
             if h is not None:
+                last_h, t_last = h, time.time()
                 while seen < h:
                     seen += 1
                     c = block_txs(port, seen)
@@ -120,8 +122,8 @@ def main():
                         total_txs += c
                         per_block.append(c)
             time.sleep(0.2)
-        t_end = time.time()
-        h_end = height(port)
+        t_end = t_last
+        h_end = last_h
         ticks1 = [cpu_ticks(p.pid) for p in procs]
         elapsed = t_end - t_start
         hz = os.sysconf("SC_CLK_TCK")
@@ -130,6 +132,7 @@ def main():
             used = (ticks1[k] - ticks0[k]) / hz / elapsed
             cpu_pct.append(round(100 * used / len(cpusets[k]), 1))
         heights = [height(a.rpc_port + i) for i in range(n)]
+        dead = [i for i, p in enumerate(procs) if p.poll() is not None]
         blocks = (h_end or 0) - (h_start or 0)
         res = {
             "validators": n, "cores_each": a.cores, "smt": a.smt, "cpus_each": len(cpusets[0]),
@@ -140,6 +143,7 @@ def main():
             "avg_tx_per_block": round(total_txs / max(len(per_block), 1), 1),
             "max_tx_per_block": max(per_block) if per_block else 0,
             "cpu_pct_of_pinned": cpu_pct, "end_heights": heights,
+            "exited": dead,
             "max_height_lag": (max(heights) - min(heights)) if all(x is not None for x in heights) else None,
         }
         print(f"{n} validators x {len(cpusets[0])} CPUs ({'cores+SMT' if a.smt else 'cores'}), offered "
