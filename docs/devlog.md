@@ -25250,3 +25250,60 @@ Profile of the EVM exec thread (perf, callees of `execute_block_staged`) said 48
 
 Lesson recorded: a `perf script` callee breakdown is only as good as its frame attribution; confirm any candidate with an interleaved
 A/B on the same configuration before keeping it.
+
+## 25 Nov 2026 — cheap authentication: delegated bundles (branch `cheap-auth`)
+
+Why: a single signed order costs ~30 us of secp256k1 recovery out of ~40 us end to end (~300k orders/s sustained on 12 cores); owner-signed
+bundles reach 9.4M orders/s but only for one account. A MAC cannot be the chain-path answer (every validator would need the secret and
+could forge); a delegation can: validators check a table, not a secret. Spec: `docs/delegated-bundle-spec.md`.
+
+Built: `TAG_DELEGATE`/`TAG_REVOKE_DELEGATE`/`TAG_DBUNDLE` (exchange), delegations in the committed KV store (no state-format change,
+roots unchanged until a delegation exists, snapshots already carry it), per-item authority check shared by the serial and lane paths
+(no delegation, expired, missing flag, over the notional cap: the item is rejected with an indexed event and moves nothing). The lane
+planner's funds proof keys reservations by the owner who funds them.
+
+A benchmark exposed a design gap: gateway bundles span every market, and lanes merged all markets of a bundle into one component, so
+the run declined (`lane_runs=0`, serial speed, 20.8 us per bundle on the laptop). Lanes now plan and execute at the ITEM level (a bundle's
+items on different markets commute under the funds proof): a bundle whose items all land on one lane stays whole and is assembled in the
+lane; a scattered bundle is reassembled in item order on the pool. Owner-signed single-market bundles keep their old speed (merge 0.03 us).
+
+Exactness: delegated bundle == the same items sent as owner-signed transactions (events, books, balances, state root); lanes == serial
+over random runs that include delegated bundles (full, place-only, capped, expired and missing delegations); scatter-only variant
+equal; box probe lanes off/on: identical chain root `20395ffc531d...` and exchange root `93361f7a9d9d...`. Mutation checks that fail
+as they should: authority always passes, notional cap ignored, lane ignores authorization, funds proof ignores owners (needed a new test),
+split-bundle events assembled in reverse. Fuzz target `exchange-delegation` (invariant: an account that never delegated is never
+moved by a delegated bundle; 476k runs clean, and it finds the violation at once with the authority check removed).
+
+Measured on the Ryzen box (12 ingest threads, 16 markets, 32 gateways of 16 owners, root stage on, `matrix-dbundle.log`):
+
+| Mix | loop alone | sustained (ingest + execution together) |
+|---|---|---|
+| owner-signed bundles (reference) | 11.2-11.7M orders/s | 9.4-9.5M |
+| **delegated bundles** | **5.2M** | **4.9-5.2M** |
+| single signed orders (reference) | 474k | ~300k |
+
+Delegated orders cost 2x an owner-signed bundle's per-order exec time because items scatter across lanes and are reassembled (merge
+4.8 us per bundle on the box before the assembly trim: exact-capacity event vectors and chunked pool tasks took the laptop's assemble
+phase 1.3 -> 1.07 us and the loop 6.5M -> 7.4M orders/s; the box has not been re-measured since that trim).
+
+Re-measured on the box after that trim (glibc malloc): no change, loop 5.3-5.5M, sustained 5.0-5.3M orders/s, while the assemble phase
+costs 4.1 us per bundle there against 1.07 us on the laptop. The cause is the allocator, not the algorithm: each item's events are
+allocated on a lane thread and freed on another during assembly, and glibc handles cross-thread frees badly at 12 threads. Measured with
+`LD_PRELOAD` (no code change; jemalloc and mimalloc agree within noise), loop throughput on the box, glibc -> mimalloc:
+
+| Mix | glibc | mimalloc |
+|---|---|---|
+| delegated bundles | 5.7M orders/s | **10.1M** (assemble 3.3 -> 0.5 us) |
+| owner-signed bundles | 11.3M | 13.9M |
+| single signed orders | 472k | 532k |
+| EVM transfers | 155k | 163k |
+
+A global allocator is therefore the next change (its own branch and PR: it adds a dependency, so it needs the justification, exact pin
+and `cargo deny` run the repo requires). The numbers above in this entry are glibc numbers.
+
+Open: the per-item fee model (bundles still pay a flat per-item gas and one envelope fee; an agent paying for many owners needs a
+policy, see the PR), a gateway-side bundler in the load generator.
+
+In plain words: traders can now authorize a gateway once and let it place their orders in bulk. Orders routed that way run at about 5
+million a second here, sixteen times the rate for orders signed one at a time, and the checks that keep a gateway from touching an
+account that never trusted it are tested, mutation-checked and fuzzed.

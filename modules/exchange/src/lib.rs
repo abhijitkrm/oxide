@@ -401,6 +401,19 @@ const TAG_AMEND: u8 = 15;
 /// point: signature recovery (~50 us) is the chain path's admission cap.
 const TAG_BUNDLE: u8 = 19;
 
+/// Delegate message tag (`docs/delegated-bundle-spec.md`): the sender authorizes an agent key to
+/// place/cancel orders for the sender's account. Body `[agent:20][flags:1][expiry_height:8 LE]
+/// [max_item_notional:8 LE]`.
+const TAG_DELEGATE: u8 = 20;
+
+/// Revoke-delegation tag: the sender removes an agent's delegation. Body `[agent:20]`.
+const TAG_REVOKE_DELEGATE: u8 = 21;
+
+/// Delegated bundle tag: ONE transaction signed by an agent carrying many owners' orders. Body
+/// `[count:2 LE]` then `count` items of `[owner:20][len:2 LE][message]` (place or cancel); each item
+/// is authorized by the owner's delegation to the signer instead of a signature recovery.
+const TAG_DBUNDLE: u8 = 22;
+
 /// Most items in one bundle (unit: messages). Origin: spec section 2; 1,024
 /// items at one recovery is ~0.05 us/item of authentication. Raising it
 /// lengthens the time one tx holds the exchange lock inside a block.
@@ -716,6 +729,7 @@ type CommittedState = (
 mod book_view;
 mod codec;
 mod decode;
+mod delegation;
 pub mod dispute;
 mod handlers;
 mod lanes;
@@ -1037,6 +1051,49 @@ pub mod msg {
         (msg.len() - 1 <= super::MAX_BUNDLE_BYTES).then_some(msg)
     }
 
+    /// Build a delegate message: the sender authorizes `agent` (flags: 1 place, 2 cancel; valid while
+    /// `height < expiry_height`; `max_item_notional` 0 = unlimited).
+    pub fn delegate(
+        agent: super::Address,
+        flags: u8,
+        expiry_height: u64,
+        max_item_notional: u64,
+    ) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(1 + 37);
+        msg.push(super::TAG_DELEGATE);
+        msg.extend_from_slice(&agent.0);
+        msg.push(flags);
+        msg.extend_from_slice(&expiry_height.to_le_bytes());
+        msg.extend_from_slice(&max_item_notional.to_le_bytes());
+        msg
+    }
+
+    /// Build a revoke-delegation message for `agent`.
+    pub fn revoke_delegate(agent: super::Address) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(21);
+        msg.push(super::TAG_REVOKE_DELEGATE);
+        msg.extend_from_slice(&agent.0);
+        msg
+    }
+
+    /// Build a delegated bundle from `(owner, place-or-cancel message)` items. `None` when the
+    /// bundle would exceed [`MAX_BUNDLE_ITEMS`] / [`MAX_BUNDLE_BYTES`].
+    pub fn dbundle(items: &[(super::Address, Vec<u8>)]) -> Option<Vec<u8>> {
+        if items.len() > super::MAX_BUNDLE_ITEMS {
+            return None;
+        }
+        let mut msg =
+            Vec::with_capacity(1 + 2 + items.iter().map(|(_, i)| 22 + i.len()).sum::<usize>());
+        msg.push(super::TAG_DBUNDLE);
+        msg.extend_from_slice(&u16::try_from(items.len()).ok()?.to_le_bytes());
+        for (owner, item) in items {
+            msg.extend_from_slice(&owner.0);
+            msg.extend_from_slice(&u16::try_from(item.len()).ok()?.to_le_bytes());
+            msg.extend_from_slice(item);
+        }
+        (msg.len() - 1 <= super::MAX_BUNDLE_BYTES).then_some(msg)
+    }
+
     /// Build an amend-order message (`docs/amend-spec.md`): resize or
     /// re-price the sender's resting order `order_id`.
     pub fn amend(
@@ -1329,6 +1386,8 @@ pub mod msg {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod delegation_tests;
 #[cfg(test)]
 mod lane_tests;
 #[cfg(test)]

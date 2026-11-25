@@ -24,8 +24,9 @@ use primitives::fixed::Qty;
 use rayon::prelude::*;
 use trading::{FillEvent, MatchingEngine, OrderType, Side};
 
-use super::{ExchangeModule, PRICE_SCALE, TAG_BUNDLE, TAG_CANCEL, TAG_PLACE};
+use super::{ExchangeModule, PRICE_SCALE, TAG_BUNDLE, TAG_CANCEL, TAG_DBUNDLE, TAG_PLACE};
 use crate::book_view::BookView;
+use crate::delegation::authorize_item;
 
 /// A fast, per-process-keyed hasher for the lane maps. Lane overlays are short-lived, merged into
 /// order-insensitive committed maps and never iterated for consensus decisions, so they do not
@@ -98,23 +99,60 @@ pub(crate) const LANE_MIN_ORDERS: usize = 512;
 pub(crate) const MAX_LANES: usize = 32;
 
 /// Names of the lane phases, in `lane_ns` order (observability: where a run's time goes).
-pub(crate) const PHASES: [&str; 7] =
-    ["plan", "components", "funds", "fees", "lanes", "merge", "ledger"];
+pub(crate) const PHASES: [&str; 8] =
+    ["plan", "components", "funds", "fees", "lanes", "merge", "assemble", "ledger"];
+
+/// `lane_of_market` entry of a market no item touches.
+const NO_LANE: u8 = u8::MAX;
+
+/// Smallest chunk of scattered bundles one pool task assembles. Unit: bundles. Origin: assembling
+/// one bundle is ~1 us on a laptop core, about the cost of a pool hand-off; 16 amortizes it.
+const ASSEMBLE_MIN_BUNDLES: usize = 16;
+
+/// Work-item index meaning "this whole bundle, on one lane": the lane runs every item in order and
+/// assembles the transaction result itself (in parallel with the other lanes).
+const WHOLE: u32 = u32::MAX;
+
+/// A bundle item's pending result while lanes report.
+type Slot = Option<Result<Vec<Event>, ExecError>>;
+
+/// How a transaction's result is assembled from its items' results.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// One place or cancel: the item's result IS the transaction's result.
+    Single,
+    /// A bundle (own account) or delegated bundle: item events in order, a failed item becomes a
+    /// `bundle_item_rejected` event carrying its index.
+    Bundle,
+    /// Fails whole with no effect (empty payload, bad bundle framing): `Err(Malformed)`.
+    Dead,
+}
+
+/// One place or cancel to execute: the unit of lane work. Items of different markets commute under
+/// the funds proof, so a bundle's items may run on different lanes; items of one market keep their
+/// canonical (transaction, item) order.
+struct Item {
+    /// The account the order is for (the envelope sender, or the owner of a delegated item).
+    owner: Address,
+    /// Message span inside the transaction payload, tag byte included.
+    start: u32,
+    end: u32,
+    /// The market it touches; `None` for a body that fails to parse (it fails with no effect).
+    market: Option<u8>,
+    /// A delegated item needs its delegation checked before it runs.
+    delegated: bool,
+}
 
 /// What the planner needs to know about one transaction, computed in parallel.
 struct TxPlan {
-    /// Markets the transaction touches, as a 256-bit set.
-    markets: [u64; 4],
-    /// Orders it carries (bundle items count): the lane load unit.
-    orders: u32,
-    /// Worst-case native-token outflow: the envelope fee plus every buy item's reservation.
+    shape: Shape,
+    items: Vec<Item>,
+    /// Worst-case native-token outflow of the envelope sender: the fee plus every buy item's
+    /// reservation for the sender's own account.
     spend: u128,
-}
-
-impl TxPlan {
-    fn mark(&mut self, market: u8) {
-        self.markets[usize::from(market >> 6)] |= 1u64 << (market & 63);
-    }
+    /// Reservations of a delegated bundle's buy items, keyed by the OWNER whose balance funds them
+    /// (empty for every other transaction: no allocation on the single-order path).
+    owner_spend: Vec<(Address, u128)>,
 }
 
 /// A buy's reservation exactly as `place_core` computes it for a limit order; saturated to the
@@ -125,87 +163,88 @@ fn buy_reservation(price: u64, qty: u64) -> u128 {
     if q > u128::from(u64::MAX) { u128::from(u64::MAX) } else { q }
 }
 
-/// Plan one `place` body; `None` when the order cannot take the lane path (a market buy: its
-/// reservation depends on the live book).
-fn plan_place(body: &[u8], p: &mut TxPlan) -> Option<()> {
-    if let Some((market, order, _)) = ExchangeModule::parse_place(body) {
-        if order.side == Side::Buy {
-            if order.order_type == OrderType::Market {
-                return None;
+/// Plan one item whose message is `payload[start..end]`; `None` when it cannot take the lane path
+/// (a market buy, whose reservation depends on the live book; an amend or any other kind).
+fn plan_item(
+    payload: &[u8],
+    start: usize,
+    end: usize,
+    owner: Address,
+    delegated: bool,
+    p: &mut TxPlan,
+) -> Option<()> {
+    let msg = &payload[start..end];
+    let (&tag, rest) = msg.split_first()?;
+    let market = match tag {
+        TAG_PLACE => {
+            let parsed = ExchangeModule::parse_place(rest);
+            if let Some((_, order, _)) = &parsed
+                && order.side == Side::Buy
+            {
+                if order.order_type == OrderType::Market {
+                    return None;
+                }
+                let reserve = buy_reservation(order.price.0, order.qty.0);
+                if delegated {
+                    p.owner_spend.push((owner, reserve));
+                } else {
+                    p.spend += reserve;
+                }
             }
-            p.spend += buy_reservation(order.price.0, order.qty.0);
+            parsed.map(|(m, _, _)| m)
         }
-        p.mark(market);
-        p.orders += 1;
-    }
+        TAG_CANCEL => ExchangeModule::parse_cancel(rest).map(|(m, _)| m),
+        _ => return None,
+    };
+    p.items.push(Item {
+        owner,
+        start: u32::try_from(start).ok()?,
+        end: u32::try_from(end).ok()?,
+        market,
+        delegated,
+    });
     Some(())
-}
-
-/// Plan one `cancel` body (a malformed body touches nothing and just fails in its lane).
-fn plan_cancel(body: &[u8], p: &mut TxPlan) {
-    if let Some((market, _)) = ExchangeModule::parse_cancel(body) {
-        p.mark(market);
-        p.orders += 1;
-    }
 }
 
 /// Plan one transaction; `None` when it cannot take the lane path.
 fn plan_tx(tx: &LaneTx<'_>) -> Option<TxPlan> {
-    let mut p = TxPlan { markets: [0; 4], orders: 0, spend: u128::from(tx.ctx.fee) };
-    let Some((&tag, body)) = tx.payload.split_first() else {
+    let payload = tx.payload;
+    let mut p = TxPlan {
+        shape: Shape::Dead,
+        items: Vec::new(),
+        spend: u128::from(tx.ctx.fee),
+        owner_spend: Vec::new(),
+    };
+    let Some((&tag, body)) = payload.split_first() else {
         return Some(p);
     };
     match tag {
-        TAG_PLACE => plan_place(body, &mut p)?,
-        TAG_CANCEL => plan_cancel(body, &mut p),
+        TAG_PLACE | TAG_CANCEL => {
+            p.shape = Shape::Single;
+            plan_item(payload, 0, payload.len(), tx.ctx.sender, false, &mut p)?;
+        }
         TAG_BUNDLE => {
             // A malformed bundle fails whole with no effect, exactly as the serial path.
             if let Ok(spans) = ExchangeModule::bundle_spans(body) {
+                p.shape = Shape::Bundle;
+                p.items.reserve(spans.len());
                 for (a, b) in spans {
-                    let item = &body[a..b];
-                    match item[0] {
-                        TAG_PLACE => plan_place(&item[1..], &mut p)?,
-                        TAG_CANCEL => plan_cancel(&item[1..], &mut p),
-                        _ => return None,
-                    }
+                    plan_item(payload, a + 1, b + 1, tx.ctx.sender, false, &mut p)?;
+                }
+            }
+        }
+        TAG_DBUNDLE => {
+            if let Ok(spans) = ExchangeModule::dbundle_spans(body) {
+                p.shape = Shape::Bundle;
+                p.items.reserve(spans.len());
+                for (owner, a, b) in spans {
+                    plan_item(payload, a + 1, b + 1, owner, owner != tx.ctx.sender, &mut p)?;
                 }
             }
         }
         _ => return None,
     }
     Some(p)
-}
-
-/// Union-find over the 256 market ids; a bundle that touches several markets merges them.
-struct Dsu([u16; 256]);
-
-impl Dsu {
-    fn new() -> Self {
-        let mut p = [0u16; 256];
-        for (i, v) in p.iter_mut().enumerate() {
-            *v = u16::try_from(i).unwrap_or(0);
-        }
-        Self(p)
-    }
-    fn find(&mut self, mut x: u16) -> u16 {
-        while self.0[usize::from(x)] != x {
-            let up = self.0[usize::from(self.0[usize::from(x)])];
-            self.0[usize::from(x)] = up;
-            x = up;
-        }
-        x
-    }
-    fn union(&mut self, a: u16, b: u16) {
-        let (ra, rb) = (self.find(a), self.find(b));
-        if ra != rb {
-            self.0[usize::from(ra.max(rb))] = ra.min(rb);
-        }
-    }
-}
-
-/// The markets set in a 256-bit mask, ascending.
-fn markets_of(mask: &[u64; 4]) -> impl Iterator<Item = u8> + '_ {
-    (0..=u8::MAX).filter(move |m| mask[usize::from(m >> 6)] >> (m & 63) & 1 == 1)
 }
 
 /// The lane backend of [`BookView`]: reads fall through to the (immutable) committed maps, writes
@@ -254,20 +293,32 @@ impl BookView for LaneBook<'_> {
 /// underlying ordered maps directly.
 #[derive(Clone, Copy)]
 struct Maps<'a> {
+    /// The committed key-value store (delegations live here).
+    dlg: &'a BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Block height, for delegation expiry.
+    height: u64,
     bal: &'a BTreeMap<(Address, u8), Qty>,
     hold: &'a BTreeMap<(Address, u8), Qty>,
     vault: &'a BTreeMap<u8, u64>,
 }
 
-/// One lane's input: the transactions (indices, canonical order) and the engines it owns.
+/// One lane's input: its work items `(transaction, item)` in canonical order, and the engines of
+/// the markets it owns.
 struct LaneWork {
-    idxs: Vec<usize>,
+    items: Vec<(u32, u32)>,
     engines: FastMap<u8, MatchingEngine>,
+}
+
+/// One executed item's outcome.
+struct ItemOut {
+    tx: u32,
+    item: u32,
+    result: Result<Vec<Event>, ExecError>,
 }
 
 /// One lane's output.
 struct LaneOut {
-    results: Vec<(usize, Result<Vec<Event>, ExecError>)>,
+    results: Vec<ItemOut>,
     engines: FastMap<u8, MatchingEngine>,
     bal: FastMap<(Address, u8), Qty>,
     hold: FastMap<(Address, u8), Qty>,
@@ -303,32 +354,28 @@ fn lane_cancel(
     ExchangeModule::cancel_core(true, sender, market, order_id, engine, book)
 }
 
-/// Execute one transaction on a lane: the lane twin of `ExchangeModule::handle`.
-fn lane_tx(
-    tx: &LaneTx<'_>,
+/// Execute one item on a lane: authorize it if delegated, then run it as `owner`.
+fn lane_item(
+    agent: &Address,
+    payload: &[u8],
+    item: &Item,
     engines: &mut FastMap<u8, MatchingEngine>,
     fills: &mut Vec<FillEvent>,
     book: &mut LaneBook<'_>,
 ) -> Result<Vec<Event>, ExecError> {
-    let Some((&tag, body)) = tx.payload.split_first() else {
-        return Err(ExecError::Malformed);
-    };
-    let sender = tx.ctx.sender;
+    let msg = &payload[item.start as usize..item.end as usize];
+    let (tag, rest) = (msg[0], &msg[1..]);
+    if item.delegated {
+        authorize_item(book.maps.dlg, book.maps.height, agent, &item.owner, tag, rest)?;
+    }
     match tag {
-        TAG_PLACE => lane_place(sender, body, engines, fills, book),
-        TAG_CANCEL => lane_cancel(sender, body, engines, book),
-        TAG_BUNDLE => ExchangeModule::bundle_core(body, |t, rest| match t {
-            TAG_PLACE => lane_place(sender, rest, engines, fills, book),
-            TAG_CANCEL => lane_cancel(sender, rest, engines, book),
-            // Amend inside a bundle is ineligible (planner), so this is unreachable.
-            _ => Err(ExecError::Malformed),
-        }),
-        _ => Err(ExecError::Malformed),
+        TAG_PLACE => lane_place(item.owner, rest, engines, fills, book),
+        _ => lane_cancel(item.owner, rest, engines, book),
     }
 }
 
-fn run_lane(work: LaneWork, txs: &[LaneTx<'_>], skipped: &[bool], maps: Maps<'_>) -> LaneOut {
-    let LaneWork { idxs, mut engines } = work;
+fn run_lane(work: LaneWork, txs: &[LaneTx<'_>], plans: &[TxPlan], maps: Maps<'_>) -> LaneOut {
+    let LaneWork { items, mut engines } = work;
     let mut book = LaneBook {
         maps,
         bal: FastMap::default(),
@@ -337,12 +384,26 @@ fn run_lane(work: LaneWork, txs: &[LaneTx<'_>], skipped: &[bool], maps: Maps<'_>
         delta: FastMap::default(),
     };
     let mut fills: Vec<FillEvent> = Vec::with_capacity(64);
-    let mut results = Vec::with_capacity(idxs.len());
-    for i in idxs {
-        if skipped[i] {
-            continue;
-        }
-        results.push((i, lane_tx(&txs[i], &mut engines, &mut fills, &mut book)));
+    let mut results = Vec::with_capacity(items.len());
+    for (tx, idx) in items {
+        let t = &txs[tx as usize];
+        let plan = &plans[tx as usize];
+        let result = if idx == WHOLE {
+            // The whole bundle: every item in order, failed items reported as the serial path does.
+            let mut events = Vec::new();
+            for (i, item) in plan.items.iter().enumerate() {
+                match lane_item(&t.ctx.sender, t.payload, item, &mut engines, &mut fills, &mut book)
+                {
+                    Ok(evs) => events.extend(evs),
+                    Err(e) => events.push(ExchangeModule::item_rejected_event(i, &e)),
+                }
+            }
+            Ok(events)
+        } else {
+            let item = &plan.items[idx as usize];
+            lane_item(&t.ctx.sender, t.payload, item, &mut engines, &mut fills, &mut book)
+        };
+        results.push(ItemOut { tx, item: idx, result });
     }
     let LaneBook { bal, hold, vault, delta, .. } = book;
     LaneOut { results, engines, bal, hold, vault, delta }
@@ -384,42 +445,34 @@ impl ExchangeModule {
         let mut t = std::time::Instant::now();
         // Plan every transaction in parallel; any ineligible one declines the whole run.
         let plans: Vec<TxPlan> = txs.par_iter().map(plan_tx).collect::<Option<Vec<_>>>()?;
-        let total_orders: usize = plans.iter().map(|p| p.orders as usize).sum();
-        if total_orders < LANE_MIN_ORDERS {
+        let total_items: usize = plans.iter().map(|p| p.items.len()).sum();
+        if total_items < LANE_MIN_ORDERS {
             return None;
         }
 
         self.tick(0, &mut t);
-        // Independent market components: a bundle touching several markets merges them.
-        let mut dsu = Dsu::new();
-        for p in &plans {
-            let mut it = markets_of(&p.markets);
-            if let Some(first) = it.next() {
-                for m in it {
-                    dsu.union(u16::from(first), u16::from(m));
-                }
+        // Load per market (items are the unit: a bundle's items split across lanes by market).
+        let mut load = [0u64; 256];
+        for it in plans.iter().flat_map(|p| &p.items) {
+            if let Some(m) = it.market {
+                load[usize::from(m)] += 1;
             }
         }
-        let mut load: FastMap<u16, u64> = FastMap::default();
-        for p in &plans {
-            if let Some(first) = markets_of(&p.markets).next() {
-                *load.entry(dsu.find(u16::from(first))).or_insert(0) += u64::from(p.orders);
-            }
-        }
-        if load.len() < 2 {
-            return None;
-        }
-        let lanes = MAX_LANES.min(rayon::current_num_threads()).min(load.len());
+        let active = load.iter().filter(|l| **l > 0).count();
+        let lanes = MAX_LANES.min(rayon::current_num_threads()).min(active);
         if lanes < 2 {
             return None;
         }
 
         self.tick(1, &mut t);
-        // Funds proof: every sender's balance covers the run's whole outflow, so no debit can
-        // fail in any interleaving (credits received meanwhile are ignored: conservative).
+        // Funds proof: every account's balance covers the run's whole outflow, so no debit can fail
+        // in any interleaving (credits received meanwhile are ignored: conservative).
         let mut spend: FastMap<Address, u128> = FastMap::default();
         for (tx, p) in txs.iter().zip(&plans) {
             *spend.entry(tx.ctx.sender).or_insert(0) += p.spend;
+            for (owner, v) in &p.owner_spend {
+                *spend.entry(*owner).or_insert(0) += *v;
+            }
         }
         if spend
             .iter()
@@ -429,50 +482,70 @@ impl ExchangeModule {
         }
 
         self.tick(2, &mut t);
-        // Greedy balance: heaviest component to the least-loaded lane (deterministic).
-        let mut comps: Vec<(u16, u64)> = load.into_iter().collect();
-        comps.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        // Greedy balance: heaviest market to the least-loaded lane (deterministic).
+        let mut markets: Vec<(u8, u64)> = (0..=u8::MAX)
+            .filter(|m| load[usize::from(*m)] > 0)
+            .map(|m| (m, load[usize::from(m)]))
+            .collect();
+        markets.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let mut lane_load = vec![0u64; lanes];
-        let mut lane_of_root: FastMap<u16, usize> = FastMap::default();
-        for (root, l) in comps {
+        let mut lane_of_market = [NO_LANE; 256];
+        for (m, l) in markets {
             let (best, _) = lane_load.iter().enumerate().min_by_key(|(i, w)| (**w, *i))?;
             lane_load[best] += l;
-            lane_of_root.insert(root, best);
+            lane_of_market[usize::from(m)] = u8::try_from(best).ok()?;
         }
+        let per_lane = total_items / lanes + 16;
         let mut works: Vec<LaneWork> = (0..lanes)
-            .map(|_| LaneWork { idxs: Vec::new(), engines: FastMap::default() })
+            .map(|_| LaneWork { items: Vec::with_capacity(per_lane), engines: FastMap::default() })
             .collect();
-        let mut guard = framework::lock_state(&self.inner);
-        for (i, p) in plans.iter().enumerate() {
-            let lane = markets_of(&p.markets)
-                .next()
-                .and_then(|m| lane_of_root.get(&dsu.find(u16::from(m))).copied())
-                .unwrap_or(0);
-            works[lane].idxs.push(i);
+        for (ti, p) in plans.iter().enumerate() {
+            let ti = u32::try_from(ti).ok()?;
+            // An item that touches no market fails with no effect; any lane can say so.
+            let lane_of =
+                |it: &Item| it.market.map(|m| usize::from(lane_of_market[usize::from(m)]));
+            if p.shape == Shape::Bundle {
+                // A bundle whose items all land on one lane stays whole (assembled inside the lane,
+                // in parallel); otherwise its items are scattered and reassembled after the lanes.
+                let mut lanes_hit = p.items.iter().filter_map(lane_of);
+                let first = lanes_hit.next();
+                if lanes_hit.all(|l| Some(l) == first) {
+                    works[first.unwrap_or(0)].items.push((ti, WHOLE));
+                    continue;
+                }
+            }
+            for (ii, it) in p.items.iter().enumerate() {
+                works[lane_of(it).unwrap_or(0)].items.push((ti, u32::try_from(ii).ok()?));
+            }
         }
+        let mut guard = framework::lock_state(&self.inner);
         for m in 0..=u8::MAX {
-            if let Some(&lane) = lane_of_root.get(&dsu.find(u16::from(m)))
+            let lane = lane_of_market[usize::from(m)];
+            if lane != NO_LANE
                 && let Some(e) = guard.markets[usize::from(m)].take()
             {
-                works[lane].engines.insert(m, e);
+                works[usize::from(lane)].engines.insert(m, e);
             }
         }
 
         self.tick(1, &mut t);
         Self::charge_fees(txs, charge);
-        let skipped = vec![false; txs.len()];
 
         self.tick(3, &mut t);
+        let store = framework::lock_state(&self.store);
         let maps = Maps {
+            dlg: store.inner(),
+            height: self.height.load(Ordering::Relaxed),
             bal: guard.base_balances.inner(),
             hold: guard.base_holds.inner(),
             vault: guard.fee_vault.inner(),
         };
         let outs: Vec<LaneOut> =
-            works.into_par_iter().map(|w| run_lane(w, txs, &skipped, maps)).collect();
+            works.into_par_iter().map(|w| run_lane(w, txs, &plans, maps)).collect();
 
+        drop(store);
         self.tick(4, &mut t);
-        let results = self.merge_lanes(guard, outs, txs.len(), ledger, &mut t);
+        let results = self.merge_lanes(guard, outs, &plans, ledger, &mut t);
         self.lane_runs.fetch_add(1, Ordering::Relaxed);
         Some(results)
     }
@@ -500,16 +573,19 @@ impl ExchangeModule {
     }
 
     /// Merge lane outputs: engines back, overlays into the committed maps (keys are disjoint across
-    /// lanes), net ledger deltas in address order, results to their transaction index.
+    /// lanes), net ledger deltas in address order, item results assembled into transaction results.
     fn merge_lanes(
         &self,
         mut guard: std::sync::MutexGuard<'_, super::Inner>,
         outs: Vec<LaneOut>,
-        n: usize,
+        plans: &[TxPlan],
         ledger: &std::sync::Arc<dyn framework::Balances + Send + Sync>,
         t: &mut std::time::Instant,
     ) -> executor::LaneRunResults {
-        let mut results: executor::LaneRunResults = (0..n).map(|_| None).collect();
+        let mut results: executor::LaneRunResults = (0..plans.len()).map(|_| None).collect();
+        // Per-bundle slots, indexed by item, created on the first scattered item of a bundle (a bundle
+        // run whole on one lane never needs them).
+        let mut slots: Vec<Vec<Slot>> = (0..plans.len()).map(|_| Vec::new()).collect();
         let mut deltas: FastMap<Address, i128> = FastMap::default();
         for out in outs {
             for (m, e) in out.engines {
@@ -527,12 +603,64 @@ impl ExchangeModule {
             for (a, d) in out.delta {
                 *deltas.entry(a).or_insert(0) += d;
             }
-            for (i, r) in out.results {
-                results[i] = Some(r);
+            for ItemOut { tx, item, result } in out.results {
+                let tx = tx as usize;
+                if plans[tx].shape == Shape::Bundle && item != WHOLE {
+                    if slots[tx].is_empty() {
+                        slots[tx] = (0..plans[tx].items.len()).map(|_| None).collect();
+                    }
+                    slots[tx][item as usize] = Some(result);
+                } else {
+                    results[tx] = Some(result);
+                }
             }
         }
-        drop(guard);
         self.tick(5, t);
+        // Transaction results. An unplayable transaction fails whole. A bundle scattered across
+        // lanes gets its events in item order (a failed item becomes the same rejection event the
+        // serial path emits); the copying runs on the pool, one bundle per task.
+        let mut split: Vec<(usize, Vec<Slot>)> = Vec::new();
+        for (i, p) in plans.iter().enumerate() {
+            match p.shape {
+                Shape::Single => {}
+                Shape::Dead => results[i] = Some(Err(ExecError::Malformed)),
+                Shape::Bundle => {
+                    if results[i].is_none() {
+                        split.push((i, std::mem::take(&mut slots[i])));
+                    }
+                }
+            }
+        }
+        let assembled: Vec<(usize, Vec<Event>)> = split
+            .into_par_iter()
+            // A bundle is ~1 us of copying: hand the pool chunks, not single bundles.
+            .with_min_len(ASSEMBLE_MIN_BUNDLES)
+            .map(|(i, slots)| {
+                // Exact capacity: one allocation per bundle instead of a doubling series.
+                let total: usize = slots
+                    .iter()
+                    .map(|s| match s {
+                        Some(Ok(evs)) => evs.len(),
+                        _ => 1,
+                    })
+                    .sum();
+                let mut events = Vec::with_capacity(total);
+                for (idx, slot) in slots.into_iter().enumerate() {
+                    match slot {
+                        Some(Ok(evs)) => events.extend(evs),
+                        Some(Err(e)) => events.push(Self::item_rejected_event(idx, &e)),
+                        // Unreachable: every item is assigned to exactly one lane.
+                        None => debug_assert!(false, "bundle item never executed"),
+                    }
+                }
+                (i, events)
+            })
+            .collect();
+        for (i, events) in assembled {
+            results[i] = Some(Ok(events));
+        }
+        self.tick(6, t);
+        drop(guard);
         let mut deltas: Vec<(Address, i128)> =
             deltas.into_iter().filter(|(_, d)| *d != 0).collect();
         deltas.sort_unstable_by_key(|(a, _)| *a);
@@ -545,7 +673,7 @@ impl ExchangeModule {
             // Unreachable: the funds proof covers every debit and supply stays below u64::MAX.
             debug_assert!(matches!(applied, Some(Ok(()))), "lane ledger delta failed");
         }
-        self.tick(6, t);
+        self.tick(7, t);
         results
     }
 }

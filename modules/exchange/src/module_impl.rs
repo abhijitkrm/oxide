@@ -9,11 +9,11 @@
 use super::{
     Address, Event, ExchangeModule, ExecError, Hash, Height, Module, RejectCategory, TAG_AMEND,
     TAG_BATCH_SETTLE, TAG_BATCH_SETTLE_COMMITTED, TAG_BOND_DEPOSIT, TAG_BUNDLE, TAG_CANCEL,
-    TAG_CANCEL_LINKED, TAG_CANCEL_REGISTERED, TAG_DEPOSIT_BASE, TAG_DEPOSIT_BASE_FOR, TAG_DISPUTE,
-    TAG_LINK_TRADING_KEY, TAG_LIST_MARKET, TAG_PLACE, TAG_REGISTER_LINKED, TAG_REGISTER_ORDER,
-    TAG_SWEEP_LINKED, TAG_UNLINK_TRADING_KEY, TAG_WITHDRAW_BASE, TAG_WITHDRAW_LINKED, TxContext,
-    base_balances_leaf, base_holds_leaf, decode, fee_vault_leaf, linked_leaf, module_id,
-    registered_leaf, store_leaf,
+    TAG_CANCEL_LINKED, TAG_CANCEL_REGISTERED, TAG_DBUNDLE, TAG_DELEGATE, TAG_DEPOSIT_BASE,
+    TAG_DEPOSIT_BASE_FOR, TAG_DISPUTE, TAG_LINK_TRADING_KEY, TAG_LIST_MARKET, TAG_PLACE,
+    TAG_REGISTER_LINKED, TAG_REGISTER_ORDER, TAG_REVOKE_DELEGATE, TAG_SWEEP_LINKED,
+    TAG_UNLINK_TRADING_KEY, TAG_WITHDRAW_BASE, TAG_WITHDRAW_LINKED, TxContext, base_balances_leaf,
+    base_holds_leaf, decode, fee_vault_leaf, linked_leaf, module_id, registered_leaf, store_leaf,
 };
 
 impl Module for ExchangeModule {
@@ -31,7 +31,7 @@ impl Module for ExchangeModule {
     fn estimate_gas(&self, msg: &[u8]) -> u64 {
         let default = 1000 + msg.len() as u64;
         match msg {
-            [TAG_BUNDLE, c0, c1, ..] => {
+            [TAG_BUNDLE | TAG_DBUNDLE, c0, c1, ..] => {
                 let count = u64::from(u16::from_le_bytes([*c0, *c1])).max(1);
                 1000u64.saturating_mul(count).saturating_add(msg.len() as u64)
             }
@@ -68,6 +68,12 @@ impl Module for ExchangeModule {
             TAG_AMEND => self.handle_amend(ctx, body, &mut inner),
 
             TAG_BUNDLE => self.handle_bundle(ctx, body, &mut inner),
+
+            TAG_DBUNDLE => self.handle_dbundle(ctx, body, &mut inner),
+
+            TAG_DELEGATE => self.handle_delegate(ctx, body),
+
+            TAG_REVOKE_DELEGATE => self.handle_revoke_delegate(ctx, body),
 
             TAG_LIST_MARKET => {
                 let cfg = Self::parse_list_market(body).ok_or(ExecError::Malformed)?;
