@@ -48,6 +48,7 @@
 //!     verify_workers: None,
 //!     intake_threads: None,
 //!     rayon_threads: None,
+//!     min_block_interval_ms: None,
 //!     exchange_markets: 1,
 //! };
 //! let mut node = Node::assemble(&config);
@@ -255,6 +256,9 @@ pub struct NodeConfig {
     /// Global rayon pool threads (hft-audit-2 X-3). `None` =
     /// [`physical_cores`].
     pub rayon_threads: Option<usize>,
+    /// Minimum time between this validator's own proposals (ms).
+    /// `None` = `validator_net::DEFAULT_MIN_BLOCK_INTERVAL` (zero: pacing off).
+    pub min_block_interval_ms: Option<u64>,
     /// Minimum transaction fee (`ctx.fee`) for native-module txs.
     /// Txs declaring less are skipped before execution — the fee
     /// field is sender-controlled, so without a floor every tx could
@@ -339,6 +343,7 @@ impl Default for NodeConfig {
             verify_workers: None,
             intake_threads: None,
             rayon_threads: None,
+            min_block_interval_ms: None,
         }
     }
 }
@@ -1307,6 +1312,7 @@ pub fn node_config_from(
         verify_workers: config.performance.verify_workers,
         intake_threads: config.performance.intake_threads,
         rayon_threads: config.performance.rayon_threads,
+        min_block_interval_ms: config.performance.min_block_interval_ms,
     })
 }
 

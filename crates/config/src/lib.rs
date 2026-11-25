@@ -705,6 +705,17 @@ pub struct PerformanceConfig {
     /// `None` = the physical-core count, for the same reason.
     #[serde(default)]
     pub rayon_threads: Option<usize>,
+
+    /// Minimum time between this validator's own proposals, in
+    /// milliseconds. A leader that proposes the instant a QC lands
+    /// builds a block from whatever few transactions arrived in the
+    /// last round trip; under load, waiting a short interval fills
+    /// each block and amortizes the per-block fixed costs (BLS
+    /// verification, state-root work). `None` = the node default
+    /// (0: pacing off, see `DEFAULT_MIN_BLOCK_INTERVAL` for why).
+    /// Never delays a view change: timeouts are unaffected.
+    #[serde(default)]
+    pub min_block_interval_ms: Option<u64>,
 }
 
 impl PerformanceConfig {
@@ -727,6 +738,9 @@ impl PerformanceConfig {
         }
         if let Some(v) = get("OXIDE_PERFORMANCE_RAYON_THREADS") {
             self.rayon_threads = if v.is_empty() { None } else { v.parse().ok() };
+        }
+        if let Some(v) = get("OXIDE_PERFORMANCE_MIN_BLOCK_INTERVAL_MS") {
+            self.min_block_interval_ms = if v.is_empty() { None } else { v.parse().ok() };
         }
     }
 }
@@ -1023,6 +1037,25 @@ settlement_operator = "0xoperator"
         let mut config = Config::default();
         config.apply_env(&env);
         assert_eq!(config.exchange.settlement_operator, None);
+    }
+
+    /// Block pacing: `min_block_interval_ms` defaults to `None` (node default), parses from TOML (0 allowed:
+    /// pacing off) and env, and an empty env value clears it.
+    #[test]
+    fn min_block_interval_from_toml_and_env() {
+        assert_eq!(Config::default().performance.min_block_interval_ms, None);
+        let config: Config =
+            toml::from_str("[performance]\nmin_block_interval_ms = 0\n").expect("parse");
+        assert_eq!(config.performance.min_block_interval_ms, Some(0));
+        let mut config = config;
+        config.apply_env(&|k: &str| {
+            (k == "OXIDE_PERFORMANCE_MIN_BLOCK_INTERVAL_MS").then(|| "35".to_string())
+        });
+        assert_eq!(config.performance.min_block_interval_ms, Some(35));
+        config.apply_env(&|k: &str| {
+            (k == "OXIDE_PERFORMANCE_MIN_BLOCK_INTERVAL_MS").then(String::new)
+        });
+        assert_eq!(config.performance.min_block_interval_ms, None);
     }
 
     /// hft-audit-2 C-1/X-3: the pool-size knobs parse from TOML and
