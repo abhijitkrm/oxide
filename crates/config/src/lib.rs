@@ -635,11 +635,19 @@ pub struct ExchangeConfig {
     /// attached to this node).
     #[serde(default)]
     pub settlement_operator: Option<String>,
+    /// How many spot markets (ids `0..n`, one default geometry) the node lists at startup. `0` or `1`
+    /// is a single market. More markets give the per-market execution lanes independent work (throughput
+    /// harnesses); capped at 256 (the `u8` market-id space).
+    #[serde(default)]
+    pub markets: usize,
 }
 
 impl ExchangeConfig {
     /// Apply overrides from `get` (the process env in production).
     fn apply_env(&mut self, get: &dyn Fn(&str) -> Option<String>) {
+        if let Some(n) = get("OXIDE_EXCHANGE_MARKETS").and_then(|v| v.parse().ok()) {
+            self.markets = n;
+        }
         if let Some(v) = get("OXIDE_EXCHANGE_SETTLEMENT_OPERATOR") {
             self.settlement_operator = if v.is_empty() { None } else { Some(v) };
         }

@@ -538,7 +538,25 @@ pub fn build_signed_tx_with(
     module_payload: &[u8],
     nonce: u64,
 ) -> types::TxBytes {
-    let fee = 100u64;
+    build_signed_tx_with_fee(privkey, sender, chain_id, module_id, module_payload, nonce, 100)
+}
+
+/// [`build_signed_tx_with`] with an explicit envelope `fee` (orders are free: the throughput harness
+/// signs them at fee 0).
+///
+/// # Panics
+///
+/// Panics if `privkey` is not a valid secp256k1 secret key.
+#[allow(clippy::too_many_arguments)]
+pub fn build_signed_tx_with_fee(
+    privkey: &[u8],
+    sender: primitives::Address,
+    chain_id: u64,
+    module_id: u8,
+    module_payload: &[u8],
+    nonce: u64,
+    fee: u64,
+) -> types::TxBytes {
     let sig =
         crypto::eip712::sign_tx(privkey, chain_id, &sender, nonce, fee, module_id, module_payload)
             .expect("key must sign");

@@ -54,6 +54,16 @@ def executed_txs(port):
     return int(v, 16) if v else None
 
 
+# One self-crossing pair costs its account exactly one protocol fee: 15 quote units (price 1.5 x qty 0.001
+# = 15,000 units, FEE_BPS 10 of 10,000) at 10^9 wei per unit. Two orders per pair.
+WEI_PER_PAIR_FEE = 15 * 10**9
+
+
+def balance(port, addr):
+    v = rpc(port, "eth_getBalance", [addr, "latest"])
+    return int(v, 16) if v else None
+
+
 def cpu_ticks(pid):
     with open(f"/proc/{pid}/stat") as f:
         parts = f.read().rsplit(")", 1)[1].split()
@@ -72,6 +82,13 @@ def main():
     ap.add_argument("--base-port", type=int, default=26000)
     ap.add_argument("--rpc-port", type=int, default=27000)
     ap.add_argument("--bin", default="target/release/oxide-devnet")
+    ap.add_argument("--orders", type=int, default=0,
+                    help="orders per bundle: switches the injector to pre-signed exchange bundles "
+                         "(--rate is then BUNDLES/s per validator, --presign the bundles signed up front)")
+    ap.add_argument("--markets", type=int, default=1, help="exchange markets listed (order mode)")
+    ap.add_argument("--perf-out", default="",
+                    help="if set, run `perf record -a -g` (system-wide, 499 Hz, frame pointers) over the "
+                         "measurement window and write the data here (needs perf; use a frame-pointer build)")
     ap.add_argument("--keep", action="store_true")
     a = ap.parse_args()
     n = a.validators
@@ -89,11 +106,14 @@ def main():
             cpus = cores + ([c + NCORES for c in cores] if a.smt else [])
             cpusets.append(cpus)
             threads = len(cpus)
-            env = dict(os.environ, RAYON_NUM_THREADS=str(threads), RUST_LOG="warn")
+            env = dict(os.environ, RAYON_NUM_THREADS=str(threads), RUST_LOG=os.environ.get("RUST_LOG", "warn"),
+                       OXIDE_EXCHANGE_MARKETS=str(a.markets))
             cmd = ["taskset", "-c", ",".join(map(str, cpus)), a.bin, "--node", str(i), "--num-nodes", str(n),
                    "--base-port", str(a.base_port), "--data-dir", os.path.join(work, f"n{i}"),
                    "--rpc-listen", f"127.0.0.1:{a.rpc_port + i}", "--genesis-file", genesis,
                    "--tx-inject-rate", str(a.rate), "--tx-inject-presign", str(a.presign)]
+            if a.orders:
+                cmd += ["--tx-inject-orders", str(a.orders)]
             log = open(os.path.join(work, f"n{i}.log"), "wb")
             procs.append(subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT))
         # Liveness: validator 0 finalizes some blocks (presigning delays the start; allow a while).
@@ -110,9 +130,24 @@ def main():
         time.sleep(a.warmup)
 
         port = a.rpc_port
+        senders = []
+        if a.orders:
+            for i in range(n):
+                with open(os.path.join(work, f"n{i}.log"), errors="replace") as f:
+                    for line in f:
+                        if "order injector sender=" in line:
+                            senders.append(line.split("sender=")[1].split()[0])
+                            break
+        bal0 = [balance(port, x) for x in senders]
         h_start, tx_start = height(port), executed_txs(port)
         ticks0 = [cpu_ticks(p.pid) for p in procs]
         t_start = time.time()
+        perf_proc = None
+        if a.perf_out:
+            perf_proc = subprocess.Popen(
+                ["perf", "record", "-F", "499", "-g", "--call-graph", "fp", "-a", "-o", a.perf_out,
+                 "--", "sleep", str(int(a.duration))],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         last_h, last_tx, t_last = h_start, tx_start, t_start
         end = t_start + a.duration
         while time.time() < end:
@@ -121,6 +156,18 @@ def main():
                 last_h, last_tx, t_last = h, c, time.time()
             time.sleep(0.5)
         t_end, h_end = t_last, last_h
+        bal1 = [balance(port, x) for x in senders]
+        if perf_proc is not None:
+            perf_proc.wait(timeout=120)
+        rss_mb = []
+        for p_ in procs:
+            try:
+                with open(f"/proc/{p_.pid}/status") as f:
+                    for line in f:
+                        if line.startswith("VmHWM:"):
+                            rss_mb.append(round(int(line.split()[1]) / 1024))
+            except OSError:
+                rss_mb.append(None)
         total_txs = (last_tx or 0) - (tx_start or 0)
         per_block = []
         ticks1 = [cpu_ticks(p.pid) for p in procs]
@@ -143,7 +190,16 @@ def main():
                     pass
             return total
         blocks = (h_end or 0) - (h_start or 0)
+        orders = None
+        if a.orders and all(x is not None for x in bal0 + bal1):
+            pairs = sum(b0 - b1 for b0, b1 in zip(bal0, bal1)) // WEI_PER_PAIR_FEE
+            orders = 2 * pairs
         res = {
+            "orders": orders,
+            "orders_per_s": round(orders / elapsed) if orders is not None else None,
+            "bundles_per_s": round(orders / a.orders / elapsed) if orders and a.orders else None,
+            "markets": a.markets, "orders_per_bundle": a.orders,
+            "offered_orders_per_s": a.rate * a.orders * n if a.orders else None,
             "validators": n, "cores_each": a.cores, "smt": a.smt, "cpus_each": len(cpusets[0]),
             "offered_per_validator": a.rate, "offered_total": a.rate * n,
             "blocks": blocks, "blocks_per_s": round(blocks / elapsed, 2),
@@ -152,12 +208,18 @@ def main():
             "avg_tx_per_block": round(total_txs / blocks, 1) if blocks else None,
             "cpu_pct_of_pinned": cpu_pct, "end_heights": heights,
             "exited": dead,
+            "peak_rss_mb": rss_mb,
             "view_timeouts": count_in_logs("view timeout"),
             "rejected_proposals": count_in_logs("app rejected proposal"),
             "max_height_lag": (max(heights) - min(heights)) if all(x is not None for x in heights) else None,
         }
-        print(f"{n} validators x {len(cpusets[0])} CPUs ({'cores+SMT' if a.smt else 'cores'}), offered "
-              f"{a.rate:.0f}/validator ({a.rate * n:.0f} total)")
+        if a.orders:
+            print(f"{n} validators x {len(cpusets[0])} CPUs ({'cores+SMT' if a.smt else 'cores'}), {a.markets} markets, "
+                  f"offered {a.rate * a.orders * n:.0f} orders/s ({a.rate:.0f} bundles/s x {a.orders} per validator)")
+            print(f"  committed {res['orders_per_s']} orders/s ({res['bundles_per_s']} bundles/s)")
+        else:
+            print(f"{n} validators x {len(cpusets[0])} CPUs ({'cores+SMT' if a.smt else 'cores'}), offered "
+                  f"{a.rate:.0f}/validator ({a.rate * n:.0f} total)")
         print(f"  committed {res['tx_per_s']} tx/s, {res['blocks_per_s']} blocks/s "
               f"(~{res['avg_block_ms']} ms/block, avg {res['avg_tx_per_block']} tx/block)")
         print(f"  CPU of pinned set: {cpu_pct}%  end heights {heights}  "
