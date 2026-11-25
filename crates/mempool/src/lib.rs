@@ -190,6 +190,11 @@ pub struct Mempool {
     /// `CHAIN_COVER_TTL` behind the executed tip (the branch died —
     /// the gap is real again and the walk stops bridging it).
     in_chain: HashMap<Address, BTreeMap<u64, u64>>,
+    /// TTL expiry index of `in_chain`: proposal height -> `(sender, nonce)` pairs whose cover was
+    /// recorded or refreshed at that height. Lets `refresh_anchors` expire dead-branch covers
+    /// without scanning every entry; an item whose cover was refreshed to a later height is stale
+    /// and skipped when it fires.
+    chain_expiry: BTreeMap<u64, Vec<(Address, u64)>>,
     /// Tx hashes already carried by an uncommitted proposal — one
     /// set per outstanding proposal position, oldest first.
     ///
@@ -379,6 +384,7 @@ impl Mempool {
             pending_commit: HashMap::new(),
             pending_expiry: BTreeMap::new(),
             in_chain: HashMap::new(),
+            chain_expiry: BTreeMap::new(),
             proposed: VecDeque::new(),
         }
     }
@@ -923,12 +929,15 @@ impl Mempool {
     pub fn note_in_chain(&mut self, txs: &[TxBytes], height: u64) {
         for tx in txs {
             if let Some((sender, nonce, _fee)) = parse_tx(tx.as_bytes()) {
-                self.in_chain
-                    .entry(sender)
-                    .or_default()
-                    .entry(nonce)
-                    .and_modify(|h| *h = (*h).max(height))
-                    .or_insert(height);
+                let cover = self.in_chain.entry(sender).or_default();
+                let newest = match cover.get(&nonce) {
+                    Some(&h) => h.max(height),
+                    None => height,
+                };
+                cover.insert(nonce, newest);
+                // Index the height this cover now carries (a refresh to a later height
+                // supersedes the earlier item, which then fires as stale).
+                self.chain_expiry.entry(newest).or_default().push((sender, nonce));
             }
         }
     }
@@ -1072,11 +1081,38 @@ impl Mempool {
         // dead and the gap is real). A sender whose queue emptied is
         // absent from the rebuilt anchor; its entries ride the TTL
         // until expiry.
+        // Anchor prune per sender (keep `nonce > anchor`: one split, not a scan of the cover) ...
+        let anchors = &self.executed_nonces;
         self.in_chain.retain(|sender, cover| {
-            let anchor = self.executed_nonces.get(sender).copied().unwrap_or(0);
-            cover.retain(|nonce, h| *nonce > anchor && *h + CHAIN_COVER_TTL > executed_height);
+            let anchor = anchors.get(sender).copied().unwrap_or(0);
+            match anchor.checked_add(1) {
+                Some(first_live) => {
+                    if cover.first_key_value().is_some_and(|(n, _)| *n <= anchor) {
+                        *cover = cover.split_off(&first_live);
+                    }
+                }
+                None => cover.clear(),
+            }
             !cover.is_empty()
         });
+        // ... and TTL prune through the expiry index: a cover dies once
+        // `h + CHAIN_COVER_TTL <= executed_height`.
+        if let Some(limit) = executed_height.checked_sub(CHAIN_COVER_TTL) {
+            let live = self.chain_expiry.split_off(&limit.saturating_add(1));
+            let due = std::mem::replace(&mut self.chain_expiry, live);
+            for (height, items) in due {
+                for (sender, nonce) in items {
+                    if let Some(cover) = self.in_chain.get_mut(&sender) {
+                        if cover.get(&nonce) == Some(&height) {
+                            cover.remove(&nonce);
+                        }
+                        if cover.is_empty() {
+                            self.in_chain.remove(&sender);
+                        }
+                    }
+                }
+            }
+        }
         // Collect stale hashes first — `by_sender` can't be mutated
         // while its queues are borrowed for the range scan.
         let mut stale: Vec<Hash> = Vec::new();
@@ -2108,6 +2144,55 @@ mod tests {
             }
             let flat: BTreeMap<(u8, u64), u64> = pool
                 .pending_commit
+                .iter()
+                .flat_map(|(a, m)| m.iter().map(move |(n, h)| ((a.0[0], *n), *h)))
+                .collect();
+            assert_eq!(flat, model, "diverged at step {step}");
+        }
+    }
+
+    /// The anchor split plus TTL expiry index must leave `in_chain` exactly as the old per-entry
+    /// scan would (keep iff `nonce > anchor && height + TTL > executed`), over random covers,
+    /// pool contents, anchors and refresh heights.
+    #[test]
+    fn in_chain_pruning_matches_a_full_scan() {
+        use std::collections::BTreeMap;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut pool = Mempool::new(1024);
+        // Some senders have pooled txs, so they get anchors; the rest ride the TTL alone.
+        for s in 1..=3u8 {
+            for n in 0..6u64 {
+                pool.submit(build_tx(addr(s), n + 40, 100, &[0])).unwrap();
+            }
+        }
+        let mut model: BTreeMap<(u8, u64), u64> = BTreeMap::new();
+        let mut height = 0u64;
+        for step in 0..4000u64 {
+            if next() % 3 != 0 {
+                let sender = (next() % 6) as u8 + 1;
+                let nonce = next() % 30;
+                height += next() % 2;
+                pool.note_in_chain(&[build_tx(addr(sender), nonce, 100, &[0])], height);
+                let e = model.entry((sender, nonce)).or_insert(height);
+                *e = (*e).max(height);
+            } else {
+                let executed = height.saturating_sub(next() % (CHAIN_COVER_TTL + 4));
+                let nexts: Vec<u64> = (0..7).map(|_| next() % 36).collect();
+                pool.refresh_anchors(executed, |a| Some(nexts[usize::from(a.0[0])]));
+                let anchors = pool.executed_nonces.clone();
+                model.retain(|(sender, nonce), h| {
+                    let anchor = anchors.get(&addr(*sender)).copied().unwrap_or(0);
+                    *nonce > anchor && *h + CHAIN_COVER_TTL > executed
+                });
+            }
+            let flat: BTreeMap<(u8, u64), u64> = pool
+                .in_chain
                 .iter()
                 .flat_map(|(a, m)| m.iter().map(move |(n, h)| ((a.0[0], *n), *h)))
                 .collect();
