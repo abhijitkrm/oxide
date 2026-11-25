@@ -25227,3 +25227,26 @@ signed by protocol).
 
 In plain words: sending orders in signed bundles, this server handles about 9 million a second end to end, while orders signed one by
 one top out near 300 thousand a second and ordinary EVM transfers near 120 thousand: the cost is checking each signature.
+
+### EVM exec stage: what a profile-driven trim round found (25 Nov, Ryzen 9 7900, `transfer` mix, 1.2M txs, 12 threads)
+
+Profile of the EVM exec thread (perf, callees of `execute_block_staged`) said 48% dispatch, 20% `end_block` (52% of it software Keccak,
+37% patch delta), and a surprising ~19% of BTreeMap iteration under the mempool's `refresh_anchors`.
+
+- **asm Keccak (kept):** `alloy-primitives` was built with only `std`, so `keccak256` (trie, history, patch, tx hashes) ran the
+  pure-Rust fallback although `crypto` assumed the asm backend. Enabling `asm-keccak` adds no crate (`keccak-asm =0.1.8` is already
+  pinned). Interleaved A/B on the box, 3 runs each: `end_block` 2.40 -> 2.03 us/tx, serial floor 391k -> 459k tx/s (+17%), loop 147k ->
+  156k tx/s (+6%). Every pinned root unchanged.
+- **Mempool expiry indexes (NOT kept):** replaced the per-block scans of `pending_commit` and `in_chain` with height indexes (exact:
+  differential tests against the old rules, 4000 random steps each, plus mutation checks). Interleaved A/B: `exec_total_us` 5.0 vs 5.0 in
+  both cases. The BTreeMap frames were mis-attributed (the exec thread also runs rayon work inside `dispatch_run`); the untimed
+  remainder of the exec stage is only ~0.55 us/tx in total, so those scans could never have been the big item. Parked on branch
+  `mempool-expiry-index` (the algorithmic cost grows with the execution backlog, so it may matter under deep lag; revisit if a backlog
+  run shows `refresh_anchors`).
+- **What remains is structural:** `end_block` ~2 us/tx at this state size is dominated by lookups in a million-account hash map
+  (cache misses) plus history/undo; dispatch ~1.9 us is the lane main-apply. Next levers: a sharded account cache, parallel history
+  and undo appends, and more EVM lanes than 8. On this box the serial floor is now ~460k tx/s; sustained with ingest competing it is
+  ~120k because signature recovery (30 us) takes most of the cores.
+
+Lesson recorded: a `perf script` callee breakdown is only as good as its frame attribution; confirm any candidate with an interleaved
+A/B on the same configuration before keeping it.
