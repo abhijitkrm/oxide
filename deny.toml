@@ -65,7 +65,24 @@ yanked = "deny"
 # is functionally stable. Ignoring is a reviewed decision; if `rcgen`
 # drops the dependency or a maintained fork emerges we will drop the
 # ignore.
-ignore = ["RUSTSEC-2025-0141", "RUSTSEC-2024-0436", "RUSTSEC-2025-0134"]
+#
+# RUSTSEC-2026-0387: `crypto-bigint 0.5.5` has timing variability in
+# operations on SECRET integers (patched in 0.7.6). Our only path to it is
+# `revm -> alloy-eip7702 -> k256 0.13 -> elliptic-curve 0.13`, used for
+# EIP-7702 authorization signature RECOVERY, which operates on public data
+# (signatures and public keys; no secret scalars). No in-tree code uses
+# `k256` or `crypto-bigint` directly, and every signing operation the node
+# performs (envelope, EVM, evidence, vote keys) goes through libsecp256k1
+# (`secp256k1` crate, constant-time C) or the BLS/ed25519 crates. The fix needs
+# `k256 0.14`, which `alloy-eip7702` (0.6.4, latest) does not yet adopt: it
+# arrives with the `revm 42 -> 43` upgrade (a major API bump, tracked
+# separately). Ignoring is a reviewed decision; drop it with that upgrade.
+ignore = [
+  "RUSTSEC-2025-0141",
+  "RUSTSEC-2024-0436",
+  "RUSTSEC-2025-0134",
+  "RUSTSEC-2026-0387",
+]
 
 [sources]
 unknown-registry = "deny"
