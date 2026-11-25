@@ -47,6 +47,17 @@ impl Module for ExchangeModule {
         self.run_lanes(txs, charge)
     }
 
+    /// Orders are free by design (their fee floor is 0); deposits, withdrawals and the rest pay the
+    /// chain floor. See `admission.rs` for what keeps free orders from being unbounded.
+    fn min_fee_for(&self, payload: &[u8]) -> Option<u64> {
+        Self::order_fee_floor(payload)
+    }
+
+    /// Admission: a zero-fee order must be fundable by its sender (`admission.rs`).
+    fn validate(&self, ctx: &TxContext, msg: &[u8]) -> Result<(), ExecError> {
+        self.admit_order(ctx, msg)
+    }
+
     fn begin_block(&self, height: Height) {
         self.height.store(height.0, std::sync::atomic::Ordering::Relaxed);
     }

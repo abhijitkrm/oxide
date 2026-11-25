@@ -1776,6 +1776,7 @@ dependencies = [
  "executor",
  "framework",
  "lanes",
+ "ports",
  "primitives",
  "proptest",
  "rayon",

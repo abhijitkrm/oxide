@@ -35,6 +35,8 @@ proptest = "1.11.0"
 # evm: benches settle against the real EVM ledger (the production
 # `Balances` impl) — dev-dep cycle with the precompile dep is legal.
 evm = { workspace = true }
+# ports: the `AppInterface` trait, to drive a real executor (ingest, propose, finalize) in the zero-fee tests.
+ports = { workspace = true }
 
 [[bench]]
 name = "settlement"

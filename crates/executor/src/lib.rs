@@ -1165,6 +1165,18 @@ pub trait Module: Send + Sync {
         None
     }
 
+    /// The fee floor for this message, overriding the chain-wide `min_fee` when `Some`.
+    ///
+    /// The executor requires `ctx.fee >= floor` before a message executes (`TxSkipReason::FeeFloor`
+    /// otherwise). `None` (the default) means the chain parameter applies. A module returns
+    /// `Some(0)` for messages that are free by design and protects itself some other way: the
+    /// exchange's orders cost nothing as long as the sender can fund them, enforced at admission
+    /// (`Module::validate`) and by escrow at execution, while deposits, withdrawals and the like
+    /// still pay the chain floor. The sender may still declare a higher fee voluntarily.
+    fn min_fee_for(&self, _payload: &[u8]) -> Option<u64> {
+        None
+    }
+
     /// Whether this module pays for its own execution internally,
     /// exempting it from the envelope fee charged by the configured
     /// fee module. `false` (default): the executor charges `ctx.fee`
