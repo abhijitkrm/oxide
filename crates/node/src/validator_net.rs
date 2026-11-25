@@ -205,6 +205,10 @@ pub struct TxInject {
     /// closure owns the sender's secp256k1 key, chain id, module
     /// route, and payload template; the pump owns pacing.
     pub build: Box<dyn FnMut(u64) -> Vec<u8> + Send>,
+    /// Admit the node's own pre-signed envelopes through `Executor::ingest_tx_recovered` (the sender is
+    /// known: the injector signed them) instead of recovering every signature again on the pump thread.
+    /// The pre-signed harness mode sets it; peers still verify every gossiped copy in full.
+    pub recovered: bool,
 }
 
 impl TxInject {
@@ -240,6 +244,7 @@ impl TxInject {
             anchor_module: Some(evm::MODULE_ID),
             interval: Duration::from_secs_f64(1.0 / rate),
             build: Box::new(move |nonce: u64| sign_evm_transfer(&key, &sender, chain_id, nonce)),
+            recovered: false,
         }
     }
 
@@ -288,6 +293,7 @@ impl TxInject {
                     None => sign_evm_transfer(&key, &sender, chain_id, nonce),
                 }
             }),
+            recovered: true,
         }
     }
 }
@@ -1906,7 +1912,12 @@ fn run_consensus_loop(
                 let tx_bytes = (inject.build)(*nonce);
                 inject_next += inject.interval;
                 emitted += 1;
-                match engine.submit_tx(types::TxBytes::new(tx_bytes.clone())) {
+                let ack = if inject.recovered {
+                    app.ingest_tx_recovered(types::TxBytes::new(tx_bytes.clone()), inject.sender.0)
+                } else {
+                    engine.submit_tx(types::TxBytes::new(tx_bytes.clone()))
+                };
+                match ack {
                     types::MempoolAck::Accepted => {
                         *nonce += 1;
                         fanout_tx(
