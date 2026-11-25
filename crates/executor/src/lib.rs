@@ -1519,6 +1519,33 @@ pub enum TxOutcome {
 /// Memory cost is bounded: outcomes hold at most a few events each.
 const MAX_TX_OUTCOMES: usize = 8192;
 
+/// Free evicted outcomes on a background thread. Dropping a bundle's events is hundreds of small
+/// frees of memory another thread allocated; doing it on the exec thread was ~10% of its serial
+/// time. Never blocks execution: if the reaper is behind (queue full) the batch is dropped inline.
+fn reap(batch: Vec<TxOutcome>) {
+    use std::sync::mpsc::{SyncSender, sync_channel};
+    /// Batches the reaper may have queued. Unit: blocks' worth of evictions. Small on purpose:
+    /// it bounds the memory kept alive, and a full queue only costs an inline drop.
+    const REAPER_QUEUE: usize = 16;
+    static REAPER: std::sync::OnceLock<Option<SyncSender<Vec<TxOutcome>>>> =
+        std::sync::OnceLock::new();
+    if batch.is_empty() {
+        return;
+    }
+    let tx = REAPER.get_or_init(|| {
+        let (tx, rx) = sync_channel::<Vec<TxOutcome>>(REAPER_QUEUE);
+        std::thread::Builder::new()
+            .name("exec-reaper".into())
+            .spawn(move || while rx.recv().is_ok() {})
+            .ok()
+            .map(|_| tx)
+    });
+    if let Some(tx) = tx {
+        // `Err(Full)` hands the batch back: drop it here.
+        let _ = tx.try_send(batch);
+    }
+}
+
 /// Insertion-ordered bounded map of tx hash → finalized outcome.
 /// The `order` deque is the eviction frontier: the oldest recorded
 /// hash is removed when the window is full.
@@ -1541,19 +1568,26 @@ impl TxOutcomeStore {
     /// `Executed` is final: execution consumes the sender nonce, so
     /// an executed tx can never dispatch again; any later record for
     /// the same hash can only be a stale re-proposal being skipped.
-    fn record(&mut self, hash: Hash, outcome: TxOutcome) {
+    ///
+    /// Returns the evicted outcome (if any) instead of dropping it, so the caller can free its
+    /// events off the execution path (`reap`): at a bundle's ~100 events per tx the frees were a
+    /// large share of the exec thread's serial time.
+    #[must_use]
+    fn record(&mut self, hash: Hash, outcome: TxOutcome) -> Option<TxOutcome> {
         if matches!(self.outcomes.get(&hash), Some(TxOutcome::Executed { .. })) {
-            return;
+            return None;
         }
         if self.outcomes.insert(hash, outcome).is_some() {
-            return; // replaced a provisional skip — position unchanged
+            return None; // replaced a provisional skip — position unchanged
         }
+        let mut evicted = None;
         if self.order.len() >= MAX_TX_OUTCOMES
             && let Some(oldest) = self.order.pop_front()
         {
-            self.outcomes.remove(&oldest);
+            evicted = self.outcomes.remove(&oldest);
         }
         self.order.push_back(hash);
+        evicted
     }
 }
 

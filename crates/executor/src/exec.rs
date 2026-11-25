@@ -73,6 +73,7 @@ impl Executor {
         module_id: u8,
         module: &dyn Module,
         verified: Option<&primitives::digest_map::DigestMap<[u8; 20]>>,
+        known_hash: Option<Hash>,
     ) -> Result<bool, &'static str> {
         let signed = is_signed_envelope(bytes);
         if module.authenticates_sender() {
@@ -101,7 +102,10 @@ impl Executor {
         // the full envelope, so a hit implies the signature was
         // verified. Skip re-verification (~40 µs saved per tx).
         if let Some(cache) = verified {
-            let tx_hash = Hasher::hash_one(Domain::Transaction, bytes);
+            // The block planner already hashed every tx in parallel (`hash_block_txs`); re-hashing
+            // the whole envelope here was ~22% of the exec thread's serial time on bundles.
+            let tx_hash =
+                known_hash.unwrap_or_else(|| Hasher::hash_one(Domain::Transaction, bytes));
             if cache.contains_key(&tx_hash) {
                 return Ok(true);
             }
@@ -243,7 +247,14 @@ impl Executor {
                 continue;
             }
             if self
-                .check_envelope_auth(bytes, &ctx, module_id, module.as_ref(), Some(preverify_cache))
+                .check_envelope_auth(
+                    bytes,
+                    &ctx,
+                    module_id,
+                    module.as_ref(),
+                    Some(preverify_cache),
+                    Some(tx_hash),
+                )
                 .is_err()
             {
                 skipped.push((tx_hash, TxSkipReason::BadSignature));
@@ -587,7 +598,7 @@ impl Executor {
         {
             let mut outcomes = primitives::sync::lock_state(&self.tx_outcomes);
             for (hash, reason) in skipped {
-                outcomes.record(hash, TxOutcome::Skipped { reason });
+                let _ = outcomes.record(hash, TxOutcome::Skipped { reason });
             }
         }
 
@@ -639,7 +650,7 @@ impl Executor {
         if !dispatch_skipped.is_empty() {
             let mut outcomes = primitives::sync::lock_state(&self.tx_outcomes);
             for (hash, reason) in dispatch_skipped {
-                outcomes.record(hash, TxOutcome::Skipped { reason });
+                let _ = outcomes.record(hash, TxOutcome::Skipped { reason });
             }
         }
         // Publish all events from this block in one lock acquisition.
@@ -788,24 +799,34 @@ impl Executor {
         results: Vec<Result<Vec<Event>, ExecError>>,
         block_events: &mut Vec<std::sync::Arc<[Event]>>,
     ) {
+        // Share, don't copy (F-08): the outcome and the block log hold the same `Arc<[Event]>`.
+        // Building the `Arc` allocates and copies, so big groups do it on the rayon pool (the lane
+        // threads allocated these events; converting them in parallel keeps the allocator traffic
+        // off the serial exec thread).
+        let to_outcome = |result: Result<Vec<Event>, ExecError>| match result {
+            Ok(events) => TxOutcome::Executed { events: events.into(), error: None },
+            Err(e) => {
+                TxOutcome::Executed { events: Vec::new().into(), error: Some(format!("{e}")) }
+            }
+        };
+        let built: Vec<TxOutcome> = if results.len() >= PAR_OUTCOME_MIN_TXS {
+            use rayon::prelude::*;
+            results.into_par_iter().map(to_outcome).collect()
+        } else {
+            results.into_iter().map(to_outcome).collect()
+        };
         let mut outcomes = primitives::sync::lock_state(&self.tx_outcomes);
-        for (t, result) in group.iter().zip(results) {
-            let outcome = match result {
-                Ok(events) => {
-                    // Share, don't copy (F-08): the outcome and the
-                    // block log hold the same `Arc<[Event]>` — the
-                    // per-event deep clone this replaced made every
-                    // event pay a second heap round-trip per block.
-                    let shared: std::sync::Arc<[Event]> = events.into();
-                    block_events.push(std::sync::Arc::clone(&shared));
-                    TxOutcome::Executed { events: shared, error: None }
-                }
-                Err(e) => {
-                    TxOutcome::Executed { events: Vec::new().into(), error: Some(format!("{e}")) }
-                }
-            };
-            outcomes.record(t.tx_hash, outcome);
+        let mut evicted: Vec<TxOutcome> = Vec::new();
+        for (t, outcome) in group.iter().zip(built) {
+            if let TxOutcome::Executed { events, error: None } = &outcome {
+                block_events.push(std::sync::Arc::clone(events));
+            }
+            if let Some(old) = outcomes.record(t.tx_hash, outcome) {
+                evicted.push(old);
+            }
         }
+        drop(outcomes);
+        crate::reap(evicted);
     }
 }
 
@@ -822,3 +843,7 @@ pub(crate) enum StagedRoot {
 /// Smallest block (unit: txs) whose tx hashes are computed on the rayon pool; below
 /// it the hand-off costs more than the ~0.2 us per hash it saves.
 const PAR_HASH_MIN_TXS: usize = 512;
+
+/// Smallest group (unit: txs) whose outcome events are converted to shared form on the rayon pool;
+/// below it the hand-off costs more than the allocations it spreads. Same order as `PAR_HASH_MIN_TXS`.
+const PAR_OUTCOME_MIN_TXS: usize = 512;

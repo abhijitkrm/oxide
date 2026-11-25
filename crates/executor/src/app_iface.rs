@@ -90,7 +90,7 @@ impl Executor {
         // signature actually verified — it decides what the preverify
         // cache may claim below.
         let envelope_verified =
-            match self.check_envelope_auth(bytes, &ctx, module_id, module.as_ref(), None) {
+            match self.check_envelope_auth(bytes, &ctx, module_id, module.as_ref(), None, None) {
                 Ok(v) => v,
                 Err(reason) => return MempoolAck::Rejected { reason: reason.to_string() },
             };
