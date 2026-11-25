@@ -25307,3 +25307,29 @@ policy, see the PR), a gateway-side bundler in the load generator.
 In plain words: traders can now authorize a gateway once and let it place their orders in bulk. Orders routed that way run at about 5
 million a second here, sixteen times the rate for orders signed one at a time, and the checks that keep a gateway from touching an
 account that never trusted it are tested, mutation-checked and fuzzed.
+
+### Global allocator: mimalloc in the node binaries and the throughput bench (25 Nov, branch `global-allocator`, stacked on `cheap-auth`)
+
+The delegated-bundle work exposed glibc malloc as a first-order bottleneck: events are allocated on lane threads and freed on other
+threads (assembly, the outcome store), and glibc's per-thread arenas make cross-thread frees contend. `LD_PRELOAD` tests with jemalloc and
+mimalloc agreed within noise, so the change is a real `#[global_allocator]` (mimalloc `=0.1.52`, MIT, published 2026-05-22; its sys crate
+`libmimalloc-sys 0.1.49`, 2026-05-22) set only in `oxide-validator`, `oxide-fullnode`, `oxide-matcher` and `chain_mix`, never in a library.
+`scripts/check-dep-age.py`: all 469 registry dependencies older than 7 days; `cargo deny`: licenses and sources ok.
+
+Interleaved A/B on the Ryzen box (real builds, 12 threads, root stage on, 16 markets), execution loop alone, glibc -> mimalloc:
+
+| Mix | glibc | mimalloc |
+|---|---|---|
+| delegated bundles | 5.1-5.5M orders/s | **10.6-10.9M** |
+| owner-signed bundles | 11.3-12.1M | **15.2-15.3M** |
+| single signed orders | 474-479k | **622-627k** |
+| EVM transfers | 154-155k | **177k** |
+
+Sustained (ingest and execution competing, 50 ms blocks of 64 MiB for bundles): owner-signed bundles **11.3-12.1M orders/s** (was 9.1-9.4M),
+delegated bundles **8.0-9.0M** (was ~5.0M), single signed orders ~307k (unchanged: signature-bound), EVM transfers ~126k (was 106-123k).
+
+Found along the way (not caused by this change): `cargo deny check advisories` fails on `main` with RUSTSEC-2026-0346..0349 and 0382 (rustls
+TLS issues), 0386 (tokio `AsyncFd` unsound), 0418 (libz-sys build script), 0544 and 0410 among others. Needs a dependency-update pass.
+
+In plain words: swapping the memory allocator the programs use made the same server about 30% faster for ordinary bundles, twice as
+fast for gateway-routed orders (now 8 to 9 million a second sustained) and 15% faster for EVM transfers, with no change to any result.
