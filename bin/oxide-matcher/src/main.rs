@@ -418,11 +418,11 @@ fn single_market_config() -> trading::MarketConfig {
     }
 }
 
-#[allow(clippy::too_many_lines)] // a CLI entry point is declaration-dense by shape
 /// The process allocator: mimalloc, not glibc malloc (see the workspace `mimalloc` entry for the measurements).
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[allow(clippy::too_many_lines)] // a CLI entry point is declaration-dense by shape
 fn main() {
     // Supervision before anything can spawn: a panic on a critical
     // actor's thread (sequencer, settlement pump) aborts the process
