@@ -2234,7 +2234,7 @@ impl Transport for TcpTransport {
             // Admission control: check rate limit and reputation.
             // If rejected, drop the message and try the next one.
             if let Some(ref ac) = self.admission
-                && !ac.admit_message(&msg.from, msg.bytes.len())
+                && !ac.admit_payload(&msg.from, &msg.bytes)
             {
                 continue; // message dropped by admission control
             }
@@ -2297,7 +2297,7 @@ impl TcpTransport {
             // message still frees its budget.
             self.inbound_queued.fetch_sub(msg.bytes.len(), Ordering::Relaxed);
             if let Some(ref ac) = self.admission
-                && !ac.admit_message(&msg.from, msg.bytes.len())
+                && !ac.admit_payload(&msg.from, &msg.bytes)
             {
                 continue; // dropped by admission control — keep waiting
             }

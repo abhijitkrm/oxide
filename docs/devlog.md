@@ -25479,3 +25479,28 @@ crate "could not be verified"; its earlier successful run flagged only `zstd-sys
 In plain words: security warnings in the networking, compression and async-runtime libraries were cleared by upgrading them to their patched releases;
 one warning about a math library cannot be cleared yet (it needs a larger upgrade of the EVM engine) and was recorded as reviewed, because the affected
 code only handles public signature data.
+
+## 25 Nov 2026 — p2p ingress policy (branch `p2p-ingress-policy`)
+
+Problem (measured on the Ryzen box, consensus bench): every message a peer sent shared ONE token bucket (10 MiB burst, 1 MiB/s), proposals and votes
+included. A proposal carries the block's transactions, so one proposing peer was capped near 4k tx/s, and a gossip burst could empty the bucket and make the
+node drop the same peer's proposals and votes: a 4-validator order run committed 97 orders/s (0.07 blocks/s) against 211,851 orders/s with the limit raised.
+
+Policy now (`p2p::admission::IngressPolicy`):
+- Untrusted peers (observers, strangers): unchanged, one strict bucket, 10 MiB burst / 1 MiB/s.
+- Trusted peers (the committee, authenticated by the BLS-signed greeting; set at startup from `peers`): consensus-class messages (tags 0x00-0x04: proposal, vote,
+  QC, timeout, TC) use their own bucket, a hard cap of 1 GiB burst / 512 MiB/s that bounds a faulty validator but cannot be starved by gossip; everything else (tx gossip,
+  block sync) uses a 512 MiB burst / 128 MiB/s budget. Sizing: 1M tx/s x ~250 B is ~250 MB/s per link, 10M orders/s in bundles 270-470 MB/s.
+- Bans apply to everyone, trusted or not. The transport calls `admit_payload` (it sees the bytes) and the node supplies the classifier (`classify_payload`).
+- `OXIDE_P2P_INGRESS_BYTES_PER_SEC` now overrides the trusted gossip rate only.
+- A peer added by a later committee rotation stays untrusted until restart (the safe direction).
+
+Tests (written first, failing to compile before the types existed): a gossip flood cannot starve a trusted peer's proposal; an untrusted peer gets no exemption; the consensus
+hard cap still bounds a flooding validator (exactly 5 of 1,000-byte messages on a 5,000-byte bucket); a banned trusted peer is still dropped; default limits (strangers 1 MiB/s,
+committee >= 100 MiB/s); the node classifier exempts exactly the five consensus tags.
+
+Also fixed: the `node` crate doctest had not been updated for `NodeConfig.exchange_markets` (added with the lanes work) and failed to compile; it is `no_run`, so only a
+`cargo test --doc` catches it.
+
+In plain words: validators no longer rate-limit each other like strangers. Votes and proposals between committee members always get through, so a flood of
+transactions can't stall the chain, and committee links may carry the data rates the throughput targets need, while unknown peers stay tightly limited.
