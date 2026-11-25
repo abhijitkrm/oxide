@@ -1,0 +1,9 @@
+    30.41%  oxide-devnet     [.] _blake3_compress_in_place_avx512
+     6.35%  oxide-devnet     [.] rustsecp256k1_v0_11_fe_mul_inner
+     6.33%  oxide-devnet     [.] <mempool::Mempool>::select_with_gas_cap
+     3.80%  oxide-devnet     [.] _blake3_hash_many_avx512
+     2.84%  oxide-devnet     [.] rustsecp256k1_v0_11_fe_sqr_inner
+     1.77%  oxide-devnet     [.] __KeccakF1600
+     1.63%  swapper          [k] mwait_idle
+     1.28%  oxide-devnet     [.] rustsecp256k1_v0_11_fe_sqrt
+     0.96%  oxide-devnet     [.] rustsecp256k1_v0_11_gej_double

@@ -1,0 +1,24 @@
+    14.10%  oxide-devnet     [.] __KeccakF1600
+     4.72%  oxide-devnet     [.] __mulx_384
+     2.74%  oxide-devnet     [.] __mulx_mont_384
+     2.59%  oxide-devnet     [.] __mulx_by_1_mont_384
+     1.93%  oxide-devnet     [.] __mulx_mont_383_nonred
+     1.79%  p2p-peer-0a0a0a  [.] __mulx_mont_384
+     1.70%  oxide-intake-0   [.] rustsecp256k1_v0_11_fe_mul_inner
+     1.53%  oxide-devnet     [.] <alloy_trie::hash_builder::HashBuilder>::update
+     1.46%  p2p-peer-0a0a0a  [.] __mulx_384
+     1.37%  oxide-devnet     [.] _blake3_compress_in_place_avx512
+     1.07%  oxide-devnet     [.] __subx_mod_384x384
+     1.03%  oxide-devnet     [.] sub_mod_384x384
+     1.00%  oxide-devnet     [.] rustsecp256k1_v0_11_fe_mul_inner
+     0.99%  exec-lane        [.] <evm::versioned::BlockUndo>::capture
+     0.87%  exec-lane        [.] _blake3_compress_in_place_avx512
+     0.83%  oxide-devnet     [.] __add_mod_384_a_is_loaded
+     0.78%  exec-lane        [.] <trading::engine::MatchingEngine>::resting_fold
+     0.75%  exec-lane        [.] core::slice::sort::stable::quicksort::quicksort::<(ruint::Uint<256, 4>, ruint::Uint<256, 4>), <[(ruint::Uint<256, 4>, ruint::Uint<256, 4>)]>::sort_by_key<ruint::Uint<256, 4>, <evm::EvmModule>::serialize_committed_account::{closure#3}>::{closure#0}>
+     0.69%  p2p-peer-0a0a0a  [.] __mulx_by_1_mont_384
+     0.69%  oxide-intake-1   [k] entry_SYSRETQ_unsafe_stack
+     0.67%  oxide-intake-0   [.] rustsecp256k1_v0_11_fe_sqr_inner
+     0.66%  p2p-peer-0a0a0a  [.] __mulx_mont_383_nonred
+     0.60%  exec-lane        [.] core::slice::sort::stable::quicksort::quicksort::<(&ruint::Uint<256, 4>, &ruint::Uint<256, 4>), <[(&ruint::Uint<256, 4>, &ruint::Uint<256, 4>)]>::sort_by_key<ruint::Uint<256, 4>, evm::persist::serialize_undo::{closure#1}>::{closure#0}>
+     0.60%  oxide-intake-1   [.] rustsecp256k1_v0_11_fe_mul_inner

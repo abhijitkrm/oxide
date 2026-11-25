@@ -25399,3 +25399,53 @@ order at fee 0 there is no fee priority among them.
 
 In plain words: sending an order is free if your account can back it; moving funds still costs a fee; an order you could not pay for is
 turned away before it reaches a block.
+
+## 25 Nov 2026 — order throughput through real consensus, profiles, and the end of the box session (branch `localnet-orders`)
+
+Setup: N real `oxide-devnet` validators (oxideBFT over loopback TCP, gossip, WAL, journal, JSON-RPC, mimalloc), each pinned with `taskset`
+(12 physical cores shared by the committee; `--smt` also uses the siblings), each injecting PRE-SIGNED zero-fee exchange bundles of 64
+orders (self-crossing sell/buy pairs spread over 16 markets; the pump never signs; `ingest_tx_recovered` skips re-recovering the node's own
+envelopes), per-peer ingress limit raised (`OXIDE_P2P_INGRESS_BYTES_PER_SEC=400000000`). New: `[exchange] markets` /
+`OXIDE_EXCHANGE_MARKETS`, `TxInject::exchange_bundles_presigned`, `oxide-devnet --tx-inject-orders K`, harness `--orders K --markets M --perf-out`.
+Executed orders are counted from the senders' balance drop: each crossing pair costs its account exactly one protocol fee (15 units).
+
+Committed orders per second (raw logs `orders/order-matrix*.log`):
+
+| Layout | Offered | Committed | ms/block | CPU of pinned cores | Timeouts |
+|---|---|---|---|---|---|
+| 4 validators x 3 cores | 205k | 213,689 | 6 | 49% | 0 |
+| 4 validators x 3 cores | 410k | 427,680 | 8 | 54% | 0 |
+| 4 validators x 3 cores | 819k | **839,510** (peak) | 37 | 58% | 0 |
+| 4 validators x 3 cores | 1.64M / 3.28M | 777,721 / 633,354 (overload degrades) | 39 / 60 | 61% | 0 |
+| 4 validators x 6 (SMT) | 819k | **851,752** (peak) | 30 | 44% | 0 |
+| 3 validators x 4 cores | 1.23M | **924,993** (peak) | 23 | 49% | 0 |
+| 3 validators x 8 (SMT) | 1.23M | 923,818 | 23 | 35% | 0 |
+
+Peak ~0.84-0.93M orders/s through consensus; peak memory ~4 GB per validator at saturation. Below ~200k offered, 3- and 4-validator
+committees show the periodic 2 s view timeouts seen in the EVM test (e.g. 4 x 3 at 51k offered: 12,733 orders/s, 2.5 blocks/s): still open.
+
+Profiles (system-wide `perf`, frame pointers, 4 x 3 at 205k orders/s; `orders/profiles/*.top.txt`, folded stacks and `perf.data` kept off-repo):
+
+- Leaf shares of busy CPU: BLS12-381 field arithmetic **28.5%** (consensus vote/certificate verification, paid PER BLOCK), Keccak **14.3%**,
+  secp256k1 6.1%, BLAKE3 2.6%. Orders are cheap; blocks are expensive. At ~157 blocks/s each validator spends ~3 ms of CPU per block on BLS alone.
+- Keccak comes from `EvmModule::state_root -> patch_delta -> storage_root`: an account's WHOLE storage trie is recomputed from scratch whenever the
+  account is touched. The EIP-2935 history contract (a ring of up to 8,191 block hashes) is written by every block, so every block pays ~8k slot
+  hashes and trie-node hashes however few orders it carries. Standalone benches (28k-transaction blocks) hid it; small frequent blocks expose it.
+- Thread split: signature-intake threads ~18% of busy CPU, exec lane ~9%, p2p ~10%, the rest in the unrenamed pool and consensus threads (the
+  `oxide-devnet` thread name covers rayon workers too, so "the pump is saturated" is NOT established).
+- With the DEFAULT 1 MiB/s per-peer ingress limit the same run commits **97 orders/s** (0.07 blocks/s, 14.5 s per block, 12 view timeouts) against
+  211,851 with the limit raised: the default makes order traffic unusable above a trickle.
+
+Not obtained: the stall evidence for 3-4 validator committees. The syscall sampler attached to the wrong process (a `pgrep` pattern matched the
+ssh command's own `bash`), and `strace` produced no output; the box was retired before a rerun. Cause remains unexplained (quorum is strict >2/3 of stake,
+so 3 validators need all 3 votes, which does not explain why 5 and 6 are clean).
+
+Levers this evidence points at, in order: (1) incremental storage roots for large accounts (reuse the account trie's retained-branch walk for the history
+contract: ~14% of CPU per block); (2) block pacing, a minimum block interval so a block carries more orders and the per-block BLS and sealing costs are
+amortized (blocks of 6 ms carry ~1,350 orders; 10M orders/s at 20 blocks/s is 500k orders per block); (3) verify each QC once and batch vote
+verification; (4) the p2p ingress policy (exempt validator consensus traffic from the per-peer bucket, make the limit configuration); (5) the 3/4-validator
+low-load stall.
+
+In plain words: through a real four-validator committee sharing one 12-core server the chain now commits about 850 thousand orders a second (925 thousand
+with three validators), up from nothing measured before today. The server is only half busy: most of the remaining cost is per block, not per order
+(vote checking and re-hashing a 8,191-entry history table every block), so fewer, larger blocks and incremental hashing are the next gains.
