@@ -759,6 +759,19 @@ pub struct TxContext {
     pub fee: u64,
 }
 
+/// Per-transaction outcomes of a lane-executed run: `Some(result)` for an executed transaction,
+/// `None` for one whose fee charge failed.
+pub type LaneRunResults = Vec<Option<Result<Vec<Event>, ExecError>>>;
+
+/// One transaction of a run handed to [`Module::handle_run_lanes`].
+#[derive(Debug, Clone, Copy)]
+pub struct LaneTx<'a> {
+    /// The authenticated envelope context.
+    pub ctx: TxContext,
+    /// The module payload (the message the module's `handle` would receive).
+    pub payload: &'a [u8],
+}
+
 /// A transaction with a pre-recovered sender.
 ///
 /// The sender is recovered from the transaction's signature at
@@ -1134,6 +1147,24 @@ pub trait Module: Send + Sync {
         Ok(())
     }
 
+    /// Execute a whole contiguous run of this module's transactions in parallel lanes, or
+    /// decline (`None`) with **no state touched** so the executor runs the serial path.
+    ///
+    /// `charge` charges one transaction's envelope fee through the fee module and says whether it
+    /// succeeded. A module that accepts must (1) prove before any effect that no fee charge or
+    /// debit of the run can fail in any order (so serial interleaving and lane execution agree
+    /// exactly), (2) call `charge` for every transaction in run order, (3) execute, and (4)
+    /// return one entry per transaction: `Some(result)` for an executed one, `None` for one
+    /// whose fee charge failed (unreachable once (1) holds; the executor reports it like the
+    /// serial path would). Default: decline.
+    fn handle_run_lanes(
+        &self,
+        _txs: &[LaneTx<'_>],
+        _charge: &mut dyn FnMut(&TxContext) -> bool,
+    ) -> Option<LaneRunResults> {
+        None
+    }
+
     /// Whether this module pays for its own execution internally,
     /// exempting it from the envelope fee charged by the configured
     /// fee module. `false` (default): the executor charges `ctx.fee`
@@ -1488,6 +1519,33 @@ pub enum TxOutcome {
 /// Memory cost is bounded: outcomes hold at most a few events each.
 const MAX_TX_OUTCOMES: usize = 8192;
 
+/// Free evicted outcomes on a background thread. Dropping a bundle's events is hundreds of small
+/// frees of memory another thread allocated; doing it on the exec thread was ~10% of its serial
+/// time. Never blocks execution: if the reaper is behind (queue full) the batch is dropped inline.
+fn reap(batch: Vec<TxOutcome>) {
+    use std::sync::mpsc::{SyncSender, sync_channel};
+    /// Batches the reaper may have queued. Unit: blocks' worth of evictions. Small on purpose:
+    /// it bounds the memory kept alive, and a full queue only costs an inline drop.
+    const REAPER_QUEUE: usize = 16;
+    static REAPER: std::sync::OnceLock<Option<SyncSender<Vec<TxOutcome>>>> =
+        std::sync::OnceLock::new();
+    if batch.is_empty() {
+        return;
+    }
+    let tx = REAPER.get_or_init(|| {
+        let (tx, rx) = sync_channel::<Vec<TxOutcome>>(REAPER_QUEUE);
+        std::thread::Builder::new()
+            .name("exec-reaper".into())
+            .spawn(move || while rx.recv().is_ok() {})
+            .ok()
+            .map(|_| tx)
+    });
+    if let Some(tx) = tx {
+        // `Err(Full)` hands the batch back: drop it here.
+        let _ = tx.try_send(batch);
+    }
+}
+
 /// Insertion-ordered bounded map of tx hash → finalized outcome.
 /// The `order` deque is the eviction frontier: the oldest recorded
 /// hash is removed when the window is full.
@@ -1510,19 +1568,26 @@ impl TxOutcomeStore {
     /// `Executed` is final: execution consumes the sender nonce, so
     /// an executed tx can never dispatch again; any later record for
     /// the same hash can only be a stale re-proposal being skipped.
-    fn record(&mut self, hash: Hash, outcome: TxOutcome) {
+    ///
+    /// Returns the evicted outcome (if any) instead of dropping it, so the caller can free its
+    /// events off the execution path (`reap`): at a bundle's ~100 events per tx the frees were a
+    /// large share of the exec thread's serial time.
+    #[must_use]
+    fn record(&mut self, hash: Hash, outcome: TxOutcome) -> Option<TxOutcome> {
         if matches!(self.outcomes.get(&hash), Some(TxOutcome::Executed { .. })) {
-            return;
+            return None;
         }
         if self.outcomes.insert(hash, outcome).is_some() {
-            return; // replaced a provisional skip — position unchanged
+            return None; // replaced a provisional skip — position unchanged
         }
+        let mut evicted = None;
         if self.order.len() >= MAX_TX_OUTCOMES
             && let Some(oldest) = self.order.pop_front()
         {
-            self.outcomes.remove(&oldest);
+            evicted = self.outcomes.remove(&oldest);
         }
         self.order.push_back(hash);
+        evicted
     }
 }
 
@@ -1840,10 +1905,10 @@ pub struct Executor {
     /// This eliminates the per-tx `mempool.lock()` on the ingestion
     /// hot path — the mempool lock is only acquired once per
     /// `prepare_proposal` call, not once per tx.
-    mempool_intake_tx: std::sync::mpsc::SyncSender<(TxBytes, u64)>,
+    mempool_intake_tx: std::sync::mpsc::SyncSender<(TxBytes, u64, Hash)>,
     /// The receiver side of the intake ring. Drained by
     /// `prepare_proposal` to flush buffered txs into the mempool.
-    mempool_intake_rx: std::sync::Mutex<std::sync::mpsc::Receiver<(TxBytes, u64)>>,
+    mempool_intake_rx: std::sync::Mutex<std::sync::mpsc::Receiver<(TxBytes, u64, Hash)>>,
     /// H4/H5 fix: per-account executed-nonce map. Tracks the next
     /// expected nonce for each sender. Updated after `execute_block`
     /// completes for each tx that was executed.

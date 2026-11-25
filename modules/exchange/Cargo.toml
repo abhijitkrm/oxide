@@ -23,6 +23,8 @@ trading = { workspace = true }
 # the chain computes use the same function (docs/lanes-spec.md §7).
 lanes = { workspace = true }
 storage = { workspace = true }
+# rayon: per-market execution lanes (`lanes.rs`); already a workspace dependency of the executor and EVM.
+rayon = { workspace = true }
 
 [dev-dependencies]
 # Benchmark harness (criterion gates: plan.md §13 Phase 3 acceptance).

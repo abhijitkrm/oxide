@@ -90,7 +90,7 @@ impl Executor {
         // signature actually verified — it decides what the preverify
         // cache may claim below.
         let envelope_verified =
-            match self.check_envelope_auth(bytes, &ctx, module_id, module.as_ref(), None) {
+            match self.check_envelope_auth(bytes, &ctx, module_id, module.as_ref(), None, None) {
                 Ok(v) => v,
                 Err(reason) => return MempoolAck::Rejected { reason: reason.to_string() },
             };
@@ -143,6 +143,10 @@ impl Executor {
         // never held), the one intake-side map that wasn't bounded
         // by any capacity check. The hash is taken now because `tx`
         // moves into the channel below.
+        // The tx hash is computed once here (on the ingest thread, in parallel across ingest
+        // threads) and rides the intake ring with the tx: the pool drain used to hash every tx
+        // again on the serial proposer thread (47% of `prepare_proposal` on bundles).
+        let tx_hash = crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, bytes);
         let cacheable = preverify_result[0]
             .as_ref()
             .ok()
@@ -155,9 +159,7 @@ impl Executor {
                     None
                 }
             })
-            .map(|sender| {
-                (crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, bytes), sender)
-            });
+            .map(|sender| (tx_hash, sender));
 
         // Push to the bounded intake ring. The mempool submission
         // is deferred to `prepare_proposal` — this eliminates the
@@ -177,7 +179,7 @@ impl Executor {
         // entry carried gas 0 and each proposal cloned the pool up to the
         // byte budget just to keep ~1% of it.
         let gas = module.estimate_gas(payload);
-        match self.mempool_intake_tx.try_send((tx, gas)) {
+        match self.mempool_intake_tx.try_send((tx, gas, tx_hash)) {
             Ok(()) => {
                 if let Some((tx_hash, sender)) = cacheable {
                     // Only the sender is cached — the payload is
@@ -307,8 +309,8 @@ impl AppInterface for Executor {
         {
             let rx = primitives::sync::lock_state(&self.mempool_intake_rx);
             let mut pool = primitives::sync::lock_state(&self.mempool);
-            while let Ok((tx, gas)) = rx.try_recv() {
-                let _ = pool.submit_with_gas(tx, gas);
+            while let Ok((tx, gas, hash)) = rx.try_recv() {
+                let _ = pool.submit_with_gas_hashed(tx, gas, hash);
             }
         }
         // Coordinated halt: once the next height is past the
@@ -385,7 +387,8 @@ impl AppInterface for Executor {
         // proposal's txs re-select rather than leak. Marked only
         // after the gas filter so filtered-out candidates stay
         // eligible.
-        primitives::sync::lock_state(&self.mempool).note_proposed(&txs);
+        let proposed_hashes = Self::hash_block_txs(&txs);
+        primitives::sync::lock_state(&self.mempool).note_proposed_hashed(proposed_hashes);
         let height = Height::new(*primitives::sync::lock_state(&self.next_proposal_height));
         if let Some(recorder) = &self.recorder {
             recorder.record("prepare_proposal", start.elapsed());
@@ -569,8 +572,12 @@ impl AppInterface for Executor {
         // inside `execute_block`) also covers the async lane: a
         // committed tx can never be re-proposed by a `prepare` that
         // runs while the worker is still draining the backlog.
-        primitives::sync::lock_state(&self.mempool)
-            .remove_committed(&block.txs, block.height.value());
+        let committed_hashes = Self::hash_block_txs(&block.txs);
+        primitives::sync::lock_state(&self.mempool).remove_committed_hashed(
+            &block.txs,
+            &committed_hashes,
+            block.height.value(),
+        );
         let lane_spawned = {
             let (lock, _cv) = &*self.exec_sync;
             primitives::sync::lock_state(lock).lane_spawned

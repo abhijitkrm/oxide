@@ -15,6 +15,7 @@ use super::{
     RegisteredOrder, RejectCategory, Reserved, SWEEP_LINKED_BODY_LEN, Side, TradingError,
     TxContext, qty_add, qty_sub,
 };
+use crate::book_view::{BookView, SerialBook};
 use crate::codec::{
     amended_event, cancel_event, decode_side, encode_side, fill_event, outcome_event, pair_event,
     removal_event,
@@ -23,6 +24,7 @@ use crate::settle::{
     BookSettlement, ConsumedMap, LegPlan, TakerCtx, consume_and_release, pair_hash,
     rejected_leg_event, settle_leg,
 };
+use trading::{FillEvent, MatchingEngine, NewOrder, OrderId};
 
 impl ExchangeModule {
     /// Handle a bundle (`docs/bundle-auth-spec.md`): validate the framing of
@@ -37,6 +39,17 @@ impl ExchangeModule {
         body: &[u8],
         inner: &mut Inner,
     ) -> Result<Vec<Event>, ExecError> {
+        Self::bundle_core(body, |tag, rest| match tag {
+            crate::TAG_PLACE => self.handle_place(ctx, rest, inner),
+            crate::TAG_CANCEL => self.handle_cancel(ctx, rest, inner),
+            _ => self.handle_amend(ctx, rest, inner),
+        })
+    }
+
+    /// Validate a bundle's framing and return every item's `(start, end)` span in `body`
+    /// (cheap, allocation-light; nothing is executed). Shared by the serial path and the lane
+    /// planner so both agree on what is a well-formed bundle.
+    pub(crate) fn bundle_spans(body: &[u8]) -> Result<Vec<(usize, usize)>, ExecError> {
         if body.len() > crate::MAX_BUNDLE_BYTES || body.len() < 2 {
             return Err(ExecError::Malformed);
         }
@@ -44,7 +57,7 @@ impl ExchangeModule {
         if count == 0 || count > crate::MAX_BUNDLE_ITEMS {
             return Err(ExecError::Malformed);
         }
-        // Pass 1: framing only (cheap, allocation-free); items are not executed
+        // Framing only (cheap, allocation-free); items are not executed
         // unless every length is consistent and every tag is allowed.
         let mut spans: Vec<(usize, usize)> = Vec::with_capacity(count);
         let mut at = 2usize;
@@ -66,16 +79,22 @@ impl ExchangeModule {
         if at != body.len() {
             return Err(ExecError::Malformed);
         }
+        Ok(spans)
+    }
+
+    /// Bundle framing and the per-item loop, with item execution supplied by the caller: the
+    /// serial path runs items against the live maps, a lane runs them against its overlay.
+    pub(crate) fn bundle_core(
+        body: &[u8],
+        mut exec_item: impl FnMut(u8, &[u8]) -> Result<Vec<Event>, ExecError>,
+    ) -> Result<Vec<Event>, ExecError> {
+        let spans = Self::bundle_spans(body)?;
         // Pass 2: execute in order for the signer.
         let mut events = Vec::new();
         for (i, (start, end)) in spans.into_iter().enumerate() {
             let item = &body[start..end];
             let (tag, rest) = (item[0], &item[1..]);
-            let result = match tag {
-                crate::TAG_PLACE => self.handle_place(ctx, rest, inner),
-                crate::TAG_CANCEL => self.handle_cancel(ctx, rest, inner),
-                _ => self.handle_amend(ctx, rest, inner),
-            };
+            let result = exec_item(tag, rest);
             match result {
                 Ok(evs) => events.extend(evs),
                 Err(e) => {
@@ -98,18 +117,30 @@ impl ExchangeModule {
         inner: &mut Inner,
     ) -> Result<Vec<Event>, ExecError> {
         let (market, order_id) = Self::parse_cancel(body).ok_or(ExecError::Malformed)?;
-
-        let Inner { markets, base_balances, base_holds, .. } = inner;
+        let Inner { markets, base_balances, base_holds, fee_vault, .. } = inner;
         let Some(engine) = markets[usize::from(market)].as_mut() else {
             return Err(ExecError::rejected(
                 RejectCategory::NotFound,
                 format!("market {market} does not exist"),
             ));
         };
+        let mut book =
+            SerialBook { ledger: self.ledger.as_ref(), base_balances, base_holds, fee_vault };
+        Self::cancel_core(self.ledger.is_some(), ctx.sender, market, order_id, engine, &mut book)
+    }
 
+    /// The body of a cancel, over any [`BookView`] backend (serial maps or a lane overlay).
+    pub(crate) fn cancel_core<B: BookView>(
+        ledger_wired: bool,
+        sender: Address,
+        market: u8,
+        order_id: OrderId,
+        engine: &mut MatchingEngine,
+        book: &mut B,
+    ) -> Result<Vec<Event>, ExecError> {
         // Authorization: only the order's owner may cancel.
         if let Some(owner) = engine.order_owner(order_id) {
-            if owner != ctx.sender {
+            if owner != sender {
                 return Err(ExecError::rejected(
                     RejectCategory::Unauthorized,
                     "cancel: not the order owner",
@@ -132,7 +163,7 @@ impl ExchangeModule {
                 // holds nothing and releases nothing).
                 match canceled.side {
                     Side::Buy => {
-                        if let Some(ledger) = &self.ledger {
+                        if ledger_wired {
                             let refund = u64::try_from(
                                 u128::from(canceled.price.0) * u128::from(canceled.qty.0)
                                     / PRICE_SCALE,
@@ -144,7 +175,7 @@ impl ExchangeModule {
                                 )
                             })?;
                             if refund > 0 {
-                                ledger.credit(&canceled.owner, refund).map_err(|_| {
+                                book.credit(&canceled.owner, refund).map_err(|_| {
                                     ExecError::rejected(
                                         RejectCategory::Internal,
                                         "cancel refund failed",
@@ -155,15 +186,12 @@ impl ExchangeModule {
                     }
                     Side::Sell => {
                         let key = (canceled.owner, market);
-                        let release =
-                            base_holds.get(&key).copied().unwrap_or_default().min(canceled.qty);
+                        let release = book.hold(&key).unwrap_or_default().min(canceled.qty);
                         if release.0 > 0 {
-                            let held = base_holds.get(&key).copied().ok_or(ExecError::Malformed)?;
-                            base_holds
-                                .insert(key, qty_sub(held, release).ok_or(ExecError::Malformed)?);
-                            let free = base_balances.get(&key).copied().unwrap_or_default();
-                            base_balances
-                                .insert(key, qty_add(free, release).ok_or(ExecError::Malformed)?);
+                            let held = book.hold(&key).ok_or(ExecError::Malformed)?;
+                            book.set_hold(key, qty_sub(held, release).ok_or(ExecError::Malformed)?);
+                            let free = book.bal(&key).unwrap_or_default();
+                            book.set_bal(key, qty_add(free, release).ok_or(ExecError::Malformed)?);
                         }
                     }
                 }
@@ -354,13 +382,18 @@ impl ExchangeModule {
             events.push(fill_event(*f));
         }
         if let Some(ledger) = &self.ledger {
-            BookSettlement { ledger, base_balances, base_holds, fee_vault, events: &mut events }
-                .apply(
-                    market,
-                    TakerCtx { price: new_price, owner: ctx.sender, reservation, base: taker_base },
-                    outcome,
-                    fills,
-                )?;
+            let mut book = SerialBook {
+                ledger: Some(ledger),
+                base_balances: &mut *base_balances,
+                base_holds: &mut *base_holds,
+                fee_vault: &mut *fee_vault,
+            };
+            BookSettlement { book: &mut book, events: &mut events }.apply(
+                market,
+                TakerCtx { price: new_price, owner: ctx.sender, reservation, base: taker_base },
+                outcome,
+                fills,
+            )?;
         }
         match outcome {
             trading::OrderOutcome::Resting { price, resting_qty, .. } => {
@@ -368,7 +401,13 @@ impl ExchangeModule {
             }
             other => events.push(outcome_event(market, other)),
         }
-        self.release_maker_holds(market, &removed, base_balances, base_holds, &mut events)?;
+        let mut book = SerialBook {
+            ledger: self.ledger.as_ref(),
+            base_balances: &mut *base_balances,
+            base_holds: &mut *base_holds,
+            fee_vault: &mut *fee_vault,
+        };
+        Self::release_maker_holds(self.ledger.is_some(), market, &removed, &mut book, &mut events)?;
         Ok(events)
     }
 
@@ -389,10 +428,6 @@ impl ExchangeModule {
         // The tx sender is the order owner (self-trade checks
         // and settlement attribution use this).
         order.owner = ctx.sender;
-
-        // Split the borrow: `inner` derefs to `Inner`, and the
-        // settlement code below needs the book maps and the base
-        // custody maps disjointly.
         let Inner { markets, fills, base_balances, base_holds, fee_vault, .. } = inner;
         let Some(engine) = markets[usize::from(market)].as_mut() else {
             return Err(ExecError::rejected(
@@ -400,7 +435,22 @@ impl ExchangeModule {
                 format!("market {market} does not exist"),
             ));
         };
+        let mut book =
+            SerialBook { ledger: self.ledger.as_ref(), base_balances, base_holds, fee_vault };
+        Self::place_core(self.ledger.is_some(), ctx.sender, market, order, engine, fills, &mut book)
+    }
 
+    /// The body of a book-path place, over any [`BookView`] backend (serial maps or a lane
+    /// overlay): reservations, the engine call, settlement, and maker-hold release.
+    pub(crate) fn place_core<B: BookView>(
+        ledger_wired: bool,
+        sender: Address,
+        market: u8,
+        order: NewOrder,
+        engine: &mut MatchingEngine,
+        fills: &mut Vec<FillEvent>,
+        book: &mut B,
+    ) -> Result<Vec<Event>, ExecError> {
         // Reservations (C6 + DvP): if the ledger is wired, BOTH sides
         // escrow their obligation up front — a reservation, not a
         // check.
@@ -430,10 +480,9 @@ impl ExchangeModule {
         // insolvency.
         let mut reservation = 0u64;
         let mut taker_base = Qty(0);
-        if self.ledger.is_some() {
+        if ledger_wired {
             match order.side {
                 Side::Buy => {
-                    let ledger = self.ledger.as_ref().ok_or(ExecError::Malformed)?;
                     // Scale-14 notional → scale-6 quote. Reject rather
                     // than cap on u64 overflow — saturating would
                     // silently change what the buyer pays.
@@ -449,7 +498,7 @@ impl ExchangeModule {
                     })?;
                     // Debit up front — fails here, BEFORE the book is
                     // touched, on insufficient funds.
-                    ledger.debit(&ctx.sender, quote_needed).map_err(|_| {
+                    book.debit(&sender, quote_needed).map_err(|_| {
                         ExecError::rejected(
                             RejectCategory::InsufficientFunds,
                             "insufficient balance for buy order",
@@ -463,8 +512,8 @@ impl ExchangeModule {
                     // made — and deposits require the ledger — so
                     // inside `self.ledger.is_some()` a zero entry is
                     // an honest rejection, not a test-mode artifact.
-                    let key = (ctx.sender, market);
-                    let free = base_balances.get(&key).copied().unwrap_or_default();
+                    let key = (sender, market);
+                    let free = book.bal(&key).unwrap_or_default();
                     if free < order.qty {
                         return Err(ExecError::rejected(
                             RejectCategory::InsufficientFunds,
@@ -472,8 +521,8 @@ impl ExchangeModule {
                         ));
                     }
                     // `free >= qty` was just proven — cannot underflow.
-                    let bal = base_balances.get(&key).copied().ok_or(ExecError::Malformed)?;
-                    base_balances.insert(key, qty_sub(bal, order.qty).ok_or(ExecError::Malformed)?);
+                    let bal = book.bal(&key).ok_or(ExecError::Malformed)?;
+                    book.set_bal(key, qty_sub(bal, order.qty).ok_or(ExecError::Malformed)?);
                     taker_base = order.qty;
                 }
             }
@@ -499,18 +548,15 @@ impl ExchangeModule {
                 // nothing rests, so both reservations come back in
                 // full. Crediting the account we just debited cannot
                 // overflow; the map_err is defensive.
-                if reservation > 0
-                    && let Some(ledger) = &self.ledger
-                {
-                    ledger.credit(&ctx.sender, reservation).map_err(|_| {
+                if reservation > 0 && ledger_wired {
+                    book.credit(&sender, reservation).map_err(|_| {
                         ExecError::rejected(RejectCategory::Internal, "engine-reject refund failed")
                     })?;
                 }
                 if taker_base.0 > 0 {
-                    let free =
-                        base_balances.get(&(ctx.sender, market)).copied().unwrap_or_default();
-                    base_balances.insert(
-                        (ctx.sender, market),
+                    let free = book.bal(&(sender, market)).unwrap_or_default();
+                    book.set_bal(
+                        (sender, market),
                         qty_add(free, taker_base).ok_or(ExecError::Malformed)?,
                     );
                 }
@@ -546,19 +592,13 @@ impl ExchangeModule {
         // with no hold. Such a fill settles VOID — the book consumed
         // the order, but no quote moves and no base is minted — the
         // `unbacked_sell_fill` event keeps the anomaly auditable.
-        if let Some(ledger) = &self.ledger {
-            BookSettlement { ledger, base_balances, base_holds, fee_vault, events: &mut events }
-                .apply(
-                    market,
-                    TakerCtx {
-                        price: order.price,
-                        owner: ctx.sender,
-                        reservation,
-                        base: taker_base,
-                    },
-                    outcome,
-                    fills,
-                )?;
+        if ledger_wired {
+            BookSettlement { book: &mut *book, events: &mut events }.apply(
+                market,
+                TakerCtx { price: order.price, owner: sender, reservation, base: taker_base },
+                outcome,
+                fills,
+            )?;
         }
 
         events.push(outcome_event(market, outcome));
@@ -566,7 +606,7 @@ impl ExchangeModule {
         // the sweep applied, so downstream accounting sees each
         // obligation the book released — a maker the engine deleted
         // silently would be invisible to settlement reconciliation.
-        self.release_maker_holds(market, &removed, base_balances, base_holds, &mut events)?;
+        Self::release_maker_holds(ledger_wired, market, &removed, book, &mut events)?;
         Ok(events)
     }
 
@@ -583,15 +623,14 @@ impl ExchangeModule {
     ///   `min(hold, removed_qty)` clamps the release to what is
     ///   actually held: a sell imported from before custody existed
     ///   holds nothing, so it releases nothing.
-    pub(crate) fn release_maker_holds(
-        &self,
+    pub(crate) fn release_maker_holds<B: BookView>(
+        ledger_wired: bool,
         market: u8,
         removed: &[trading::MakerRemoval],
-        base_balances: &mut framework::CommittedMap<(Address, u8), Qty>,
-        base_holds: &mut framework::CommittedMap<(Address, u8), Qty>,
+        book: &mut B,
         events: &mut Vec<Event>,
     ) -> Result<(), ExecError> {
-        if let Some(ledger) = &self.ledger {
+        if ledger_wired {
             for r in removed {
                 if r.side == Side::Buy && r.removed_qty > 0 {
                     let refund = u64::try_from(
@@ -604,7 +643,7 @@ impl ExchangeModule {
                         )
                     })?;
                     if refund > 0 {
-                        ledger.credit(&r.owner, refund).map_err(|_| {
+                        book.credit(&r.owner, refund).map_err(|_| {
                             ExecError::rejected(
                                 RejectCategory::Internal,
                                 "STP release refund failed",
@@ -617,13 +656,12 @@ impl ExchangeModule {
         for r in removed {
             if r.side == Side::Sell && r.removed_qty > 0 {
                 let key = (r.owner, market);
-                let release =
-                    base_holds.get(&key).copied().unwrap_or_default().min(Qty(r.removed_qty));
+                let release = book.hold(&key).unwrap_or_default().min(Qty(r.removed_qty));
                 if release.0 > 0 {
-                    let held = base_holds.get(&key).copied().ok_or(ExecError::Malformed)?;
-                    base_holds.insert(key, qty_sub(held, release).ok_or(ExecError::Malformed)?);
-                    let free = base_balances.get(&key).copied().unwrap_or_default();
-                    base_balances.insert(key, qty_add(free, release).ok_or(ExecError::Malformed)?);
+                    let held = book.hold(&key).ok_or(ExecError::Malformed)?;
+                    book.set_hold(key, qty_sub(held, release).ok_or(ExecError::Malformed)?);
+                    let free = book.bal(&key).unwrap_or_default();
+                    book.set_bal(key, qty_add(free, release).ok_or(ExecError::Malformed)?);
                 }
             }
             events.push(removal_event(market, *r));

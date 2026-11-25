@@ -2970,13 +2970,13 @@ fn tx_outcome_records_executed_and_skipped() {
 fn tx_outcome_store_overwrite_semantics() {
     let mut store = TxOutcomeStore::default();
     let h = Hash([1u8; 32]);
-    store.record(h, TxOutcome::Skipped { reason: TxSkipReason::GasLimit });
+    let _ = store.record(h, TxOutcome::Skipped { reason: TxSkipReason::GasLimit });
     // The tx lands in a later block — Executed supersedes.
     let executed = TxOutcome::Executed { events: Vec::new().into(), error: None };
-    store.record(h, executed.clone());
+    let _ = store.record(h, executed.clone());
     assert_eq!(store.outcomes.get(&h), Some(&executed));
     // A stale re-proposal skipping afterwards cannot rewrite it.
-    store.record(h, TxOutcome::Skipped { reason: TxSkipReason::StaleNonce });
+    let _ = store.record(h, TxOutcome::Skipped { reason: TxSkipReason::StaleNonce });
     assert_eq!(store.outcomes.get(&h), Some(&executed), "Executed is final");
 }
 

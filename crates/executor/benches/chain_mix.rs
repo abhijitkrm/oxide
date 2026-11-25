@@ -26,7 +26,7 @@
 //!
 //! ```sh
 //! cargo bench -p executor --bench chain_mix -- [--mix transfer,clob,mixed] [--txs 100000] \
-//!     [--threads 1,4,16] [--accounts 512] [--ring]
+//!     [--threads 1,4,16] [--accounts 512] [--markets 1] [--ring]
 //! ```
 //!
 //! `--ring` makes every transfer pay the next sender (the worst case for speculative
@@ -63,7 +63,16 @@ const FEE: u64 = 100;
 /// EVM gas price for transfers (above the 7 gwei base fee the module is built with).
 const GAS_PRICE: u64 = 10_000_000_000;
 /// Block budget: bytes and gas generous enough that a block holds every pending tx up to this size.
-const BUDGET: BlockBudget = BlockBudget { max_bytes: 8 << 20, max_gas: 1 << 40 };
+/// Block byte budget: `CHAIN_MIX_BLOCK_BYTES` (default 8 MiB, the node's `max_block_bytes`). Together with the
+/// block interval it caps throughput: bytes per order x orders per second <= bytes per block / interval.
+fn block_bytes() -> u64 {
+    std::env::var("CHAIN_MIX_BLOCK_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(8 << 20)
+}
+
+/// The proposal budget: generous gas (the executor still enforces the chain's block gas limit) and `block_bytes()`.
+fn budget() -> BlockBudget {
+    BlockBudget { max_bytes: block_bytes(), max_gas: 1 << 40 }
+}
 
 struct Account {
     key: [u8; 32],
@@ -71,9 +80,16 @@ struct Account {
 }
 
 fn accounts(n: usize) -> Vec<Account> {
+    // Keys derive from (seed, index), so two runs build byte-identical transactions: the `roots,`
+    // line is then comparable across execution knobs. `CHAIN_MIX_SEED` varies the population.
+    let seed: u64 = std::env::var("CHAIN_MIX_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     (0..n)
-        .map(|_| {
-            let (key, addr) = secp::generate_keypair_for_test();
+        .map(|i| {
+            let mut pre = b"chain_mix-account".to_vec();
+            pre.extend_from_slice(&seed.to_le_bytes());
+            pre.extend_from_slice(&(i as u64).to_le_bytes());
+            let key = secp::keccak256(&pre);
+            let addr = secp::signable_pubkey_address(&key).expect("derived key is a valid scalar");
             Account { key, addr: Address(addr.0) }
         })
         .collect()
@@ -119,9 +135,22 @@ fn signed_native(acct: &Account, nonce: u64, module_id: u8, payload: &[u8]) -> T
     TxBytes::new(b)
 }
 
-fn clob_cfg() -> MarketConfig {
+/// Markets the CLOB and bundle mixes trade on (`--markets N`, default 1). Account `i` trades market
+/// `(i / 2) % N`: a buyer and a seller of the same pair share a market, so every order still crosses.
+static MARKETS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+fn markets() -> usize {
+    MARKETS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The market account `i` trades.
+fn market_of(i: usize) -> u8 {
+    u8::try_from((i / 2) % markets()).expect("at most 256 markets")
+}
+
+fn clob_cfg(id: u8) -> MarketConfig {
     MarketConfig {
-        market_id: 0,
+        market_id: u16::from(id),
         tick_size: Price(1_000_000),
         lot_size: Qty(1_000),
         min_price: Price(1_000_000_000),
@@ -166,12 +195,16 @@ fn rig(accts: &[Account], capacity: usize) -> Rig {
     executor.set_fee_module(framework::module_id::EVM);
     let ledger: Arc<dyn framework::Balances + Send + Sync> = evm;
     let ex = ExchangeModule::with_ledger(ledger);
-    ex.list_market(clob_cfg()).expect("list market");
+    // CHAIN_MIX_EX_LANES=0 turns the per-market execution lanes off (default: on).
+    ex.set_exec_lanes(std::env::var("CHAIN_MIX_EX_LANES").map_or(true, |v| v != "0"));
+    for m in 0..markets() {
+        ex.list_market(clob_cfg(u8::try_from(m).expect("market id"))).expect("list market");
+    }
     // Sellers need base custody before they can place sell orders.
     for (i, a) in accts.iter().enumerate() {
         if i % 2 == 0 {
             let ctx = TxContext { sender: a.addr, nonce: 0, fee: 0 };
-            ex.handle(&ctx, &msg::deposit_base(0, 1 << 40)).expect("deposit base");
+            ex.handle(&ctx, &msg::deposit_base(market_of(i), 1 << 40)).expect("deposit base");
         }
     }
     let exchange = Arc::new(ex);
@@ -207,7 +240,7 @@ fn build(mix: &str, accts: &[Account], per_acct: usize, ring: bool) -> Vec<Vec<T
                         // (docs/bundle-auth-spec.md): same orders as the `clob` mix, one signature.
                         let side = if i % 2 == 0 { Side::Sell } else { Side::Buy };
                         let items: Vec<Vec<u8>> = (0..bundle_items())
-                            .map(|_| msg::place(0, order(side, a.addr)))
+                            .map(|_| msg::place(market_of(i), order(side, a.addr)))
                             .collect();
                         signed_native(
                             a,
@@ -222,7 +255,7 @@ fn build(mix: &str, accts: &[Account], per_acct: usize, ring: bool) -> Vec<Vec<T
                             a,
                             n,
                             framework::module_id::EXCHANGE,
-                            &msg::place(0, order(side, a.addr)),
+                            &msg::place(market_of(i), order(side, a.addr)),
                         )
                     } else {
                         // `ring`: pay the next sender (every account both sends and receives: the
@@ -259,7 +292,7 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
         .unwrap_or(600_000_000);
     let executor = executor.with_chain_params(Arc::new(types::ChainParams {
         max_gas: std::sync::atomic::AtomicU64::new(gas_limit),
-        max_bytes: std::sync::atomic::AtomicU64::new(8 << 20),
+        max_bytes: std::sync::atomic::AtomicU64::new(block_bytes()),
         min_fee: std::sync::atomic::AtomicU64::new(0),
     }));
     let executor = if lane_mode == "root" { executor.with_root_stage(true) } else { executor };
@@ -268,14 +301,26 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
         executor.spawn_exec_lane();
     }
 
-    // Ingest: `threads` workers each take a contiguous slice of accounts.
+    // Ingest: `threads` workers each take a contiguous slice of accounts. With
+    // `CHAIN_MIX_CONCURRENT=1` they run WHILE the propose/finalize loop drains the pool (so the two
+    // compete for cores, as on a live node); by default ingest finishes first and the loop
+    // follows, which reports each stage's own ceiling.
+    let concurrent = std::env::var("CHAIN_MIX_CONCURRENT").is_ok_and(|v| v == "1");
     let chunk = n_accts.div_ceil(threads);
     let t0 = Instant::now();
-    let accepted: usize = std::thread::scope(|s| {
+    let accepted_ctr = std::sync::atomic::AtomicUsize::new(0);
+    let finished = std::sync::atomic::AtomicUsize::new(0);
+    let n_workers = txs.chunks(chunk).count();
+    let (mut propose, mut finalize, mut fin_call) = (0.0f64, 0.0f64, 0.0f64);
+    let mut height = 1u64;
+    let mut executed_txs = 0usize;
+    let mut ingest = 0.0f64;
+    std::thread::scope(|s| {
         let hs: Vec<_> = txs
             .chunks(chunk)
             .map(|group| {
                 let ex = &executor;
+                let (ctr, fin) = (&accepted_ctr, &finished);
                 s.spawn(move || {
                     let mut ok = 0usize;
                     for list in group {
@@ -283,44 +328,64 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
                             ok += usize::from(ex.ingest_tx(t.clone()) == MempoolAck::Accepted);
                         }
                     }
-                    ok
+                    ctr.fetch_add(ok, std::sync::atomic::Ordering::Relaxed);
+                    fin.fetch_add(1, std::sync::atomic::Ordering::Release);
                 })
             })
             .collect();
-        hs.into_iter().map(|h| h.join().expect("ingest thread")).sum()
+        if !concurrent {
+            for h in hs {
+                h.join().expect("ingest thread");
+            }
+            ingest = t0.elapsed().as_secs_f64();
+        }
+        // Propose + finalize until the mempool is drained (and, when concurrent, ingest is done).
+        eprintln!(
+            "phase: execution start ({mix}, {threads} ingest threads, concurrent={concurrent})"
+        );
+        // Block cadence (concurrent mode only): propose once per interval so blocks accumulate
+        // transactions as on a live chain (`CHAIN_MIX_BLOCK_MS`, default 50 ms).
+        let interval = std::time::Duration::from_millis(
+            std::env::var("CHAIN_MIX_BLOCK_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(50),
+        );
+        let mut next_block = Instant::now() + interval;
+        loop {
+            if concurrent {
+                while Instant::now() < next_block {
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                next_block = Instant::now().max(next_block) + interval;
+            }
+            let t = Instant::now();
+            let proposal = executor.prepare_proposal(&budget());
+            propose += t.elapsed().as_secs_f64();
+            if proposal.txs.is_empty() {
+                if finished.load(std::sync::atomic::Ordering::Acquire) == n_workers {
+                    break;
+                }
+                std::thread::yield_now();
+                continue;
+            }
+            executed_txs += proposal.txs.len();
+            let t = Instant::now();
+            let _ = executor.process_proposal(&proposal);
+            let block = FinalizedBlock {
+                context: types::BlockContext::default(),
+                height: Height::new(height),
+                txs: proposal.txs,
+                signers: Vec::new(),
+            };
+            let tf = Instant::now();
+            let _ = executor.finalize_block(&block);
+            fin_call += tf.elapsed().as_secs_f64();
+            if lane_mode == "sync" {
+                let _ = executor.attest_state(Height::new(height));
+            }
+            finalize += t.elapsed().as_secs_f64();
+            height += 1;
+        }
     });
-    let ingest = t0.elapsed().as_secs_f64();
-
-    // Propose + finalize until the mempool is drained.
-    eprintln!("phase: execution start ({mix}, {threads} ingest threads)");
-    let (mut propose, mut finalize, mut fin_call) = (0.0f64, 0.0f64, 0.0f64);
-    let mut height = 1u64;
-    let mut executed_txs = 0usize;
-    loop {
-        let t = Instant::now();
-        let proposal = executor.prepare_proposal(&BUDGET);
-        propose += t.elapsed().as_secs_f64();
-        if proposal.txs.is_empty() {
-            break;
-        }
-        executed_txs += proposal.txs.len();
-        let t = Instant::now();
-        let _ = executor.process_proposal(&proposal);
-        let block = FinalizedBlock {
-            context: types::BlockContext::default(),
-            height: Height::new(height),
-            txs: proposal.txs,
-            signers: Vec::new(),
-        };
-        let tf = Instant::now();
-        let _ = executor.finalize_block(&block);
-        fin_call += tf.elapsed().as_secs_f64();
-        if lane_mode == "sync" {
-            let _ = executor.attest_state(Height::new(height));
-        }
-        finalize += t.elapsed().as_secs_f64();
-        height += 1;
-    }
+    let accepted = accepted_ctr.load(std::sync::atomic::Ordering::Relaxed);
 
     eprintln!(
         "finalize_block call time: {:.3} us/tx, propose {:.3} us/tx",
@@ -334,6 +399,13 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
         let _ = executor.attest_state(Height::new(height - 1));
         finalize += t.elapsed().as_secs_f64();
     }
+    // End-to-end wall clock from the first ingest to the last executed (and rooted) block: with
+    // `CHAIN_MIX_CONCURRENT=1` this is the sustained rate with ingest and execution sharing cores.
+    let wall = t0.elapsed().as_secs_f64();
+    eprintln!(
+        "wall,concurrent={concurrent},secs={wall:.3},items_per_s={:.0}",
+        (executed_txs * weight) as f64 / wall
+    );
     // Native (CLOB) senders: the executor's nonce must have advanced by exactly their tx count.
     // EVM senders track nonces inside the EVM module, so for them we require that every
     // transaction was admitted and went through proposal and finalization.
@@ -344,7 +416,26 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
             .enumerate()
             .filter(|(i, _)| is_clob(mix, *i))
             .all(|(_, a)| executor.executed_nonce_of(&a.addr) == per as u64);
-    let resting = exchange.resting_count(0);
+    let resting: u32 =
+        (0..markets()).map(|m| exchange.resting_count(u8::try_from(m).unwrap_or(0))).sum();
+    // Exactness probe: the final chain state root and the exchange's own root. With a single ingest
+    // thread the block contents are deterministic, so two runs that differ only in a execution knob
+    // (CHAIN_MIX_EX_LANES, CHAIN_MIX_EVM_LANES) must print identical `roots,` lines.
+    eprintln!(
+        "roots,chain={:?},exchange={:?},exchange_lane_runs={}",
+        executor.attest_state(Height::new(height.saturating_sub(1))),
+        executor::Module::state_root(exchange.as_ref()),
+        exchange.lane_runs_for_test()
+    );
+    // Where the lane executor's time goes, per executed transaction (stderr, `lane_phases,` line).
+    if exchange.lane_runs_for_test() > 0 {
+        let per: Vec<String> = exchange
+            .lane_phase_ns()
+            .into_iter()
+            .map(|(n, ns)| format!("{n}_us={:.3}", ns as f64 / 1e3 / executed_txs as f64))
+            .collect();
+        eprintln!("lane_phases,{}", per.join(","));
+    }
     // Measurement spine (plan W0): where `execute_block` spends its time, per transaction,
     // from the executor's permanent stage recorder. Stderr so the CSV on stdout is unchanged;
     // `scripts/rig/summarize.py` and humans read the `stages,` lines.
@@ -399,6 +490,10 @@ fn main() {
                 continue;
             }
             "--accounts" => n_accts = v.and_then(|x| x.parse().ok()).unwrap_or(n_accts),
+            "--markets" => {
+                let n = v.and_then(|x| x.parse().ok()).unwrap_or(1usize).clamp(1, 256);
+                MARKETS.store(n, std::sync::atomic::Ordering::Relaxed);
+            }
             _ => {
                 i += 1;
                 continue;
