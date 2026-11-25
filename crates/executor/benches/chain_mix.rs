@@ -379,6 +379,15 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
         executor::Module::state_root(exchange.as_ref()),
         exchange.lane_runs_for_test()
     );
+    // Where the lane executor's time goes, per executed transaction (stderr, `lane_phases,` line).
+    if exchange.lane_runs_for_test() > 0 {
+        let per: Vec<String> = exchange
+            .lane_phase_ns()
+            .into_iter()
+            .map(|(n, ns)| format!("{n}_us={:.3}", ns as f64 / 1e3 / executed_txs as f64))
+            .collect();
+        eprintln!("lane_phases,{}", per.join(","));
+    }
     // Measurement spine (plan W0): where `execute_block` spends its time, per transaction,
     // from the executor's permanent stage recorder. Stderr so the CSV on stdout is unchanged;
     // `scripts/rig/summarize.py` and humans read the `stages,` lines.

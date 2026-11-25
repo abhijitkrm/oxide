@@ -544,6 +544,8 @@ pub struct ExchangeModule {
     exec_lanes: std::sync::atomic::AtomicBool,
     /// Runs executed by the lane path (test and bench observability).
     lane_runs: std::sync::atomic::AtomicU64,
+    /// Nanoseconds spent in each lane phase, summed over runs (see `lanes::PHASES`).
+    lane_ns: [std::sync::atomic::AtomicU64; lanes::PHASES.len()],
 }
 
 /// Per-map domain separation for the committed-map leaf preimages —
@@ -747,6 +749,7 @@ impl ExchangeModule {
             endorsements: framework::Endorsements::new(),
             exec_lanes: std::sync::atomic::AtomicBool::new(true),
             lane_runs: std::sync::atomic::AtomicU64::new(0),
+            lane_ns: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
