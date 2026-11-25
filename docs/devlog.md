@@ -25169,3 +25169,33 @@ orders/s, and the bench thread (propose + finalize) shares the cores. At 256 mar
 
 In plain words: using more than 12 markets works (up to 256) and gives the same ~6M orders a second; beyond that the extra
 cores sit idle because the single-threaded steps around the matching are now the limit, not the matching itself.
+
+### Trimming the serial parts (25 Nov, branch `exchange-lanes`)
+
+Per-phase timers inside the lane executor (`lane_phases,` line of `chain_mix`) showed the lane executor's own serial work is tiny:
+per 64-order bundle plan 0.11 us, components 0.15, funds proof 0.01, fees 0.01, merge 0.02, ledger apply 0.01. The parallel lane phase
+(~5.5 us) held the cost, and a `perf script` leaf breakdown of lane-thread samples put ~30% of it in std's SipHash (lane overlay maps
+and the engine lookup). Fix: a per-process-keyed multiply-rotate hasher for the lane maps (they are merged into order-insensitive
+committed maps and never iterated for consensus; keyed so addresses cannot be ground to collide). Lane phase 5.5 -> 2.1 us (box).
+
+With that, the exec thread's own work outside the lanes dominated. `perf script` aggregated by callee of `execute_block_staged`:
+40% `record_group_outcomes` (Vec<Event> -> Arc<[Event]> allocation and the frees of evicted outcomes' events), 22%
+`check_envelope_auth` (88% BLAKE3: it re-hashed every envelope although `hash_block_txs` had already hashed the block in parallel),
+10% the parallel hash pass, 8% the exchange `state_root`, 5% lane planning, 3% nonce bumps. Fixes: the planner's tx hash is passed
+into `check_envelope_auth` (plan 2.36 -> 0.24 us per bundle); outcome events are converted in parallel for groups >= 512 txs;
+evicted outcomes are freed on a background `exec-reaper` thread (never blocks: a full queue drops inline).
+
+Measured (Ryzen 9 7900, 12 threads, root stage on, 16 markets, 3 runs each):
+
+| Workload | before this round | now |
+|---|---|---|
+| bundles (64 orders per signed tx) | 6.0M orders/s | **8.5-8.8M orders/s** (exec stage 5.0 us per bundle, ingest 16.7M/s) |
+| one signed order per tx | ~415k/s | ~407k/s: signature-bound (ingest ~320k/s) |
+| EVM transfers | ~180-204k/s | ~176-180k/s: signature-bound plus exec lane 3.6 us/tx |
+
+Roots are identical with lanes on and off after the changes (single ingest thread, deterministic keys).
+Still serial on the exec thread: exchange `state_root` (0.55 us/bundle, not deferred to the root stage), nonce bumps, `begin_block`.
+
+In plain words: bundled orders now reach about 8.7 million a second on this server, up from 2.4 million before the parallel work and
+6 million at the start of today. Orders sent one at a time with their own signature, and ordinary EVM transfers, did not move: they
+are limited by checking one signature each, which this 12-core machine does about 320 thousand times a second.
