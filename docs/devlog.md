@@ -25102,3 +25102,11 @@ attempt, `matrix-accounts100k.log`) was a different workload (dispatch 3.1 us/tx
 
 In plain words: the new server confirms the lane redesign helps (about 12% more EVM transfers per second), but the pipeline stops
 scaling at about 200k transfers/s no matter how many cores it gets, because a few single-threaded steps set the pace.
+## 25 Nov 2026 — first full test run on the Ryzen 9 7900 box: one CPU-speed-dependent test
+
+`cargo test --workspace --release` on the new box (12 cores / 24 threads) failed exactly one test,
+`simulation_respects_wall_clock_timeout`: a 30M-gas spin loop was expected to outlive a 50 ms deadline, but on this faster
+core it reached the gas cap first and returned `OutOfGas`. Not a product bug: the test's margin was machine-dependent.
+Fix: the deadline is 1 ms, below the fastest plausible loop time, so the deadline always fires first.
+
+In plain words: a test assumed the machine was slow enough; the new server is fast enough to break that assumption.
