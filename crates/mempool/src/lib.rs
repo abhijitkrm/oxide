@@ -166,12 +166,6 @@ pub struct Mempool {
     /// anchor, a skipped one un-bridges so the sender's refilled
     /// nonce becomes selectable again.
     pending_commit: HashMap<Address, BTreeMap<u64, u64>>,
-    /// Expiry index of `pending_commit`: committing height -> `(sender, nonce)` pairs recorded at
-    /// that height. `refresh_anchors` used to scan every pending entry each block (cost grows with
-    /// the execution backlog: ~19% of the EVM exec thread on the Ryzen box); with this index it only
-    /// touches the entries that expire. An index item whose entry was re-committed at a later
-    /// height is stale and skipped when it fires (the later height has its own item).
-    pending_expiry: BTreeMap<u64, Vec<(Address, u64)>>,
     /// Per-sender nonces carried by observed uncommitted chain
     /// blocks: `(nonce -> proposal height)`. Under pipelined
     /// consensus the sender's nonce chain is contiguous across the
@@ -377,7 +371,6 @@ impl Mempool {
             max_pending_per_sender: DEFAULT_MAX_PENDING_PER_SENDER,
             executed_nonces: HashMap::new(),
             pending_commit: HashMap::new(),
-            pending_expiry: BTreeMap::new(),
             in_chain: HashMap::new(),
             proposed: VecDeque::new(),
         }
@@ -983,7 +976,6 @@ impl Mempool {
             // resolves the slot identically.
             if let Some((sender, nonce, _fee)) = parse_tx(tx.as_bytes()) {
                 self.pending_commit.entry(sender).or_default().insert(nonce, height);
-                self.pending_expiry.entry(height).or_default().push((sender, nonce));
             }
             self.remove(&hash);
         }
@@ -1048,22 +1040,10 @@ impl Mempool {
         // Expire resolved bridges — `<= executed_height` covers both
         // outcomes: consumed slots are inside the refreshed anchor,
         // skipped ones must stop shadowing the sender's nonce floor.
-        // Via the expiry index: only heights <= executed_height are visited.
-        let live = self.pending_expiry.split_off(&executed_height.saturating_add(1));
-        let due = std::mem::replace(&mut self.pending_expiry, live);
-        for (height, items) in due {
-            for (sender, nonce) in items {
-                if let Some(pending) = self.pending_commit.get_mut(&sender) {
-                    // Skip a stale item: the entry was re-committed at a later height.
-                    if pending.get(&nonce) == Some(&height) {
-                        pending.remove(&nonce);
-                    }
-                    if pending.is_empty() {
-                        self.pending_commit.remove(&sender);
-                    }
-                }
-            }
-        }
+        self.pending_commit.retain(|_, pending| {
+            pending.retain(|_, committed_height| *committed_height > executed_height);
+            !pending.is_empty()
+        });
         // Same for observed chain coverage: a cover dies when the
         // rebuilt anchor passes its nonce (execution resolved the
         // slot — the pool no longer needs the bridge) or when its
@@ -2074,44 +2054,5 @@ mod tests {
         pool.remove_committed(&[], 1);
         let fourth = pool.select(1 << 20);
         assert_eq!(nonces_of(&fourth), vec![1], "position 2 resolves on its own commit");
-    }
-
-    /// The expiry index must leave `pending_commit` exactly as the old full scan would: random
-    /// commits (including a nonce re-committed at a later height) interleaved with refreshes.
-    #[test]
-    fn pending_commit_expiry_index_matches_a_full_scan() {
-        use std::collections::BTreeMap;
-        let mut state = 0x2545_F491_4F6C_DD1Du64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        let mut pool = Mempool::new(1024);
-        let mut model: BTreeMap<(u8, u64), u64> = BTreeMap::new();
-        let mut height = 0u64;
-        for step in 0..4000u64 {
-            if next() % 4 != 0 {
-                // Commit a tx for a random (sender, nonce) at the current height.
-                let sender = (next() % 6) as u8 + 1;
-                let nonce = next() % 20;
-                let tx = build_tx(addr(sender), nonce, 100, &[0]);
-                height += next() % 2; // sometimes several commits share a height
-                pool.remove_committed(&[tx], height);
-                model.insert((sender, nonce), height);
-            } else {
-                // Refresh at an executed height at or below the commit tip.
-                let executed = height.saturating_sub(next() % 4);
-                pool.refresh_anchors(executed, |_| None);
-                model.retain(|_, h| *h > executed);
-            }
-            let flat: BTreeMap<(u8, u64), u64> = pool
-                .pending_commit
-                .iter()
-                .flat_map(|(a, m)| m.iter().map(move |(n, h)| ((a.0[0], *n), *h)))
-                .collect();
-            assert_eq!(flat, model, "diverged at step {step}");
-        }
     }
 }
