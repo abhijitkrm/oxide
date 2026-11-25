@@ -25333,3 +25333,43 @@ TLS issues), 0386 (tokio `AsyncFd` unsound), 0418 (libz-sys build script), 0544 
 
 In plain words: swapping the memory allocator the programs use made the same server about 30% faster for ordinary bundles, twice as
 fast for gateway-routed orders (now 8 to 9 million a second sustained) and 15% faster for EVM transfers, with no change to any result.
+
+## 25 Nov 2026 — consensus in the loop: N pinned validators on the Ryzen box (branch `consensus-bench`)
+
+Harness: `scripts/consensus-bench.py` launches N real `oxide-devnet` processes (oxideBFT over loopback TCP, tx gossip, WAL, JSON-RPC, the
+production module graph, mimalloc) each pinned with `taskset` to its own cores (`--smt` adds the SMT siblings: "threads as cores"), each
+injecting pre-signed EVM transfers, and samples committed transactions (the sink account's balance, 1 wei per executed transfer: one RPC
+call per sample), blocks and per-process CPU. New: `TxInject::evm_transfers_presigned` (signs the stream up front on std threads; admits
+through `ingest_tx_recovered` because the node signed the envelopes itself, so the pump thread does not recover every signature again).
+
+Findings, in the order they surfaced:
+
+1. **A mempool bug cost ~15% of proposals (fixed).** `select_with_gas_cap` stepped over nonces covered by uncommitted ancestors or this
+   leader's own in-flight proposals even after it had selected one of the sender's txs, so one proposal could hold nonces 9076 then 9129.
+   Validators reject any proposal whose sender nonces are not contiguous ("nonce gap/reorder"), losing the round. Symptom: at 8,000 tx/s
+   offered, committed 1,802 tx/s; at 40,000 offered, 790 tx/s (it fell as load rose). Failing test first
+   (`selection_never_leaves_a_hole_inside_a_senders_chain`), then the fix (stepping over is only allowed before a sender's first selected tx):
+   rejections 0, committed 8,001 tx/s at 8,000 offered.
+2. **The p2p per-peer ingress limit (default 10 MiB burst, 1 MiB/s refill, ALL of a peer's messages, proposals and votes included) caps the
+   chain** at roughly 4k tx/s of block data per proposing peer: an emptied bucket drops that peer's votes and proposals and the view times
+   out after 2 s. On a stall-free 6-validator committee at 48,000 tx/s offered: default limit 8,982 tx/s with 11 view timeouts and 55% CPU;
+   limit raised (`OXIDE_P2P_INGRESS_BYTES_PER_SEC=400000000`, harness knob only, default unchanged) 15,975 tx/s, 0 timeouts, 93% CPU. At 1M tx/s
+   the data rate is ~250 MB/s per link: the default is 250x too small. Policy fix needed (decision for the owner): exempt consensus traffic
+   from known validators from the bucket, and/or scale it with committee and block size, and at least make it configuration.
+3. **Replication, not consensus, sets the ceiling.** With the limit raised, every layout of 12 physical cores plateaus at ~25-29k tx/s of EVM
+   transfers (4 validators x 3 cores 24.7-25.3k; 3 x 4 23.9-25.8k; 4 x 6 SMT 27.5-27.9k; 3 x 8 SMT 29.2k; raw logs
+   `consensus-matrix2.log`). Every validator verifies and executes every tx, so the 12 cores are shared by 3-4 copies of the same work: about 120
+   us of CPU per transaction per validator, close to the in-process single node (12 cores / 126k tx/s = 95 us). SMT adds ~10%. CPU of the
+   pinned set stays at 59-79%, so the pump thread or message latency may also bind; not yet separated.
+4. **Open, unexplained:** committees of 3 and 4 validators show periodic 2 s view timeouts at LOW load (3 validators: every 127 views, all
+   validators at once, not tied to one leader; heights 128, 255, ...), independent of offered rate from 300 to 12,000 tx/s total, and vanish
+   at high load; committees of 5 and 6 (2 cores each) show none. No slow syscalls (strace), no log lines, quorum is strict >2/3 of stake (3 of 3
+   at n=3). The first matrix (default limits) mixes this with finding 2.
+
+Harness lessons: per-block RPC count calls trip the RPC's per-IP rate limit at 100+ blocks/s (use the sink balance); the devnet injector admitted
+and signed on the consensus pump thread (a saturated pump looked like consensus collapse).
+
+In plain words: with several validators on one 12-core server the chain tops out near 25-29 thousand EVM transfers a second, because every
+validator must check and run every transaction. Two real defects were found and one fixed: a transaction-selection bug that made validators reject
+15% of proposals (fixed), and a built-in network limit of 1 MB per second per peer that would cap the chain around 4 thousand transactions a second
+(needs a policy decision). Small committees of 3 or 4 also stall for two seconds at a time under light load, cause not yet known.
