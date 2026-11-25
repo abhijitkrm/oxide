@@ -86,6 +86,9 @@ def main():
                     help="orders per bundle: switches the injector to pre-signed exchange bundles "
                          "(--rate is then BUNDLES/s per validator, --presign the bundles signed up front)")
     ap.add_argument("--markets", type=int, default=1, help="exchange markets listed (order mode)")
+    ap.add_argument("--perf-out", default="",
+                    help="if set, run `perf record -a -g` (system-wide, 499 Hz, frame pointers) over the "
+                         "measurement window and write the data here (needs perf; use a frame-pointer build)")
     ap.add_argument("--keep", action="store_true")
     a = ap.parse_args()
     n = a.validators
@@ -139,6 +142,12 @@ def main():
         h_start, tx_start = height(port), executed_txs(port)
         ticks0 = [cpu_ticks(p.pid) for p in procs]
         t_start = time.time()
+        perf_proc = None
+        if a.perf_out:
+            perf_proc = subprocess.Popen(
+                ["perf", "record", "-F", "499", "-g", "--call-graph", "fp", "-a", "-o", a.perf_out,
+                 "--", "sleep", str(int(a.duration))],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         last_h, last_tx, t_last = h_start, tx_start, t_start
         end = t_start + a.duration
         while time.time() < end:
@@ -148,6 +157,17 @@ def main():
             time.sleep(0.5)
         t_end, h_end = t_last, last_h
         bal1 = [balance(port, x) for x in senders]
+        if perf_proc is not None:
+            perf_proc.wait(timeout=120)
+        rss_mb = []
+        for p_ in procs:
+            try:
+                with open(f"/proc/{p_.pid}/status") as f:
+                    for line in f:
+                        if line.startswith("VmHWM:"):
+                            rss_mb.append(round(int(line.split()[1]) / 1024))
+            except OSError:
+                rss_mb.append(None)
         total_txs = (last_tx or 0) - (tx_start or 0)
         per_block = []
         ticks1 = [cpu_ticks(p.pid) for p in procs]
@@ -188,6 +208,7 @@ def main():
             "avg_tx_per_block": round(total_txs / blocks, 1) if blocks else None,
             "cpu_pct_of_pinned": cpu_pct, "end_heights": heights,
             "exited": dead,
+            "peak_rss_mb": rss_mb,
             "view_timeouts": count_in_logs("view timeout"),
             "rejected_proposals": count_in_logs("app rejected proposal"),
             "max_height_lag": (max(heights) - min(heights)) if all(x is not None for x in heights) else None,
