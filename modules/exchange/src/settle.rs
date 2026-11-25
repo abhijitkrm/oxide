@@ -13,6 +13,7 @@ use super::{
     OrderKey, OrderOutcome, PRICE_SCALE, Price, Qty, RegisteredOrder, RejectCategory, Reserved,
     Side, qty_add, qty_sub,
 };
+use crate::book_view::BookView;
 use crate::codec::{w32, w64};
 
 /// The taker's side of a book-path settlement — everything `apply`
@@ -32,20 +33,14 @@ pub(crate) struct TakerCtx {
 /// The mutable settlement surfaces a book-path place touches,
 /// bundled so the fill loop borrows one value instead of five
 /// disjoint `Inner` fields. All custody mutations go through here.
-pub(crate) struct BookSettlement<'a> {
-    /// The native ledger — quote credits and reservation refunds.
-    pub(crate) ledger: &'a Arc<dyn framework::Balances + Send + Sync>,
-    /// Free base custody (buyer deliveries land here).
-    pub(crate) base_balances: &'a mut framework::CommittedMap<(Address, u8), Qty>,
-    /// Resting-sell base holds (maker deliveries draw from here).
-    pub(crate) base_holds: &'a mut framework::CommittedMap<(Address, u8), Qty>,
-    /// Per-market protocol-fee sink (quote units).
-    pub(crate) fee_vault: &'a mut framework::CommittedMap<u8, u64>,
+pub(crate) struct BookSettlement<'a, B: BookView> {
+    /// The ledger and custody surface (serial maps or a lane overlay).
+    pub(crate) book: &'a mut B,
     /// The event sink every settlement-visible mutation appends to.
     pub(crate) events: &'a mut Vec<Event>,
 }
 
-impl BookSettlement<'_> {
+impl<B: BookView> BookSettlement<'_, B> {
     /// Settle every fill the engine produced, then release the
     /// taker's leftover reservations.
     ///
@@ -94,16 +89,13 @@ impl BookSettlement<'_> {
             // admission); a maker sell must still hold the fill
             // qty in `base_holds`.
             let maker_covered = f.taker_side == Side::Sell
-                || self.base_holds.get(&(f.maker_owner, market)).copied().unwrap_or_default()
-                    >= f.qty;
+                || self.book.hold(&(f.maker_owner, market)).unwrap_or_default() >= f.qty;
             if !maker_covered {
                 self.events.push(unbacked_sell_fill_event(market, *f));
                 continue;
             }
             let bkey = (buyer, market);
-            let Some(buyer_next) =
-                qty_add(self.base_balances.get(&bkey).copied().unwrap_or_default(), f.qty)
-            else {
+            let Some(buyer_next) = qty_add(self.book.bal(&bkey).unwrap_or_default(), f.qty) else {
                 // Unreachable while Σ custody < u64::MAX (custody is
                 // native-backed). Void rather than mint.
                 self.events.push(fill_voided_event(market, *f));
@@ -112,12 +104,8 @@ impl BookSettlement<'_> {
             if f.taker_side == Side::Buy {
                 // `maker_covered` proved the entry exists with
                 // enough held.
-                let held = self
-                    .base_holds
-                    .get(&(f.maker_owner, market))
-                    .copied()
-                    .ok_or(ExecError::Malformed)?;
-                self.base_holds.insert(
+                let held = self.book.hold(&(f.maker_owner, market)).ok_or(ExecError::Malformed)?;
+                self.book.set_hold(
                     (f.maker_owner, market),
                     qty_sub(held, f.qty).ok_or(ExecError::Malformed)?,
                 );
@@ -126,7 +114,7 @@ impl BookSettlement<'_> {
                 // contract — `qty_sub` documents it.
                 taker_base = qty_sub(taker_base, f.qty).ok_or(ExecError::Malformed)?;
             }
-            self.base_balances.insert(bkey, buyer_next);
+            self.book.set_bal(bkey, buyer_next);
             if f.taker_side == Side::Buy {
                 taker_paid = taker_paid.saturating_add(quote_amount);
             }
@@ -145,16 +133,16 @@ impl BookSettlement<'_> {
             })?;
             // `fee <= quote_amount` (`FEE_BPS < BPS_DENOM`) —
             // saturating is the same value and fails closed.
-            self.ledger.credit(&seller, quote_amount.saturating_sub(fee)).map_err(|_| {
+            self.book.credit(&seller, quote_amount.saturating_sub(fee)).map_err(|_| {
                 ExecError::rejected(
                     RejectCategory::Internal,
                     format!("settlement credit failed (market {market})"),
                 )
             })?;
-            let vault = self.fee_vault.get(&market).copied().unwrap_or(0);
+            let vault = self.book.vault(market).unwrap_or(0);
             match vault.checked_add(fee) {
                 Some(v) => {
-                    self.fee_vault.insert(market, v);
+                    self.book.set_vault(market, v);
                 }
                 // Saturation burns the excess (the units were
                 // deducted from the seller's payment regardless) —
@@ -187,7 +175,7 @@ impl BookSettlement<'_> {
             // in custody rather than minting a refund.
             let refund = taker.reservation.saturating_sub(taker_paid.saturating_add(held));
             if refund > 0 {
-                self.ledger.credit(&taker.owner, refund).map_err(|_| {
+                self.book.credit(&taker.owner, refund).map_err(|_| {
                     ExecError::rejected(RejectCategory::Internal, "reservation refund failed")
                 })?;
             }
@@ -222,15 +210,14 @@ impl BookSettlement<'_> {
             _ => Qty(0),
         };
         if resting.0 > 0 {
-            let hold = self.base_holds.get(&(owner, market)).copied().unwrap_or_default();
-            self.base_holds
-                .insert((owner, market), qty_add(hold, resting).ok_or(ExecError::Malformed)?);
+            let hold = self.book.hold(&(owner, market)).unwrap_or_default();
+            self.book
+                .set_hold((owner, market), qty_add(hold, resting).ok_or(ExecError::Malformed)?);
         }
         let release = Qty(taker_base.0.saturating_sub(resting.0));
         if release.0 > 0 {
-            let free = self.base_balances.get(&(owner, market)).copied().unwrap_or_default();
-            self.base_balances
-                .insert((owner, market), qty_add(free, release).ok_or(ExecError::Malformed)?);
+            let free = self.book.bal(&(owner, market)).unwrap_or_default();
+            self.book.set_bal((owner, market), qty_add(free, release).ok_or(ExecError::Malformed)?);
         }
         Ok(())
     }

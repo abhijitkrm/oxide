@@ -334,6 +334,32 @@ impl Executor {
         let self_authenticating = module.authenticates_sender();
         let mut executed = Vec::with_capacity(run.len());
         let mut results = Vec::with_capacity(run.len());
+        // Lane path: a module that can prove the run order-independent executes it in parallel
+        // lanes (`Module::handle_run_lanes`); it declines with nothing touched otherwise. Only
+        // attempted when no earlier run failed a fee charge (the broken-nonce rules are serial).
+        if broken_nonce.is_empty() && !module.pays_own_fee() {
+            let txs: Vec<crate::LaneTx<'_>> =
+                run.iter().map(|e| crate::LaneTx { ctx: e.ctx, payload: e.payload }).collect();
+            let mut charge = |ctx: &TxContext| fee_module.is_none_or(|m| m.charge_fee(ctx).is_ok());
+            if let Some(lane_results) = module.handle_run_lanes(&txs, &mut charge) {
+                debug_assert_eq!(lane_results.len(), run.len());
+                for (entry, res) in run.into_iter().zip(lane_results) {
+                    if let Some(r) = res {
+                        results.push(r);
+                        executed.push(entry);
+                    } else {
+                        // Unreachable once the module proved no fee charge can fail; reported
+                        // exactly like a serial fee failure.
+                        dispatch_skipped.push((entry.tx_hash, TxSkipReason::FeeCharge));
+                        broken_nonce.entry(entry.ctx.sender).or_insert(entry.ctx.nonce);
+                        if !self_authenticating {
+                            local_nonce.bump(entry.ctx.sender, entry.ctx.nonce);
+                        }
+                    }
+                }
+                return (executed, results);
+            }
+        }
         for entry in run {
             let ctx = entry.ctx;
             if let Some(&broken) = broken_nonce.get(&ctx.sender)

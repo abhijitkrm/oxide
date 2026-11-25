@@ -39,6 +39,14 @@ impl Module for ExchangeModule {
         }
     }
 
+    fn handle_run_lanes(
+        &self,
+        txs: &[executor::LaneTx<'_>],
+        charge: &mut dyn FnMut(&TxContext) -> bool,
+    ) -> Option<executor::LaneRunResults> {
+        self.run_lanes(txs, charge)
+    }
+
     fn begin_block(&self, height: Height) {
         self.height.store(height.0, std::sync::atomic::Ordering::Relaxed);
     }

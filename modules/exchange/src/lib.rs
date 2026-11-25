@@ -540,6 +540,10 @@ pub struct ExchangeModule {
     /// two-thirds of the committee. One validator's signature is a
     /// vote, never a command.
     endorsements: framework::Endorsements,
+    /// Per-market parallel execution of eligible runs (`lanes`); on by default.
+    exec_lanes: std::sync::atomic::AtomicBool,
+    /// Runs executed by the lane path (test and bench observability).
+    lane_runs: std::sync::atomic::AtomicU64,
 }
 
 /// Per-map domain separation for the committed-map leaf preimages —
@@ -707,10 +711,12 @@ type CommittedState = (
     BTreeMap<Address, LinkedEntry>,
 );
 
+mod book_view;
 mod codec;
 mod decode;
 pub mod dispute;
 mod handlers;
+mod lanes;
 mod module_impl;
 mod settle;
 
@@ -739,6 +745,8 @@ impl ExchangeModule {
             height: std::sync::atomic::AtomicU64::new(0),
             committee: None,
             endorsements: framework::Endorsements::new(),
+            exec_lanes: std::sync::atomic::AtomicBool::new(true),
+            lane_runs: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1318,5 +1326,7 @@ pub mod msg {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod lane_tests;
 #[cfg(test)]
 mod tests;

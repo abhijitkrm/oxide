@@ -759,6 +759,19 @@ pub struct TxContext {
     pub fee: u64,
 }
 
+/// Per-transaction outcomes of a lane-executed run: `Some(result)` for an executed transaction,
+/// `None` for one whose fee charge failed.
+pub type LaneRunResults = Vec<Option<Result<Vec<Event>, ExecError>>>;
+
+/// One transaction of a run handed to [`Module::handle_run_lanes`].
+#[derive(Debug, Clone, Copy)]
+pub struct LaneTx<'a> {
+    /// The authenticated envelope context.
+    pub ctx: TxContext,
+    /// The module payload (the message the module's `handle` would receive).
+    pub payload: &'a [u8],
+}
+
 /// A transaction with a pre-recovered sender.
 ///
 /// The sender is recovered from the transaction's signature at
@@ -1132,6 +1145,24 @@ pub trait Module: Send + Sync {
     /// insufficient balance to cover the fee.
     fn charge_fee(&self, _ctx: &TxContext) -> Result<(), ExecError> {
         Ok(())
+    }
+
+    /// Execute a whole contiguous run of this module's transactions in parallel lanes, or
+    /// decline (`None`) with **no state touched** so the executor runs the serial path.
+    ///
+    /// `charge` charges one transaction's envelope fee through the fee module and says whether it
+    /// succeeded. A module that accepts must (1) prove before any effect that no fee charge or
+    /// debit of the run can fail in any order (so serial interleaving and lane execution agree
+    /// exactly), (2) call `charge` for every transaction in run order, (3) execute, and (4)
+    /// return one entry per transaction: `Some(result)` for an executed one, `None` for one
+    /// whose fee charge failed (unreachable once (1) holds; the executor reports it like the
+    /// serial path would). Default: decline.
+    fn handle_run_lanes(
+        &self,
+        _txs: &[LaneTx<'_>],
+        _charge: &mut dyn FnMut(&TxContext) -> bool,
+    ) -> Option<LaneRunResults> {
+        None
     }
 
     /// Whether this module pays for its own execution internally,

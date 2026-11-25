@@ -1778,6 +1778,7 @@ dependencies = [
  "lanes",
  "primitives",
  "proptest",
+ "rayon",
  "storage",
  "trading",
  "types",
