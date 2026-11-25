@@ -25449,3 +25449,33 @@ low-load stall.
 In plain words: through a real four-validator committee sharing one 12-core server the chain now commits about 850 thousand orders a second (925 thousand
 with three validators), up from nothing measured before today. The server is only half busy: most of the remaining cost is per block, not per order
 (vote checking and re-hashing a 8,191-entry history table every block), so fewer, larger blocks and incremental hashing are the next gains.
+
+## 25 Nov 2026 — dependency security pass (branch `deps-advisories`)
+
+`cargo deny check advisories` was failing on `main` with 10 advisories across six crates (newly published after the lockfile was frozen).
+Fixed by patch-level lockfile updates, all within existing version requirements:
+
+| Crate | From | To | Advisories |
+|---|---|---|---|
+| rustls | 0.23.45 | 0.23.46 | RUSTSEC-2026-0346, 0347, 0348, 0349 (Debug impls expose TLS secrets, buffered data to outer server, brotli allocation, ServerHello downgrade) |
+| rustls-webpki | 0.103.15 | 0.103.17 | RUSTSEC-2026-0382 (accepts distrusted intermediates) |
+| tokio | 1.53.1 | 1.54.1 | RUSTSEC-2026-0386 (`AsyncFd::new` violates I/O safety) |
+| libz-sys | 1.1.29 | 1.1.33 | RUSTSEC-2026-0418, 0544 |
+| zstd-sys | 2.1.0 | 2.1.2 | RUSTSEC-2026-0410 |
+
+`zstd-sys` is pinned to 2.1.2, not the newest 2.2.0: 2.2.0 was published the day before and fails the repo's 7-day release-age rule
+(`scripts/check-dep-age.py`); 2.1.2 is patched and old enough.
+
+Not fixable by an update: RUSTSEC-2026-0387 (`crypto-bigint 0.5.5`, timing variability on secret integers, patched in 0.7.6). The only path is
+`revm -> alloy-eip7702 -> k256 0.13`, used for EIP-7702 authorization signature recovery on public data; no in-tree code uses `k256`, and the node's own signing
+goes through libsecp256k1, BLS and ed25519 crates. `alloy-eip7702 0.6.4` (latest) still pins `k256 0.13`; the fix comes with the `revm 42 -> 43` major
+upgrade, which is a separate piece of work. Added to `deny.toml`'s reviewed ignore list with that rationale; drop it with the revm upgrade.
+
+Result: `cargo deny check`: advisories ok, bans ok, licenses ok, sources ok. Full workspace tests with the updated tokio and rustls: 2,233 passed, 0 failed.
+Release age (the repo's 7-day rule), checked against crates.io for each bumped crate: rustls 0.23.46 (42 days), rustls-webpki 0.103.17 (12), tokio 1.54.1 (34),
+libz-sys 1.1.33 (15), zstd-sys 2.1.2 (39); none yanked. (`scripts/check-dep-age.py` itself was rate-limited by crates.io when re-run after the update, every
+crate "could not be verified"; its earlier successful run flagged only `zstd-sys 2.2.0`, which is no longer in the lockfile. CI re-checks the whole lockfile.)
+
+In plain words: security warnings in the networking, compression and async-runtime libraries were cleared by upgrading them to their patched releases;
+one warning about a math library cannot be cleared yet (it needs a larger upgrade of the EVM engine) and was recorded as reviewed, because the affected
+code only handles public signature data.
