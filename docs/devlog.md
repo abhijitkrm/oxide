@@ -25286,8 +25286,23 @@ Delegated orders cost 2x an owner-signed bundle's per-order exec time because it
 4.8 us per bundle on the box before the assembly trim: exact-capacity event vectors and chunked pool tasks took the laptop's assemble
 phase 1.3 -> 1.07 us and the loop 6.5M -> 7.4M orders/s; the box has not been re-measured since that trim).
 
+Re-measured on the box after that trim (glibc malloc): no change, loop 5.3-5.5M, sustained 5.0-5.3M orders/s, while the assemble phase
+costs 4.1 us per bundle there against 1.07 us on the laptop. The cause is the allocator, not the algorithm: each item's events are
+allocated on a lane thread and freed on another during assembly, and glibc handles cross-thread frees badly at 12 threads. Measured with
+`LD_PRELOAD` (no code change; jemalloc and mimalloc agree within noise), loop throughput on the box, glibc -> mimalloc:
+
+| Mix | glibc | mimalloc |
+|---|---|---|
+| delegated bundles | 5.7M orders/s | **10.1M** (assemble 3.3 -> 0.5 us) |
+| owner-signed bundles | 11.3M | 13.9M |
+| single signed orders | 472k | 532k |
+| EVM transfers | 155k | 163k |
+
+A global allocator is therefore the next change (its own branch and PR: it adds a dependency, so it needs the justification, exact pin
+and `cargo deny` run the repo requires). The numbers above in this entry are glibc numbers.
+
 Open: the per-item fee model (bundles still pay a flat per-item gas and one envelope fee; an agent paying for many owners needs a
-policy, see the note in the PR), re-measure the box after the assembly trim, a gateway-side bundler in the load generator.
+policy, see the PR), a gateway-side bundler in the load generator.
 
 In plain words: traders can now authorize a gateway once and let it place their orders in bulk. Orders routed that way run at about 5
 million a second here, sixteen times the rate for orders signed one at a time, and the checks that keep a gateway from touching an
