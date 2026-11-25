@@ -63,7 +63,16 @@ const FEE: u64 = 100;
 /// EVM gas price for transfers (above the 7 gwei base fee the module is built with).
 const GAS_PRICE: u64 = 10_000_000_000;
 /// Block budget: bytes and gas generous enough that a block holds every pending tx up to this size.
-const BUDGET: BlockBudget = BlockBudget { max_bytes: 8 << 20, max_gas: 1 << 40 };
+/// Block byte budget: `CHAIN_MIX_BLOCK_BYTES` (default 8 MiB, the node's `max_block_bytes`). Together with the
+/// block interval it caps throughput: bytes per order x orders per second <= bytes per block / interval.
+fn block_bytes() -> u64 {
+    std::env::var("CHAIN_MIX_BLOCK_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(8 << 20)
+}
+
+/// The proposal budget: generous gas (the executor still enforces the chain's block gas limit) and `block_bytes()`.
+fn budget() -> BlockBudget {
+    BlockBudget { max_bytes: block_bytes(), max_gas: 1 << 40 }
+}
 
 struct Account {
     key: [u8; 32],
@@ -283,7 +292,7 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
         .unwrap_or(600_000_000);
     let executor = executor.with_chain_params(Arc::new(types::ChainParams {
         max_gas: std::sync::atomic::AtomicU64::new(gas_limit),
-        max_bytes: std::sync::atomic::AtomicU64::new(8 << 20),
+        max_bytes: std::sync::atomic::AtomicU64::new(block_bytes()),
         min_fee: std::sync::atomic::AtomicU64::new(0),
     }));
     let executor = if lane_mode == "root" { executor.with_root_stage(true) } else { executor };
@@ -348,7 +357,7 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
                 next_block = Instant::now().max(next_block) + interval;
             }
             let t = Instant::now();
-            let proposal = executor.prepare_proposal(&BUDGET);
+            let proposal = executor.prepare_proposal(&budget());
             propose += t.elapsed().as_secs_f64();
             if proposal.txs.is_empty() {
                 if finished.load(std::sync::atomic::Ordering::Acquire) == n_workers {
