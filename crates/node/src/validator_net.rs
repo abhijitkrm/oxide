@@ -779,8 +779,21 @@ pub(crate) fn build_transport(
     // caps, per-peer ingress rate limits, and reputation bans are not
     // optional defenses. Default limits (256 connections, 10 MiB
     // burst / 1 MiB/s per peer) comfortably fit consensus traffic.
-    let admission =
-        p2p::admission::SharedAdmissionControl::new(p2p::admission::AdmissionControl::new());
+    // `OXIDE_P2P_INGRESS_BYTES_PER_SEC` (harness/experiment knob, unset in production) overrides the
+    // per-peer ingress refill rate, with a burst of ten seconds' worth. The default refill of 1 MiB/s is
+    // shared by ALL of a peer's messages, proposals and votes included, so it caps a chain at roughly
+    // 4k tx/s per proposing peer (docs/devlog.md, consensus bench).
+    let admission = match std::env::var("OXIDE_P2P_INGRESS_BYTES_PER_SEC")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(rate) => p2p::admission::SharedAdmissionControl::new(
+            p2p::admission::AdmissionControl::with_limits(256, rate.saturating_mul(10), rate),
+        ),
+        None => {
+            p2p::admission::SharedAdmissionControl::new(p2p::admission::AdmissionControl::new())
+        }
+    };
     if let Some(tls_spec) = tls {
         let trusted_peers: Vec<(Vec<u8>, String)> = tls_spec
             .trusted_peer_certs
