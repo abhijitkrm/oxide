@@ -204,3 +204,30 @@ fn an_unfunded_order_is_refused_at_ingest_even_at_zero_fee() {
         "an order its sender cannot fund must not enter the pool"
     );
 }
+
+#[test]
+fn a_sell_right_after_a_deposit_is_not_refused_for_want_of_custody() {
+    // Owner 2 is rich in quote but holds no base custody. A sell with nothing ahead of it is refused at
+    // admission; the same sell queued behind a deposit (nonce 1 after nonce 0, same pass) must be admitted,
+    // because the custody it needs is about to land. Found by the node governance test, which deposits and
+    // sells in one block.
+    let (_ledger, ex) = rig();
+    let mut executor = Executor::new(1_000).with_unsigned_tx_policy(UnsignedTxPolicy::Allow);
+    executor.register_module(Arc::new(ex));
+    let trader = addr(2);
+    let sell = msg::place(0, order(Side::Sell, OrderType::Limit));
+    // Alone (nonce 0, nothing ahead): refused.
+    assert!(matches!(
+        executor.ingest_tx(envelope(trader, 0, 0, &sell)),
+        MempoolAck::Rejected { .. }
+    ));
+    // Behind a deposit (nonce 0), the sell at nonce 1 is admitted.
+    assert!(matches!(
+        executor.ingest_tx(envelope(trader, 0, 0, &msg::deposit_base(0, 10_000))),
+        MempoolAck::Accepted
+    ));
+    assert!(
+        matches!(executor.ingest_tx(envelope(trader, 1, 0, &sell)), MempoolAck::Accepted),
+        "a sell queued behind a deposit must be admitted"
+    );
+}

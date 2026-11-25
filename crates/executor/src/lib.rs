@@ -913,6 +913,27 @@ pub trait Module: Send + Sync {
         self.validate(ctx, msg)
     }
 
+    /// [`validate_preverified`](Self::validate_preverified) plus a hint: `predecessors_in_flight` is
+    /// true when the sender's nonce is past the next expected one, i.e. earlier transactions of the
+    /// same sender (a deposit, say) may still be queued or in unexecuted blocks. A module whose
+    /// admission check depends on state that such a predecessor could change (the exchange's custody
+    /// check for a sell right after a deposit) must not refuse on that state alone. The default
+    /// ignores the hint.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`validate`](Self::validate).
+    fn validate_in_flight(
+        &self,
+        ctx: &TxContext,
+        msg: &[u8],
+        preverified: Option<&PreverifiedTx<'_>>,
+        predecessors_in_flight: bool,
+    ) -> Result<(), ExecError> {
+        let _ = predecessors_in_flight;
+        self.validate_preverified(ctx, msg, preverified)
+    }
+
     /// Handle a message. Returns events on success, or an error.
     ///
     /// The `ctx` carries the sender, nonce, and fee parsed from the

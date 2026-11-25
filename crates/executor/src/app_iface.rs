@@ -58,7 +58,7 @@ impl Executor {
         // already been executed. Without this, a tx removed from the
         // mempool after block selection can be re-submitted and
         // re-executed — a replay attack.
-        {
+        let predecessors_in_flight = {
             let executed = primitives::sync::lock_state(&self.executed_nonce);
             let next_expected = executed.map.get(&ctx.sender).copied().unwrap_or(0);
             if ctx.nonce < next_expected {
@@ -66,7 +66,9 @@ impl Executor {
                     reason: format!("replay: nonce {} < next expected {next_expected}", ctx.nonce),
                 };
             }
-        }
+            // Earlier txs of this sender may still be in flight (module validation can depend on it).
+            ctx.nonce > next_expected
+        };
         // Nonce u64::MAX is reserved: executing it would wrap the
         // next-expected counter (MAX + 1 → 0) and reopen the sender's
         // entire nonce range to replay. Rejecting it at admission
@@ -114,9 +116,12 @@ impl Executor {
             }
             None => module.preverify_batch(&msgs),
         };
-        if let Err(e) =
-            module.validate_preverified(&ctx, payload, preverify_result[0].as_ref().ok())
-        {
+        if let Err(e) = module.validate_in_flight(
+            &ctx,
+            payload,
+            preverify_result[0].as_ref().ok(),
+            predecessors_in_flight,
+        ) {
             return MempoolAck::Rejected { reason: format!("validate: {e}") };
         }
 
@@ -1057,10 +1062,12 @@ impl Executor {
         // path re-locked per tx; this map is read-mostly and the
         // write side is block execution, so a single short critical
         // section per batch beats N per-tx sections).
+        let mut ahead: Vec<bool> = Vec::with_capacity(routed.len());
         {
             let executed = primitives::sync::lock_state(&self.executed_nonce);
             for r in routed {
                 let next_expected = executed.map.get(&r.ctx.sender).copied().unwrap_or(0);
+                ahead.push(r.ctx.nonce > next_expected);
                 if r.ctx.nonce < next_expected {
                     results[r.result_idx] = MempoolAck::Rejected {
                         reason: format!(
@@ -1106,7 +1113,7 @@ impl Executor {
                     .and_then(|group_results| group_results.get(*slot))
                     .and_then(|res| res.as_ref().ok())
             });
-            if let Err(e) = r.module.validate_preverified(&r.ctx, payload, preverified) {
+            if let Err(e) = r.module.validate_in_flight(&r.ctx, payload, preverified, ahead[pos]) {
                 results[r.result_idx] = MempoolAck::Rejected { reason: format!("validate: {e}") };
                 continue;
             }

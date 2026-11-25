@@ -80,7 +80,15 @@ impl ExchangeModule {
     }
 
     /// Admission check for an order message; see the module docs. `Ok` for every other message kind.
-    pub(crate) fn admit_order(&self, ctx: &TxContext, msg: &[u8]) -> Result<(), ExecError> {
+    /// `predecessors_in_flight`: the sender has earlier transactions queued or unexecuted (a deposit may
+    /// be about to create the custody a sell needs), so the custody check is skipped; the balance and
+    /// authorization checks still apply.
+    pub(crate) fn admit_order(
+        &self,
+        ctx: &TxContext,
+        msg: &[u8],
+        predecessors_in_flight: bool,
+    ) -> Result<(), ExecError> {
         let Some(ledger) = self.ledger.as_ref() else {
             return Ok(());
         };
@@ -115,6 +123,7 @@ impl ExchangeModule {
             }
         }
         if !needs.sells.is_empty()
+            && !predecessors_in_flight
             && let Ok(inner) = self.inner.try_lock()
         {
             for ((payer, market), qty) in &needs.sells {
