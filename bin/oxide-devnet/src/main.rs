@@ -403,6 +403,30 @@ fn run_node(node_index_str: &str) {
         let sender = crypto::secp::test_identity_address(identity).expect("valid devnet identity");
         // `--tx-inject-presign N` signs the first N envelopes up front, in parallel (throughput
         // harnesses: keeps ~40 us of signing per tx off the consensus pump thread).
+        // `--tx-inject-orders K` switches the injector to exchange bundles of K orders (self-crossing
+        // pairs over `OXIDE_EXCHANGE_MARKETS` markets); `--tx-inject-rate` is then BUNDLES per second and
+        // `--tx-inject-presign` the number of bundles signed up front.
+        if let Some(items) =
+            node::cli::parse_cli_flag("--tx-inject-orders").and_then(|v| v.parse::<usize>().ok())
+        {
+            let bundles = node::cli::parse_cli_flag("--tx-inject-presign")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1_000);
+            println!(
+                "oxide-devnet[{node_index}]: order injector sender=0x{} ({items} orders per bundle, {bundles} bundles presigned, {} markets)",
+                node::cli::hex_encode(&sender.0),
+                cfg.node.exchange_markets.clamp(1, 256),
+            );
+            return node::validator_net::TxInject::exchange_bundles_presigned(
+                rate,
+                key,
+                sender,
+                cfg.node.chain_id,
+                bundles,
+                items,
+                cfg.node.exchange_markets,
+            );
+        }
         match node::cli::parse_cli_flag("--tx-inject-presign").and_then(|v| v.parse::<usize>().ok())
         {
             Some(n) if n > 0 => node::validator_net::TxInject::evm_transfers_presigned(

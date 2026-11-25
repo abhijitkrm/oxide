@@ -278,6 +278,10 @@ pub struct NodeConfig {
     /// retains in memory (`Executor::with_history_retention`).
     /// `None` = the executor default (4096).
     pub history_retention: Option<usize>,
+    /// How many spot markets the exchange lists at assembly (ids `0..n`, the same default geometry each).
+    /// Default 1. More markets give the per-market execution lanes something to run in parallel
+    /// (throughput harnesses; a production chain lists markets through governance).
+    pub exchange_markets: usize,
     /// The EVM base fee (wei per gas) the module advertises and
     /// charges. Must equal the RPC-advertised base fee — the
     /// validator binary sources both from `rpc.base_fee` so the
@@ -322,6 +326,7 @@ impl Default for NodeConfig {
             chain_id: 1,
             require_signed_txs: true,
             history_retention: None,
+            exchange_markets: 1,
             base_fee: 7_000_000_000,
             genesis: None,
             block_budget: types::CHAIN_BLOCK_BUDGET,
@@ -973,16 +978,18 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
         exchange_mod.set_settlement_operator(operator);
     }
     let exchange = Arc::new(exchange_mod);
-    exchange
-        .list_market(trading::MarketConfig {
-            market_id: 0,
-            tick_size: Price(1_000_000),
-            lot_size: Qty(1_000),
-            min_price: Price(1_000_000_000),
-            max_price: Price(2_000_000_000),
-            max_resting: DEFAULT_MARKET_MAX_RESTING,
-        })
-        .expect("default market config is valid");
+    for market_id in 0..config.exchange_markets.clamp(1, 256) {
+        exchange
+            .list_market(trading::MarketConfig {
+                market_id: u16::try_from(market_id).expect("clamped to 256 markets"),
+                tick_size: Price(1_000_000),
+                lot_size: Qty(1_000),
+                min_price: Price(1_000_000_000),
+                max_price: Price(2_000_000_000),
+                max_resting: DEFAULT_MARKET_MAX_RESTING,
+            })
+            .expect("default market config is valid");
+    }
     executor.register_module(exchange.clone());
     // Register the perps module with a default perpetual market
     // (10x max leverage, 0.5% maintenance margin). The perps
@@ -1281,6 +1288,7 @@ pub fn node_config_from(
         // so neither can silently weaken the other.
         require_signed_txs: !(overrides.allow_unsigned_txs || config.executor.allow_unsigned_txs),
         history_retention: Some(config.storage.history_retention),
+        exchange_markets: config.exchange.markets,
         genesis: overrides.genesis.clone(),
         block_budget: types::BlockBudget {
             max_bytes: config.consensus.max_block_bytes,

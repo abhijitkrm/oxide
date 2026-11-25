@@ -298,6 +298,103 @@ impl TxInject {
     }
 }
 
+impl TxInject {
+    /// A pre-signed exchange order injector, for the throughput harness: the node trades against itself.
+    ///
+    /// Nonces `0..markets` are base deposits (one per market, so sells have custody); every later nonce is
+    /// ONE zero-fee delegated-free bundle of `items` orders: sell-then-buy pairs of one lot at one price,
+    /// spread round-robin over the markets, so every order crosses and nothing rests. The whole stream
+    /// (`bundles` bundles) is signed up front on std threads, so the pump thread never signs. `rate` is
+    /// BUNDLES per second (orders per second = `rate * items`). Each executed pair costs the account
+    /// exactly one protocol fee, which is how the harness counts executed orders from the balance.
+    ///
+    /// # Panics
+    /// If `key` cannot sign (impossible for `crypto::secp::test_identity_key` output).
+    #[must_use]
+    pub fn exchange_bundles_presigned(
+        rate: f64,
+        key: [u8; 32],
+        sender: primitives::Address,
+        chain_id: u64,
+        bundles: usize,
+        items: usize,
+        markets: usize,
+    ) -> Self {
+        let markets = markets.clamp(1, 256);
+        let pairs = (items / 2).max(1);
+        let make = move |nonce: u64| -> Vec<u8> {
+            let idx = usize::try_from(nonce).unwrap_or(usize::MAX);
+            let payload = if idx < markets {
+                exchange::msg::deposit_base(
+                    u8::try_from(nonce).expect("clamped to 256 markets"),
+                    BASE_DEPOSIT,
+                )
+            } else {
+                let n = idx - markets;
+                let order = |side| trading::NewOrder {
+                    side,
+                    order_type: trading::OrderType::Limit,
+                    tif: trading::TimeInForce::Gtc,
+                    price: primitives::fixed::Price(1_500_000_000),
+                    qty: primitives::fixed::Qty(1_000),
+                    owner: sender,
+                    stp: trading::StpMode::None,
+                };
+                let mut list: Vec<Vec<u8>> = Vec::with_capacity(pairs * 2);
+                for p in 0..pairs {
+                    let m = u8::try_from((n * pairs + p) % markets).expect("clamped");
+                    list.push(exchange::msg::place(m, order(trading::Side::Sell)));
+                    list.push(exchange::msg::place(m, order(trading::Side::Buy)));
+                }
+                exchange::msg::bundle(&list).expect("bundle within the item and byte bounds")
+            };
+            crate::cli::build_signed_tx_with_fee(
+                &key,
+                sender,
+                chain_id,
+                framework::module_id::EXCHANGE,
+                &payload,
+                nonce,
+                0,
+            )
+            .0
+        };
+        let total = markets + bundles;
+        let workers = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let chunk = total.div_ceil(workers).max(1);
+        let mut pool: Vec<Vec<u8>> = Vec::with_capacity(total);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..total)
+                .step_by(chunk)
+                .map(|start| {
+                    let end = (start + chunk).min(total);
+                    let make = &make;
+                    s.spawn(move || (start..end).map(|n| make(n as u64)).collect::<Vec<_>>())
+                })
+                .collect();
+            for h in handles {
+                pool.extend(h.join().expect("presign worker"));
+            }
+        });
+        Self {
+            sender,
+            anchor_module: None,
+            interval: Duration::from_secs_f64(1.0 / rate),
+            build: Box::new(move |nonce: u64| {
+                match usize::try_from(nonce).ok().and_then(|i| pool.get(i)) {
+                    Some(bytes) => bytes.clone(),
+                    None => make(nonce),
+                }
+            }),
+            recovered: true,
+        }
+    }
+}
+
+/// Base units each injected deposit moves into custody per market (the sell side of the injected pairs
+/// draws it down and the buy side refills it, so this only needs to cover the in-flight working set).
+const BASE_DEPOSIT: u64 = 1_000_000_000;
+
 /// One signed EVM transfer envelope: a 21 000-gas legacy transfer of 1 wei to a fixed sink at 10 gwei
 /// (the bid `evm_workload` uses) wrapped in the standard EVM envelope. The envelope fee field is exempted
 /// for EVM txs (`pays_own_fee`, gas covers it); the value mirrors `evm_workload`'s convention.
