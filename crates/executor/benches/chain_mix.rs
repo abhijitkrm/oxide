@@ -292,14 +292,26 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
         executor.spawn_exec_lane();
     }
 
-    // Ingest: `threads` workers each take a contiguous slice of accounts.
+    // Ingest: `threads` workers each take a contiguous slice of accounts. With
+    // `CHAIN_MIX_CONCURRENT=1` they run WHILE the propose/finalize loop drains the pool (so the two
+    // compete for cores, as on a live node); by default ingest finishes first and the loop
+    // follows, which reports each stage's own ceiling.
+    let concurrent = std::env::var("CHAIN_MIX_CONCURRENT").is_ok_and(|v| v == "1");
     let chunk = n_accts.div_ceil(threads);
     let t0 = Instant::now();
-    let accepted: usize = std::thread::scope(|s| {
+    let accepted_ctr = std::sync::atomic::AtomicUsize::new(0);
+    let finished = std::sync::atomic::AtomicUsize::new(0);
+    let n_workers = txs.chunks(chunk).count();
+    let (mut propose, mut finalize, mut fin_call) = (0.0f64, 0.0f64, 0.0f64);
+    let mut height = 1u64;
+    let mut executed_txs = 0usize;
+    let mut ingest = 0.0f64;
+    std::thread::scope(|s| {
         let hs: Vec<_> = txs
             .chunks(chunk)
             .map(|group| {
                 let ex = &executor;
+                let (ctr, fin) = (&accepted_ctr, &finished);
                 s.spawn(move || {
                     let mut ok = 0usize;
                     for list in group {
@@ -307,44 +319,64 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
                             ok += usize::from(ex.ingest_tx(t.clone()) == MempoolAck::Accepted);
                         }
                     }
-                    ok
+                    ctr.fetch_add(ok, std::sync::atomic::Ordering::Relaxed);
+                    fin.fetch_add(1, std::sync::atomic::Ordering::Release);
                 })
             })
             .collect();
-        hs.into_iter().map(|h| h.join().expect("ingest thread")).sum()
+        if !concurrent {
+            for h in hs {
+                h.join().expect("ingest thread");
+            }
+            ingest = t0.elapsed().as_secs_f64();
+        }
+        // Propose + finalize until the mempool is drained (and, when concurrent, ingest is done).
+        eprintln!(
+            "phase: execution start ({mix}, {threads} ingest threads, concurrent={concurrent})"
+        );
+        // Block cadence (concurrent mode only): propose once per interval so blocks accumulate
+        // transactions as on a live chain (`CHAIN_MIX_BLOCK_MS`, default 50 ms).
+        let interval = std::time::Duration::from_millis(
+            std::env::var("CHAIN_MIX_BLOCK_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(50),
+        );
+        let mut next_block = Instant::now() + interval;
+        loop {
+            if concurrent {
+                while Instant::now() < next_block {
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                next_block = Instant::now().max(next_block) + interval;
+            }
+            let t = Instant::now();
+            let proposal = executor.prepare_proposal(&BUDGET);
+            propose += t.elapsed().as_secs_f64();
+            if proposal.txs.is_empty() {
+                if finished.load(std::sync::atomic::Ordering::Acquire) == n_workers {
+                    break;
+                }
+                std::thread::yield_now();
+                continue;
+            }
+            executed_txs += proposal.txs.len();
+            let t = Instant::now();
+            let _ = executor.process_proposal(&proposal);
+            let block = FinalizedBlock {
+                context: types::BlockContext::default(),
+                height: Height::new(height),
+                txs: proposal.txs,
+                signers: Vec::new(),
+            };
+            let tf = Instant::now();
+            let _ = executor.finalize_block(&block);
+            fin_call += tf.elapsed().as_secs_f64();
+            if lane_mode == "sync" {
+                let _ = executor.attest_state(Height::new(height));
+            }
+            finalize += t.elapsed().as_secs_f64();
+            height += 1;
+        }
     });
-    let ingest = t0.elapsed().as_secs_f64();
-
-    // Propose + finalize until the mempool is drained.
-    eprintln!("phase: execution start ({mix}, {threads} ingest threads)");
-    let (mut propose, mut finalize, mut fin_call) = (0.0f64, 0.0f64, 0.0f64);
-    let mut height = 1u64;
-    let mut executed_txs = 0usize;
-    loop {
-        let t = Instant::now();
-        let proposal = executor.prepare_proposal(&BUDGET);
-        propose += t.elapsed().as_secs_f64();
-        if proposal.txs.is_empty() {
-            break;
-        }
-        executed_txs += proposal.txs.len();
-        let t = Instant::now();
-        let _ = executor.process_proposal(&proposal);
-        let block = FinalizedBlock {
-            context: types::BlockContext::default(),
-            height: Height::new(height),
-            txs: proposal.txs,
-            signers: Vec::new(),
-        };
-        let tf = Instant::now();
-        let _ = executor.finalize_block(&block);
-        fin_call += tf.elapsed().as_secs_f64();
-        if lane_mode == "sync" {
-            let _ = executor.attest_state(Height::new(height));
-        }
-        finalize += t.elapsed().as_secs_f64();
-        height += 1;
-    }
+    let accepted = accepted_ctr.load(std::sync::atomic::Ordering::Relaxed);
 
     eprintln!(
         "finalize_block call time: {:.3} us/tx, propose {:.3} us/tx",
@@ -358,6 +390,13 @@ fn run(mix: &str, threads: usize, total: usize, n_accts: usize, ring: bool) {
         let _ = executor.attest_state(Height::new(height - 1));
         finalize += t.elapsed().as_secs_f64();
     }
+    // End-to-end wall clock from the first ingest to the last executed (and rooted) block: with
+    // `CHAIN_MIX_CONCURRENT=1` this is the sustained rate with ingest and execution sharing cores.
+    let wall = t0.elapsed().as_secs_f64();
+    eprintln!(
+        "wall,concurrent={concurrent},secs={wall:.3},items_per_s={:.0}",
+        (executed_txs * weight) as f64 / wall
+    );
     // Native (CLOB) senders: the executor's nonce must have advanced by exactly their tx count.
     // EVM senders track nonces inside the EVM module, so for them we require that every
     // transaction was admitted and went through proposal and finalization.
