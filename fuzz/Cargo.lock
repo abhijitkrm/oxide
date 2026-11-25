@@ -996,9 +996,9 @@ dependencies = [
  "blst",
  "codec",
  "ed25519-dalek",
+ "keccak-asm",
  "primitives",
  "secp256k1",
- "sha3",
  "zeroize",
 ]
 
@@ -1229,7 +1229,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.1",
- "const-oid 0.10.2",
  "crypto-common 0.2.2",
 ]
 
@@ -1376,7 +1375,9 @@ dependencies = [
  "crypto",
  "executor",
  "framework",
+ "lanes",
  "primitives",
+ "rayon",
  "storage",
  "trading",
  "types",
@@ -1909,6 +1910,15 @@ name = "konst_macro_rules"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
+
+[[package]]
+name = "lanes"
+version = "0.1.0"
+dependencies = [
+ "crypto",
+ "primitives",
+ "trading",
+]
 
 [[package]]
 name = "lazy_static"

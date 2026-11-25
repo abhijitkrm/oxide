@@ -1,6 +1,6 @@
 # Delegated bundles: cheap authentication on the chain path (spec, draft 25 Nov 2026)
 
-Status: IN PROGRESS on branch `cheap-auth`. User decision (25 Nov): "trim bundles first then cheap-auth", after the box showed that
+Status: IMPLEMENTED and measured on the box (25 Nov): ~5M orders/s sustained for delegated bundles; see `docs/devlog.md`. Open: the per-item fee model. User decision (25 Nov): "trim bundles first then cheap-auth", after the box showed that
 a single signed order costs ~30 us of secp256k1 recovery out of ~40 us end to end (~300k orders/s sustained on 12 cores) while
 owner-signed bundles reach 9.1-9.4M orders/s. Builds on `docs/bundle-auth-spec.md` (section 3, "gateway-certified bundle") and the
 exchange's `docs/lanes-spec.md` authentication seam.

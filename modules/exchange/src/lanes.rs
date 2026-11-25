@@ -99,11 +99,15 @@ pub(crate) const LANE_MIN_ORDERS: usize = 512;
 pub(crate) const MAX_LANES: usize = 32;
 
 /// Names of the lane phases, in `lane_ns` order (observability: where a run's time goes).
-pub(crate) const PHASES: [&str; 7] =
-    ["plan", "components", "funds", "fees", "lanes", "merge", "ledger"];
+pub(crate) const PHASES: [&str; 8] =
+    ["plan", "components", "funds", "fees", "lanes", "merge", "assemble", "ledger"];
 
 /// `lane_of_market` entry of a market no item touches.
 const NO_LANE: u8 = u8::MAX;
+
+/// Smallest chunk of scattered bundles one pool task assembles. Unit: bundles. Origin: assembling
+/// one bundle is ~1 us on a laptop core, about the cost of a pool hand-off; 16 amortizes it.
+const ASSEMBLE_MIN_BUNDLES: usize = 16;
 
 /// Work-item index meaning "this whole bundle, on one lane": the lane runs every item in order and
 /// assembles the transaction result itself (in parallel with the other lanes).
@@ -611,6 +615,7 @@ impl ExchangeModule {
                 }
             }
         }
+        self.tick(5, t);
         // Transaction results. An unplayable transaction fails whole. A bundle scattered across
         // lanes gets its events in item order (a failed item becomes the same rejection event the
         // serial path emits); the copying runs on the pool, one bundle per task.
@@ -628,8 +633,18 @@ impl ExchangeModule {
         }
         let assembled: Vec<(usize, Vec<Event>)> = split
             .into_par_iter()
+            // A bundle is ~1 us of copying: hand the pool chunks, not single bundles.
+            .with_min_len(ASSEMBLE_MIN_BUNDLES)
             .map(|(i, slots)| {
-                let mut events = Vec::new();
+                // Exact capacity: one allocation per bundle instead of a doubling series.
+                let total: usize = slots
+                    .iter()
+                    .map(|s| match s {
+                        Some(Ok(evs)) => evs.len(),
+                        _ => 1,
+                    })
+                    .sum();
+                let mut events = Vec::with_capacity(total);
                 for (idx, slot) in slots.into_iter().enumerate() {
                     match slot {
                         Some(Ok(evs)) => events.extend(evs),
@@ -644,8 +659,8 @@ impl ExchangeModule {
         for (i, events) in assembled {
             results[i] = Some(Ok(events));
         }
+        self.tick(6, t);
         drop(guard);
-        self.tick(5, t);
         let mut deltas: Vec<(Address, i128)> =
             deltas.into_iter().filter(|(_, d)| *d != 0).collect();
         deltas.sort_unstable_by_key(|(a, _)| *a);
@@ -658,7 +673,7 @@ impl ExchangeModule {
             // Unreachable: the funds proof covers every debit and supply stays below u64::MAX.
             debug_assert!(matches!(applied, Some(Ok(()))), "lane ledger delta failed");
         }
-        self.tick(6, t);
+        self.tick(7, t);
         results
     }
 }

@@ -12,6 +12,23 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Exchange: delegated bundles, cheap authentication for many traders**
+  (`TAG_DELEGATE` 20, `TAG_REVOKE_DELEGATE` 21, `TAG_DBUNDLE` 22;
+  `docs/delegated-bundle-spec.md`). An owner delegates place/cancel rights on
+  their account to an agent key (a gateway) once, with an expiry and an optional
+  per-order notional cap. The agent then signs ONE transaction carrying orders
+  for many owners; each order is authorized by a table lookup instead of a
+  signature recovery. Delegations live in the exchange's committed store, so
+  roots are unchanged until a delegation exists. Agents cannot withdraw or
+  transfer. The execution lanes now split a bundle's orders across markets.
+  - **In plain words:** instead of every trader signing every order (about 30
+    microseconds of checking each, around 300 thousand orders a second on a
+    12-core server), a trusted gateway can sign for all its traders in one
+    go. Measured on the same server: about 5 million orders a second sustained
+    for orders routed this way, with results identical to the single-core path.
+    Traders stay in control: they can revoke the gateway at any time, cap the
+    size of any order, and the gateway can never move money out of their account.
+
 - **Matcher: session and certificate frames, expiry, gateway suspension**
   (binary TCP control frames `0xFD`, JSON-RPC `oxide_openSession` /
   `oxide_closeSession`; `--max-session-ttl-ms`, `--gateway-suspend-after`).

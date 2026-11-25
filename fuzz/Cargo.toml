@@ -101,6 +101,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "exchange-delegation"
+path = "fuzz_targets/exchange_delegation.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "p2p-handshake"
 path = "fuzz_targets/p2p_handshake.rs"
 test = false
