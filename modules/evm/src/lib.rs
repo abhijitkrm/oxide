@@ -94,6 +94,7 @@ mod read;
 pub mod receipts;
 mod rootstage;
 pub mod spec;
+mod storage_trie;
 pub mod trace;
 pub mod trie;
 pub mod tx;
@@ -578,6 +579,10 @@ pub struct EvmModule {
     /// computation, not the trie assembly).
     storage_root_cache:
         Mutex<std::collections::HashMap<revm::primitives::Address, alloy_primitives::B256>>,
+    /// Incremental storage tries of the large accounts (the EIP-2935 history contract and any big
+    /// contract): `patch_delta` updates only the changed slots instead of rehashing every slot
+    /// (see `storage_trie`). Lock order: `db`, then this; written only by `patch_delta`.
+    large_storage: Mutex<storage_trie::LargeStorageTries>,
     /// Cached state root from the last `state_root` call. If no
     /// Phase B: incremental account-trie leaf cache — hashed
     /// address (`keccak256` of the 20-byte EVM address) →
@@ -718,6 +723,7 @@ impl EvmModule {
             touched: Mutex::new(std::collections::BTreeSet::new()),
             parallel_reexecs: std::sync::atomic::AtomicUsize::new(0),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
+            large_storage: Mutex::new(storage_trie::LargeStorageTries::default()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
             retained_depth: std::sync::atomic::AtomicUsize::new(0),
@@ -759,6 +765,7 @@ impl EvmModule {
             touched: Mutex::new(std::collections::BTreeSet::new()),
             parallel_reexecs: std::sync::atomic::AtomicUsize::new(0),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
+            large_storage: Mutex::new(storage_trie::LargeStorageTries::default()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
             retained_depth: std::sync::atomic::AtomicUsize::new(0),
@@ -827,6 +834,7 @@ impl EvmModule {
             touched: Mutex::new(std::collections::BTreeSet::new()),
             parallel_reexecs: std::sync::atomic::AtomicUsize::new(0),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
+            large_storage: Mutex::new(storage_trie::LargeStorageTries::default()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
             retained_branches: Mutex::new(std::collections::HashMap::new()),
             retained_depth: std::sync::atomic::AtomicUsize::new(0),

@@ -25518,3 +25518,29 @@ No measurable difference (noise about 3%): rounds already take longer than the i
 Decision: default OFF (zero, behavior unchanged). The knob ships so the multi-core box run can A/B it where rounds are faster than the interval; set a default only after that.
 
 In plain words: a setting to make a validator wait a few milliseconds between blocks so each block holds more transactions. On the laptop it changed nothing, so it is off by default until it is tested on a faster machine.
+
+## 25 Nov 2026 — incremental storage roots for large contracts (branch `incremental-history-root`)
+
+Cause (consensus bench profile, earlier today): `patch_delta` recomputed the storage root of every touched account from ALL its slots. The EIP-2935 history contract is
+touched by every block (the parent-hash write) and holds an 8,191-slot ring buffer, so each block keccak-hashed 8,191 slot keys and rebuilt the whole storage trie to change one
+leaf: the Keccak 14.3% of CPU on the validators. Any big token or order-book contract had the same O(slots) cost per touching block.
+
+Change: `modules/evm/src/storage_trie.rs`. For accounts with >= 512 slots, `patch_delta` keeps the account's storage trie (leaves + retained branches, the same structure the
+state trie keeps) and updates only changed slots through the existing `sparse_walk`. The cache stores the `slot -> value` map it represents and each block DIFFS the account's
+slots against that, so correctness never depends on tracking history: a rollback, a snapshot import or anything else that changes the account cache just produces a larger
+diff (or a rebuild when over a quarter of the slots changed). Entries are dropped when an account is deleted or shrinks below 512 slots; total cached slots are capped at 1M
+(~200 MB), beyond which the old full computation is used (bounds memory, never changes a root). Lock order: db, then `large_storage`; only `patch_delta` writes it.
+Not changed: the first state-root build after construction or import, `import_state`, and the proof paths (they still use the full computation).
+
+Verification: 7 new tests, all comparing against the pre-existing `trie::storage_root` byte for byte: ring buffer (8,191 slots, 200 single-slot updates), random
+insert/update/zero-write/removal/bulk mixes over 6 seeds x 120 steps, rollback and unrelated-replacement of an account, shrink below threshold, heavy shrink then regrow, slot
+budget fallback, independent accounts. Mutation checks: skipping the stale-branch sweep fails 1 test, skipping removed-slot detection fails 2; restored code passes. The
+whole `evm` crate (235 tests, including the existing history and deferred-root equality tests) passes.
+
+Measured (release, `cargo test -p evm --release storage_trie_timing -- --ignored --nocapture`, laptop): one-slot update of an 8,191-slot ring, storage root only:
+incremental 220 us per block, full 4,296 us per block, 19.5x. At the 22 blocks/s of the laptop devnet that is ~9% of a core saved; at the 100+ blocks/s the box ran at low load it
+is ~40% of a core. What is left (220 us) is the diff pass over 8,191 slots; an exact changed-slot set from execution would remove it but needs a hook in revm's commit, not done.
+Not yet measured end to end: validator CPU and orders/s through consensus on a multi-core machine (Phase 2).
+
+In plain words: every block used to re-add up all 8,191 entries of a bookkeeping contract to change one of them. It now remembers the previous result and fixes only the one
+entry that changed, about 20 times faster, and the answer is bit-for-bit the same.
