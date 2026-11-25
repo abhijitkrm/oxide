@@ -132,6 +132,16 @@ def main():
             cpu_pct.append(round(100 * used / len(cpusets[k]), 1))
         heights = [height(a.rpc_port + i) for i in range(n)]
         dead = [i for i, p in enumerate(procs) if p.poll() is not None]
+
+        def count_in_logs(needle):
+            total = 0
+            for i in range(n):
+                try:
+                    with open(os.path.join(work, f"n{i}.log"), errors="replace") as f:
+                        total += sum(1 for line in f if needle in line)
+                except OSError:
+                    pass
+            return total
         blocks = (h_end or 0) - (h_start or 0)
         res = {
             "validators": n, "cores_each": a.cores, "smt": a.smt, "cpus_each": len(cpusets[0]),
@@ -142,13 +152,16 @@ def main():
             "avg_tx_per_block": round(total_txs / blocks, 1) if blocks else None,
             "cpu_pct_of_pinned": cpu_pct, "end_heights": heights,
             "exited": dead,
+            "view_timeouts": count_in_logs("view timeout"),
+            "rejected_proposals": count_in_logs("app rejected proposal"),
             "max_height_lag": (max(heights) - min(heights)) if all(x is not None for x in heights) else None,
         }
         print(f"{n} validators x {len(cpusets[0])} CPUs ({'cores+SMT' if a.smt else 'cores'}), offered "
               f"{a.rate:.0f}/validator ({a.rate * n:.0f} total)")
         print(f"  committed {res['tx_per_s']} tx/s, {res['blocks_per_s']} blocks/s "
               f"(~{res['avg_block_ms']} ms/block, avg {res['avg_tx_per_block']} tx/block)")
-        print(f"  CPU of pinned set: {cpu_pct}%  end heights {heights}")
+        print(f"  CPU of pinned set: {cpu_pct}%  end heights {heights}  "
+              f"view timeouts {res['view_timeouts']}  rejected proposals {res['rejected_proposals']}")
         print("RESULT " + json.dumps(res))
     finally:
         for p in procs:
