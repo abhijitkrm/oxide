@@ -31,9 +31,11 @@ use crate::book_view::BookView;
 /// this the serial path is faster. Raising it keeps small runs serial; lowering it risks a net loss.
 pub(crate) const LANE_MIN_ORDERS: usize = 512;
 
-/// Most lanes one run is split into. Unit: lanes. Origin: the 8-core x86 box of the hardware
-/// ladder; more lanes than cores only adds merge work. Raising it needs more cores.
-pub(crate) const MAX_LANES: usize = 8;
+/// Most lanes one run is split into. Unit: lanes. The effective count is also capped by the rayon
+/// pool size and the number of independent market components, so this only bounds the largest box.
+/// Origin: was 8 (the 8-core rung of the hardware ladder); raised to 32 after the 12-core box showed
+/// the 8 cap flattening throughput between 8 and 12 markets (docs/devlog.md, 25 Nov).
+pub(crate) const MAX_LANES: usize = 32;
 
 /// What the planner needs to know about one transaction, computed in parallel.
 struct TxPlan {
